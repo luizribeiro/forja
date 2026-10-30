@@ -77,6 +77,30 @@ impl Config {
             cpu: true,
         }
     }
+    /// Describes convolution history and float32 carry for every recurrent layer.
+    ///
+    /// # Errors
+    /// Refuses invalid configuration or overflowing projection widths.
+    pub fn state_planes(self) -> Result<Vec<forja_sdk::PagedStateDescriptor>> {
+        self.validate()?;
+        let channels = self.qkv()?;
+        Ok((0..self.layers)
+            .filter(|&layer| !self.full_attention(layer))
+            .flat_map(|_| {
+                [
+                    forja_sdk::PagedStateDescriptor {
+                        dtype: forja_sdk::DType::BF16,
+                        shape: vec![self.conv_width - 1, channels],
+                    },
+                    forja_sdk::PagedStateDescriptor {
+                        dtype: forja_sdk::DType::F32,
+                        shape: vec![self.value_heads, self.key_dim, self.value_dim],
+                    },
+                ]
+            })
+            .collect())
+    }
+
     /// Checks projection packing, attention grouping and bounded dimensions.
     ///
     /// # Errors

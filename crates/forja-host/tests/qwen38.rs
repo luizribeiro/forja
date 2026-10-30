@@ -393,3 +393,28 @@ fn prefill_blocks_refuse_invalid_token_and_hidden_widths() -> Result<(), Box<dyn
     }
     Ok(())
 }
+
+#[test]
+fn private_serving_planes_cover_each_recurrent_layer() {
+    for (config, layers, channels, heads, width) in [
+        (qwen38::Config::model(), 48, 10_240, 48, 128),
+        (qwen38::Config::tiny(), 3, 96, 4, 16),
+    ] {
+        let planes = config.state_planes().unwrap();
+        assert_eq!(planes.len(), layers * 2);
+        for pair in planes.as_chunks::<2>().0 {
+            assert_eq!(pair[0].dtype, forja_sdk::DType::BF16);
+            assert_eq!(pair[0].shape, [3, channels]);
+            assert_eq!(pair[1].dtype, forja_sdk::DType::F32);
+            assert_eq!(pair[1].shape, [heads, width, width]);
+        }
+    }
+    assert!(
+        qwen38::Config {
+            key_heads: 0,
+            ..qwen38::Config::tiny()
+        }
+        .state_planes()
+        .is_err()
+    );
+}
