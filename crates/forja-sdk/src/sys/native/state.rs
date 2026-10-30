@@ -72,4 +72,33 @@ impl State {
             }
         }
     }
+
+    pub(crate) fn delta_rule_block(
+        &mut self,
+        inputs: [&Tensor; 5],
+        output: &Tensor,
+        variant: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Cpu(state) => {
+                let inputs: [_; 5] = cpu_inputs(&inputs)?
+                    .try_into()
+                    .map_err(|_| Error::new("invalid state input count"))?;
+                let output = cpu_inputs(&[output])?;
+                state
+                    .delta_rule_block(inputs, output[0], variant)
+                    .map_err(state_error)
+            }
+            #[cfg(all(feature = "native-metal", target_os = "macos"))]
+            Self::Metal(state) => {
+                let inputs: [_; 5] = metal_inputs(&inputs)?
+                    .try_into()
+                    .map_err(|_| Error::new("invalid state input count"))?;
+                let output = metal_inputs(&[output])?;
+                state
+                    .delta_rule_block(inputs, output[0], variant)
+                    .map_err(state_error)
+            }
+        }
+    }
 }

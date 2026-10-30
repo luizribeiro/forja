@@ -73,6 +73,45 @@ impl StatePlane {
         Ok(output)
     }
 
+    /// Applies canonical 64-token transforms from normalized Q/K and log decay.
+    /// Metal execution requires an explicit catalog pick.
+    ///
+    /// # Errors
+    /// Returns validation, quota or execution errors; failed work is never published.
+    pub fn delta_rule_block<T: FloatElement>(
+        &mut self,
+        q: &Tensor<f32>,
+        k: &Tensor<f32>,
+        v: &Tensor<T>,
+        log_decay: &Tensor<f32>,
+        beta: &Tensor<T>,
+        pick: Option<&crate::target::metal::Variant>,
+    ) -> Result<Tensor<T>> {
+        let output = Tensor::<T>::zeros(v.shape())?;
+        eval()?;
+        let inputs = [
+            q.handle(),
+            k.handle(),
+            v.handle(),
+            log_decay.handle(),
+            beta.handle(),
+        ];
+        let name = pick.map_or("", crate::target::metal::Variant::name);
+        #[cfg(target_family = "wasm")]
+        self.raw
+            .delta_rule_block(&inputs, output.handle(), name)
+            .map_err(|error| Error::new(format!("{error:?}")))?;
+        #[cfg(all(not(target_family = "wasm"), feature = "native"))]
+        self.raw.delta_rule_block(inputs, output.handle(), name)?;
+        #[cfg(all(not(target_family = "wasm"), not(feature = "native")))]
+        {
+            let _ = (inputs, output, name);
+            return Err(Error::new("state storage requires a host"));
+        }
+        #[cfg(any(target_family = "wasm", feature = "native"))]
+        Ok(output)
+    }
+
     /// Applies raw causal depthwise convolution and carries its private input history.
     ///
     /// # Errors
