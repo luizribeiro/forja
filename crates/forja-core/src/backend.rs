@@ -716,6 +716,18 @@ pub trait Backend {
         Err(BackendError::UnsupportedOperation)
     }
 
+    /// Profiles work while retaining trusted owners through physical completion.
+    ///
+    /// # Errors
+    /// The default refuses before execution; owners must survive every caller timeout.
+    fn submit_profiled_retained(
+        &self,
+        _commands: CommandList,
+        _owners: Vec<CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        Err(BackendError::UnsupportedOperation)
+    }
+
     /// Prepares a validated graph for repeated execution.
     ///
     /// The default tier retains the template unchanged. Backend-specific encoding plans may be

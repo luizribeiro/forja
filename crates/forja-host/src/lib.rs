@@ -13107,6 +13107,14 @@ mod tests {
         ) -> Result<Self::Submission, BackendError> {
             self.inner.submit_retained(commands, owners)
         }
+
+        fn submit_profiled_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            self.inner.submit_profiled_retained(commands, owners)
+        }
     }
 
     #[test]
@@ -14091,6 +14099,17 @@ mod tests {
             Ok(self.wrap_submission(commands, inner))
         }
 
+        fn submit_profiled_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            let inner = self
+                .inner
+                .submit_profiled_retained(commands.clone(), owners)?;
+            Ok(self.wrap_submission(commands, inner))
+        }
+
         fn supports_replay_overlap(&self) -> bool {
             true
         }
@@ -14157,6 +14176,14 @@ mod tests {
             owners: Vec<forja_core::CompletionResource>,
         ) -> Result<Self::Submission, BackendError> {
             self.inner.submit_retained(commands, owners)
+        }
+
+        fn submit_profiled_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            self.inner.submit_profiled_retained(commands, owners)
         }
     }
 }

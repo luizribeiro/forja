@@ -123,6 +123,13 @@ impl Backend for ControlledBackend {
             .push(Arc::clone(&submission.retained));
         Ok(submission)
     }
+    fn submit_profiled_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        self.submit_retained(commands, owners)
+    }
 }
 
 type Setup = (

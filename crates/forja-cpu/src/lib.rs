@@ -1346,6 +1346,14 @@ impl Backend for CpuBackend {
         completed
     }
 
+    fn submit_profiled_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<forja_core::CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        self.submit_retained(commands, owners)
+    }
+
     fn prepare_program(
         &self,
         _program: &ValidatedProgram,

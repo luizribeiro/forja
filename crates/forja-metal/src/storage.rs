@@ -1260,6 +1260,16 @@ impl Backend for MetalBackend {
         Ok(submission)
     }
 
+    fn submit_profiled_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<forja_core::CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        let submission = self.submit_commands_profiled(commands)?;
+        submission.retain_resources(owners);
+        Ok(submission)
+    }
+
     fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands_profiled(commands)
     }

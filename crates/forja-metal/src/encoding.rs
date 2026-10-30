@@ -11886,7 +11886,7 @@ mod tests {
         backend.submit(CommandList::new()).unwrap().wait().unwrap();
     }
 
-    fn retained_owners_release_after_completion(backend: &impl Backend) {
+    fn retained_owners_release_after_completion(backend: &impl Backend, profiled: bool) {
         struct Owner(Arc<AtomicUsize>);
         impl Drop for Owner {
             fn drop(&mut self) {
@@ -11900,19 +11900,28 @@ mod tests {
         let output = backend.alloc(DType::F32, &[4097]).unwrap();
         let mut commands = CommandList::new();
         commands.dispatch(Op::Copy, &[&input], &output).unwrap();
-        let submission = backend.submit_retained(commands, vec![owner]).unwrap();
+        let submission = if profiled {
+            backend.submit_profiled_retained(commands, vec![owner])
+        } else {
+            backend.submit_retained(commands, vec![owner])
+        }
+        .unwrap();
         submission.wait().unwrap();
         assert_eq!(released.load(Ordering::Acquire), 1);
     }
 
     #[test]
     fn cpu_retained_owners_release_after_completion() {
-        retained_owners_release_after_completion(&CpuBackend::new());
+        for profiled in [false, true] {
+            retained_owners_release_after_completion(&CpuBackend::new(), profiled);
+        }
     }
 
     #[test]
     fn metal_retained_owners_release_outside_callbacks_after_completion() {
-        retained_owners_release_after_completion(&MetalBackend::new().unwrap());
+        for profiled in [false, true] {
+            retained_owners_release_after_completion(&MetalBackend::new().unwrap(), profiled);
+        }
     }
 
     #[test]
