@@ -48,6 +48,39 @@ impl StateSequence {
         )
     }
 
+    /// Replaces a retained checkpoint only when a new reservation succeeds.
+    ///
+    /// # Errors
+    /// Refuses foreign checkpoints, unavailable versions or invalid transaction serials.
+    pub fn begin_releasing_checkpoint(
+        &mut self,
+        serial: u64,
+        checkpoint: &mut Option<StateCheckpoint>,
+    ) -> Result<StateTransaction, PagePoolError> {
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| !Arc::ptr_eq(&self.identity, &checkpoint.identity))
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let previous = checkpoint.take().map(|checkpoint| {
+            let bookmark = (checkpoint.version(), checkpoint.published.clone());
+            drop(checkpoint);
+            bookmark
+        });
+        match self.begin(serial) {
+            Ok(transaction) => Ok(transaction),
+            Err(error) => {
+                if let Some((version, published)) = previous {
+                    let mut restored = self.pin(version)?;
+                    restored.published = published;
+                    *checkpoint = Some(restored);
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Retains the input version of a live speculative transaction.
     ///
     /// # Errors
@@ -110,6 +143,30 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn cloned_checkpoint_keeps_its_version_pinned_during_reservation() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let mut retained = Some(sequence.checkpoint().unwrap());
+        let caller = retained.as_ref().unwrap().clone();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted(&first).unwrap();
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&first, true).unwrap();
+        let second = sequence
+            .begin_releasing_checkpoint(2, &mut retained)
+            .unwrap();
+        assert_ne!(second.output, caller.version());
+        assert!(retained.is_none());
+        sequence.cancel_unsubmitted(&second).unwrap();
+        sequence.rewind(&caller).unwrap();
+    }
 
     #[test]
     fn speculative_checkpoints_require_successful_publication() {

@@ -72,11 +72,20 @@ impl StateJournal {
         if position.tokens > position.reserved_tokens {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        let transaction = self.sequence.begin(serial)?;
-        let checkpoint = match self.sequence.predecessor(&transaction) {
-            Ok(checkpoint) => checkpoint,
+        let checkpoint = self.sequence.checkpoint_latest()?;
+        let (mut retained, position_before) = self
+            .retained
+            .take()
+            .map_or((None, None), |(checkpoint, position)| {
+                (Some(checkpoint), Some(position))
+            });
+        let transaction = match self
+            .sequence
+            .begin_releasing_checkpoint(serial, &mut retained)
+        {
+            Ok(transaction) => transaction,
             Err(error) => {
-                self.sequence.cancel_unsubmitted(&transaction)?;
+                self.retained = retained.zip(position_before);
                 return Err(error);
             }
         };
@@ -194,6 +203,39 @@ impl StateJournal {
 mod tests {
     use super::*;
     use forja_core::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn accepted_predecessors_release_the_next_depth_two_version() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut journal = StateJournal::new(pool.reserve().unwrap());
+        let position = |tokens| LanePosition {
+            tokens,
+            reserved_tokens: 128,
+            ..LanePosition::default()
+        };
+        let caller = journal.checkpoint_latest().unwrap();
+        let first = journal.begin(1, Some(position(1))).unwrap();
+        journal.mark_submitted(&first).unwrap();
+        let second = journal.begin(2, Some(position(2))).unwrap();
+        journal.mark_submitted(&second).unwrap();
+        pool.observe_completion(1).unwrap();
+        journal.finish(&first, true).unwrap();
+        assert!(journal.begin(3, Some(position(3))).is_err());
+        assert_eq!(journal.retained.as_ref().unwrap().1.tokens, 0);
+        drop(caller);
+        let third = journal.begin(3, Some(position(3))).unwrap();
+        journal.mark_submitted(&third).unwrap();
+        pool.observe_completion(3).unwrap();
+        journal.finish(&second, true).unwrap();
+        journal.finish(&third, true).unwrap();
+        journal.rewind(2).unwrap();
+        assert_eq!(journal.position, position(2));
+    }
 
     #[test]
     fn positions_publish_atomically_and_rewind_to_the_queued_input() {
