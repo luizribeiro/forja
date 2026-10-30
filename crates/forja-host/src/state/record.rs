@@ -11,7 +11,8 @@ pub struct StateRecording<B: Backend> {
     pub(super) transaction: StateTransaction,
     pub(super) sequence: StateSequenceHandle<B>,
     pub(super) handed_off: bool,
-    access: StateAccess,
+    pub(super) access: StateAccess,
+    pub(super) scratch: Vec<super::block::StateScratch<B>>,
     metadata: Vec<Tensor>,
     _charge: StateCharge,
     pub(super) commands: CommandList,
@@ -62,6 +63,7 @@ impl<B: Backend> StateStorage<B> {
             sequence: sequence.clone(),
             handed_off: false,
             access,
+            scratch: Vec::new(),
             metadata: Vec::new(),
             _charge: charge,
             commands: CommandList::new(),
@@ -140,6 +142,18 @@ impl<B: Backend> StateRecording<B> {
         inputs: &[&Tensor],
         output: &Tensor,
     ) -> Result<(), compute::Error> {
+        let dispatch = self.prepare_update(plane, operation, inputs, output, None)?;
+        self.record_update(plane, dispatch)
+    }
+
+    pub(super) fn prepare_update(
+        &self,
+        plane: usize,
+        operation: StateOp,
+        inputs: &[&Tensor],
+        output: &Tensor,
+        scratch: Option<&Tensor>,
+    ) -> Result<forja_core::Dispatch, compute::Error> {
         if self.updated.get(plane).copied() != Some(false) {
             return Err(invalid_handle("state plane is unknown or already updated"));
         }
@@ -150,7 +164,11 @@ impl<B: Backend> StateRecording<B> {
         let mut operands = inputs.to_vec();
         operands.push(&previous);
         operands.extend(&self.metadata);
-        for tensor in operands.iter().copied().chain([output, &next]) {
+        let outputs = [output, &next]
+            .into_iter()
+            .chain(scratch)
+            .collect::<Vec<_>>();
+        for tensor in operands.iter().copied().chain(outputs.iter().copied()) {
             if tensor.layout().shape().len() > self.limits.tensor_rank
                 || tensor.layout().element_count() > self.limits.tensor_elements
             {
@@ -159,12 +177,19 @@ impl<B: Backend> StateRecording<B> {
         }
         let mut candidate = CommandList::new();
         candidate
-            .dispatch_many(Op::State(operation), &operands, &[output, &next])
+            .dispatch_many(Op::State(operation), &operands, &outputs)
             .map_err(guest_error)?;
-        let dispatch = candidate
+        candidate
             .into_dispatches()
             .pop()
-            .ok_or_else(|| invalid_handle("missing validated state operation"))?;
+            .ok_or_else(|| invalid_handle("missing validated state operation"))
+    }
+
+    pub(super) fn record_update(
+        &mut self,
+        plane: usize,
+        dispatch: forja_core::Dispatch,
+    ) -> Result<(), compute::Error> {
         let cost = KernelCost::of(&dispatch).ok_or_else(|| quota("state work overflow"))?;
         let work = cost
             .flops

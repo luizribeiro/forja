@@ -62,7 +62,7 @@ impl<B: Backend> StateCell<B> {
         self.submitted
     }
 
-    fn update(
+    pub(super) fn update(
         &mut self,
         limits: Limits,
         record: impl FnOnce(&mut super::StateRecording<B>) -> Result<(), compute::Error>,

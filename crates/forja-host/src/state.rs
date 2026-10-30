@@ -1,5 +1,6 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
+mod block;
 mod cell;
 mod guest;
 pub use guest::StateEntry;
