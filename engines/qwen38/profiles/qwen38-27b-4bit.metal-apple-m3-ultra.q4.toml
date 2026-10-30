@@ -35,7 +35,7 @@ paged-cache = false
 quant = "quant-matmul.portable"
 attention = "sdpa.vector-256-two-pass"
 sample = "sample.parallel"
-delta-prefill = "delta-rule-block.wy64-fixed"
+delta-prefill = "delta-rule-block.wy64-mma-v32"
 
 [quantization]
 scheme = "mlx-affine"
