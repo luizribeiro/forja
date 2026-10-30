@@ -1,10 +1,10 @@
-use super::StateStorage;
+use super::{LanePosition, StateStorage, journal::StateJournal};
 use forja_core::{Backend, PagePoolError, StateSequence, StateTransaction};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Shared sequence ownership retained by every recording and completion guard.
 pub struct StateSequenceHandle<B: Backend> {
-    inner: Arc<Mutex<StateSequence>>,
+    inner: Arc<Mutex<StateJournal>>,
     pub(super) storage: Arc<StateStorage<B>>,
 }
 
@@ -20,12 +20,12 @@ impl<B: Backend> Clone for StateSequenceHandle<B> {
 impl<B: Backend> StateSequenceHandle<B> {
     pub(super) fn new(storage: Arc<StateStorage<B>>, sequence: StateSequence) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(sequence)),
+            inner: Arc::new(Mutex::new(StateJournal::new(sequence))),
             storage,
         }
     }
 
-    pub(super) fn lock(&self) -> MutexGuard<'_, StateSequence> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, StateJournal> {
         match self.inner.lock() {
             Ok(sequence) => sequence,
             Err(poisoned) => poisoned.into_inner(),
@@ -37,7 +37,33 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// # Errors
     /// Refuses stale serials, excess descendants or versions awaiting a failed submission's drain.
     pub fn begin(&self, serial: u64) -> Result<StateTransaction, PagePoolError> {
-        self.lock().begin(serial)
+        self.lock().begin(serial, None)
+    }
+
+    /// Reserves a version and all serving cursors in one lane transaction.
+    ///
+    /// # Errors
+    /// Refuses invalid capacity or an unavailable transaction version.
+    pub fn begin_at(
+        &self,
+        serial: u64,
+        position: LanePosition,
+    ) -> Result<StateTransaction, PagePoolError> {
+        self.lock().begin(serial, Some(position))
+    }
+
+    /// Returns the cursors published with the last successful state version.
+    #[must_use]
+    pub fn position(&self) -> LanePosition {
+        self.lock().position
+    }
+
+    /// Selects the retained predecessor and all its serving cursors after drain.
+    ///
+    /// # Errors
+    /// Refuses a missing boundary or outstanding device work.
+    pub fn rewind(&self, tokens: u64) -> Result<(), PagePoolError> {
+        self.lock().rewind(tokens)
     }
 
     /// Cancels an unsubmitted reservation and its descendants.

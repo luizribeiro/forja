@@ -13,8 +13,10 @@ mod multiple_sequences;
 pub use cell::StateCell;
 mod record;
 pub use record::StateRecording;
+mod journal;
 #[cfg(test)]
 mod quota_tests;
+pub use journal::LanePosition;
 mod sequence;
 pub use sequence::StateSequenceHandle;
 mod submit;

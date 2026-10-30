@@ -10,8 +10,8 @@ mod fuzz_tests;
 mod native;
 mod state;
 pub use state::{
-    StateCapture, StateCell, StateEntry, StateRecording, StateSequenceHandle, StateStorage,
-    StateSubmission,
+    LanePosition, StateCapture, StateCell, StateEntry, StateRecording, StateSequenceHandle,
+    StateStorage, StateSubmission,
 };
 mod weights;
 
