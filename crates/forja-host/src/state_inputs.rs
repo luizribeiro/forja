@@ -27,6 +27,7 @@ impl StateInputBank {
 pub(crate) struct StateInputs {
     pub(crate) banks: [StateInputBank; 2],
     pub(crate) feedback: u32,
+    pub(crate) feedback_versions: crate::state::feedback::FeedbackBinding,
 }
 
 impl StateInputs {
@@ -106,6 +107,7 @@ impl<B: Backend + 'static> Host<B> {
         let scalars = lanes
             .checked_mul(5)
             .ok_or_else(|| invalid_handle("state feedback count overflowed"))?;
+        let feedback_versions = crate::state::feedback::FeedbackBinding::new(self, lanes)?;
         let mut handles = Vec::new();
         let result = (|| {
             let mut alloc = |dtype, shape: &[u32]| {
@@ -126,6 +128,7 @@ impl<B: Backend + 'static> Host<B> {
             };
             let banks = [bank()?, bank()?];
             Ok(StateInputs {
+                feedback_versions,
                 banks,
                 feedback: alloc(compute::Dtype::U32, &[scalars])?,
             })
@@ -155,6 +158,7 @@ mod tests {
         let bytes = host.live_bytes.load(Ordering::Acquire);
         assert_ne!(inputs.banks[0].logits, inputs.banks[1].logits);
         host.drop_paged_handles(inputs.handles().collect());
+        drop(inputs);
         assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
         for limit in (0..bytes).step_by(4) {
             host.limits.live_bytes = limit;

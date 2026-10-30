@@ -35,6 +35,7 @@ pub(super) struct StateJournal {
     rollback_paged: Option<PagedInput>,
     retained_paged: Option<PagedInput>,
     sequence: StateSequence,
+    feedback: Option<super::feedback::LaneFeedback>,
     pub(super) position: LanePosition,
     pending: VecDeque<Pending>,
     retained: Option<(StateCheckpoint, LanePosition)>,
@@ -58,10 +59,22 @@ impl StateJournal {
             rollback_paged: None,
             retained_paged: None,
             sequence,
+            feedback: None,
             position: LanePosition::default(),
             pending: VecDeque::new(),
             retained: None,
         }
+    }
+
+    pub(super) fn attach_feedback(
+        &mut self,
+        binding: super::feedback::FeedbackBinding,
+    ) -> Result<(), PagePoolError> {
+        if self.feedback.is_some() {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        self.feedback = Some(super::feedback::LaneFeedback::new(binding, &self.sequence)?);
+        Ok(())
     }
 
     pub(super) fn begin(
@@ -219,8 +232,15 @@ impl StateJournal {
     }
 
     pub(super) fn checkpoint_latest(&self) -> Result<super::StateLaneCheckpoint, PagePoolError> {
+        let version = self.sequence.checkpoint_latest()?;
+        let feedback = self
+            .feedback
+            .as_ref()
+            .map(|feedback| feedback.checkpoint(version.version()))
+            .transpose()?;
         Ok(super::StateLaneCheckpoint {
-            version: self.sequence.checkpoint_latest()?,
+            version,
+            feedback,
             position: self
                 .pending
                 .back()
@@ -233,11 +253,19 @@ impl StateJournal {
         checkpoint: &super::StateLaneCheckpoint,
         action: impl FnOnce() -> Result<(), PagePoolError>,
     ) -> Result<(), PagePoolError> {
+        if let Some(feedback) = &self.feedback {
+            feedback.validate(checkpoint.feedback.as_ref())?;
+        } else if checkpoint.feedback.is_some() {
+            return Err(PagePoolError::ForeignResource);
+        }
         let previous = self.sequence.checkpoint()?;
         self.sequence.rewind(&checkpoint.version)?;
         if let Err(error) = action() {
             self.sequence.rewind(&previous)?;
             return Err(error);
+        }
+        if let (Some(feedback), Some(boundary)) = (&self.feedback, &checkpoint.feedback) {
+            feedback.restore(boundary)?;
         }
         self.position = checkpoint.position;
         self.retained = None;

@@ -12,6 +12,7 @@ use std::{
 pub struct StateLaneCheckpoint {
     pub(super) version: StateCheckpoint,
     pub(super) position: LanePosition,
+    pub(super) feedback: Option<super::feedback::FeedbackBoundary>,
 }
 
 impl StateLaneCheckpoint {

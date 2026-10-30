@@ -17,6 +17,7 @@ struct Lane<B: Backend> {
 /// Two rebinding banks of lane transactions over one private state pool.
 pub struct StateSlots<B: Backend> {
     storage: Arc<StateStorage<B>>,
+    feedback: Option<super::feedback::FeedbackBinding>,
     inactive_access: StateAccess,
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
@@ -53,11 +54,17 @@ impl<B: Backend> StateSlots<B> {
         let padding = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         Ok(Self {
             storage,
+            feedback: None,
             inactive_access,
             lanes,
             banks,
             padding,
         })
+    }
+
+    pub(crate) fn with_feedback(mut self, feedback: super::feedback::FeedbackBinding) -> Self {
+        self.feedback = Some(feedback);
+        self
     }
 
     /// Creates poisoned, inactive command bindings without reserving a request lease.
@@ -78,7 +85,14 @@ impl<B: Backend> StateSlots<B> {
             .get_mut(lane)
             .ok_or_else(|| invalid_handle("state lane is out of range"))?;
         if lane.sequence.is_none() {
-            lane.sequence = Some(self.storage.reserve()?);
+            let sequence = self.storage.reserve()?;
+            if let Some(feedback) = &self.feedback {
+                sequence
+                    .lock()
+                    .attach_feedback(feedback.clone())
+                    .map_err(pool_error)?;
+            }
+            lane.sequence = Some(sequence);
             lane.serial = 0;
         }
         Ok(())

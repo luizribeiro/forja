@@ -33,6 +33,7 @@ impl<B: Backend + 'static> Host<B> {
         let storage = self.create_state_storage(layout, lanes)?;
         let state = StateSlots::new(storage, lanes)?;
         let backing = self.allocate_state_inputs(lanes, inputs)?;
+        let state = state.with_feedback(backing.feedback_versions.clone());
         let slot = match self.open_paged_slot(pool, planes) {
             Ok(slot) => slot,
             Err(error) => {

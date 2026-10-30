@@ -15,6 +15,7 @@ mod multiple_sequences;
 pub use cell::StateCell;
 mod record;
 pub use record::{StateCommands, StateRecording};
+pub(crate) mod feedback;
 mod journal;
 mod outcome;
 mod paired;
