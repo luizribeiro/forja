@@ -1,7 +1,8 @@
 use super::{Error, verification};
 use std::{env, path::PathBuf, time::Duration};
 
-async fn verify_component(name: &str) -> Result<(), Box<dyn Error>> {
+type Runner = forja_host::EngineRunner<forja_metal::MetalBackend>;
+async fn load() -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
     let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?)
         .join("Qwen3.8-27B-4bit");
     let fixtures = golden_fixtures::FixtureDirectory::open(root.join("forja-fixtures"))?;
@@ -42,6 +43,10 @@ async fn verify_component(name: &str) -> Result<(), Box<dyn Error>> {
     let mut config = crate::common::load_config(component)?;
     config.replay = false;
     engine.load_with_selections(None, &config).await??;
+    Ok((engine, fixtures))
+}
+async fn verify_component(name: &str) -> Result<(), Box<dyn Error>> {
+    let (mut engine, fixtures) = load().await?;
     verification::verify(
         &mut engine,
         fixtures.prompt(name).ok_or("missing prompt fixture")?,
@@ -62,4 +67,57 @@ async fn metal_real_arithmetic_matches_teacher_forced_transformers() -> Result<(
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_real_completion_matches_teacher_forced_transformers() -> Result<(), Box<dyn Error>> {
     verify_component("completion").await
+}
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box<dyn Error>> {
+    let (mut engine, fixtures) = load().await?;
+    let prompt = fixtures.prompt("hello").ok_or("missing prompt fixture")?;
+    let mut tokens = prompt
+        .prompt_ids()
+        .iter()
+        .map(|&id| u32::try_from(id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sampling = forja_host::SamplingParams::default();
+    let first = engine
+        .decode(forja_host::EngineDecode {
+            tokens: Some(tokens.clone()),
+            start_pos: 0,
+            sampling,
+        })
+        .await??;
+    let selected = u32::from_le_bytes(
+        engine
+            .read(&first.token)
+            .await?
+            .try_into()
+            .map_err(|_| "invalid selected token")?,
+    );
+    let logits = golden_fixtures::decode_f32_le(&engine.read(&first.logits).await?)?;
+    assert_eq!(
+        Some(usize::try_from(selected)?),
+        verification::top1(&logits)
+    );
+    let next = engine
+        .decode(forja_host::EngineDecode {
+            tokens: None,
+            start_pos: u32::try_from(tokens.len())?,
+            sampling,
+        })
+        .await??;
+    let retained = golden_fixtures::decode_f32_le(&engine.read(&next.logits).await?)?;
+    tokens.push(selected);
+    let explicit = engine
+        .step(forja_host::EngineStep {
+            tokens,
+            start_pos: 0,
+            taps: false,
+        })
+        .await??;
+    assert_eq!(
+        retained,
+        golden_fixtures::decode_f32_le(&engine.read(&explicit.logits).await?)?
+    );
+    Ok(())
 }
