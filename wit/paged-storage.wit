@@ -1,7 +1,7 @@
 package l9o:gpu@0.1.0;
 
 interface paged-storage {
-  use compute.{affine, command-list, error, params, tensor};
+  use compute.{affine, command-list, dtype, error, params, tensor};
 
   record variant-arm {
     lo: u32,
@@ -19,8 +19,13 @@ interface paged-storage {
   resource batch-slot {
     tensors: func() -> result<slot-tensors, error>;
   }
+  record state-plane-descriptor {
+    dtype: dtype,
+    shape: list<u32>,
+  }
   resource page-pool {
     open-slot: func(planes: u32) -> result<batch-slot, error>;
+    open-state-slot: func(planes: u32, state-planes: list<state-plane-descriptor>) -> result<batch-slot, error>;
   }
 
   enum copy-direction {

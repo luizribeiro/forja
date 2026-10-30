@@ -16,6 +16,14 @@ pub struct PagedSlot<'a> {
     lifetime: PhantomData<&'a ()>,
 }
 
+/// Geometry of one private, three-version serving state plane.
+pub struct PagedStateDescriptor {
+    /// Floating-point storage type.
+    pub dtype: crate::DType,
+    /// Per-sequence plane dimensions.
+    pub shape: Vec<u32>,
+}
+
 /// Host-filled lane metadata used by serving graphs.
 pub struct PagedSlotTensors {
     /// Per-lane logical sequence lengths.
@@ -74,6 +82,18 @@ impl PagedPool<'_> {
     ///
     /// Returns an error when the layer count overflows or the host refuses the slot.
     pub fn cache_set(self, layers: u32) -> Result<PagedCacheSet> {
+        self.cache_set_with_state(layers, &[])
+    }
+
+    /// Allocates attention caches and opaque state planes within the same serving slot.
+    ///
+    /// # Errors
+    /// Refuses invalid geometry, overflow or insufficient host quota.
+    pub fn cache_set_with_state(
+        self,
+        layers: u32,
+        state: &[PagedStateDescriptor],
+    ) -> Result<PagedCacheSet> {
         let planes = layers
             .checked_mul(2)
             .ok_or_else(|| Error::loading("paged cache plane count overflowed"))?;
@@ -81,10 +101,23 @@ impl PagedPool<'_> {
             return Err(Error::loading("paged cache requires at least one layer"));
         }
         #[cfg(target_family = "wasm")]
-        let slot = self
-            .raw
-            .open_slot(planes)
-            .map_err(|error| Error::loading(format!("{error:?}")))?;
+        let slot = if state.is_empty() {
+            self.raw.open_slot(planes)
+        } else {
+            let descriptors = state
+                .iter()
+                .map(
+                    |plane| crate::sys::guest::paged_storage::StatePlaneDescriptor {
+                        dtype: crate::sys::guest::wit_dtype(plane.dtype),
+                        shape: plane.shape.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            self.raw.open_state_slot(planes, &descriptors)
+        }
+        .map_err(|error| Error::loading(format!("{error:?}")))?;
+        #[cfg(not(target_family = "wasm"))]
+        let _ = state;
         Ok(PagedCacheSet {
             #[cfg(target_family = "wasm")]
             _slot: slot,

@@ -7,6 +7,7 @@ pub use prompt::PromptChunking;
 
 #[cfg(test)]
 mod fuzz_tests;
+mod hybrid;
 mod native;
 mod state;
 pub use state::{
@@ -3596,6 +3597,7 @@ pub struct Host<B: Backend> {
     current_profile_scope: Option<Arc<forja_core::ProfileScope>>,
     epoch_registration: Option<Arc<()>>,
     explicit_metal_variants: bool,
+    state_slots: HashMap<u32, StateSlots<B>>,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -3639,6 +3641,7 @@ impl<B: Backend + 'static> Host<B> {
             current_profile_scope: None,
             epoch_registration: None,
             explicit_metal_variants: false,
+            state_slots: HashMap::new(),
         }
     }
 
@@ -8163,6 +8166,16 @@ where
         std::future::ready(Ok(self.open_paged_slot(&resource, planes)))
     }
 
+    fn open_state_slot(
+        &mut self,
+        resource: Resource<PagePoolEntry>,
+        planes: u32,
+        state_planes: Vec<paged_storage::StatePlaneDescriptor>,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<BatchSlotEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.open_state_slot(&resource, planes, state_planes)))
+    }
+
     fn drop(
         &mut self,
         resource: Resource<PagePoolEntry>,
@@ -8253,6 +8266,7 @@ where
         &mut self,
         resource: Resource<BatchSlotEntry>,
     ) -> impl Future<Output = wasmtime::Result<()>> + Send {
+        self.state_slots.remove(&resource.rep());
         let result = self
             .table
             .delete(resource)
@@ -9228,6 +9242,30 @@ mod tests {
                 live_bytes: Arc::clone(&host.live_bytes),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn state_slots_share_the_existing_quota_and_rollback_failed_admission() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let before = host.live_bytes.load(Ordering::Acquire);
+        let descriptor = || super::paged_storage::StatePlaneDescriptor {
+            dtype: compute::Dtype::F32,
+            shape: vec![3, 7],
+        };
+        assert!(host.open_state_slot(&pool, 3, vec![descriptor()]).is_err());
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        assert!(host.state_slots.is_empty());
+        host.limits.live_bytes = before;
+        assert!(host.open_state_slot(&pool, 2, vec![descriptor()]).is_err());
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        host.limits = GENEROUS;
+        let slot = host.open_state_slot(&pool, 2, vec![descriptor()]).unwrap();
+        assert!(host.state_slots.contains_key(&slot.rep()));
+        let charge = host.live_bytes.load(Ordering::Acquire);
+        assert!(charge > before);
+        assert!(host.open_state_slot(&pool, 2, vec![descriptor()]).is_err());
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), charge);
     }
 
     #[test]
