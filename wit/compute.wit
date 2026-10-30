@@ -96,6 +96,7 @@ interface compute {
     sigmoid,
     recip,
     floor,
+    log1p,
   }
 
   enum binop {

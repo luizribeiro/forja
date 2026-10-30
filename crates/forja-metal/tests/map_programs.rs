@@ -253,7 +253,7 @@ fn run_corner_program<B: Backend>(
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-    let outputs = (0..4)
+    let outputs = (0..program.program().outputs.len())
         .map(|_| backend.alloc(DType::F32, &shape).unwrap())
         .collect::<Vec<_>>();
     let input_refs = inputs.iter().collect::<Vec<_>>();
@@ -305,7 +305,7 @@ fn run_program<B: Backend>(
 ) -> Vec<Vec<u8>> {
     let input = backend.alloc(DType::F32, &[4097]).unwrap();
     backend.write(&input, input_bytes).unwrap();
-    let outputs = (0..4)
+    let outputs = (0..program.program().outputs.len())
         .map(|_| backend.alloc(dtype, &[4097]).unwrap())
         .collect::<Vec<_>>();
     let output_refs = outputs.iter().collect::<Vec<_>>();
@@ -331,7 +331,7 @@ fn run_small_program<B: Backend>(
     let shape = [u32::try_from(len).unwrap()];
     let input = backend.alloc(DType::F32, &shape).unwrap();
     backend.write(&input, input_bytes).unwrap();
-    let outputs = (0..4)
+    let outputs = (0..program.program().outputs.len())
         .map(|_| backend.alloc(DType::F32, &shape).unwrap())
         .collect::<Vec<_>>();
     let output_refs = outputs.iter().collect::<Vec<_>>();
@@ -507,4 +507,60 @@ fn program_commands(
 
 fn run(backend: &MetalBackend, commands: CommandList) {
     backend.submit(commands).unwrap().wait().unwrap();
+}
+
+#[test]
+fn metal_log1p_retains_small_arguments_and_domain_boundaries() {
+    let program = Program {
+        kind: ProgramKind::Map,
+        insts: vec![Inst::Input(0), Inst::Unary(UnOp::Log1p, 0)],
+        outputs: vec![(0, 1)],
+    }
+    .validate()
+    .unwrap();
+    let values = [
+        -0.999_999_f32,
+        -0.5,
+        -1e-7,
+        -1e-20,
+        0.0,
+        1e-20,
+        1e-7,
+        1.0,
+        1e30,
+        -0.0,
+        -1.0,
+        -2.0,
+        f32::INFINITY,
+        f32::NAN,
+    ];
+    let bytes = values
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let expected = run_small_program(&CpuBackend::new(), &program, &bytes, values.len());
+    let actual = run_small_program(
+        &MetalBackend::new().unwrap(),
+        &program,
+        &bytes,
+        values.len(),
+    );
+    for (expected, actual) in expected.iter().zip(actual) {
+        for (expected, actual) in expected
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(actual.as_chunks::<4>().0)
+        {
+            let reference = f32::from_le_bytes(*expected);
+            let computed = f32::from_le_bytes(*actual);
+            if reference.is_nan() {
+                assert!(computed.is_nan());
+            } else if reference.is_infinite() || reference == 0.0 {
+                assert_eq!(reference.to_bits(), computed.to_bits());
+            } else {
+                assert_outputs_agree(DType::F32, expected, actual).unwrap();
+            }
+        }
+    }
 }

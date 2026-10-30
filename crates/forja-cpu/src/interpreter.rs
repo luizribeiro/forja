@@ -285,6 +285,7 @@ fn unary(op: UnOp, value: Scalar) -> Result<Scalar, BackendError> {
         UnOp::Abs => value.abs(),
         UnOp::Exp => value.exp(),
         UnOp::Log => value.ln(),
+        UnOp::Log1p => value.ln_1p(),
         UnOp::Sqrt => value.sqrt(),
         UnOp::Rsqrt => value.sqrt().recip(),
         UnOp::Sin => value.sin(),
@@ -434,6 +435,21 @@ mod tests {
     }
 
     #[test]
+    fn log1p_retains_small_values_signed_zero_and_domain_semantics() {
+        let input = [1e-20_f32, -1e-20, 0.0, -0.0, -1.0, -2.0];
+        let result = run(
+            vec![Inst::Input(0), Inst::Unary(UnOp::Log1p, 0)],
+            1,
+            &[Input::F32(&input)],
+        );
+        for (actual, expected) in result.iter().zip(input).take(4) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert_eq!(result[4], f32::NEG_INFINITY);
+        assert!(result[5].is_nan());
+    }
+
+    #[test]
     fn evaluates_coordinates_inputs_and_every_unary_operation() {
         let input = [4.0_f32, 9.0];
         let operations = [
@@ -449,6 +465,7 @@ mod tests {
             UnOp::Sigmoid,
             UnOp::Recip,
             UnOp::Floor,
+            UnOp::Log1p,
         ];
         for operation in operations {
             let result = run(

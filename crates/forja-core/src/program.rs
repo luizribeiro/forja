@@ -77,6 +77,8 @@ pub enum UnOp {
     Recip,
     /// Round toward negative infinity.
     Floor,
+    /// Natural logarithm of one plus the input, retaining small arguments.
+    Log1p,
 }
 
 /// A binary scalar operation.
@@ -1405,6 +1407,7 @@ const fn unary_tag(op: UnOp) -> u8 {
         UnOp::Sigmoid => 9,
         UnOp::Recip => 10,
         UnOp::Floor => 11,
+        UnOp::Log1p => 12,
     }
 }
 
@@ -2221,7 +2224,7 @@ mod tests {
     }
 
     const fn biased_unop(word: u64) -> UnOp {
-        match word % 12 {
+        match word % 13 {
             0 => UnOp::Neg,
             1 => UnOp::Abs,
             2 => UnOp::Exp,
@@ -2233,7 +2236,8 @@ mod tests {
             8 => UnOp::Tanh,
             9 => UnOp::Sigmoid,
             10 => UnOp::Recip,
-            _ => UnOp::Floor,
+            11 => UnOp::Floor,
+            _ => UnOp::Log1p,
         }
     }
 
@@ -2321,6 +2325,7 @@ mod tests {
             UnOp::Sigmoid,
             UnOp::Recip,
             UnOp::Floor,
+            UnOp::Log1p,
         ])
     }
 

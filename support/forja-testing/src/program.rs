@@ -527,7 +527,7 @@ fn finite(word: u64) -> f32 {
 }
 
 fn unop(word: u64) -> UnOp {
-    const OPS: [UnOp; 12] = [
+    const OPS: [UnOp; 13] = [
         UnOp::Neg,
         UnOp::Abs,
         UnOp::Exp,
@@ -540,8 +540,9 @@ fn unop(word: u64) -> UnOp {
         UnOp::Sigmoid,
         UnOp::Recip,
         UnOp::Floor,
+        UnOp::Log1p,
     ];
-    OPS[usize::try_from(word % 12).unwrap_or(0)]
+    OPS[usize::try_from(word % 13).unwrap_or(0)]
 }
 
 fn selected_unop(domain: NumericDomain, word: u64) -> UnOp {

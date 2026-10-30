@@ -43,6 +43,7 @@ pub(crate) enum UnaryOp {
     Sigmoid,
     Recip,
     Floor,
+    Log1p,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -530,6 +531,12 @@ impl<'a> F32<'a> {
     #[must_use]
     pub fn ln(self) -> Self {
         self.unary(UnaryOp::Log)
+    }
+
+    /// Computes the natural logarithm of one plus the input without cancellation.
+    #[must_use]
+    pub fn ln_1p(self) -> Self {
+        self.unary(UnaryOp::Log1p)
     }
 
     /// Computes the square root.

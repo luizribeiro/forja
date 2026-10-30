@@ -24,6 +24,7 @@ macro_rules! program_op_conversions {
                 $source_unop::Sigmoid => $target_unop::Sigmoid,
                 $source_unop::Recip => $target_unop::Recip,
                 $source_unop::Floor => $target_unop::Floor,
+                $source_unop::Log1p => $target_unop::Log1p,
             }
         }
 

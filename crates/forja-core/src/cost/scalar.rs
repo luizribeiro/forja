@@ -116,7 +116,7 @@ mod tests {
     use crate::program::{BinOp, RedOp, UnOp};
 
     #[test]
-    fn scalar_map_counts_its_single_element() {
+    fn scalar_log1p_counts_its_single_element() {
         use crate::{
             DType, Dispatch,
             cost::tests::tensor,
@@ -124,7 +124,7 @@ mod tests {
         };
         let program = Program {
             kind: ProgramKind::Map,
-            insts: vec![Inst::Input(0), Inst::Unary(UnOp::Exp, 0)],
+            insts: vec![Inst::Input(0), Inst::Unary(UnOp::Log1p, 0)],
             outputs: vec![(0, 1)],
         }
         .validate()

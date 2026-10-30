@@ -45,6 +45,7 @@ fn unary(op: UnOp, operand: u32) -> String {
         UnOp::Neg => format!("-v{operand}"),
         UnOp::Abs => format!("abs(v{operand})"),
         UnOp::Exp => format!("select(precise::exp(v{operand}), {nan}, f32_is_nan(v{operand}))"),
+        UnOp::Log1p => format!("f32_log1p(v{operand})"),
         UnOp::Log => format!(
             "select(precise::log(v{operand}), {nan}, f32_is_nan(v{operand}) || v{operand} < 0.0f)"
         ),

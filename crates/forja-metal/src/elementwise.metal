@@ -29,6 +29,15 @@ bool f32_is_non_finite(float value) {
     return (as_type<uint>(value) & 0x7fffffffu) >= 0x7f800000u;
 }
 
+float f32_log1p(float x) {
+    if (f32_is_nan(x) || x < -1.0f) { return as_type<float>(0x7fc00000u); }
+    if (x == -1.0f) { return as_type<float>(0xff800000u); }
+    if (as_type<uint>(x) == 0x7f800000u) { return x; }
+    float u = 1.0f + x;
+    if (u == 1.0f) { return x; }
+    return precise::log(u) * (x / (u - 1.0f));
+}
+
 bool f32_lt(float left, float right) {
     return !f32_is_nan(left) && !f32_is_nan(right) && left < right;
 }
