@@ -7696,9 +7696,10 @@ impl MetalBackend {
                     arguments.write(112)?;
                 }
             }
-            Op::State(_) => {
-                arguments.write((dispatch.inputs().len() - 1) * 112)?;
-                arguments.write(7 * size_of::<u32>())?;
+            Op::State(operation) => {
+                let block = matches!(operation, forja_core::StateOp::DeltaRuleBlock(_));
+                arguments.write((dispatch.inputs().len() - usize::from(!block)) * 112)?;
+                arguments.write(if block { 19 } else { 7 } * size_of::<u32>())?;
                 arguments.write(2 * size_of::<u32>())?;
             }
             Op::Copy => Self::size_copy_arguments(arguments)?,
@@ -10199,6 +10200,9 @@ fn function_constants(
 }
 
 fn nan_preserving_kernel(name: &str) -> bool {
+    if name.starts_with("state_block_") {
+        return true;
+    }
     matches!(
         name,
         "state_causal_conv"

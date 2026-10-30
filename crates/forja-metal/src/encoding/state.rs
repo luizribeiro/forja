@@ -6,6 +6,8 @@ use super::{
     dtype_code, encode_layout, error_state, set_argument_table, set_pipeline,
 };
 
+mod block;
+
 impl MetalBackend {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_state(
@@ -19,6 +21,9 @@ impl MetalBackend {
         let Op::State(operation) = dispatch.op() else {
             return Err(BackendError::InvalidInput);
         };
+        if matches!(operation, StateOp::DeltaRuleBlock(_)) {
+            return self.encode_delta_block(encoder, table, dispatch, bindings, arguments);
+        }
         let input = dispatch.inputs();
         let ordinary = input.len() - 3;
         let (kernel, geometry, groups) = state_geometry(operation, input, dispatch.outputs())?;
@@ -121,5 +126,47 @@ fn state_geometry(
                 groups,
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod block_encoding_tests {
+    use super::*;
+    use forja_core::{DType, DeltaBlockScratch};
+    use forja_testing::{
+        AgreementError, TensorSpec, assert_backends_agree_many, state_test_metadata,
+    };
+    #[test]
+    fn metal_delta_block_encoder_refuses_overwide_keys() {
+        let (access, metadata) = state_test_metadata().unwrap();
+        let mut inputs = [
+            &[7, 1, 257][..],
+            &[7, 1, 257],
+            &[7, 1, 33],
+            &[7, 1],
+            &[7, 1],
+            &[1, 257, 33],
+        ]
+        .map(|shape| TensorSpec::contiguous(DType::F32, shape))
+        .to_vec();
+        inputs.extend(metadata);
+        let outputs = [
+            TensorSpec::contiguous(DType::F32, &[7, 1, 33]),
+            TensorSpec::contiguous(DType::F32, &[1, 257, 33]),
+            TensorSpec::contiguous(
+                DType::F32,
+                &[DeltaBlockScratch::new(7, 1, 257, 33).unwrap().elements()],
+            ),
+        ];
+        assert!(matches!(
+            assert_backends_agree_many(
+                &forja_cpu::CpuBackend::new(),
+                &MetalBackend::new().unwrap(),
+                Op::State(StateOp::DeltaRuleBlock(access)),
+                &inputs,
+                &outputs
+            ),
+            Err(AgreementError::Backend(BackendError::UnsupportedOperation))
+        ));
     }
 }
