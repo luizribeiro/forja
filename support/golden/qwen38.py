@@ -80,12 +80,48 @@ def load_model(root):
     return model.eval()
 
 
+def bind_grant(output, grant, pinned=None):
+    """Bind unchanged numerical fixtures to the verified, byte-preserving text grant."""
+    if pinned is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("qwen38_download", Path(__file__).parents[2] / "engines/qwen38/download.py")
+        pinned = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pinned)
+    if sha256(grant) != pinned.TEXT_SHA256:
+        raise ValueError("text grant does not match the pinned projection")
+    path = output / "manifest.json"
+    manifest = json.loads(path.read_text())
+    source = manifest.get("tensor_source_model",manifest["model"])
+    if source["sha256"] != pinned.SOURCE_HASHES.get(source["file"]):
+        raise ValueError("reference source index differs from the pinned checkpoint")
+    shards = {name:digest for name,digest in pinned.SOURCE_HASHES.items() if name.endswith(".safetensors")}
+    if source.get("shards") != shards:
+        raise ValueError("reference source shard hashes differ from the pinned checkpoint")
+    for prompt in manifest["prompts"]:
+        fixture = output / prompt["file"]
+        if sha256(fixture) != prompt["sha256"]:
+            raise ValueError("reference fixture hash mismatch")
+        with fixture.open("rb") as stream:
+            header = json.loads(stream.read(int.from_bytes(stream.read(8),"little")))
+        prompt["prompt_tokens"] = header["prompt_token_ids"]["shape"][0]
+    manifest["tensor_source_model"] = source
+    manifest["model"] = {"directory":grant.parent.name,"file":grant.name,"sha256":pinned.TEXT_SHA256}
+    manifest["binding_source_sha256"] = sha256(Path(__file__))
+    path.write_text(json.dumps(manifest,indent=2)+"\n")
+
+
 def main():
     """Record independent hidden states and 32-token teacher-forced continuations."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--bind-grant", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+    if args.bind_grant:
+        bind_grant(args.out,args.bind_grant)
+        return
+    if args.model is None:
+        parser.error("--model is required when generating fixtures")
     import torch
     from safetensors.torch import save_file
     from tokenizers import Tokenizer
@@ -113,6 +149,8 @@ def main():
         print(f"completed {name}: {tensors['greedy_token_ids'].tolist()}", flush=True)
     manifest["prompts"] = prompts
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    if (root / "model.safetensors").is_file():
+        bind_grant(args.out,root / "model.safetensors")
 
 
 if __name__ == "__main__":
