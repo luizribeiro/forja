@@ -6,6 +6,35 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+/// Publication requested by a stateful engine entry point.
+#[derive(Clone, Copy, Debug)]
+pub enum StateAction {
+    /// Publishes carry with externally supplied token feedback.
+    Step,
+    /// Advances carry and selects the next token.
+    Combined,
+    /// Advances carry and awaits a separate token selection.
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SelectionPhase {
+    #[default]
+    External,
+    Ready,
+    Awaiting,
+}
+
+impl StateAction {
+    const fn phase(self) -> SelectionPhase {
+        match self {
+            Self::Step => SelectionPhase::External,
+            Self::Combined => SelectionPhase::Ready,
+            Self::Forward => SelectionPhase::Awaiting,
+        }
+    }
+}
+
 /// Host-owned cursors published together with a complete recurrent/conv version.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LanePosition {
@@ -25,6 +54,7 @@ struct Pending {
     paged: Option<PagedInput>,
     serial: u64,
     position: LanePosition,
+    phase: SelectionPhase,
     predecessor: super::StateLaneCheckpoint,
     outcome: Arc<StateOutcome>,
     dependency: Option<Arc<StateOutcome>>,
@@ -36,6 +66,7 @@ pub(super) struct StateJournal {
     sequence: StateSequence,
     feedback: Option<super::feedback::LaneFeedback>,
     pub(super) position: LanePosition,
+    phase: SelectionPhase,
     pending: VecDeque<Pending>,
     retained: Option<super::StateLaneCheckpoint>,
 }
@@ -60,6 +91,7 @@ impl StateJournal {
             sequence,
             feedback: None,
             position: LanePosition::default(),
+            phase: SelectionPhase::External,
             pending: VecDeque::new(),
             retained: None,
         }
@@ -81,6 +113,15 @@ impl StateJournal {
         serial: u64,
         position: Option<LanePosition>,
     ) -> Result<StateTransaction, PagePoolError> {
+        self.begin_action(serial, position, None)
+    }
+
+    pub(super) fn begin_action(
+        &mut self,
+        serial: u64,
+        position: Option<LanePosition>,
+        action: Option<StateAction>,
+    ) -> Result<StateTransaction, PagePoolError> {
         self.restore_paged_if_drained()?;
         if self.rollback_paged.is_some() {
             return Err(PagePoolError::BankInFlight);
@@ -89,7 +130,22 @@ impl StateJournal {
             .pending
             .back()
             .map_or(self.position, |entry| entry.position);
-        let position = position.unwrap_or(input);
+        let mut position = position.unwrap_or(input);
+        if let Some(action) = action {
+            position = LanePosition {
+                tokens: position.tokens,
+                reserved_tokens: position.reserved_tokens,
+                ..input
+            };
+            if matches!(action, StateAction::Combined) {
+                position.sampler = position
+                    .tokens
+                    .checked_sub(1)
+                    .ok_or(PagePoolError::InvalidCheckpoint)?;
+                position.grammar = position.tokens;
+                position.parser = position.tokens;
+            }
+        }
         if position.tokens > position.reserved_tokens {
             return Err(PagePoolError::InvalidCheckpoint);
         }
@@ -98,28 +154,27 @@ impl StateJournal {
             self.retained.take().map_or((None, None), |checkpoint| {
                 (
                     Some(checkpoint.version),
-                    Some((checkpoint.position, checkpoint.feedback)),
+                    Some((checkpoint.position, checkpoint.feedback, checkpoint.phase)),
                 )
             });
-        let transaction = match self
-            .sequence
-            .begin_releasing_checkpoint(serial, &mut retained)
-        {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                self.retained =
-                    retained
-                        .zip(boundary_before)
-                        .map(
-                            |(version, (position, feedback))| super::StateLaneCheckpoint {
-                                version,
-                                position,
-                                feedback,
-                            },
-                        );
-                return Err(error);
-            }
-        };
+        let transaction =
+            match self
+                .sequence
+                .begin_releasing_checkpoint(serial, &mut retained)
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.retained = retained.zip(boundary_before).map(
+                        |(version, (position, feedback, phase))| super::StateLaneCheckpoint {
+                            version,
+                            position,
+                            feedback,
+                            phase,
+                        },
+                    );
+                    return Err(error);
+                }
+            };
         drop(boundary_before);
         let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
         self.retained_paged = None;
@@ -127,6 +182,7 @@ impl StateJournal {
             paged: None,
             serial,
             position,
+            phase: action.map_or(SelectionPhase::External, StateAction::phase),
             predecessor: checkpoint,
             outcome: Arc::default(),
             dependency,
@@ -170,6 +226,7 @@ impl StateJournal {
         if success {
             if let Some(entry) = self.pending.pop_front() {
                 self.position = entry.position;
+                self.phase = entry.phase;
                 self.retained = Some(entry.predecessor);
                 self.retained_paged = entry.paged;
                 entry.outcome.finish(true);
@@ -250,6 +307,10 @@ impl StateJournal {
         Ok(super::StateLaneCheckpoint {
             version,
             feedback,
+            phase: self
+                .pending
+                .back()
+                .map_or(self.phase, |pending| pending.phase),
             position: self
                 .pending
                 .back()
@@ -277,6 +338,7 @@ impl StateJournal {
             feedback.restore(boundary)?;
         }
         self.position = checkpoint.position;
+        self.phase = checkpoint.phase;
         self.retained = None;
         self.retained_paged = None;
         Ok(())
@@ -296,6 +358,7 @@ impl StateJournal {
             feedback.restore(boundary)?;
         }
         self.position = checkpoint.position;
+        self.phase = checkpoint.phase;
         self.retained = None;
         Ok(())
     }

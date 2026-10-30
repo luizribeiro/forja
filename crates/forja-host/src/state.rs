@@ -21,7 +21,7 @@ mod outcome;
 mod paired;
 #[cfg(test)]
 mod quota_tests;
-pub use journal::LanePosition;
+pub use journal::{LanePosition, StateAction};
 mod sequence;
 pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;

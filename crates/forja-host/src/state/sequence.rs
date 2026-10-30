@@ -13,6 +13,7 @@ pub struct StateLaneCheckpoint {
     pub(super) version: StateCheckpoint,
     pub(super) position: LanePosition,
     pub(super) feedback: Option<super::feedback::FeedbackBoundary>,
+    pub(super) phase: super::journal::SelectionPhase,
 }
 
 impl StateLaneCheckpoint {
@@ -140,6 +141,28 @@ impl<B: Backend> StateSequenceHandle<B> {
         self.lock().begin(serial, Some(position))
     }
 
+    /// Reserves state and the requested selection boundary in one construction operation.
+    ///
+    /// # Errors
+    /// Refuses invalid capacity or an unavailable version.
+    pub fn begin_action_at(
+        &self,
+        serial: u64,
+        position: LanePosition,
+        action: super::StateAction,
+    ) -> Result<StateTransaction, PagePoolError> {
+        self.lock()
+            .begin_action(serial, Some(position), Some(action))
+    }
+
+    /// Returns the newest declared cursor boundary, including a pending forward operation.
+    ///
+    /// # Errors
+    /// Refuses exhausted checkpoint reference counts.
+    pub fn latest_position(&self) -> Result<LanePosition, PagePoolError> {
+        Ok(self.lock().checkpoint_latest()?.position)
+    }
+
     /// Returns the cursors published with the last successful state version.
     #[must_use]
     pub fn position(&self) -> LanePosition {
@@ -149,9 +172,13 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Pins the latest declared boundary, which must succeed before it can be restored.
     ///
     /// # Errors
-    /// Refuses exhausted checkpoint reference counts.
+    /// Refuses exhausted checkpoint counts or a forward boundary awaiting selection.
     pub fn checkpoint_latest(&self) -> Result<StateLaneCheckpoint, PagePoolError> {
-        self.lock().checkpoint_latest()
+        let checkpoint = self.lock().checkpoint_latest()?;
+        if checkpoint.phase == super::journal::SelectionPhase::Awaiting {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        Ok(checkpoint)
     }
 
     pub(crate) fn restore_with(
@@ -230,5 +257,82 @@ mod tests {
         });
         drop(sequence);
         storage.reserve().unwrap();
+    }
+    #[test]
+    fn forward_selection_phase_preserves_consumer_cursors_until_selection() {
+        use crate::StateAction;
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 128, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+                1,
+            )
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        let first = sequence
+            .begin_action_at(
+                1,
+                LanePosition {
+                    tokens: 64,
+                    reserved_tokens: 129,
+                    ..LanePosition::default()
+                },
+                StateAction::Combined,
+            )
+            .unwrap();
+        let selected = sequence.checkpoint_latest().unwrap();
+        assert_eq!(
+            (
+                selected.position.sampler,
+                selected.position.grammar,
+                selected.position.parser
+            ),
+            (63, 64, 64)
+        );
+        sequence.lock().mark_submitted(&first).unwrap();
+        storage.pool.observe_completion(1).unwrap();
+        sequence.lock().finish(&first, true).unwrap();
+        let forward = sequence
+            .begin_action_at(
+                2,
+                LanePosition {
+                    tokens: 65,
+                    reserved_tokens: 129,
+                    ..LanePosition::default()
+                },
+                StateAction::Forward,
+            )
+            .unwrap();
+        assert!(sequence.checkpoint_latest().is_err());
+        assert_eq!(sequence.latest_position().unwrap().sampler, 63);
+        sequence.lock().mark_submitted(&forward).unwrap();
+        storage.pool.observe_completion(2).unwrap();
+        sequence.lock().finish(&forward, true).unwrap();
+        assert!(sequence.checkpoint_latest().is_err());
+        assert_eq!(
+            (sequence.position().tokens, sequence.position().parser),
+            (65, 64)
+        );
+        sequence.rewind(64).unwrap();
+        assert_eq!(
+            sequence.checkpoint_latest().unwrap().position,
+            selected.position
+        );
+        let step = sequence
+            .begin_action_at(
+                3,
+                LanePosition {
+                    tokens: 65,
+                    reserved_tokens: 129,
+                    ..LanePosition::default()
+                },
+                StateAction::Step,
+            )
+            .unwrap();
+        assert_eq!(sequence.latest_position().unwrap().grammar, 64);
+        sequence.cancel(&step).unwrap();
     }
 }

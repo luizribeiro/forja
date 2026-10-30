@@ -12,9 +12,9 @@ mod native;
 mod state;
 mod state_inputs;
 pub use state::{
-    LanePosition, StateBatch, StateBatchSubmission, StateCapture, StateCell, StateCommands,
-    StateEntry, StateLaneCheckpoint, StateRecording, StateSequenceHandle, StateSlots, StateStorage,
-    StateSubmission,
+    LanePosition, StateAction, StateBatch, StateBatchSubmission, StateCapture, StateCell,
+    StateCommands, StateEntry, StateLaneCheckpoint, StateRecording, StateSequenceHandle,
+    StateSlots, StateStorage, StateSubmission,
 };
 mod weights;
 
