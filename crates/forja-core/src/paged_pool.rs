@@ -1055,10 +1055,7 @@ impl PagedSequence {
     ///
     /// Returns an error for a foreign or stale checkpoint.
     pub fn rollback(&mut self, mut checkpoint: SequenceCheckpoint) -> Result<(), PagePoolError> {
-        if !self.pool.same_pool(&checkpoint.pool)
-            || !Arc::ptr_eq(&self.identity, &checkpoint.sequence)
-            || !checkpoint.active
-        {
+        if !checkpoint.belongs_to(self) {
             return Err(PagePoolError::InvalidCheckpoint);
         }
         if let Some(tail) = checkpoint.tail.as_mut() {
@@ -1113,6 +1110,14 @@ struct CheckpointTail {
 }
 
 impl SequenceCheckpoint {
+    /// Whether this live checkpoint was created by the supplied sequence.
+    #[must_use]
+    pub fn belongs_to(&self, sequence: &PagedSequence) -> bool {
+        self.active
+            && self.pool.same_pool(&sequence.pool)
+            && Arc::ptr_eq(&self.sequence, &sequence.identity)
+    }
+
     /// Logical KV boundary retained by this checkpoint.
     #[must_use]
     pub const fn logical_len(&self) -> u64 {
@@ -1473,6 +1478,8 @@ mod tests {
         original.commit_write(7).unwrap();
         let sibling = original.fork(7).unwrap();
         let checkpoint = original.checkpoint().unwrap();
+        assert!(checkpoint.belongs_to(&original));
+        assert!(!checkpoint.belongs_to(&sibling));
         original.cow_tail().unwrap().unwrap();
         original.commit_write(1).unwrap();
 

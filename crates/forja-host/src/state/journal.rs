@@ -1,4 +1,4 @@
-use super::outcome::StateOutcome;
+use super::{outcome::StateOutcome, paired::PagedInput};
 use forja_core::{PagePoolError, StateCheckpoint, StateSequence, StateTransaction};
 use std::sync::Arc;
 use std::{
@@ -22,6 +22,7 @@ pub struct LanePosition {
 }
 
 struct Pending {
+    paged: Option<PagedInput>,
     serial: u64,
     position: LanePosition,
     predecessor: StateCheckpoint,
@@ -31,6 +32,8 @@ struct Pending {
 }
 
 pub(super) struct StateJournal {
+    rollback_paged: Option<PagedInput>,
+    retained_paged: Option<PagedInput>,
     sequence: StateSequence,
     pub(super) position: LanePosition,
     pending: VecDeque<Pending>,
@@ -52,6 +55,8 @@ impl DerefMut for StateJournal {
 impl StateJournal {
     pub(super) fn new(sequence: StateSequence) -> Self {
         Self {
+            rollback_paged: None,
+            retained_paged: None,
             sequence,
             position: LanePosition::default(),
             pending: VecDeque::new(),
@@ -64,6 +69,10 @@ impl StateJournal {
         serial: u64,
         position: Option<LanePosition>,
     ) -> Result<StateTransaction, PagePoolError> {
+        self.restore_paged_if_drained()?;
+        if self.rollback_paged.is_some() {
+            return Err(PagePoolError::BankInFlight);
+        }
         let input = self
             .pending
             .back()
@@ -90,7 +99,9 @@ impl StateJournal {
             }
         };
         let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
+        self.retained_paged = None;
         self.pending.push_back(Pending {
+            paged: None,
             serial,
             position,
             predecessor: checkpoint,
@@ -112,18 +123,17 @@ impl StateJournal {
             .position(|entry| entry.serial == transaction.serial())
             .ok_or(PagePoolError::InvalidCheckpoint)?;
         self.sequence.cancel_unsubmitted(transaction)?;
-        for entry in self.pending.drain(index..) {
-            entry.outcome.finish(false);
-        }
-        Ok(())
+        self.fail_pending(index);
+        self.restore_paged_if_drained()
     }
 
     pub(super) fn abandon(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
-        self.sequence.abandon(transaction)?;
-        for entry in self.pending.drain(..) {
-            entry.outcome.finish(false);
+        let result = self.sequence.abandon(transaction);
+        if result.is_ok() {
+            self.fail_pending(0);
         }
-        Ok(())
+        self.restore_paged_if_drained()?;
+        result
     }
 
     pub(super) fn finish(
@@ -139,12 +149,60 @@ impl StateJournal {
             if let Some(entry) = self.pending.pop_front() {
                 self.position = entry.position;
                 self.retained = Some((entry.predecessor, entry.input));
+                self.retained_paged = entry.paged;
                 entry.outcome.finish(true);
             }
         } else {
-            for entry in self.pending.drain(..) {
-                entry.outcome.finish(false);
+            self.fail_pending(0);
+        }
+        self.restore_paged_if_drained()
+    }
+
+    pub(super) fn attach_paged(
+        &mut self,
+        serial: u64,
+        paged: PagedInput,
+    ) -> Result<(), PagePoolError> {
+        let entry = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.serial == serial)
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        if entry.paged.is_some() || entry.input.tokens != paged.tokens() {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        entry.paged = Some(paged);
+        Ok(())
+    }
+
+    fn fail_pending(&mut self, index: usize) {
+        for mut entry in self.pending.drain(index..) {
+            if let Some(paged) = entry.paged.take()
+                && self
+                    .rollback_paged
+                    .as_ref()
+                    .is_none_or(|old| old.tokens() > paged.tokens())
+            {
+                self.rollback_paged = Some(paged);
             }
+            entry.outcome.finish(false);
+        }
+    }
+
+    fn restore_paged_if_drained(&mut self) -> Result<(), PagePoolError> {
+        let Some(paged) = &self.rollback_paged else {
+            return Ok(());
+        };
+        let checkpoint = self.sequence.checkpoint()?;
+        match self.sequence.rewind(&checkpoint) {
+            Err(PagePoolError::BankInFlight) => return Ok(()),
+            result => result?,
+        }
+        if paged.tokens() != self.position.tokens {
+            return Err(PagePoolError::CorruptState);
+        }
+        if let Some(paged) = self.rollback_paged.take() {
+            paged.restore()?;
         }
         Ok(())
     }
@@ -183,6 +241,7 @@ impl StateJournal {
         }
         self.position = checkpoint.position;
         self.retained = None;
+        self.retained_paged = None;
         Ok(())
     }
 
@@ -193,6 +252,9 @@ impl StateJournal {
             .filter(|(_, position)| position.tokens == tokens)
             .ok_or(PagePoolError::InvalidCheckpoint)?;
         self.sequence.rewind(checkpoint)?;
+        if let Some(paged) = self.retained_paged.take() {
+            paged.restore()?;
+        }
         self.position = *position;
         self.retained = None;
         Ok(())

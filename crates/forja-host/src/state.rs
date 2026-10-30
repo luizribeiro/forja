@@ -17,6 +17,7 @@ mod record;
 pub use record::{StateCommands, StateRecording};
 mod journal;
 mod outcome;
+mod paired;
 #[cfg(test)]
 mod quota_tests;
 pub use journal::LanePosition;
