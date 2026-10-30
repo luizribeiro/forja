@@ -66,7 +66,10 @@ fn agree(bits: &[u32], actual: &[f32]) -> Result<(), Box<dyn Error>> {
 }
 #[test]
 fn softplus_matches_transformers_float32_and_threshold() -> Result<(), Box<dyn Error>> {
-    agree(&SOFTPLUS, &INPUT.map(f32::from_bits).map(guest::softplus))
+    agree(
+        &SOFTPLUS,
+        &guest::softplus(&inputs()?, &Tensor::<f32>::zeros(&[15])?)?.to_vec()?,
+    )
 }
 #[test]
 fn negative_softplus_retains_transformers_decay() -> Result<(), Box<dyn Error>> {
@@ -77,4 +80,15 @@ fn negative_softplus_retains_transformers_decay() -> Result<(), Box<dyn Error>> 
         agree(std::slice::from_ref(expected), &[actual])?;
     }
     Ok(())
+}
+
+#[test]
+fn metal_softplus_matches_transformers_float32_and_threshold() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    softplus_matches_transformers_float32_and_threshold()
+}
+#[test]
+fn metal_negative_softplus_retains_transformers_decay() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    negative_softplus_retains_transformers_decay()
 }
