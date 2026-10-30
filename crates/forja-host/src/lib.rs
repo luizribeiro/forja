@@ -467,6 +467,8 @@ pub struct EngineDecodeOutput {
 /// Input to the forward phase of constrained decode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineBeginDecode {
+    /// Numerical scheduling phase, independent of the token count or position.
+    pub phase: BatchPhase,
     /// Tokens to process, or `None` to reuse the retained feedback token.
     pub tokens: Option<Vec<u32>>,
     /// Position assigned to the first token.
@@ -2124,7 +2126,7 @@ where
             .store
             .run_concurrent(async move |accessor| {
                 engine
-                    .call_begin_decode(accessor, input.tokens, input.start_pos)
+                    .call_begin_decode(accessor, input.tokens, input.start_pos, input.phase.into())
                     .await
             })
             .await

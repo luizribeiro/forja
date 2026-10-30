@@ -1926,6 +1926,7 @@ where
 {
     runner
         .begin_decode(EngineBeginDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos,
         })

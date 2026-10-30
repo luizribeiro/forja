@@ -396,12 +396,13 @@ fn engine_decode_phases() -> proc_macro2::TokenStream {
         async fn begin_decode(
             tokens: Option<Vec<u32>>,
             start_pos: u32,
+            phase_value: bindings::exports::l9o::gpu::engine::BatchPhase,
         ) -> ::std::result::Result<compute::Tensor, compute::Error> {
             let tokens = tokens.as_deref().map(token_tensor).transpose()?;
             let logits = with_engine(|engine| {
                 <ExportedEngine as ::forja_sdk::Engine>::begin_decode(
                     engine,
-                    ::forja_sdk::BeginDecodeInput { tokens, start_pos },
+                    ::forja_sdk::BeginDecodeInput { tokens, start_pos, phase: phase(phase_value) },
                 )
             })?;
             ::forja_sdk::eval().map_err(wit_error)?;

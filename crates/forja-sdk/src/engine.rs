@@ -275,6 +275,8 @@ pub struct BatchOutput {
 
 /// Input to the forward phase of constrained decode.
 pub struct BeginDecodeInput {
+    /// Numerical scheduling phase, independent of the token count or position.
+    pub phase: BatchPhase,
     /// Tokens to process, or `None` to reuse the retained feedback token.
     pub tokens: Option<Tensor<u32>>,
     /// Position assigned to the first token.

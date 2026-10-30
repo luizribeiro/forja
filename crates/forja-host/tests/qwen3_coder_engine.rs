@@ -527,6 +527,7 @@ async fn populate_single_replay_catalog(
     assert_eq!(runner.metrics().live_graphs, 3);
     let logits = runner
         .begin_decode(EngineBeginDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: Some(vec![17]),
             start_pos: position,
         })
@@ -943,6 +944,7 @@ async fn profile_masked_sample(
     runner.set_profiling(true);
     let logits = runner
         .begin_decode(EngineBeginDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: position,
         })
@@ -1047,6 +1049,7 @@ async fn constrained_continuation(
     for position in first_position..end {
         let logits = runner
             .begin_decode(EngineBeginDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: None,
                 start_pos: position,
             })

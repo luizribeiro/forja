@@ -19,6 +19,33 @@ const LIMITS: Limits = Limits::new(1024 * 1024, 4, 1024, 128, 1024 * 1024);
 static NEXT_WEIGHT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
+async fn constrained_forward_preserves_the_explicit_phase() -> wasmtime::Result<()> {
+    let weights = weight_file("constrained-phase")?;
+    let mut runner = EngineRunner::new(
+        test_guests::engine_smoke(),
+        CpuBackend::new(),
+        LIMITS,
+        weights.path(),
+    )
+    .await?;
+    runner.load().await??;
+    for (phase, message) in [
+        (BatchPhase::Prompt, "prompt forward"),
+        (BatchPhase::Decode, "decode forward"),
+    ] {
+        let result = runner
+            .begin_decode(forja_host::EngineBeginDecode {
+                tokens: Some(vec![1]),
+                start_pos: 0,
+                phase,
+            })
+            .await?;
+        assert!(matches!(result, Err(Error::OpSignature(value)) if value == message));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
     run_engine(test_guests::engine_smoke(), false, "engine").await
 }

@@ -124,9 +124,17 @@ impl Guest for Component {
         ))
     }
 
-    async fn begin_decode(_tokens: Option<Vec<u32>>, _start_pos: u32) -> Result<Tensor, Error> {
+    async fn begin_decode(
+        _tokens: Option<Vec<u32>>,
+        _start_pos: u32,
+        phase: BatchPhase,
+    ) -> Result<Tensor, Error> {
         Err(Error::OpSignature(
-            "engine does not support constrained decode".to_owned(),
+            match phase {
+                BatchPhase::Prompt => "prompt forward",
+                BatchPhase::Decode => "decode forward",
+            }
+            .to_owned(),
         ))
     }
 
