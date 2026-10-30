@@ -39,13 +39,13 @@ const POOL_METADATA_RESERVE: u64 = 4096;
 const RECORD_METADATA_RESERVE: u64 = 128;
 const SEQUENCE_METADATA_RESERVE: u64 = 1024;
 
-struct StateCharge {
+pub(crate) struct StateCharge {
     bytes: u64,
     live: Arc<AtomicU64>,
 }
 
 impl StateCharge {
-    fn reserve(
+    pub(crate) fn reserve(
         backend: &impl Backend,
         live: Arc<AtomicU64>,
         limit: u64,

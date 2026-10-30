@@ -475,6 +475,30 @@ impl PagedSlotBanks {
         self.pool.same_pool(&sequence.pool)
     }
 
+    /// Bytes needed to retain both CPU slot tables while a lane transition is prepared.
+    ///
+    /// # Errors
+    /// Refuses invalid lanes, poisoned metadata or overflowing sizes.
+    pub fn snapshot_bytes(&self, lane: usize) -> Result<u64, PagePoolError> {
+        self.banks.iter().try_fold(0_u64, |bytes, bank| {
+            let bank = bank.lock().map_err(|_| PagePoolError::CorruptState)?;
+            let slot = bank.get(lane).ok_or(PagePoolError::ForeignResource)?;
+            let entries = u64::try_from(slot.table.entries().len())
+                .ok()
+                .and_then(|n| n.checked_mul(8));
+            let generations = u64::try_from(slot.table.generations().len())
+                .ok()
+                .and_then(|n| n.checked_mul(4));
+            entries
+                .zip(generations)
+                .and_then(|(entries, generations)| {
+                    bytes.checked_add(entries)?.checked_add(generations)
+                })
+                .and_then(|bytes| bytes.checked_add(u64::try_from(size_of::<PagedSlot>()).ok()?))
+                .ok_or(PagePoolError::ArithmeticOverflow)
+        })
+    }
+
     /// Rebinds an active sequence capability into one lane.
     ///
     /// # Errors

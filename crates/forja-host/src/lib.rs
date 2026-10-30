@@ -4104,38 +4104,61 @@ impl<B: Backend + 'static> Host<B> {
                     "paged append start does not match the sequence".to_owned(),
                 ));
             }
+            let _snapshot_charge = state::StateCharge::reserve(
+                self.backend.as_ref(),
+                Arc::clone(&self.live_bytes),
+                self.limits.live_bytes,
+                binding.banks.snapshot_bytes(lane).map_err(paged_refusal)?,
+            )?;
             let previous = [
                 binding.banks.slot(0, lane).map_err(paged_refusal)?,
                 binding.banks.slot(1, lane).map_err(paged_refusal)?,
             ];
-            let copy = sequence
-                .cow_tail()
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            sequence
-                .commit_write(u64::from(tokens))
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            if copy.is_some() {
-                for dirty in &lane_binding.table_dirty {
-                    dirty.store(true, Ordering::Release);
+            let prepared = (|| {
+                let copy = sequence
+                    .cow_tail()
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+                sequence
+                    .commit_write(u64::from(tokens))
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?;
+                if copy.is_some() {
+                    for dirty in &lane_binding.table_dirty {
+                        dirty.store(true, Ordering::Release);
+                    }
                 }
-            }
-            if lane_binding.table_dirty[bank].load(Ordering::Acquire) {
+                if lane_binding.table_dirty[bank].load(Ordering::Acquire) {
+                    binding
+                        .banks
+                        .bind(bank, lane, &sequence)
+                        .map_err(|error| compute::Error::Quota(error.to_string()))?;
+                }
                 binding
                     .banks
-                    .bind(bank, lane, &sequence)
+                    .open_append(bank, lane, u64::from(start), sequence.logical_len())
                     .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            }
-            binding
-                .banks
-                .open_append(bank, lane, u64::from(start), sequence.logical_len())
-                .map_err(|error| compute::Error::Quota(error.to_string()))?;
-            let table = binding
-                .banks
-                .slot(bank, lane)
-                .map_err(|error| compute::Error::Quota(error.to_string()))?
-                .table()
-                .clone();
-            let upload = lane_binding.table_dirty[bank].swap(false, Ordering::AcqRel);
+                let table = binding
+                    .banks
+                    .slot(bank, lane)
+                    .map_err(|error| compute::Error::Quota(error.to_string()))?
+                    .table()
+                    .clone();
+                let upload = lane_binding.table_dirty[bank].swap(false, Ordering::AcqRel);
+                Ok((table, copy, upload))
+            })();
+            let (table, copy, upload) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    sequence.rollback(checkpoint).map_err(paged_refusal)?;
+                    binding
+                        .banks
+                        .restore_all(lane, previous)
+                        .map_err(paged_refusal)?;
+                    for dirty in &lane_binding.table_dirty {
+                        dirty.store(true, Ordering::Release);
+                    }
+                    return Err(error);
+                }
+            };
             (checkpoint, state_checkpoint, previous, table, copy, upload)
         };
         if let Some(state) = self.state_slots.get_mut(&slot_rep) {
@@ -10867,6 +10890,32 @@ mod tests {
         assert!(entry.slot_banks.is_none());
         assert_eq!(pool_state.memory_usage().unwrap(), before_memory);
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
+    }
+
+    #[test]
+    fn refused_partial_tail_append_restores_pages_and_reservation() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        host.open_paged_slot(&pool, 1).unwrap();
+        host.bind_paged_request(pool.rep(), None, 4).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 3).unwrap();
+        let prefix = host.paged_prefix(pool.rep()).unwrap();
+        let before = prefix.sequence.lock().unwrap().table().unwrap();
+        let memory = host.table.get(&pool).unwrap().pool.memory_usage().unwrap();
+        assert!(host.begin_paged_append(pool.rep(), 3, 2).is_err());
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(matches!(
+            host.begin_paged_append(pool.rep(), 3, 1),
+            Err(compute::Error::Quota(_))
+        ));
+        let sequence = prefix.sequence.lock().unwrap();
+        assert_eq!(sequence.logical_len(), 3);
+        assert_eq!(sequence.table().unwrap(), before);
+        assert_eq!(sequence.reserved_tokens(), 4);
+        assert_eq!(
+            host.table.get(&pool).unwrap().pool.memory_usage().unwrap(),
+            memory
+        );
     }
 
     #[test]
