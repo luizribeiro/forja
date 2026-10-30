@@ -3012,6 +3012,32 @@ mod tests {
     }
 
     #[test]
+    fn delta_block_catalog_checks_the_key_width_boundary() {
+        for name in [
+            "delta-rule-block.wy64-fixed",
+            "delta-rule-block.wy64-mma-v16",
+            "delta-rule-block.wy64-mma-v32",
+        ] {
+            assert!(
+                resolve(
+                    &state_dispatch_keys(forja_core::StateOp::DeltaRuleBlock, 256),
+                    name,
+                    METAL4
+                )
+                .is_ok()
+            );
+            assert!(
+                resolve(
+                    &state_dispatch_keys(forja_core::StateOp::DeltaRuleBlock, 257),
+                    name,
+                    METAL4
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn weighted_gather_variants_partition_route_counts() {
         let weighted_broad = weighted_gather_dispatch(1, 9, 257);
         for variant in [
@@ -3032,6 +3058,13 @@ mod tests {
     }
 
     fn state_dispatch(constructor: fn(forja_core::StateAccess) -> forja_core::StateOp) -> Dispatch {
+        state_dispatch_keys(constructor, 7)
+    }
+
+    fn state_dispatch_keys(
+        constructor: fn(forja_core::StateAccess) -> forja_core::StateOp,
+        keys: u32,
+    ) -> Dispatch {
         use forja_core::{DeltaBlockScratch, StateOp};
         let cpu = CpuBackend::new();
         let (access, _) = forja_testing::state_test_metadata().unwrap();
@@ -3039,12 +3072,12 @@ mod tests {
         let shapes: &[&[u32]] = match operation {
             StateOp::DeltaRule(_) => &[&[1, 7], &[1, 7], &[3, 7], &[3], &[3], &[3, 7, 7]],
             StateOp::DeltaRuleBlock(_) => &[
-                &[7, 1, 7],
-                &[7, 1, 7],
+                &[7, 1, keys],
+                &[7, 1, keys],
                 &[7, 3, 7],
                 &[7, 3],
                 &[7, 3],
-                &[3, 7, 7],
+                &[3, keys, 7],
             ],
             StateOp::CausalDepthwiseConv(_) => &[&[1, 7], &[4, 7], &[3, 7]],
         };
@@ -3064,7 +3097,7 @@ mod tests {
         let scratch = matches!(operation, StateOp::DeltaRuleBlock(_)).then(|| {
             cpu.alloc(
                 DType::F32,
-                &[DeltaBlockScratch::new(7, 3, 7, 7).unwrap().elements()],
+                &[DeltaBlockScratch::new(7, 3, keys, 7).unwrap().elements()],
             )
             .unwrap()
         });
