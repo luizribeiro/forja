@@ -147,6 +147,14 @@ impl MetalBuffer {
     }
 
     pub(super) fn wait_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
+        self.wait_pending_mode(timeout, true)
+    }
+
+    fn wait_pending_mode(
+        &mut self,
+        timeout: Duration,
+        retain_failed: bool,
+    ) -> Result<(), BackendError> {
         let mut result = Ok(());
         for pending in std::mem::take(&mut self.pending) {
             let Some(completion) = pending.completion.upgrade() else {
@@ -155,12 +163,16 @@ impl MetalBuffer {
             if let Err(error) = completion.wait(timeout)
                 && (pending.writes || error == BackendError::Timeout)
             {
-                result = Err(error);
-                self.pending.push(PendingCompletion {
-                    completion: Arc::downgrade(&completion),
-                    range: pending.range,
-                    writes: pending.writes,
-                });
+                if result != Err(BackendError::Timeout) {
+                    result = Err(error);
+                }
+                if retain_failed || error == BackendError::Timeout {
+                    self.pending.push(PendingCompletion {
+                        completion: Arc::downgrade(&completion),
+                        range: pending.range,
+                        writes: pending.writes,
+                    });
+                }
             }
         }
         result
@@ -1234,7 +1246,12 @@ impl Backend for MetalBackend {
             .buffers
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        buffers.get_mut(tensor)?.wait_pending(self.gpu_timeout)?;
+        let completion = buffers
+            .get_mut(tensor)?
+            .wait_pending_mode(self.gpu_timeout, false);
+        if completion == Err(BackendError::Timeout) {
+            return completion;
+        }
         let buffer = buffers.remove(tensor)?;
         drop(buffers);
         if buffer.pooled {

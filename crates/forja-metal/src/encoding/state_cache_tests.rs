@@ -87,3 +87,53 @@ fn protected_replay_bindings_replace_both_banks_without_new_parameters() {
         );
     }
 }
+
+#[test]
+fn drained_failed_state_outputs_retire_without_authorizing_reads() {
+    use forja_core::{Backend, BackendError, Submission};
+    let backend = crate::MetalBackend::new().unwrap();
+    let (access, _) = forja_testing::state_test_metadata().unwrap();
+    let inputs = [
+        (DType::F32, vec![1, 1]),
+        (DType::F32, vec![2, 1]),
+        (DType::F32, vec![1, 1]),
+        (DType::U32, vec![2, 2]),
+        (DType::U32, vec![3]),
+        (DType::U32, vec![1]),
+    ]
+    .into_iter()
+    .map(|(dtype, shape)| backend.alloc(dtype, &shape).unwrap())
+    .collect::<Vec<_>>();
+    backend
+        .write(&inputs[3], &u32::MAX.to_le_bytes().repeat(4))
+        .unwrap();
+    backend.write(&inputs[5], &1_u32.to_le_bytes()).unwrap();
+    let output = backend.alloc(DType::F32, &[1, 1]).unwrap();
+    let next = backend.alloc(DType::F32, &[1, 1]).unwrap();
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_many(
+            Op::State(StateOp::CausalDepthwiseConv(access)),
+            &inputs.iter().collect::<Vec<_>>(),
+            &[&output, &next],
+        )
+        .unwrap();
+    let submission = backend.submit(commands).unwrap();
+    let failure = submission
+        .wait_timeout(std::time::Duration::from_secs(10))
+        .unwrap_err();
+    assert!(matches!(failure, BackendError::DeviceErrorFlag { .. }));
+    for tensor in [&output, &next] {
+        assert_eq!(backend.read(tensor), Err(failure));
+        backend.release(tensor).unwrap();
+        assert!(
+            backend
+                .tensor(tensor.buffer(), tensor.layout().clone())
+                .is_err()
+        );
+    }
+    assert_eq!(
+        submission.wait_timeout(std::time::Duration::from_secs(10)),
+        Err(failure)
+    );
+}
