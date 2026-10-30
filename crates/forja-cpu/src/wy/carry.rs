@@ -95,36 +95,7 @@ impl<'a> Prepared<'a> {
 mod tests {
     use super::*;
 
-    fn recurrent(
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        g: &[f32],
-        beta: &[f32],
-        initial: &[f32],
-        shape: [usize; 2],
-    ) -> (Vec<f32>, Vec<f32>) {
-        let [keys, width] = shape;
-        let mut state = initial.to_vec();
-        let mut output = vec![0.0; v.len()];
-        for row in 0..g.len() {
-            for column in 0..width {
-                let mut prediction = 0.0;
-                for key in 0..keys {
-                    let index = key * width + column;
-                    state[index] *= g[row].exp();
-                    prediction += state[index] * k[row * keys + key];
-                }
-                let delta = beta[row] * (v[row * width + column] - prediction);
-                for key in 0..keys {
-                    let index = key * width + column;
-                    state[index] += k[row * keys + key] * delta;
-                    output[row * width + column] += q[row * keys + key] * state[index];
-                }
-            }
-        }
-        (output, state)
-    }
+    use forja_testing::delta_rule::recurrent;
 
     #[test]
     fn block_outputs_and_carry_match_recurrence_through_decay_underflow() {

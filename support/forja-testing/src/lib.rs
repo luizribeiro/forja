@@ -3,6 +3,7 @@
 pub mod program;
 pub mod representative;
 
+pub mod delta_rule;
 mod interval;
 
 use std::{
