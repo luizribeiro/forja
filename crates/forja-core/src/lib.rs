@@ -9,6 +9,8 @@ mod ops;
 mod paged;
 mod paged_pool;
 mod profile_scope;
+mod replay_bindings;
+pub use replay_bindings::ReplayBindings;
 pub mod program;
 mod quantized;
 pub mod roofline;

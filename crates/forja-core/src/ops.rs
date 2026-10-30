@@ -479,6 +479,15 @@ struct EpilogueDispatch {
 }
 
 impl Dispatch {
+    pub(crate) fn bind_state(&mut self, operation: crate::StateOp) -> Result<(), OpError> {
+        operation.validate(
+            &self.inputs.iter().collect::<Vec<_>>(),
+            &self.outputs.iter().collect::<Vec<_>>(),
+        )?;
+        self.op = Op::State(operation);
+        Ok(())
+    }
+
     /// Returns engine-owned diagnostic attribution, when supplied.
     #[must_use]
     pub fn profile_scope(&self) -> Option<&Arc<crate::ProfileScope>> {

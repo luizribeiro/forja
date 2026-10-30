@@ -804,6 +804,34 @@ pub trait Backend {
         self.submit_profiled(commands)
     }
 
+    /// Replays a graph with trusted protected-storage bindings chosen for this submission.
+    ///
+    /// # Errors
+    /// Returns invalid input for incompatible bindings or a backend submission failure.
+    fn replay_bound(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &crate::ReplayBindings,
+        profiled: bool,
+    ) -> Result<Self::Submission, BackendError> {
+        let values = graph
+            .values(values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = graph
+            .template()
+            .instantiate(&values)
+            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = bindings
+            .apply(commands)
+            .map_err(|_| BackendError::InvalidInput)?;
+        if profiled {
+            self.submit_profiled(commands)
+        } else {
+            self.submit(commands)
+        }
+    }
+
     /// Reports whether graph submissions may complete asynchronously on this backend.
     fn supports_replay_overlap(&self) -> bool {
         false
