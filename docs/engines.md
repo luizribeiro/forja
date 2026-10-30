@@ -10,6 +10,13 @@ device choices; the host validates generic operations and memory capabilities.
    Expect named dimensions matching
    [`Config`](../engines/smollm2/src/lib.rs), including tied embeddings and rotary
    conventions. Secondary model descriptions are clues, not a loading contract.
+   Converted storage may differ from the reference state dict: verify affine
+   dequantization, convolution axes, pre-adjusted norm weights and cast boundaries.
+   Preserve source shards and hashes. When the checkpoint includes unused modalities,
+   create a deterministic text-only grant by copying selected tensor bytes unchanged;
+   test every rewritten offset and reject duplicate or invalid tensor spans.
+   Select the pinned tokenizer JSON explicitly with `Tokenizer.from_file`; automatic
+   loaders can rebuild a different tokenizer even when the template bytes match.
 
 2. **Create the guest crate.** Copy the layout of
    [`Cargo.toml`](../engines/smollm2/Cargo.toml) and
@@ -37,6 +44,14 @@ device choices; the host validates generic operations and memory capabilities.
    greedy steps each. Run `forja verify --engine smollm2-135m-instruct.metal-apple-m3-ultra.reference --fixtures "$FORJA_MODELS/golden/smollm2-135m-instruct"`.
    Expect all layer, distribution and token checks to pass. A fixture generator
    must be independent of your guest so it can expose architecture mistakes.
+   Pin a reference version that actually implements the architecture, in a separate
+   requirements file when necessary; see
+   [the hybrid reference requirements](../support/golden/qwen38-requirements.txt).
+   Record that environment with the fixtures. Every prompt entry requires
+   `prompt_tokens`, including fixtures generated from converted quantized storage.
+   Match reference operation order, dtype and rounding points: algebraic rewrites
+   can change greedy choices. Test negative inputs and threshold boundaries for
+   scalar functions, and enforce reduced-precision agreement per prompt.
    Per-operation normwise limits are f32 1e-5, f16 2e-3, bf16/quantized 1e-2.
    Full f32 models require hidden error <= 2e-2, identical greedy tokens, and mean
    logit KL <= 5e-3. Reduced precision uses reference-token teacher forcing:
