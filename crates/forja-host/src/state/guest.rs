@@ -277,6 +277,55 @@ mod tests {
         .unwrap()
     }
     #[tokio::test]
+    async fn state_updates_use_current_admission_limits_without_advancing_on_refusal() {
+        use std::sync::atomic::Ordering;
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 8, 4096),
+        );
+        let state = host
+            .create(compute::Dtype::F32, vec![1, 1])
+            .await
+            .unwrap()
+            .unwrap();
+        let x = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        let weights = host.alloc(compute::Dtype::F32, &[2, 1]).unwrap();
+        let y = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        host.write(&x, &2_f32.to_le_bytes()).unwrap();
+        host.write(
+            &weights,
+            &[1_f32.to_le_bytes(), 1_f32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let handles = [state.rep(), x.rep(), weights.rep(), y.rep()];
+        host.limits.gpu_time_budget = Duration::ZERO;
+        assert!(matches!(
+            convolve(&mut host, handles).await,
+            Err(compute::Error::Quota(_))
+        ));
+        host.limits.gpu_time_budget = Duration::MAX;
+        host.limits.work_per_dispatch = 0;
+        assert!(matches!(
+            convolve(&mut host, handles).await,
+            Err(compute::Error::Quota(_))
+        ));
+        host.limits.work_per_dispatch = u64::MAX;
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(matches!(
+            convolve(&mut host, handles).await,
+            Err(compute::Error::Quota(_))
+        ));
+        host.limits.live_bytes = 65536;
+        convolve(&mut host, handles).await.unwrap();
+        assert_eq!(
+            host.backend.read(&host.entry(&y).unwrap().tensor).unwrap(),
+            2_f32.to_le_bytes()
+        );
+        assert_eq!(host.queued_submissions.load(Ordering::Acquire), 1);
+        assert_eq!(host.completed_submissions.load(Ordering::Acquire), 1);
+        assert!(host.gpu_time_ns.load(Ordering::Acquire) > 0);
+    }
+    #[tokio::test]
     async fn validation_refusals_refund_gpu_budget_before_a_valid_update() {
         use std::sync::atomic::Ordering;
         let mut host = Host::new(
