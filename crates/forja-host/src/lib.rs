@@ -7479,6 +7479,12 @@ struct TaintFlight {
 }
 
 impl TaintFlight {
+    fn refuse(self, error: BackendError, timeout: Duration) -> BackendError {
+        self.finish::<()>(Err(error), false, timeout)
+            .err()
+            .unwrap_or(BackendError::ExecutionFailed)
+    }
+
     fn check_dependencies<T>(
         &self,
         result: Result<T, BackendError>,
@@ -7725,13 +7731,7 @@ where
                         state_owners,
                         |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
                     ) {
-                        Err(error) => {
-                            let error = taint
-                                .finish::<()>(Err(error), false, self.timeout)
-                                .err()
-                                .unwrap_or(BackendError::ExecutionFailed);
-                            Err(error)
-                        }
+                        Err(error) => Err(taint.refuse(error, timeout)),
                         Ok(submission) => {
                             let serial = submission.backend().completion_serial();
                             let marked = PagedUse::mark_all(&paged, serial);
