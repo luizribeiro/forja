@@ -195,6 +195,40 @@ mod tests {
     use crate::Limits;
     use compute::HostStatePlane;
     #[tokio::test]
+    async fn resources_charge_quota_and_reject_invalid_updates() {
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 3, 4096),
+        );
+        let before = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let state = host
+            .create(compute::Dtype::F32, vec![1, 1])
+            .await
+            .unwrap()
+            .unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        let borrow = || Resource::new_borrow(state.rep());
+        let result = host
+            .delta_rule(borrow(), vec![], Resource::new_borrow(output.rep()))
+            .await
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(host.live_handles, 2);
+        host.drop_tensor(output).unwrap();
+        HostStatePlane::drop(&mut host, state).await.unwrap();
+        assert_eq!(host.live_handles, 0);
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+        assert!(
+            host.create(compute::Dtype::U32, vec![1])
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+    #[tokio::test]
     async fn execution_errors_take_precedence_over_settlement_errors() {
         use std::sync::atomic::Ordering;
         for execution_failed in [false, true] {
