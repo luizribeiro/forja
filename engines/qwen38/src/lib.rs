@@ -7,6 +7,7 @@ pub use config::Config;
 /// Affine quantized projection storage.
 pub mod quant;
 
+mod carry;
 mod deltanet;
 mod numerics;
 pub use deltanet::DeltaNet;

@@ -1,5 +1,5 @@
-use crate::{Config, numerics, quant::Affine};
-use forja_sdk::{DType, Result, Tensor, Weights, bf16, state::StatePlane, target::metal::Variant};
+use crate::{Config, carry::Carry, numerics, quant::Affine};
+use forja_sdk::{Result, Tensor, Weights, bf16, target::metal::Variant};
 
 /// Gated delta-rule layer with opaque recurrent and raw convolution state.
 pub struct DeltaNet {
@@ -13,8 +13,7 @@ pub struct DeltaNet {
     norm: Tensor<bf16>,
     log_a: Tensor<f32>,
     dt_bias: Tensor<f32>,
-    history: StatePlane,
-    recurrent: StatePlane,
+    carry: Carry,
 }
 impl DeltaNet {
     /// Loads exact projection shapes and allocates zeroed private state.
@@ -53,11 +52,7 @@ impl DeltaNet {
             dt_bias: weights
                 .tensor::<bf16>("dt_bias", &[config.value_heads])?
                 .to_dtype()?,
-            history: StatePlane::new(DType::BF16, &[config.conv_width - 1, channels])?,
-            recurrent: StatePlane::new(
-                DType::F32,
-                &[config.value_heads, config.key_dim, config.value_dim],
-            )?,
+            carry: Carry::new(config)?,
         })
     }
     /// Starts a new sequence with zero convolution history and recurrent state.
@@ -65,9 +60,7 @@ impl DeltaNet {
     /// # Errors
     /// Returns host quota or allocation errors.
     pub fn reset(&mut self) -> Result<()> {
-        let c = self.config;
-        self.history = StatePlane::new(DType::BF16, &[c.conv_width - 1, c.qkv()?])?;
-        self.recurrent = StatePlane::new(DType::F32, &[c.value_heads, c.key_dim, c.value_dim])?;
+        self.carry = Carry::new(self.config)?;
         Ok(())
     }
     /// Processes one normalized token, publishing each private plane after completion.
@@ -112,9 +105,7 @@ impl DeltaNet {
         let key_rows = rows(tokens, c.key_heads)?;
         let value_rows = rows(tokens, c.value_heads)?;
         let projected = self.qkv.forward(input, pick)?;
-        let convolved = self
-            .history
-            .causal_convolution(&projected, &self.convolution)?;
+        let convolved = self.carry.convolve(&projected, &self.convolution)?;
         let mixed = numerics::silu_bf16(&convolved)?;
         let keys = c.key_heads * c.key_dim;
         let query = mixed
@@ -149,20 +140,23 @@ impl DeltaNet {
             let bias = self.dt_bias.broadcast_as(&gate_shape)?;
             let log_a = self.log_a.broadcast_as(&gate_shape)?;
             let log_decay = numerics::log_decay(&a, &bias, &log_a)?;
-            self.recurrent
-                .delta_rule_block(
-                    &query.reshape(&[tokens, c.key_heads, c.key_dim])?,
-                    &key.reshape(&[tokens, c.key_heads, c.key_dim])?,
+            self.carry
+                .delta(
+                    [
+                        &query.reshape(&[tokens, c.key_heads, c.key_dim])?,
+                        &key.reshape(&[tokens, c.key_heads, c.key_dim])?,
+                    ],
                     &value.reshape(&[tokens, c.value_heads, c.value_dim])?,
                     &log_decay,
                     &beta,
+                    true,
                     delta,
                 )?
                 .reshape(&[value_rows, c.value_dim])?
         } else {
             let decay = numerics::decay(&a, &self.dt_bias, &self.log_a)?;
-            self.recurrent
-                .delta_rule(&query, &key, &value, &decay, &beta)?
+            self.carry
+                .delta([&query, &key], &value, &decay, &beta, false, None)?
         };
         let z = self
             .z
