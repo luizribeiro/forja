@@ -108,7 +108,10 @@ impl StateOp {
     pub(crate) fn cost(self, inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCost> {
         cost.scalar_ops = AUTHENTICATION_SCALAR_OPS;
         cost.flops = match self {
-            Self::DeltaRuleBlock(_) => return None,
+            Self::DeltaRuleBlock(_) => {
+                return crate::cost::state_block::stages(inputs, &inputs[2])
+                    .and_then(|stages| crate::cost::state_block::composite(&stages));
+            }
             Self::DeltaRule(_) => {
                 let s = inputs[5].layout();
                 cost.state_read_bytes = s.element_count().checked_mul(4)?;

@@ -110,6 +110,43 @@ fn block_contract_refuses_bad_grouping_scratch_and_aliases() {
 }
 
 #[test]
+fn block_cost_counts_each_stage_once_with_scratch_and_special_functions() {
+    let (access, inputs, [y, state]) = delta_fixture(true);
+    let scratch = tensor(
+        12,
+        DType::F32,
+        &[crate::DeltaBlockScratch::new(7, 3, 7, 33)
+            .unwrap()
+            .elements()],
+    );
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_many(
+            Op::State(StateOp::DeltaRuleBlock(access)),
+            &inputs.iter().collect::<Vec<_>>(),
+            &[&y, &state, &scratch],
+        )
+        .unwrap();
+    let dispatch = commands.last_dispatch().unwrap();
+    let stages = KernelCost::delta_block_stages(dispatch).unwrap();
+    let total = KernelCost::of(dispatch).unwrap();
+    assert_eq!(
+        total.read_bytes,
+        stages.iter().map(|stage| stage.read_bytes).sum::<u64>()
+    );
+    assert_eq!(
+        total.write_bytes,
+        stages.iter().map(|stage| stage.write_bytes).sum::<u64>()
+    );
+    assert_eq!(total.sfu_ops, stages[0].sfu_ops);
+    assert!(total.sfu_ops > 0);
+    assert!(total.scratch_read_bytes > 0);
+    assert_eq!(stages[0].scratch_write_bytes, 3 * 4096 * 8 + 3 * 7 * 8);
+    assert_eq!(total.state_read_bytes, 3 * 7 * 33 * 4);
+    assert_eq!(total.state_write_bytes, total.state_read_bytes);
+}
+
+#[test]
 fn convolution_counts_history_tap_reads_and_boundary_carry() {
     let (access, metadata, _) = delta_fixture(false);
     for tokens in [1, 7, 33] {

@@ -12,6 +12,7 @@ mod matrix_values;
 mod scalar;
 #[cfg(test)]
 mod scalar_values;
+pub(crate) mod state_block;
 mod tiling;
 pub use tiling::CostModel;
 
@@ -50,6 +51,11 @@ pub struct KernelCost {
 }
 
 impl KernelCost {
+    /// Work of the four authenticated delta-block GPU stages, excluding the composite duplicate.
+    #[must_use]
+    pub fn delta_block_stages(dispatch: &Dispatch) -> Option<[Self; 4]> {
+        state_block::dispatch_stages(dispatch)
+    }
     /// Returns a machine-readable declaration with explicit units.
     #[must_use]
     pub fn json(self) -> serde_json::Value {
