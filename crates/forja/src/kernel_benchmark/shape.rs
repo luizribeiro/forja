@@ -70,6 +70,7 @@ impl Shape {
 #[derive(Deserialize)]
 #[serde(remote = "Op", tag = "kind", rename_all = "kebab-case")]
 enum Operation {
+    State(#[serde(deserialize_with = "state_operation")] forja_core::StateOp),
     Matmul,
     QuantMatmul {
         bits: u8,
@@ -108,6 +109,29 @@ enum Operation {
         fast_max_chunks: u32,
         rejection_rounds: u32,
     },
+}
+
+fn state_operation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<forja_core::StateOp, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
+    enum StateOperation {
+        DeltaRuleBlock,
+    }
+    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+    let StateOperation::DeltaRuleBlock = StateOperation::deserialize(deserializer)?;
+    let access = || -> Result<_, Box<dyn Error>> {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1])?])?;
+        let pool = StatePool::new(layout, 1, 128)?;
+        let mut sequence = pool.reserve()?;
+        let transaction = sequence.begin(1)?;
+        let slot = sequence.bind(&transaction)?;
+        Ok(StateAccess::from_slot(&slot)?)
+    };
+    access()
+        .map(forja_core::StateOp::DeltaRuleBlock)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Deserialize)]

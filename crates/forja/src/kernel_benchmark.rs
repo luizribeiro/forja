@@ -227,6 +227,32 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_kernel_diagnostics_authenticate_delta_block_stages() {
+        let root = std::env::temp_dir().join(format!("forja-block-kernel-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let scratch = forja_core::DeltaBlockScratch::new(7, 3, 7, 33)
+            .unwrap()
+            .elements();
+        let shape = serde_json::json!({
+            "operation": {"kind":"state", "operation":"delta-rule-block"},
+            "inputs": [{"dtype":"f32","shape":[7,1,7],"seed":1},
+                {"dtype":"f32","shape":[7,1,7],"seed":2}, {"dtype":"f32","shape":[7,3,33],"seed":3},
+                {"dtype":"f32","shape":[7,3]}, {"dtype":"f32","shape":[7,3]}, {"dtype":"f32","shape":[3,7,33]},
+                {"dtype":"u32","shape":[2,2],"u32_values":[0,1,1,1]},
+                {"dtype":"u32","shape":[3],"u32_values":[1,1,1]}, {"dtype":"u32","shape":[1],"u32_values":[1]}],
+            "outputs": [{"dtype":"f32","shape":[7,3,33]}, {"dtype":"f32","shape":[3,7,33]},
+                {"dtype":"f32","shape":[scratch]}]
+        });
+        for variant in [
+            "delta-rule-block.wy64-mma-v16",
+            "delta-rule-block.wy64-mma-v32",
+        ] {
+            assert_diagnostic_record(&root, variant, &shape);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(target_os = "macos")]
     fn assert_diagnostic_record(root: &std::path::Path, variant: &str, shape: &serde_json::Value) {
         let mut options = Options {
             variant: variant.into(),
