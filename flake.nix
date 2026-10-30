@@ -249,6 +249,7 @@
                 cargo nextest run --release -p forja-sdk --features native-metal --test sdk -E 'test(qwen_moe::)' --run-ignored only
                 cargo nextest run --release -p forja-host --test host -E 'test(qwen_engine::)' --run-ignored only
                 cargo nextest run --release -p forja-host --test host -E 'test(qwen3_coder_engine::)' --run-ignored only
+                cargo nextest run --release -p forja-host --test host -E 'test(qwen38::real::)' --run-ignored only --success-output immediate
                 cargo nextest run --release -p golden-fixtures --test fixtures -E 'test(qwen_fixtures::)' --run-ignored only
                 cargo nextest run --release -p golden-fixtures --test fixtures -E 'test(mixture_fixtures::)' --run-ignored only
                 cargo nextest run --release -p forja --bin forja --run-ignored only

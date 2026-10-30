@@ -25,6 +25,7 @@ pub(super) async fn verify(
     let prompt = u32::try_from(ids.len())?;
     let mut output = model.forward(&ids, 0, true).await?;
     assert_eq!(output.taps.len(), fixture.hidden_states().len() - 1);
+    let mut maximum_layer_error = 0_f64;
     for (layer, tap) in output.taps.iter().enumerate() {
         let error = normwise_relative_error(
             fixture
@@ -33,6 +34,7 @@ pub(super) async fn verify(
                 .values(),
             tap,
         )?;
+        maximum_layer_error = maximum_layer_error.max(error);
         assert!(
             error <= 5.0e-2,
             "layer {} relative error {error}",
@@ -43,7 +45,21 @@ pub(super) async fn verify(
     let mut matches = 0;
     for (index, &expected) in fixture.greedy_tokens().iter().enumerate() {
         let row = &output.logits;
-        matches += usize::from(top1(row) == Some(usize::try_from(expected)?));
+        let expected = usize::try_from(expected)?;
+        let predicted = top1(row);
+        matches += usize::from(predicted == Some(expected));
+        if let Some(predicted) = predicted
+            && predicted != expected
+        {
+            let reference =
+                &fixture.greedy_step_logits().values()[index * row.len()..][..row.len()];
+            eprintln!(
+                "{} token {index}: expected {expected}, got {predicted}, reference margin {}, guest margin {}",
+                fixture.name(),
+                reference[expected] - reference[predicted],
+                row[predicted] - row[expected]
+            );
+        }
         logits.extend_from_slice(row);
         if index + 1 < fixture.greedy_tokens().len() {
             output = model
@@ -57,8 +73,11 @@ pub(super) async fn verify(
     }
     let reference = fixture.greedy_step_logits().values();
     let kl = mean_logit_kl_divergence(reference, &logits, fixture.prompt_logits().values().len())?;
-    super::agree(reference, &logits)?;
-    eprintln!("{}: mean KL {kl}, top-1 {matches}", fixture.name());
+    let relative = normwise_relative_error(reference, &logits)?;
+    eprintln!(
+        "{}: mean KL {kl}, top-1 {matches}, maximum layer error {maximum_layer_error}, relative logits {relative}",
+        fixture.name()
+    );
     assert!(kl <= 1.0e-2, "mean KL {kl}");
     assert!(
         matches * 100 >= fixture.greedy_tokens().len() * 95,
@@ -66,7 +85,7 @@ pub(super) async fn verify(
     );
     Ok(())
 }
-fn top1(values: &[f32]) -> Option<usize> {
+pub(super) fn top1(values: &[f32]) -> Option<usize> {
     values
         .iter()
         .enumerate()

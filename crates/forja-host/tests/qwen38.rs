@@ -248,6 +248,10 @@ fn component_metadata_declares_the_text_only_single_lane_contract() -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[path = "qwen38/real.rs"]
+mod real;
+
 #[test]
 fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Result<(), Box<dyn Error>>
 {
