@@ -13,6 +13,7 @@ pub struct StateCapture {
     _owner: CompletionResource,
     private_scratch: Vec<CompletionResource>,
     scratch_charges: Vec<CompletionResource>,
+    binding_charges: Vec<CompletionResource>,
 }
 
 impl std::fmt::Debug for StateCapture {
@@ -44,6 +45,7 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
             planes,
             metadata: self.metadata.to_vec(),
             updated: self.updated.clone(),
+            binding_charges: self.binding_resources(),
             scratch_charges: self
                 .scratch
                 .iter()
@@ -65,6 +67,14 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
 }
 
 impl StateCapture {
+    /// Retains accounting until backend completion without retaining backend ownership.
+    pub fn retained_resources(&self) -> impl Iterator<Item = CompletionResource> + '_ {
+        self.binding_charges
+            .iter()
+            .chain(&self.scratch_charges)
+            .cloned()
+    }
+
     pub(crate) fn release_graph_scratch(&mut self) {
         self.private_scratch.clear();
         self.scratch_charges.clear();
@@ -151,6 +161,7 @@ mod tests {
             .causal_convolution(0, &input, &weights, &output)
             .unwrap();
         let capture = recording.capture().unwrap();
+        assert!(capture.retained_resources().count() >= 2);
         let mut graph =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         for dispatch in recording.commands.dispatches() {
@@ -242,6 +253,7 @@ mod tests {
             )
             .unwrap();
         let capture = recording.capture().unwrap();
+        assert!(capture.retained_resources().count() >= 2);
         let template = recording.commands.clone();
         let scratch = template.dispatches()[0].outputs()[2].clone();
         let charged = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);

@@ -214,11 +214,15 @@ impl<B: Backend> StateCommands<B> {
         self.captured_scratch_charges.clear();
     }
 
-    pub(crate) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
-        let mut owners = vec![
+    pub(super) fn binding_resources(&self) -> Vec<forja_core::CompletionResource> {
+        vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
             forja_core::CompletionResource::new(Arc::clone(&self.metadata.charge)),
-        ];
+        ]
+    }
+
+    pub(crate) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
+        let mut owners = self.binding_resources();
         owners.extend(
             self.scratch
                 .iter()
