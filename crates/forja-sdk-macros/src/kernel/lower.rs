@@ -609,8 +609,8 @@ impl Lowerer {
         match (receiver.ty, name.as_str(), arguments) {
             (
                 ValueType::F32,
-                "abs" | "exp" | "ln" | "ln_1p" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos"
-                | "tanh" | "sigmoid" | "floor",
+                "abs" | "exp" | "exp_rounded" | "ln" | "ln_1p" | "sqrt" | "rsqrt" | "recip" | "sin"
+                | "cos" | "tanh" | "sigmoid" | "floor",
                 [],
             ) => {
                 let receiver = receiver.ident;
@@ -964,9 +964,9 @@ fn method_arity(name: &str, ty: ValueType) -> Option<usize> {
     match (ty, name) {
         (
             ValueType::F32,
-            "abs" | "exp" | "ln" | "ln_1p" | "sqrt" | "rsqrt" | "recip" | "sin" | "cos" | "tanh"
-            | "sigmoid" | "floor" | "ceil" | "log2" | "log10" | "exp2" | "row_sum" | "row_max"
-            | "row_min" | "row_mean",
+            "abs" | "exp" | "exp_rounded" | "ln" | "ln_1p" | "sqrt" | "rsqrt" | "recip" | "sin"
+            | "cos" | "tanh" | "sigmoid" | "floor" | "ceil" | "log2" | "log10" | "exp2" | "row_sum"
+            | "row_max" | "row_min" | "row_mean",
         ) => Some(0),
         (ValueType::F32, "maximum" | "minimum" | "powf" | "powi") => Some(1),
         (ValueType::F32, "clamp") => Some(2),
@@ -1141,7 +1141,7 @@ fn binary_operator(operator: &BinOp) -> &'static str {
 fn unknown_method(method: &Ident, ty: ValueType) -> syn::Error {
     let supported = match ty {
         ValueType::F32 => {
-            "abs, exp, ln, ln_1p, sqrt, rsqrt, recip, sin, cos, tanh, sigmoid, floor, maximum, minimum, powf, powi, clamp, ceil, log2, log10, exp2, row_sum, row_max, row_min, row_mean"
+            "abs, exp, exp_rounded, ln, ln_1p, sqrt, rsqrt, recip, sin, cos, tanh, sigmoid, floor, maximum, minimum, powf, powi, clamp, ceil, log2, log10, exp2, row_sum, row_max, row_min, row_mean"
         }
         ValueType::U32 => "wrapping_add, wrapping_sub, wrapping_mul, min, max",
         ValueType::Bool => "none",

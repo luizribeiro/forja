@@ -44,6 +44,7 @@ pub(crate) enum UnaryOp {
     Recip,
     Floor,
     Log1p,
+    ExpRounded,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -525,6 +526,12 @@ impl<'a> F32<'a> {
     #[must_use]
     pub fn exp(self) -> Self {
         self.unary(UnaryOp::Exp)
+    }
+
+    /// Computes the exponential with extended intermediates before float32 rounding.
+    #[must_use]
+    pub fn exp_rounded(self) -> Self {
+        self.unary(UnaryOp::ExpRounded)
     }
 
     /// Computes the natural logarithm.

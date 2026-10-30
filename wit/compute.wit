@@ -97,6 +97,7 @@ interface compute {
     recip,
     floor,
     log1p,
+    exp-rounded,
   }
 
   enum binop {

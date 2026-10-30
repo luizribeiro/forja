@@ -385,7 +385,7 @@ fn unary(op: UnOp, input: ScalarInterval) -> Result<ScalarInterval, AgreementErr
     let result = match op {
         UnOp::Neg => map_monotone(input, |value| -value, true, 0),
         UnOp::Abs => absolute(input),
-        UnOp::Exp => map_monotone(input, f64::exp, false, PRECISE_ULPS),
+        UnOp::Exp | UnOp::ExpRounded => map_monotone(input, f64::exp, false, PRECISE_ULPS),
         UnOp::Log => domain_monotone(input, 0.0, false, f64::ln, PRECISE_ULPS),
         UnOp::Log1p => domain_monotone(input, -1.0, false, f64::ln_1p, PRECISE_ULPS),
         UnOp::Sqrt => domain_monotone(input, 0.0, true, f64::sqrt, PRECISE_ULPS),
@@ -410,7 +410,7 @@ fn exact_transcendental(op: UnOp, input: FloatInterval) -> Option<FloatInterval>
         return None;
     }
     let value = match (op, input.lo) {
-        (UnOp::Exp | UnOp::Cos, 0.0) => 1.0_f64,
+        (UnOp::Exp | UnOp::ExpRounded | UnOp::Cos, 0.0) => 1.0_f64,
         (UnOp::Log, 1.0) => 0.0,
         (UnOp::Sqrt | UnOp::Sin | UnOp::Tanh | UnOp::Log1p, 0.0) => input.lo,
         (UnOp::Sigmoid, 0.0) => 0.5,
@@ -1345,7 +1345,7 @@ mod tests {
         match op {
             UnOp::Log => input.ln(),
             UnOp::Log1p => input.ln_1p(),
-            UnOp::Exp => input.exp(),
+            UnOp::Exp | UnOp::ExpRounded => input.exp(),
             UnOp::Sqrt => input.sqrt(),
             UnOp::Neg
             | UnOp::Abs

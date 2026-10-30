@@ -54,6 +54,33 @@ float2 f32_ln2_pair() {
     return float2(0.693147182464599609375f, -1.904654323148236e-9f);
 }
 
+float f32_exp_rounded(float x) {
+    if (f32_is_nan(x)) { return as_type<float>(0x7fc00000u); }
+    if (x >= 88.72283935546875f) { return as_type<float>(0x7f800000u); }
+    if (x <= -103.97208404541016f) { return 0.0f; }
+    int n = int(floor(x * 1.4426950408889634f + 0.5f));
+    float2 r = f32_dd_add(float2(x, 0.0f),
+        -f32_dd_mul(float2(float(n), 0.0f), f32_ln2_pair()));
+    float2 term = float2(1.0f, 0.0f);
+    float2 sum = term;
+    for (uint i = 1; i <= 16; ++i) {
+        term = f32_dd_div(f32_dd_mul(term, r), float2(float(i), 0.0f));
+        sum = f32_dd_add(sum, term);
+    }
+    uint bits = as_type<uint>(sum.x + sum.y);
+    int exponent = int(bits >> 23) + n;
+    if (exponent > 0) {
+        return as_type<float>((bits & 0x7fffffu) | (uint(exponent) << 23));
+    }
+    float high = ldexp(sum.x, n + 149);
+    float low = ldexp(sum.y, n + 149);
+    uint integral = uint(floor(high));
+    float fraction = high - float(integral);
+    bool up = fraction > 0.5f || (fraction == 0.5f &&
+        (low > 0.0f || (low == 0.0f && (integral & 1u) != 0)));
+    return as_type<float>(integral + uint(up));
+}
+
 float f32_log1p(float x) {
     if (f32_is_nan(x) || x < -1.0f) { return as_type<float>(0x7fc00000u); }
     if (x == -1.0f) { return as_type<float>(0xff800000u); }

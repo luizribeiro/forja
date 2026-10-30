@@ -593,3 +593,45 @@ fn metal_log1p_matches_rounded_double_reference() {
         );
     }
 }
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn metal_exp_rounded_matches_double_reference_including_underflow() {
+    let program = Program {
+        kind: ProgramKind::Map,
+        insts: vec![Inst::Input(0), Inst::Unary(UnOp::ExpRounded, 0)],
+        outputs: vec![(0, 1)],
+    }
+    .validate()
+    .unwrap();
+    let mut values = (0..6161_u16)
+        .map(|i| -103.9 + f32::from(i) / 32.0)
+        .collect::<Vec<_>>();
+    values.extend([
+        -104.0,
+        -103.972_08,
+        88.722_84,
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::NAN,
+    ]);
+    let bytes = values
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<_>>();
+    let actual = run_small_program(
+        &MetalBackend::new().unwrap(),
+        &program,
+        &bytes,
+        values.len(),
+    );
+    for (value, bytes) in values.iter().zip(actual[0].as_chunks::<4>().0) {
+        let computed = f32::from_le_bytes(*bytes);
+        let expected = f64::from(*value).exp() as f32;
+        if expected.is_nan() {
+            assert!(computed.is_nan());
+        } else {
+            assert_eq!(computed.to_bits(), expected.to_bits(), "exp({value})");
+        }
+    }
+}

@@ -283,7 +283,7 @@ fn unary(op: UnOp, value: Scalar) -> Result<Scalar, BackendError> {
     Ok(Scalar::F32(match op {
         UnOp::Neg => -value,
         UnOp::Abs => value.abs(),
-        UnOp::Exp => value.exp(),
+        UnOp::Exp | UnOp::ExpRounded => value.exp(),
         UnOp::Log => value.ln(),
         UnOp::Log1p => value.ln_1p(),
         UnOp::Sqrt => value.sqrt(),
@@ -466,6 +466,7 @@ mod tests {
             UnOp::Recip,
             UnOp::Floor,
             UnOp::Log1p,
+            UnOp::ExpRounded,
         ];
         for operation in operations {
             let result = run(
