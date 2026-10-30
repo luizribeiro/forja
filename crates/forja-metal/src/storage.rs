@@ -1317,6 +1317,19 @@ impl Backend for MetalBackend {
         self.replay_graph(graph, values, profiled, Some(bindings))
     }
 
+    fn replay_bound_retained(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &forja_core::ReplayBindings,
+        owners: Vec<forja_core::CompletionResource>,
+        profiled: bool,
+    ) -> Result<Self::Submission, BackendError> {
+        let submission = self.replay_graph(graph, values, profiled, Some(bindings))?;
+        submission.retain_resources(owners);
+        Ok(submission)
+    }
+
     fn supports_replay_overlap(&self) -> bool {
         true
     }

@@ -58,11 +58,20 @@ fn protected_replay_bindings_replace_both_banks_without_new_parameters() {
         .buffer(output.buffer(), other_output.buffer())
         .unwrap();
     for profiled in [false, true] {
+        let owner = std::sync::Arc::new(());
+        let released = std::sync::Arc::downgrade(&owner);
         backend
-            .replay_bound(&graph, Vec::new(), &bindings, profiled)
+            .replay_bound_retained(
+                &graph,
+                Vec::new(),
+                &bindings,
+                vec![forja_core::CompletionResource::new(owner)],
+                profiled,
+            )
             .unwrap()
             .wait_timeout(std::time::Duration::from_secs(10))
             .unwrap();
+        assert!(released.upgrade().is_none());
         assert_eq!(
             backend.read(&other_output).unwrap(),
             2_f32.to_le_bytes().repeat(231)

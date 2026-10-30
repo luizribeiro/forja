@@ -815,6 +815,21 @@ pub trait Backend {
         bindings: &crate::ReplayBindings,
         profiled: bool,
     ) -> Result<Self::Submission, BackendError> {
+        self.replay_bound_retained(graph, values, bindings, Vec::new(), profiled)
+    }
+
+    /// Replays protected bindings while retaining their charges through physical completion.
+    ///
+    /// # Errors
+    /// Returns invalid input for incompatible bindings or a backend submission failure.
+    fn replay_bound_retained(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &crate::ReplayBindings,
+        owners: Vec<CompletionResource>,
+        profiled: bool,
+    ) -> Result<Self::Submission, BackendError> {
         let values = graph
             .values(values)
             .map_err(|_| BackendError::InvalidInput)?;
@@ -826,9 +841,9 @@ pub trait Backend {
             .apply(commands)
             .map_err(|_| BackendError::InvalidInput)?;
         if profiled {
-            self.submit_profiled(commands)
+            self.submit_profiled_retained(commands, owners)
         } else {
-            self.submit(commands)
+            self.submit_retained(commands, owners)
         }
     }
 
