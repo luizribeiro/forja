@@ -3,8 +3,11 @@
 Text-only inference for `mlx-community/Qwen3.8-27B-4bit`: 64 hybrid decoder layers,
 affine q4/group-64 weights, BF16 activations, F32 recurrent state and F16 KV.
 The Metal profile targets Apple M3 Ultra and limits context to 32,768 tokens.
-Prefill and decode process recurrent state one token at a time. Each new request
-clears its recurrent carry; graph replay and cross-request cache reuse are disabled.
+Prompt processing uses canonical 64-token WY blocks and a final partial block;
+decode advances recurrent state one token at a time. Single-lane SDK calls declare
+`BatchPhase::Prompt` or `BatchPhase::Decode` explicitly. Prompt submissions start
+on a 64-token boundary. Each new request clears its recurrent carry; graph replay
+and cross-request cache reuse are disabled.
 
 ## Use
 
@@ -35,11 +38,12 @@ The full WebAssembly component passes the reduced-precision end-to-end criteria:
 
 | Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
 | --- | ---: | ---: | ---: | ---: |
-| Hello | 1 | 31/32 | 0.0008397 | 0.01435 |
-| What is 2 + 2? | 8 | 32/32 | 0.0002168 | 0.01425 |
-| The capital of France is | 5 | 32/32 | 0.0001143 | 0.01709 |
+| Hello | 1 | 31/32 | 0.0006813 | 0.01493 |
+| What is 2 + 2? | 8 | 32/32 | 0.0001912 | 0.01415 |
+| The capital of France is | 5 | 32/32 | 0.0001259 | 0.01498 |
 
-Operator differentials use normwise relative error at most `1e-2`; full-model
+Operator differentials use normwise relative error at most `1e-5` for F32 and
+`1e-2` for BF16/quantized tensors; full-model
 checks require mean KL at most `1e-2`, top-1 agreement at least 95%, and per-layer
 error at most `5e-2`. These are correctness results. No performance is claimed.
 
@@ -51,8 +55,10 @@ uv run --no-project --python 3.12 --with-requirements support/golden/qwen38-requ
 
 ## Porting notes
 
-Decay uses float32 scalar `exp`/`ln_1p` with a softplus threshold of 20,
-matching the reference operation order. The checkpoint's ordinary RMS weights
+Decay uses GPU float32 `exp_rounded`/`ln_1p` with a softplus threshold of 20,
+matching the reference operation order without scalar readbacks. The block
+transform uses F32 MMA products, fixed-tree solves and 32-column carry panels;
+16-column panels share its reduction class and produce identical state/output bits. The checkpoint's ordinary RMS weights
 already include the unit offset. The
 DeltaNet gated norm uses direct multipliers, with normalization rounded to BF16
 before the learned weight and float32 SiLU gate. Convolution taps are stored as
