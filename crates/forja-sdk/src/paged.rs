@@ -1,3 +1,6 @@
+mod state;
+pub use state::PagedState;
+
 use std::marker::PhantomData;
 
 use crate::{Dim, Element, Error, Result, Tensor};
@@ -122,6 +125,8 @@ impl PagedPool<'_> {
             #[cfg(target_family = "wasm")]
             _slot: slot,
             layers,
+            state_planes: u32::try_from(state.len())
+                .map_err(|_| Error::loading("state plane count overflowed"))?,
         })
     }
 }
@@ -131,9 +136,25 @@ pub struct PagedCacheSet {
     #[cfg(target_family = "wasm")]
     pub(crate) _slot: crate::sys::guest::paged_storage::BatchSlot,
     layers: u32,
+    state_planes: u32,
 }
 
 impl PagedCacheSet {
+    /// Borrows one lane's protected state plane without exposing tensor storage.
+    ///
+    /// # Errors
+    /// Refuses a plane outside this slot's declared state geometry.
+    pub fn state_at(&self, lane: u32, plane: u32) -> Result<PagedState<'_>> {
+        if plane >= self.state_planes {
+            return Err(Error::loading("state plane is out of range"));
+        }
+        Ok(PagedState {
+            set: self,
+            lane,
+            plane,
+        })
+    }
+
     /// Returns the number of layer cache pairs.
     #[must_use]
     pub const fn len(&self) -> u32 {
@@ -393,7 +414,10 @@ mod tests {
     #[test]
     fn append_attention_requires_compatible_single_rows() {
         use crate::{Dim, Tensor};
-        let caches = PagedCacheSet { layers: 1 };
+        let caches = PagedCacheSet {
+            layers: 1,
+            state_planes: 0,
+        };
         let cache = caches.layer(0).unwrap();
         let query = Tensor::<f32>::zeros(&[1, 16, 128]).unwrap();
         let key = Tensor::<f32>::zeros(&[1, 8, 128]).unwrap();
@@ -420,7 +444,10 @@ mod tests {
 
     #[test]
     fn assigns_one_key_value_pair_per_layer() {
-        let caches = PagedCacheSet { layers: 3 };
+        let caches = PagedCacheSet {
+            layers: 3,
+            state_planes: 2,
+        };
         let middle = caches.layer(1).unwrap();
         let batched = caches.layer_at(7, 2).unwrap();
         assert_eq!(caches.len(), 3);
@@ -430,5 +457,7 @@ mod tests {
         assert_eq!(batched.lane(), 7);
         assert_eq!(batched.key_plane(), 4);
         assert!(caches.layer(3).is_err());
+        assert!(caches.state_at(7, 1).is_ok());
+        assert!(caches.state_at(0, 2).is_err());
     }
 }
