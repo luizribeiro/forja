@@ -96,6 +96,7 @@ pub(super) struct MetalBuffer {
     pending: Vec<PendingCompletion>,
 }
 
+#[derive(Clone)]
 struct PendingCompletion {
     completion: Weak<Completion>,
     range: std::ops::Range<u64>,
@@ -129,6 +130,45 @@ impl MetalBuffer {
                 source.len(),
             );
         }
+    }
+
+    fn overwrite(
+        &mut self,
+        range: std::ops::Range<usize>,
+        source: &[u8],
+        timeout: Duration,
+    ) -> Result<(), BackendError> {
+        for pending in &self.pending {
+            if let Some(completion) = pending.completion.upgrade()
+                && completion.wait(timeout) == Err(BackendError::Timeout)
+            {
+                return Err(BackendError::Timeout);
+            }
+        }
+        let overwritten = u64::try_from(range.start).map_err(|_| BackendError::InvalidInput)?
+            ..u64::try_from(range.end).map_err(|_| BackendError::InvalidInput)?;
+        self.write(range, source);
+        let pending = std::mem::take(&mut self.pending);
+        for pending in pending {
+            let Some(completion) = pending.completion.upgrade() else {
+                continue;
+            };
+            if !pending.writes || completion.result() == Some(Ok(())) {
+                continue;
+            }
+            for range in [
+                pending.range.start..pending.range.end.min(overwritten.start),
+                pending.range.start.max(overwritten.end)..pending.range.end,
+            ] {
+                if range.start < range.end {
+                    self.pending.push(PendingCompletion {
+                        range,
+                        ..pending.clone()
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn bytes(&self) -> &[u8] {
@@ -1216,9 +1256,7 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_mut(tensor)?;
-        buffer.wait_pending(self.gpu_timeout)?;
-        buffer.write(range, bytes);
-        Ok(())
+        buffer.overwrite(range, bytes, self.gpu_timeout)
     }
 
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {

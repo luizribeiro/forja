@@ -94,9 +94,9 @@ fn drained_failed_state_outputs_retire_without_authorizing_reads() {
     let backend = crate::MetalBackend::new().unwrap();
     let (access, _) = forja_testing::state_test_metadata().unwrap();
     let inputs = [
-        (DType::F32, vec![1, 1]),
-        (DType::F32, vec![2, 1]),
-        (DType::F32, vec![1, 1]),
+        (DType::F32, vec![1, 7]),
+        (DType::F32, vec![2, 7]),
+        (DType::F32, vec![1, 7]),
         (DType::U32, vec![2, 2]),
         (DType::U32, vec![3]),
         (DType::U32, vec![1]),
@@ -108,8 +108,8 @@ fn drained_failed_state_outputs_retire_without_authorizing_reads() {
         .write(&inputs[3], &u32::MAX.to_le_bytes().repeat(4))
         .unwrap();
     backend.write(&inputs[5], &1_u32.to_le_bytes()).unwrap();
-    let output = backend.alloc(DType::F32, &[1, 1]).unwrap();
-    let next = backend.alloc(DType::F32, &[1, 1]).unwrap();
+    let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+    let next = backend.alloc(DType::F32, &[1, 7]).unwrap();
     let mut commands = CommandList::new();
     commands
         .dispatch_many(
@@ -123,8 +123,44 @@ fn drained_failed_state_outputs_retire_without_authorizing_reads() {
         .wait_timeout(std::time::Duration::from_secs(10))
         .unwrap_err();
     assert!(matches!(failure, BackendError::DeviceErrorFlag { .. }));
+    let middle = backend
+        .tensor(
+            output.buffer(),
+            forja_core::Layout::new(DType::F32, 1, vec![5], vec![1], 28).unwrap(),
+        )
+        .unwrap();
+    backend
+        .write(&middle, &3_f32.to_le_bytes().repeat(5))
+        .unwrap();
+    assert_eq!(
+        backend.read_replay_output(&middle).unwrap(),
+        3_f32.to_le_bytes().repeat(5)
+    );
+    assert_eq!(backend.read(&output), Err(failure));
+    let head = backend
+        .tensor(
+            output.buffer(),
+            forja_core::Layout::new(DType::F32, 0, vec![1], vec![1], 28).unwrap(),
+        )
+        .unwrap();
+    let tail = backend
+        .tensor(
+            output.buffer(),
+            forja_core::Layout::new(DType::F32, 6, vec![1], vec![1], 28).unwrap(),
+        )
+        .unwrap();
+    for edge in [&head, &tail] {
+        assert_eq!(backend.read_replay_output(edge), Err(failure));
+    }
+    backend
+        .write(&output, &2_f32.to_le_bytes().repeat(7))
+        .unwrap();
+    assert_eq!(
+        backend.read(&output).unwrap(),
+        2_f32.to_le_bytes().repeat(7)
+    );
+    assert_eq!(backend.read(&next), Err(failure));
     for tensor in [&output, &next] {
-        assert_eq!(backend.read(tensor), Err(failure));
         backend.release(tensor).unwrap();
         assert!(
             backend
