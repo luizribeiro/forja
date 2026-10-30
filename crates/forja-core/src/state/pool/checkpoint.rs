@@ -1,4 +1,4 @@
-use super::{Arc, AtomicU32, Ordering, PagePoolError, StateSequence, StateTransaction};
+use super::{Arc, AtomicBool, AtomicU32, Ordering, PagePoolError, StateSequence, StateTransaction};
 
 struct VersionPin {
     counts: Arc<[AtomicU32; 3]>,
@@ -16,6 +16,7 @@ impl Drop for VersionPin {
 pub struct StateCheckpoint {
     identity: Arc<()>,
     pin: Arc<VersionPin>,
+    published: Option<Arc<AtomicBool>>,
 }
 
 impl StateCheckpoint {
@@ -33,6 +34,18 @@ impl StateSequence {
     /// Refuses exhausted checkpoint reference counts.
     pub fn checkpoint(&self) -> Result<StateCheckpoint, PagePoolError> {
         self.pin(self.committed)
+    }
+
+    /// Pins the newest declared output, restoring it only after successful publication.
+    ///
+    /// # Errors
+    /// Refuses exhausted checkpoint reference counts.
+    pub fn checkpoint_latest(&self) -> Result<StateCheckpoint, PagePoolError> {
+        self.pin(
+            self.pending
+                .back()
+                .map_or(self.committed, |transaction| transaction.output),
+        )
     }
 
     /// Retains the input version of a live speculative transaction.
@@ -55,6 +68,11 @@ impl StateSequence {
             .map_err(|_| PagePoolError::ArithmeticOverflow)?;
         Ok(StateCheckpoint {
             identity: Arc::clone(&self.identity),
+            published: self
+                .pending
+                .iter()
+                .find(|transaction| transaction.output == version)
+                .map(|transaction| Arc::clone(&transaction.published)),
             pin: Arc::new(VersionPin {
                 counts: Arc::clone(&self.pins),
                 version,
@@ -76,6 +94,13 @@ impl StateSequence {
         {
             return Err(PagePoolError::BankInFlight);
         }
+        if checkpoint
+            .published
+            .as_ref()
+            .is_some_and(|published| !published.load(Ordering::Acquire))
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
         self.committed = checkpoint.version();
         Ok(())
     }
@@ -85,6 +110,43 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn speculative_checkpoints_require_successful_publication() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        for outcome in [0, 1, 2] {
+            let mut sequence = pool.reserve().unwrap();
+            let first = sequence.begin(1).unwrap();
+            let checkpoint = sequence.checkpoint_latest().unwrap();
+            let second = sequence.begin(2).unwrap();
+            let predecessor = sequence.predecessor(&second).unwrap();
+            assert_eq!(checkpoint.version(), predecessor.version());
+            if outcome == 0 {
+                sequence.cancel_unsubmitted(&first).unwrap();
+            } else {
+                sequence.mark_submitted(&first).unwrap();
+                sequence.mark_submitted(&second).unwrap();
+                pool.observe_completion(2).unwrap();
+                sequence.finish(&first, outcome == 2).unwrap();
+                if outcome == 2 {
+                    sequence.finish(&second, true).unwrap();
+                }
+            }
+            for checkpoint in [&checkpoint, &predecessor] {
+                let restored = sequence.rewind(checkpoint);
+                if outcome == 2 {
+                    restored.unwrap();
+                } else {
+                    assert_eq!(restored, Err(PagePoolError::InvalidCheckpoint));
+                }
+            }
+        }
+    }
 
     #[test]
     fn queued_descendants_retain_their_own_input_boundary() {

@@ -126,6 +126,7 @@ pub struct StateTransaction {
     output: u32,
     submitted: Arc<AtomicU64>,
     bound: Arc<AtomicBool>,
+    published: Arc<AtomicBool>,
 }
 
 impl StateTransaction {
@@ -170,6 +171,7 @@ impl StateSequence {
             output,
             submitted: Arc::new(AtomicU64::new(0)),
             bound: Arc::new(AtomicBool::new(false)),
+            published: Arc::new(AtomicBool::new(false)),
         };
         self.latest_serial = serial;
         self.pending.push_back(transaction.clone());
@@ -285,6 +287,7 @@ impl StateSequence {
         self.validate_finish(transaction, success)?;
         if success {
             self.committed = transaction.output;
+            transaction.published.store(true, Ordering::Release);
             self.pending.pop_front();
         } else {
             self.drain_until = self
