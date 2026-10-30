@@ -401,7 +401,6 @@
         };
 
         devShells.default = pkgs.mkShell {
-          FORJA_BUILD_REV = self.rev or self.dirtyRev or "unknown";
           packages = [
             toolchain
             pkgs.wasmtime
