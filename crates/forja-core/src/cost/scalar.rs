@@ -1,9 +1,13 @@
 use crate::{
     Dispatch, KernelCost, Op,
-    program::{Inst, Program, ProgramKind},
+    program::{BinOp, Inst, Program, ProgramKind, UnOp},
 };
 
 pub(super) fn program_ops(program: &Program, elements: u64, width: u64) -> Option<u64> {
+    program_work(program, elements, width, false)
+}
+
+fn program_work(program: &Program, elements: u64, width: u64, special_only: bool) -> Option<u64> {
     let rows = elements.checked_div(width)?;
     let mut uniform = Vec::with_capacity(program.insts.len());
     let mut operations = 0_u64;
@@ -40,7 +44,26 @@ pub(super) fn program_ops(program: &Program, elements: u64, width: u64) -> Optio
             | Inst::Cast(_, _)
             | Inst::Select(_, _, _) => 0,
         };
-        operations = operations.checked_add(count)?;
+        let special = matches!(
+            inst,
+            Inst::Unary(
+                UnOp::Exp
+                    | UnOp::ExpRounded
+                    | UnOp::Log
+                    | UnOp::Log1p
+                    | UnOp::Sqrt
+                    | UnOp::Rsqrt
+                    | UnOp::Sin
+                    | UnOp::Cos
+                    | UnOp::Tanh
+                    | UnOp::Sigmoid
+                    | UnOp::Recip,
+                _
+            ) | Inst::Binary(BinOp::Pow, _, _)
+        );
+        if !special_only || special {
+            operations = operations.checked_add(count)?;
+        }
         uniform.push(is_uniform);
     }
     Some(operations)
@@ -61,6 +84,7 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
                     .copied()
                     .unwrap_or(1),
             );
+            cost.sfu_ops = program_work(program, elements, width, true)?;
             program_ops(program, elements, width)?
         }
         Op::RmsNorm { .. } => elements.checked_mul(4)?.checked_add(
@@ -95,6 +119,12 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         | Op::PagedSdpaAppend { .. } => cost.scalar_ops,
     };
     if let Some(epilogue) = dispatch.prepared_epilogue() {
+        cost.sfu_ops = cost.sfu_ops.checked_add(program_work(
+            epilogue.validated().program(),
+            elements,
+            1,
+            true,
+        )?)?;
         cost.scalar_ops = cost.scalar_ops.checked_add(program_ops(
             epilogue.validated().program(),
             elements,
@@ -139,6 +169,8 @@ mod tests {
         let dispatch = Dispatch::kernel(&prepared, &[&input], &[&output]).unwrap();
         let cost = KernelCost::of(&dispatch).unwrap();
         assert_eq!(cost.scalar_ops, 1);
+        assert_eq!(cost.sfu_ops, 1);
+        assert_eq!(cost.json()["sfu_ops"], 1);
         assert_eq!((cost.read_bytes, cost.write_bytes), (4, 4));
     }
 
@@ -159,6 +191,7 @@ mod tests {
             program_ops(&program, 7 * 33, 33),
             Some(7 * (33 + 32 + 1 + 33))
         );
+        assert_eq!(program_work(&program, 7 * 33, 33, true), Some(7));
         program.kind = ProgramKind::Map;
         program.insts = vec![Inst::Input(0), Inst::Unary(UnOp::Exp, 0)];
         assert_eq!(program_ops(&program, 4097, 4097), Some(4097));

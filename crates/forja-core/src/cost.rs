@@ -28,6 +28,8 @@ pub struct KernelCost {
     pub flops: u64,
     /// Scalar arithmetic, comparisons and special functions (one operation each).
     pub scalar_ops: u64,
+    /// Logical special functions included in scalar operations; their ceiling is uncalibrated.
+    pub sfu_ops: u64,
     /// Weight bytes included in reads, before data-dependent expert reuse.
     pub weight_bytes: u64,
     /// Minimum footprint for distinct per-row routes; zero for non-routed operations.
@@ -44,7 +46,7 @@ impl KernelCost {
     #[must_use]
     pub fn json(self) -> serde_json::Value {
         serde_json::json!({"read_bytes": self.read_bytes, "write_bytes": self.write_bytes,
-            "flops": self.flops, "scalar_ops": self.scalar_ops,
+            "flops": self.flops, "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops,
             "weight_bytes": self.weight_bytes, "kv_bytes": self.kv_bytes,
             "minimum_weight_bytes": self.minimum_weight_bytes,
             "maximum_weight_bytes": self.maximum_weight_bytes})

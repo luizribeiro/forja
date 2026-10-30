@@ -10,6 +10,8 @@ pub(crate) struct Cost {
     write_bytes: u64,
     flops: u64,
     scalar_ops: u64,
+    #[serde(default)]
+    sfu_ops: u64,
     weight_bytes: u64,
     minimum_weight_bytes: u64,
     maximum_weight_bytes: u64,

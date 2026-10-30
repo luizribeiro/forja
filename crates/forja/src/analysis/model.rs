@@ -16,6 +16,8 @@ struct Totals {
     write: u64,
     kv: u64,
     flops: u64,
+    scalar_ops: u64,
+    sfu_ops: u64,
     compute: [f64; 3],
     dispatches: u64,
     attributed: f64,
@@ -61,6 +63,14 @@ impl Totals {
             .flops
             .checked_add(cost.flops)
             .ok_or("FLOP total overflow")?;
+        self.scalar_ops = self
+            .scalar_ops
+            .checked_add(cost.scalar_ops)
+            .ok_or("scalar total overflow")?;
+        self.sfu_ops = self
+            .sfu_ops
+            .checked_add(cost.sfu_ops)
+            .ok_or("SFU total overflow")?;
         self.dispatches = self
             .dispatches
             .checked_add(count)
@@ -152,6 +162,7 @@ impl Totals {
         Ok(
             json!({"bound_kind": if mode == "decode" { "matrix-weights-plus-KV-once" } else { "aggregate-prefill-roofline" },
             "weight_bytes_range": self.weights, "kv_bytes": self.kv, "logical_read_bytes_range": self.read, "write_bytes": self.write,
+            "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops, "scalar_sfu_ceiling": "uncalibrated",
             "matrix_product_flops": self.flops, "physical_dispatches": self.dispatches, "layers": self.layers, "layer_count": self.layers.len(),
             "streaming_bound_seconds_range": memory, "compute_bound_seconds": self.compute[1],
             "dispatch_count_floor_seconds": floor, "lower_bound_seconds_range": bounds, "target_seconds_range": targets,
@@ -253,6 +264,8 @@ mod tests {
             .add(
                 KernelCost {
                     flops: 500,
+                    scalar_ops: 33,
+                    sfu_ops: 7,
                     ..KernelCost::default()
                 },
                 1,
@@ -261,6 +274,9 @@ mod tests {
             )
             .unwrap();
         let within = total.json("prefill", 0.48, None, 0.8, ceiling).unwrap();
+        assert_eq!(within["scalar_ops"], 33);
+        assert_eq!(within["sfu_ops"], 7);
+        assert_eq!(within["scalar_sfu_ceiling"], "uncalibrated");
         assert_eq!(within["over_100_percent"], true);
         assert_eq!(within["bound_exceeds_observed"], false);
         let outside = total.json("prefill", 0.4, None, 0.8, ceiling).unwrap();
