@@ -9031,6 +9031,7 @@ pub(super) fn variant_supported(
         }
         MetalVariant::PagedSdpaWideTwoPass
         | MetalVariant::DeltaRule
+        | MetalVariant::DeltaBlockWy64
         | MetalVariant::CausalDepthwiseConv
         | MetalVariant::MatmulPortable
         | MetalVariant::QuantMatmulPortable

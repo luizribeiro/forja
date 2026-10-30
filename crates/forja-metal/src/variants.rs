@@ -15,6 +15,7 @@ use crate::matmul::{MatrixLayout, classify};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
     DeltaRule,
+    DeltaBlockWy64,
     CausalDepthwiseConv,
     MatmulPortable,
     MatmulGemv,
@@ -1438,6 +1439,21 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         ]
     ),
     batch_invariant_variant!(
+        "delta-rule-block.wy64-fixed",
+        DeltaRuleBlock,
+        DeltaBlockWy64,
+        &[value(
+            dim("key width", QUERY, Axis::Index(2)),
+            Relation::Range {
+                min: 1,
+                max: crate::geometry::DELTA_RULE_MAX_KEYS
+            }
+        )],
+        &["canonical 64-token block transforms with serial state carry."],
+        &["key widths above 256 or a different numerical block identity."],
+        &["Fixed-tree f32 Gram, solve, carry and output stages; masked partial blocks."]
+    ),
+    batch_invariant_variant!(
         "causal-depthwise-conv.direct",
         CausalDepthwiseConv,
         CausalDepthwiseConv,
@@ -2234,6 +2250,7 @@ mod tests {
                 "sample.portable",
                 "sample.parallel",
                 "delta-rule.simd",
+                "delta-rule-block.wy64-fixed",
                 "causal-depthwise-conv.direct",
                 "sdpa.steel-256",
                 "sdpa.steel-half-256",
@@ -2957,6 +2974,16 @@ mod tests {
     }
 
     #[test]
+    fn delta_block_catalog_pins_fixed_tree_reductions() {
+        let name = "delta-rule-block.wy64-fixed";
+        let (_, entry) = definition(OperationKind::DeltaRuleBlock, name, METAL4).unwrap();
+        assert!(entry.batch_invariant);
+        assert_eq!(entry.reduction_class, Some(name));
+        assert_eq!(entry.constraints.len(), 1);
+        assert_eq!(entry.cost.tile, [0; 3]);
+    }
+
+    #[test]
     fn weighted_gather_variants_partition_route_counts() {
         let weighted_broad = weighted_gather_dispatch(1, 9, 257);
         for variant in [
@@ -2976,13 +3003,22 @@ mod tests {
         );
     }
 
-    fn state_dispatch(delta: bool) -> Dispatch {
+    fn state_dispatch(constructor: fn(forja_core::StateAccess) -> forja_core::StateOp) -> Dispatch {
+        use forja_core::{DeltaBlockScratch, StateOp};
         let cpu = CpuBackend::new();
         let (access, _) = forja_testing::state_test_metadata().unwrap();
-        let shapes: &[&[u32]] = if delta {
-            &[&[1, 7], &[1, 7], &[3, 7], &[3], &[3], &[3, 7, 7]]
-        } else {
-            &[&[1, 7], &[4, 7], &[3, 7]]
+        let operation = constructor(access);
+        let shapes: &[&[u32]] = match operation {
+            StateOp::DeltaRule(_) => &[&[1, 7], &[1, 7], &[3, 7], &[3], &[3], &[3, 7, 7]],
+            StateOp::DeltaRuleBlock(_) => &[
+                &[7, 1, 7],
+                &[7, 1, 7],
+                &[7, 3, 7],
+                &[7, 3],
+                &[7, 3],
+                &[3, 7, 7],
+            ],
+            StateOp::CausalDepthwiseConv(_) => &[&[1, 7], &[4, 7], &[3, 7]],
         };
         let mut inputs = shapes
             .iter()
@@ -2991,21 +3027,27 @@ mod tests {
         for shape in [&[2, 2][..], &[3], &[1]] {
             inputs.push(cpu.alloc(DType::U32, shape).unwrap());
         }
-        let output = cpu
-            .alloc(DType::F32, if delta { &[3, 7] } else { &[1, 7] })
-            .unwrap();
-        let next = cpu.alloc(DType::F32, shapes[shapes.len() - 1]).unwrap();
-        let op = if delta {
-            forja_core::StateOp::DeltaRule(access)
-        } else {
-            forja_core::StateOp::CausalDepthwiseConv(access)
+        let output_shape = match operation {
+            StateOp::DeltaRule(_) | StateOp::DeltaRuleBlock(_) => shapes[2],
+            StateOp::CausalDepthwiseConv(_) => shapes[0],
         };
+        let output = cpu.alloc(DType::F32, output_shape).unwrap();
+        let next = cpu.alloc(DType::F32, shapes[shapes.len() - 1]).unwrap();
+        let scratch = matches!(operation, StateOp::DeltaRuleBlock(_)).then(|| {
+            cpu.alloc(
+                DType::F32,
+                &[DeltaBlockScratch::new(7, 3, 7, 7).unwrap().elements()],
+            )
+            .unwrap()
+        });
+        let mut outputs = vec![&output, &next];
+        outputs.extend(scratch.as_ref());
         let mut commands = CommandList::new();
         commands
             .dispatch_many(
-                Op::State(op),
+                Op::State(operation),
                 &inputs.iter().collect::<Vec<_>>(),
-                &[&output, &next],
+                &outputs,
             )
             .unwrap();
         commands.into_dispatches().remove(0)
@@ -3015,6 +3057,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = vec![
+            (
+                "delta-rule-block.wy64-fixed",
+                state_dispatch(forja_core::StateOp::DeltaRuleBlock),
+                "state_delta_rule_block",
+            ),
             (
                 "sdpa.steel-256",
                 sdpa_dispatch(DType::F32, 6, 7, 33, 256, 256),
@@ -3045,10 +3092,14 @@ mod tests {
                 sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256),
                 "mlx_sdpa_vector_2pass_256",
             ),
-            ("delta-rule.simd", state_dispatch(true), "state_delta_rule"),
+            (
+                "delta-rule.simd",
+                state_dispatch(forja_core::StateOp::DeltaRule),
+                "state_delta_rule",
+            ),
             (
                 "causal-depthwise-conv.direct",
-                state_dispatch(false),
+                state_dispatch(forja_core::StateOp::CausalDepthwiseConv),
                 "state_causal_conv",
             ),
             (
