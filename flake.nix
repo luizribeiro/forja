@@ -77,7 +77,7 @@
         metalFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(guests|test-guests)|crates/forja-(core|host|metal|sdk[^/]*))/|.*\\.metal$)";
         guestFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(guests|test-guests)|crates/forja-(chat-format|program-conversions|sdk[^/]*))/)";
         qwenFiles = "^(${runEverythingFiles}|(wit|engines|chat-formats|support/(golden-fixtures|guests|test-guests)|crates/forja-(core|host|metal|sdk[^/]*))/|.*\\.metal$)";
-        pythonFiles = "^support/.*\\.py$";
+        pythonFiles = "^(support/.*|engines/[^/]+/download)\\.py$";
         allLocalStages = [
           "pre-commit"
           "pre-push"
@@ -272,7 +272,7 @@
                 ];
                 text = ''
                   pytest -q support
-                  ruff check --select E4,E7,E9,F support
+                  ruff check --select E4,E7,E9,F support engines/*/download.py
                 '';
               }
             }/bin/python-checks-hook";
