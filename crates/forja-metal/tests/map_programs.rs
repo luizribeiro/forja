@@ -511,13 +511,7 @@ fn run(backend: &MetalBackend, commands: CommandList) {
 
 #[test]
 fn metal_log1p_retains_small_arguments_and_domain_boundaries() {
-    let program = Program {
-        kind: ProgramKind::Map,
-        insts: vec![Inst::Input(0), Inst::Unary(UnOp::Log1p, 0)],
-        outputs: vec![(0, 1)],
-    }
-    .validate()
-    .unwrap();
+    let program = log1p_program();
     let values = [
         -0.999_999_f32,
         -0.5,
@@ -562,5 +556,40 @@ fn metal_log1p_retains_small_arguments_and_domain_boundaries() {
                 assert_outputs_agree(DType::F32, expected, actual).unwrap();
             }
         }
+    }
+}
+
+fn log1p_program() -> ValidatedProgram {
+    Program {
+        kind: ProgramKind::Map,
+        insts: vec![Inst::Input(0), Inst::Unary(UnOp::Log1p, 0)],
+        outputs: vec![(0, 1)],
+    }
+    .validate()
+    .unwrap()
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn metal_log1p_matches_rounded_double_reference() {
+    let values = (0..4097_u16)
+        .map(|i| (-20.0 + f32::from(i) / 128.0).exp())
+        .collect::<Vec<_>>();
+    let bytes = values
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect::<Vec<_>>();
+    let actual = run_small_program(
+        &MetalBackend::new().unwrap(),
+        &log1p_program(),
+        &bytes,
+        values.len(),
+    );
+    for (value, bytes) in values.iter().zip(actual[0].as_chunks::<4>().0) {
+        assert_eq!(
+            f32::from_le_bytes(*bytes).to_bits(),
+            (f64::from(*value).ln_1p() as f32).to_bits(),
+            "log1p({value})"
+        );
     }
 }

@@ -29,13 +29,53 @@ bool f32_is_non_finite(float value) {
     return (as_type<uint>(value) & 0x7fffffffu) >= 0x7f800000u;
 }
 
+float2 f32_dd_add(float2 a, float2 b) {
+    float s = a.x + b.x;
+    float v = s - a.x;
+    float e = (a.x - (s - v)) + (b.x - v) + a.y + b.y;
+    float hi = s + e;
+    return float2(hi, e - (hi - s));
+}
+
+float2 f32_dd_mul(float2 a, float2 b) {
+    float p = a.x * b.x;
+    float e = fma(a.x, b.x, -p) + a.x * b.y + a.y * b.x;
+    float hi = p + e;
+    return float2(hi, e - (hi - p));
+}
+
+float2 f32_dd_div(float2 a, float2 b) {
+    float q = a.x / b.x;
+    float2 r = f32_dd_add(a, -f32_dd_mul(b, float2(q, 0.0f)));
+    return f32_dd_add(float2(q, 0.0f), float2((r.x + r.y) / b.x, 0.0f));
+}
+
+float2 f32_ln2_pair() {
+    return float2(0.693147182464599609375f, -1.904654323148236e-9f);
+}
+
 float f32_log1p(float x) {
     if (f32_is_nan(x) || x < -1.0f) { return as_type<float>(0x7fc00000u); }
     if (x == -1.0f) { return as_type<float>(0xff800000u); }
-    if (as_type<uint>(x) == 0x7f800000u) { return x; }
-    float u = 1.0f + x;
-    if (u == 1.0f) { return x; }
-    return precise::log(u) * (x / (u - 1.0f));
+    if (as_type<uint>(x) == 0x7f800000u || abs(x) < 0x1p-24f) { return x; }
+    float2 u = f32_dd_add(float2(1.0f, 0.0f), float2(x, 0.0f));
+    uint bits = as_type<uint>(u.x);
+    int exponent = int(bits >> 23) - 127;
+    float2 z = float2(as_type<float>((bits & 0x7fffffu) | 0x3f800000u),
+                       ldexp(u.y, -exponent));
+    if (z.x > 1.4142135623730951f) { z *= 0.5f; exponent += 1; }
+    float2 t = f32_dd_div(f32_dd_add(z, float2(-1.0f, 0.0f)),
+                          f32_dd_add(z, float2(1.0f, 0.0f)));
+    float2 squared = f32_dd_mul(t, t);
+    float2 term = t;
+    float2 sum = t;
+    for (uint n = 3; n <= 23; n += 2) {
+        term = f32_dd_mul(term, squared);
+        sum = f32_dd_add(sum, f32_dd_div(term, float2(float(n), 0.0f)));
+    }
+    float2 result = f32_dd_add(sum * 2.0f,
+        f32_dd_mul(float2(float(exponent), 0.0f), f32_ln2_pair()));
+    return result.x + result.y;
 }
 
 bool f32_lt(float left, float right) {
