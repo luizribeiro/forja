@@ -386,8 +386,8 @@ fn unary(op: UnOp, input: ScalarInterval) -> Result<ScalarInterval, AgreementErr
         UnOp::Neg => map_monotone(input, |value| -value, true, 0),
         UnOp::Abs => absolute(input),
         UnOp::Exp | UnOp::ExpRounded => map_monotone(input, f64::exp, false, PRECISE_ULPS),
-        UnOp::Log => domain_monotone(input, 0.0, false, f64::ln, PRECISE_ULPS),
-        UnOp::Log1p => domain_monotone(input, -1.0, false, f64::ln_1p, PRECISE_ULPS),
+        UnOp::Log => domain_monotone(input, 0.0, true, f64::ln, PRECISE_ULPS),
+        UnOp::Log1p => domain_monotone(input, -1.0, true, f64::ln_1p, PRECISE_ULPS),
         UnOp::Sqrt => domain_monotone(input, 0.0, true, f64::sqrt, PRECISE_ULPS),
         UnOp::Rsqrt => reciprocal_sqrt(input),
         UnOp::Sin => trigonometric(input, true),
@@ -1338,6 +1338,38 @@ mod tests {
                 (stored.to_le_bytes().to_vec(), f64::from(stored.to_f32()))
             }
             DType::F32 | DType::I32 | DType::U32 => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn logarithmic_domains_preserve_infinite_endpoints() {
+        for (op, boundary, below) in [
+            (UnOp::Log, 0.0, -f64::from(f32::MIN_POSITIVE)),
+            (UnOp::Log, -0.0, -f64::from(f32::MIN_POSITIVE)),
+            (UnOp::Log1p, -1.0, f64::from(-1.000_000_1_f32)),
+        ] {
+            for crosses_boundary in [false, true] {
+                let input = FloatInterval {
+                    lo: if crosses_boundary { below } else { boundary },
+                    hi: boundary,
+                    may_nan: false,
+                };
+                let ScalarInterval::Float(result) =
+                    unary(op, ScalarInterval::Float(input)).unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(result.lo, f64::NEG_INFINITY);
+                assert_eq!(result.hi, f64::NEG_INFINITY);
+                assert_eq!(result.may_nan, crosses_boundary);
+            }
+            let ScalarInterval::Float(invalid) =
+                unary(op, ScalarInterval::Float(FloatInterval::point(below))).unwrap()
+            else {
+                unreachable!()
+            };
+            assert!(!invalid.has_numbers());
+            assert!(invalid.may_nan);
         }
     }
 
