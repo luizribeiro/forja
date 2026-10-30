@@ -9,7 +9,9 @@ pub use prompt::PromptChunking;
 mod fuzz_tests;
 mod native;
 mod state;
-pub use state::{StateCell, StateRecording, StateSequenceHandle, StateStorage, StateSubmission};
+pub use state::{
+    StateCell, StateEntry, StateRecording, StateSequenceHandle, StateStorage, StateSubmission,
+};
 mod weights;
 
 use std::time::{Duration, Instant};
@@ -67,6 +69,7 @@ pub mod bindings {
         require_store_data_send: true,
         with: {
             "l9o:gpu/compute.tensor": crate::TensorEntry,
+            "l9o:gpu/compute.state-plane": crate::StateEntry,
             "l9o:gpu/compute.kernel": crate::KernelEntry,
             "l9o:gpu/compute.epilogue": crate::EpilogueEntry,
             "l9o:gpu/compute.command-list": crate::CommandListEntry,

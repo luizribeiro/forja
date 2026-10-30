@@ -1,6 +1,8 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
 mod cell;
+mod guest;
+pub use guest::StateEntry;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

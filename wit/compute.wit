@@ -200,6 +200,10 @@ interface compute {
     read: async func() -> result<list<u8>, error>;
   }
 
+  resource state-plane {
+    create: static func(dt: dtype, shape: list<u32>) -> result<state-plane, error>;
+  }
+
   resource weights {
     info: func(name: string) -> result<tensor-info, error>;
     tensor: func(name: string) -> result<tensor, error>;
