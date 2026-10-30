@@ -1,5 +1,7 @@
 //! Validated geometry for opaque per-sequence state.
 
+mod feedback;
+pub use feedback::{FeedbackCheckpoint, FeedbackPin, FeedbackVersions};
 mod block;
 pub use block::DeltaBlockScratch;
 mod access;
