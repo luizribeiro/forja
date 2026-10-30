@@ -1,4 +1,4 @@
-use super::{StateCell, StateCharge, StateRecording};
+use super::{StateCell, StateCharge, StateCommands};
 use crate::{Limits, compute, guest_error, invalid_handle, quota};
 use forja_core::{Backend, DeltaBlockScratch, StateOp, Tensor};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ impl<B: Backend> Drop for StateScratch<B> {
     }
 }
 
-impl<B: Backend + 'static> StateRecording<B> {
+impl<B: Backend + 'static> StateCommands<B> {
     /// Records fixed-size delta blocks with charged, private intermediate storage.
     ///
     /// # Errors

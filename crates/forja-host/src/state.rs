@@ -14,7 +14,7 @@ mod lifecycle_tests;
 mod multiple_sequences;
 pub use cell::StateCell;
 mod record;
-pub use record::StateRecording;
+pub use record::{StateCommands, StateRecording};
 mod journal;
 mod outcome;
 #[cfg(test)]

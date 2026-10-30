@@ -1,4 +1,4 @@
-use super::StateRecording;
+use super::StateCommands;
 use crate::{compute, invalid_handle};
 use forja_core::{Backend, CompletionResource, ReplayBindings, StateAccess, Tensor};
 use std::sync::Arc;
@@ -22,8 +22,8 @@ impl std::fmt::Debug for StateCapture {
     }
 }
 
-impl<B: Backend + Send + Sync + 'static> StateRecording<B> {
-    /// Retains protected backing and metadata without retaining this sequence's allocation lease.
+impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
+    /// Retains protected backing and metadata without retaining a sequence allocation lease.
     ///
     /// # Errors
     /// Returns an error if any protected plane view cannot be constructed.
@@ -57,7 +57,7 @@ impl StateCapture {
     /// Refuses incompatible planes or a duplicate update in a different transaction.
     pub fn bind<B: Backend>(
         &self,
-        recording: &mut StateRecording<B>,
+        recording: &mut StateCommands<B>,
     ) -> Result<ReplayBindings, compute::Error> {
         let same_recording = self.metadata.as_slice() == &**recording.metadata;
         if self.planes.len() != recording.updated.len()

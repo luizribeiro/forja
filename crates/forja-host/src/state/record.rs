@@ -26,19 +26,43 @@ impl<B: Backend> Drop for StateMetadata<B> {
     }
 }
 
-/// A transaction recording that never exposes state backing as ordinary tensors.
-pub struct StateRecording<B: Backend> {
+/// Authenticated plane commands without ownership of a request's transaction.
+pub struct StateCommands<B: Backend> {
     pub(super) storage: Arc<StateStorage<B>>,
-    pub(super) transaction: StateTransaction,
-    pub(super) sequence: StateSequenceHandle<B>,
-    pub(super) handed_off: bool,
     pub(super) access: StateAccess,
-    pub(super) predecessor: Option<Arc<super::outcome::StateOutcome>>,
     pub(super) scratch: Vec<super::block::StateScratch<B>>,
     pub(super) metadata: Arc<StateMetadata<B>>,
     pub(super) commands: CommandList,
     pub(super) updated: Vec<bool>,
     pub(super) limits: Limits,
+}
+
+/// A transaction recording that never exposes state backing as ordinary tensors.
+pub struct StateRecording<B: Backend> {
+    body: StateCommands<B>,
+    pub(super) transaction: StateTransaction,
+    pub(super) sequence: StateSequenceHandle<B>,
+    pub(super) handed_off: bool,
+    pub(super) predecessor: Option<Arc<super::outcome::StateOutcome>>,
+}
+
+impl<B: Backend> std::ops::Deref for StateRecording<B> {
+    type Target = StateCommands<B>;
+    fn deref(&self) -> &Self::Target {
+        &self.body
+    }
+}
+impl<B: Backend> std::ops::DerefMut for StateRecording<B> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.body
+    }
+}
+impl<B: Backend> StateRecording<B> {
+    /// Serial of the version whose publication this recording requests.
+    #[must_use]
+    pub fn serial(&self) -> u64 {
+        self.transaction.serial()
+    }
 }
 
 impl<B: Backend> StateStorage<B> {
@@ -97,17 +121,19 @@ impl<B: Backend> StateStorage<B> {
             charge: Arc::new(charge),
         };
         let mut recording = StateRecording {
-            storage: Arc::clone(self),
+            body: StateCommands {
+                storage: Arc::clone(self),
+                access,
+                scratch: Vec::new(),
+                metadata: Arc::new(metadata),
+                commands: CommandList::new(),
+                updated: vec![false; self.planes.len()],
+                limits,
+            },
             transaction,
             sequence: sequence.clone(),
             handed_off: false,
-            access,
             predecessor,
-            scratch: Vec::new(),
-            metadata: Arc::new(metadata),
-            commands: CommandList::new(),
-            updated: vec![false; self.planes.len()],
-            limits,
         };
         for (shape, values) in [
             (vec![2, 2], table),
@@ -132,7 +158,7 @@ impl<B: Backend> StateStorage<B> {
     }
 }
 
-impl<B: Backend> StateRecording<B> {
+impl<B: Backend> StateCommands<B> {
     pub(super) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
         let mut owners = vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
@@ -144,12 +170,6 @@ impl<B: Backend> StateRecording<B> {
                 .map(super::block::StateScratch::retained_resource),
         );
         owners
-    }
-
-    /// Serial of the version whose publication this recording requests.
-    #[must_use]
-    pub fn serial(&self) -> u64 {
-        self.transaction.serial()
     }
 
     /// Records one plane's delta-rule update from Q, K, V, decay and beta.
