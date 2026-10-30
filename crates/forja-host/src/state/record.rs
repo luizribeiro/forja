@@ -88,18 +88,7 @@ impl<B: Backend> StateStorage<B> {
         if !Arc::ptr_eq(self, &sequence.storage) {
             return Err(invalid_handle("state sequence belongs to another storage"));
         }
-        let records = self.planes[0].layout().shape()[0];
-        let bytes = u64::from(records)
-            .checked_mul(8)
-            .and_then(|n| n.checked_add(1024))
-            .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
-            .ok_or_else(|| quota("state recording size overflow"))?;
-        let charge = StateCharge::reserve(
-            self.backend.as_ref(),
-            Arc::clone(&self.charge.live),
-            self.limit.min(limits.live_bytes),
-            bytes,
-        )?;
+        let charge = self.command_charge(limits)?;
         let (slot, predecessor) = {
             let sequence = sequence.lock();
             (
@@ -115,36 +104,78 @@ impl<B: Backend> StateStorage<B> {
             .iter()
             .flat_map(|entry| [entry.page(), entry.generation()])
             .collect::<Vec<_>>();
-        let metadata = StateMetadata {
-            backend: Arc::clone(&self.backend),
-            tensors: Vec::new(),
-            charge: Arc::new(charge),
-        };
         let mut recording = StateRecording {
-            body: StateCommands {
-                storage: Arc::clone(self),
-                access,
-                scratch: Vec::new(),
-                metadata: Arc::new(metadata),
-                commands: CommandList::new(),
-                updated: vec![false; self.planes.len()],
-                limits,
-            },
+            body: StateCommands::empty(self, access, charge, limits),
             transaction,
             sequence: sequence.clone(),
             handed_off: false,
             predecessor,
         };
+        recording.initialize_metadata(table, slot.table().generations().to_vec(), true)?;
+        Ok(recording)
+    }
+    fn command_charge(&self, limits: Limits) -> Result<Arc<StateCharge>, compute::Error> {
+        let records = self.planes[0].layout().shape()[0];
+        let bytes = u64::from(records)
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(1024))
+            .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
+            .ok_or_else(|| quota("state recording size overflow"))?;
+        StateCharge::reserve(
+            self.backend.as_ref(),
+            Arc::clone(&self.charge.live),
+            self.limit.min(limits.live_bytes),
+            bytes,
+        )
+        .map(Arc::new)
+    }
+}
+
+impl<B: Backend> StateCommands<B> {
+    fn empty(
+        storage: &Arc<StateStorage<B>>,
+        access: StateAccess,
+        charge: Arc<StateCharge>,
+        limits: Limits,
+    ) -> Self {
+        Self {
+            storage: Arc::clone(storage),
+            access,
+            scratch: Vec::new(),
+            metadata: Arc::new(StateMetadata {
+                backend: Arc::clone(&storage.backend),
+                tensors: Vec::new(),
+                charge,
+            }),
+            commands: CommandList::new(),
+            updated: vec![false; storage.planes.len()],
+            limits,
+        }
+    }
+
+    fn initialize_metadata(
+        &mut self,
+        table: Vec<u32>,
+        generations: Vec<u32>,
+        active: bool,
+    ) -> Result<(), compute::Error> {
+        let records = self.storage.planes[0].layout().shape()[0];
+        if table.len() != 4 || u32::try_from(generations.len()).ok() != Some(records) {
+            return Err(invalid_handle(
+                "state authentication metadata has invalid extents",
+            ));
+        }
         for (shape, values) in [
             (vec![2, 2], table),
-            (vec![records], slot.table().generations().to_vec()),
-            (vec![1], vec![1]),
+            (vec![records], generations),
+            (vec![1], vec![u32::from(active)]),
         ] {
             let tensor = self
+                .storage
                 .backend
                 .alloc(DType::U32, &shape)
                 .map_err(guest_error)?;
-            Arc::get_mut(&mut recording.metadata)
+            Arc::get_mut(&mut self.metadata)
                 .ok_or_else(|| invalid_handle("state metadata was shared before construction"))?
                 .tensors
                 .push(tensor.clone());
@@ -152,13 +183,14 @@ impl<B: Backend> StateStorage<B> {
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>();
-            self.backend.write(&tensor, &bytes).map_err(guest_error)?;
+            self.storage
+                .backend
+                .write(&tensor, &bytes)
+                .map_err(guest_error)?;
         }
-        Ok(recording)
+        Ok(())
     }
-}
 
-impl<B: Backend> StateCommands<B> {
     pub(super) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
         let mut owners = vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
