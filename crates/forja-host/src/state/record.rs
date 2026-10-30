@@ -1,5 +1,5 @@
 use super::{StateCharge, StateSequenceHandle, StateStorage, pool_error};
-use crate::{compute, guest_error, invalid_handle, quota};
+use crate::{Limits, compute, guest_error, invalid_handle, quota};
 use forja_core::{
     Backend, CommandList, DType, KernelCost, Op, StateAccess, StateOp, StateTransaction, Tensor,
 };
@@ -16,6 +16,7 @@ pub struct StateRecording<B: Backend> {
     _charge: StateCharge,
     pub(super) commands: CommandList,
     pub(super) updated: Vec<bool>,
+    pub(super) limits: Limits,
 }
 
 impl<B: Backend> StateStorage<B> {
@@ -28,6 +29,15 @@ impl<B: Backend> StateStorage<B> {
         sequence: &StateSequenceHandle<B>,
         transaction: StateTransaction,
     ) -> Result<StateRecording<B>, compute::Error> {
+        self.record_with_limits(sequence, transaction, self.limits)
+    }
+
+    pub(super) fn record_with_limits(
+        self: &Arc<Self>,
+        sequence: &StateSequenceHandle<B>,
+        transaction: StateTransaction,
+        limits: Limits,
+    ) -> Result<StateRecording<B>, compute::Error> {
         self.check_usable()?;
         if !Arc::ptr_eq(self, &sequence.storage) {
             return Err(invalid_handle("state sequence belongs to another storage"));
@@ -38,7 +48,11 @@ impl<B: Backend> StateStorage<B> {
             .and_then(|n| n.checked_add(1024))
             .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
             .ok_or_else(|| quota("state recording size overflow"))?;
-        let charge = StateCharge::reserve(Arc::clone(&self.charge.live), self.limit, bytes)?;
+        let charge = StateCharge::reserve(
+            Arc::clone(&self.charge.live),
+            self.limit.min(limits.live_bytes),
+            bytes,
+        )?;
         let slot = sequence.lock().bind(&transaction).map_err(pool_error)?;
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
@@ -52,6 +66,7 @@ impl<B: Backend> StateStorage<B> {
             _charge: charge,
             commands: CommandList::new(),
             updated: vec![false; self.planes.len()],
+            limits,
         };
         let table = slot
             .table()
@@ -136,8 +151,8 @@ impl<B: Backend> StateRecording<B> {
         operands.push(&previous);
         operands.extend(&self.metadata);
         for tensor in operands.iter().copied().chain([output, &next]) {
-            if tensor.layout().shape().len() > self.storage.limits.tensor_rank
-                || tensor.layout().element_count() > self.storage.limits.tensor_elements
+            if tensor.layout().shape().len() > self.limits.tensor_rank
+                || tensor.layout().element_count() > self.limits.tensor_elements
             {
                 return Err(quota("state operand exceeds tensor limits"));
             }
@@ -157,8 +172,8 @@ impl<B: Backend> StateRecording<B> {
             .and_then(|n| n.checked_add(cost.read_bytes))
             .and_then(|n| n.checked_add(cost.write_bytes))
             .ok_or_else(|| quota("state work overflow"))?;
-        if work > self.storage.limits.work_per_dispatch
-            || self.commands.len() >= self.storage.limits.dispatches_per_list
+        if work > self.limits.work_per_dispatch
+            || self.commands.len() >= self.limits.dispatches_per_list
         {
             return Err(quota("state recording exceeds command work limits"));
         }
