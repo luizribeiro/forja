@@ -209,3 +209,8 @@ fn mma_carry_matches_cpu_stage_oracle() {
         check(2, "state_block_carry_mma", Some(panel), 128).unwrap();
     }
 }
+
+#[test]
+fn panel_solve_matches_cpu_stage_oracle() {
+    check(1, "state_block_solve_panel", Some(32), 128).unwrap();
+}

@@ -153,6 +153,7 @@ mod tests {
             "state_block_gram",
             "state_block_gram_mma",
             "state_block_solve",
+            "state_block_solve_panel",
             "state_block_carry",
             "state_block_carry_mma",
             "state_block_output",
