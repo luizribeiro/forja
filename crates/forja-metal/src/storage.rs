@@ -1296,7 +1296,7 @@ impl Backend for MetalBackend {
         graph: &PreparedGraph,
         values: Vec<u32>,
     ) -> Result<Self::Submission, BackendError> {
-        self.replay_graph(graph, values, false)
+        self.replay_graph(graph, values, false, None)
     }
 
     fn replay_profiled(
@@ -1304,7 +1304,17 @@ impl Backend for MetalBackend {
         graph: &PreparedGraph,
         values: Vec<u32>,
     ) -> Result<Self::Submission, BackendError> {
-        self.replay_graph(graph, values, true)
+        self.replay_graph(graph, values, true, None)
+    }
+
+    fn replay_bound(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &forja_core::ReplayBindings,
+        profiled: bool,
+    ) -> Result<Self::Submission, BackendError> {
+        self.replay_graph(graph, values, profiled, Some(bindings))
     }
 
     fn supports_replay_overlap(&self) -> bool {

@@ -29,3 +29,52 @@ fn state_replay_requires_fresh_authentication_flags() {
         .unwrap();
     assert!(!reusable_dispatch(commands.last_dispatch().unwrap()));
 }
+
+#[test]
+fn protected_replay_bindings_replace_both_banks_without_new_parameters() {
+    use forja_core::{Backend, GraphLimits, GraphTemplate, ParamSpace, ReplayBindings, Submission};
+    let backend = crate::MetalBackend::new().unwrap();
+    let left = backend.alloc(DType::F32, &[7, 33]).unwrap();
+    let right = backend.alloc(DType::F32, &[7, 33]).unwrap();
+    let output = backend.alloc(DType::F32, &[7, 33]).unwrap();
+    let other_output = backend.alloc(DType::F32, &[7, 33]).unwrap();
+    backend
+        .write(&left, &1_f32.to_le_bytes().repeat(231))
+        .unwrap();
+    backend
+        .write(&right, &2_f32.to_le_bytes().repeat(231))
+        .unwrap();
+    let mut commands = CommandList::new();
+    commands.dispatch(Op::Copy, &[&left], &output).unwrap();
+    let mut template =
+        GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+    template
+        .record_validated(commands.into_dispatches().remove(0))
+        .unwrap();
+    let graph = backend.prepare_graph(template).unwrap();
+    let mut bindings = ReplayBindings::default();
+    bindings.buffer(left.buffer(), right.buffer()).unwrap();
+    bindings
+        .buffer(output.buffer(), other_output.buffer())
+        .unwrap();
+    for profiled in [false, true] {
+        backend
+            .replay_bound(&graph, Vec::new(), &bindings, profiled)
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            backend.read(&other_output).unwrap(),
+            2_f32.to_le_bytes().repeat(231)
+        );
+        backend
+            .replay(&graph, Vec::new())
+            .unwrap()
+            .wait_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            1_f32.to_le_bytes().repeat(231)
+        );
+    }
+}

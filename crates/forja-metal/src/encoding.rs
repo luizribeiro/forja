@@ -2707,6 +2707,7 @@ impl MetalBackend {
         graph: &PreparedGraph,
         values: Vec<u32>,
         profile: bool,
+        bindings: Option<&forja_core::ReplayBindings>,
     ) -> Result<MetalSubmission, BackendError> {
         let state = graph
             .backend_state::<PreparedMetalGraph>()
@@ -2746,17 +2747,25 @@ impl MetalBackend {
                 .map_err(|_| BackendError::InvalidInput)?;
             }
         }
+        let rebound = bindings.is_some_and(|bindings| !bindings.is_empty());
+        let commands = match bindings.filter(|_| rebound) {
+            Some(bindings) => bindings
+                .apply(commands)
+                .map_err(|_| BackendError::InvalidInput)?,
+            None => commands,
+        };
+        let encoding = (!rebound).then_some(state);
         let submission = if profile {
             self.submit_commands_inner::<true>(
                 commands,
-                Some(state),
+                encoding,
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
             )
         } else {
             self.submit_commands_inner::<false>(
                 commands,
-                Some(state),
+                encoding,
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
             )
@@ -13367,7 +13376,9 @@ mod tests {
                     .record_validated(commands.into_dispatches().remove(0))
                     .unwrap();
                 let graph = backend.prepare_graph(template).unwrap();
-                let replay = backend.replay_graph(&graph, Vec::new(), true).unwrap();
+                let replay = backend
+                    .replay_graph(&graph, Vec::new(), true, None)
+                    .unwrap();
                 replay.wait().unwrap();
                 let replay_profile = replay.profile().unwrap();
                 assert_eq!(replay_profile.per_dispatch[0].internal.len(), 6);
