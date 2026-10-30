@@ -93,6 +93,37 @@ fn queued_cancellation<B: Backend + Send + Sync + 'static>(backend: B) {
     for lane in &lanes {
         assert_eq!(lane.position(), position(4));
     }
+    let copied = submit_with_copy(batch(9, 5), host.backend.as_ref(), &outputs[0]);
+    for lane in &lanes {
+        assert_eq!(lane.position(), position(5));
+    }
+    assert_eq!(
+        host.backend.read(&copied).unwrap(),
+        8_f32.to_le_bytes().repeat(7)
+    );
+}
+
+fn submit_with_copy<B: Backend>(
+    mut batch: StateBatch<B>,
+    backend: &B,
+    source: &forja_core::Tensor,
+) -> forja_core::Tensor {
+    let mut commands = CommandList::new();
+    for recording in &mut batch.recordings {
+        for dispatch in std::mem::take(&mut recording.commands).into_dispatches() {
+            commands.record_validated(dispatch);
+        }
+    }
+    let copied = backend.alloc(DType::F32, &[1, 7]).unwrap();
+    commands
+        .dispatch(forja_core::Op::Copy, &[source], &copied)
+        .unwrap();
+    batch
+        .submit_using(|owners| backend.submit_retained(commands, owners))
+        .unwrap()
+        .finish()
+        .unwrap();
+    copied
 }
 
 #[test]

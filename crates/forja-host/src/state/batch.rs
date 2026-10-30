@@ -50,16 +50,27 @@ impl<B: Backend> StateBatch<B> {
     /// # Errors
     /// Returns admission or submission failure; uncertain execution requires reload.
     pub fn submit(mut self) -> Result<StateBatchSubmission<B>, compute::Error> {
-        let storage = Arc::clone(&self.recordings[0].storage);
-        storage.check_usable()?;
         let mut commands = CommandList::new();
-        let mut retained = Vec::new();
         for recording in &mut self.recordings {
             for dispatch in std::mem::take(&mut recording.commands).into_dispatches() {
                 commands.record_validated(dispatch);
             }
-            retained.extend(recording.retained_resources());
         }
+        let storage = Arc::clone(&self.recordings[0].storage);
+        self.submit_using(|owners| storage.backend.submit_retained(commands, owners))
+    }
+
+    pub(crate) fn submit_using(
+        mut self,
+        submit: impl FnOnce(Vec<forja_core::CompletionResource>) -> Result<B::Submission, BackendError>,
+    ) -> Result<StateBatchSubmission<B>, compute::Error> {
+        let storage = Arc::clone(&self.recordings[0].storage);
+        storage.check_usable()?;
+        let retained = self
+            .recordings
+            .iter()
+            .flat_map(|recording| recording.retained_resources())
+            .collect();
         let mut queue = storage
             .queue_position
             .lock()
@@ -87,9 +98,7 @@ impl<B: Backend> StateBatch<B> {
             recording.handed_off = true;
         }
         *queue = position;
-        let submission = storage
-            .backend
-            .submit_retained(commands, retained)
+        let submission = submit(retained)
             .inspect_err(|_| storage.poisoned.store(true, Ordering::Release))
             .map_err(guest_error)?;
         drop(queue);
