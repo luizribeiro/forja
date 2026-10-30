@@ -136,6 +136,14 @@ impl Tensor {
         self.writable
     }
 
+    /// Lends the same validated extent without granting write access.
+    #[must_use]
+    pub fn read_only(&self) -> Self {
+        let mut view = self.clone();
+        view.writable = false;
+        view
+    }
+
     pub(crate) fn rebase(&self, buffer: BufferId, byte_offset: u64) -> Result<Self, LayoutError> {
         let layout = self.layout.rebase(byte_offset, buffer.byte_len())?;
         Self::from_allocation(buffer, layout, self.writable)
@@ -2597,8 +2605,7 @@ mod tests {
     fn dispatch_rejects_a_read_only_output() {
         let input = tensor(1, DType::F32, &[2], &[1]);
         let writable = tensor(2, DType::F32, &[2], &[1]);
-        let output =
-            Tensor::from_allocation(writable.buffer(), writable.layout().clone(), false).unwrap();
+        let output = writable.read_only();
 
         assert_eq!(
             CommandList::new().dispatch(Op::Copy, &[&input], &output),

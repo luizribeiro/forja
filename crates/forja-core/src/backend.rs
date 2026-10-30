@@ -245,8 +245,12 @@ impl<S> AllocationRegistry<S> {
     /// tensor or layout.
     pub fn view(&self, tensor: &Tensor, layout: Layout) -> Result<Tensor, BackendError> {
         let allocation = self.validate(tensor)?;
-        Tensor::from_allocation(tensor.buffer(), layout, allocation.writable)
-            .map_err(|_| BackendError::InvalidInput)
+        Tensor::from_allocation(
+            tensor.buffer(),
+            layout,
+            allocation.writable && tensor.is_writable(),
+        )
+        .map_err(|_| BackendError::InvalidInput)
     }
 
     /// Returns storage after validating that the tensor names this live allocation.
@@ -310,7 +314,7 @@ impl<S> AllocationRegistry<S> {
 
     fn validate(&self, tensor: &Tensor) -> Result<&Allocation<S>, BackendError> {
         let allocation = self.validate_buffer(tensor.buffer(), tensor.layout().buffer_len())?;
-        if allocation.writable != tensor.is_writable() {
+        if tensor.is_writable() && !allocation.writable {
             return Err(BackendError::InvalidInput);
         }
         Ok(allocation)

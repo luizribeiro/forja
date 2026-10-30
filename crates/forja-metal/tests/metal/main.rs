@@ -22,6 +22,8 @@ mod quant_embed;
 mod quant_matmul;
 #[path = "../queue_ordering.rs"]
 mod queue_ordering;
+#[path = "../read_only_views.rs"]
+mod read_only_views;
 #[path = "../rounding.rs"]
 mod rounding;
 #[path = "../row_programs.rs"]
