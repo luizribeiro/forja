@@ -41,3 +41,35 @@ async fn canonical_prompt_groups_and_reset_preserve_bits() -> Result<(), Box<dyn
     }
     Ok(())
 }
+
+#[test]
+fn prompt_and_decode_refuse_ambiguous_or_split_token_spans() -> Result<(), Box<dyn Error>> {
+    use forja_sdk::{DecodeInput, Engine, SamplingParams, Tensor};
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let mut model = model(&weights)?;
+    let one = Tensor::from_slice(&[1_u32], &[1])?;
+    let pair = Tensor::from_slice(&[1_u32, 2], &[2])?;
+    model.forward(&one, 0, false)?;
+    assert!(model.forward(&one, 1, false).is_err());
+    assert!(model.decode_token(&pair, 1, false).is_err());
+    let mut load = verification::tiny_load();
+    load.max_context = Some(128);
+    let mut engine = qwen38::Qwen38::with_config(&weights, &load, qwen38::Config::tiny())?;
+    engine.decode(DecodeInput {
+        phase: forja_sdk::BatchPhase::Prompt,
+        tokens: Some(Tensor::from_slice(&[1_u32; 64], &[64])?),
+        start_pos: 0,
+        sampling: SamplingParams::default(),
+    })?;
+    assert!(
+        engine
+            .decode(DecodeInput {
+                phase: forja_sdk::BatchPhase::Prompt,
+                tokens: None,
+                start_pos: 64,
+                sampling: SamplingParams::default()
+            })
+            .is_err()
+    );
+    Ok(())
+}

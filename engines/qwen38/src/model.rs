@@ -131,6 +131,9 @@ impl Model {
             .checked_add(sequence)
             .filter(|&end| sequence > 0 && end <= self.context)
             .ok_or_else(|| Error::loading("invalid token span"))?;
+        if (prefill && !start.is_multiple_of(64)) || (!prefill && sequence != 1) {
+            return Err(Error::loading("token span splits a canonical prompt block"));
+        }
         if !self.usable || (start != 0 && start != self.position) {
             return Err(Error::loading(
                 "sequence requires reload or contiguous positions",

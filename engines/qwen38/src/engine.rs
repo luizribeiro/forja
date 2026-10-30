@@ -63,6 +63,7 @@ impl Engine for Qwen38 {
         let prefill = input.phase == forja_sdk::BatchPhase::Prompt;
         let tokens = match input.tokens {
             Some(tokens) => tokens,
+            None if prefill => return Err(Error::loading("prompt phase requires explicit tokens")),
             None if self.feedback_position == Some(input.start_pos) => self.decode.token()?,
             None => return Err(Error::loading("decode has no token at this position")),
         };
