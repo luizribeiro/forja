@@ -74,19 +74,18 @@ impl StateCapture {
             ));
         }
         let mut bindings = ReplayBindings::default();
-        bindings
-            .state(self.access, recording.access)
-            .map_err(invalid_handle)?;
+        let mut views = Vec::new();
         for (plane, captured) in self.planes.iter().enumerate() {
             for (old, record) in captured
                 .iter()
                 .zip([recording.access.source(), recording.access.destination()])
             {
-                bindings
-                    .view(old.clone(), recording.storage.version_view(plane, record)?)
-                    .map_err(invalid_handle)?;
+                views.push((old.clone(), recording.storage.version_view(plane, record)?));
             }
         }
+        bindings
+            .state_table(self.metadata[0].clone(), recording.access, views)
+            .map_err(invalid_handle)?;
         for (old, new) in self.metadata.iter().zip(recording.metadata.iter()) {
             bindings
                 .buffer(old.buffer(), new.buffer())

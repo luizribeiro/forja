@@ -6,7 +6,21 @@ use crate::{BufferId, CommandList, Op, OpError, StateAccess, StateOp, Tensor};
 pub struct ReplayBindings {
     views: Vec<(Tensor, Tensor)>,
     buffers: Vec<(BufferId, BufferId)>,
-    states: Vec<(StateAccess, StateAccess)>,
+    states: Vec<StateBinding>,
+}
+
+#[derive(Clone, Debug)]
+struct StateBinding {
+    table: Tensor,
+    access: StateAccess,
+    views: Vec<(Tensor, Tensor)>,
+}
+
+fn compatible(old: &Tensor, new: &Tensor) -> bool {
+    old.layout().dtype() == new.layout().dtype()
+        && old.layout().shape() == new.layout().shape()
+        && old.layout().strides() == new.layout().strides()
+        && old.is_writable() == new.is_writable()
 }
 
 impl ReplayBindings {
@@ -15,12 +29,7 @@ impl ReplayBindings {
     /// # Errors
     /// Refuses incompatible geometry or ambiguous replacements.
     pub fn view(&mut self, old: Tensor, new: Tensor) -> Result<(), OpError> {
-        if old.layout().dtype() != new.layout().dtype()
-            || old.layout().shape() != new.layout().shape()
-            || old.layout().strides() != new.layout().strides()
-            || old.is_writable() != new.is_writable()
-            || self.views.iter().any(|(existing, _)| existing == &old)
-        {
+        if !compatible(&old, &new) || self.views.iter().any(|(existing, _)| existing == &old) {
             return Err(OpError::InvalidKernelParameter);
         }
         self.views.push((old, new));
@@ -41,15 +50,49 @@ impl ReplayBindings {
         Ok(())
     }
 
-    /// Replaces the expected authenticated input/output identities for one lane.
+    /// Rebinds one lane's state operands by its captured authentication table.
     ///
     /// # Errors
-    /// Refuses ambiguous source bindings.
-    pub fn state(&mut self, old: StateAccess, new: StateAccess) -> Result<(), OpError> {
-        if self.states.iter().any(|(existing, _)| *existing == old) {
+    /// Refuses incompatible views or ambiguous table/operand replacements.
+    pub fn state_table(
+        &mut self,
+        table: Tensor,
+        access: StateAccess,
+        views: Vec<(Tensor, Tensor)>,
+    ) -> Result<(), OpError> {
+        if table.layout().dtype() != crate::DType::U32
+            || table.layout().shape() != [2, 2]
+            || self.states.iter().any(|state| state.table == table)
+            || views.iter().enumerate().any(|(index, (old, new))| {
+                !compatible(old, new) || views[..index].iter().any(|(existing, _)| existing == old)
+            })
+        {
             return Err(OpError::InvalidKernelParameter);
         }
-        self.states.push((old, new));
+        self.states.push(StateBinding {
+            table,
+            access,
+            views,
+        });
+        Ok(())
+    }
+
+    /// Combines independent lane and bank bindings without partially changing this set on error.
+    ///
+    /// # Errors
+    /// Refuses conflicting replacements.
+    pub fn extend(&mut self, other: Self) -> Result<(), OpError> {
+        let mut combined = self.clone();
+        for (old, new) in other.views {
+            combined.view(old, new)?;
+        }
+        for (old, new) in other.buffers {
+            combined.buffer(old, new)?;
+        }
+        for state in other.states {
+            combined.state_table(state.table, state.access, state.views)?;
+        }
+        *self = combined;
         Ok(())
     }
 
@@ -66,8 +109,19 @@ impl ReplayBindings {
     pub fn apply(&self, commands: CommandList) -> Result<CommandList, OpError> {
         let mut bound = CommandList::new();
         for dispatch in commands.into_dispatches() {
+            let state = matches!(dispatch.op(), Op::State(_))
+                .then(|| {
+                    self.states
+                        .iter()
+                        .find(|state| state.table == dispatch.inputs()[dispatch.inputs().len() - 3])
+                })
+                .flatten();
+
             let mut dispatch = dispatch.rebase_tensors(|tensor| {
-                if let Some((_, replacement)) = self.views.iter().find(|(old, _)| old == tensor) {
+                if let Some((_, replacement)) = state
+                    .and_then(|state| state.views.iter().find(|(old, _)| old == tensor))
+                    .or_else(|| self.views.iter().find(|(old, _)| old == tensor))
+                {
                     return Ok(replacement.clone());
                 }
                 self.buffers
@@ -79,15 +133,12 @@ impl ReplayBindings {
                     )
             })?;
             if let Op::State(operation) = dispatch.op()
-                && let Some((_, replacement)) = self
-                    .states
-                    .iter()
-                    .find(|(old, _)| *old == operation.access())
+                && let Some(state) = state
             {
                 let operation = match operation {
-                    StateOp::DeltaRule(_) => StateOp::DeltaRule(*replacement),
-                    StateOp::DeltaRuleBlock(_) => StateOp::DeltaRuleBlock(*replacement),
-                    StateOp::CausalDepthwiseConv(_) => StateOp::CausalDepthwiseConv(*replacement),
+                    StateOp::DeltaRule(_) => StateOp::DeltaRule(state.access),
+                    StateOp::DeltaRuleBlock(_) => StateOp::DeltaRuleBlock(state.access),
+                    StateOp::CausalDepthwiseConv(_) => StateOp::CausalDepthwiseConv(state.access),
                 };
                 dispatch.bind_state(operation)?;
             }
@@ -103,10 +154,20 @@ mod tests {
     use crate::{DType, Layout};
 
     fn tensor(id: u64, size: u32) -> Tensor {
-        let buffer = BufferId::new(id, 1, u64::from(size) * 4);
+        shaped(id, DType::F32, &[size])
+    }
+
+    fn shaped(id: u64, dtype: DType, shape: &[u32]) -> Tensor {
+        let bytes = shape
+            .iter()
+            .try_fold(dtype.byte_size(), |bytes, dimension| {
+                bytes.checked_mul(u64::from(*dimension))
+            })
+            .unwrap();
+        let buffer = BufferId::new(id, 1, bytes);
         Tensor::from_allocation(
             buffer,
-            Layout::contiguous(DType::F32, 0, vec![size], buffer.byte_len()).unwrap(),
+            Layout::contiguous(dtype, 0, shape.to_vec(), bytes).unwrap(),
             true,
         )
         .unwrap()
@@ -134,5 +195,78 @@ mod tests {
             Err(OpError::Aliasing { .. })
         ));
         assert!(ReplayBindings::default().view(a, tensor(4, 7)).is_err());
+    }
+    #[test]
+    fn lane_tables_disambiguate_identical_captured_state_views() {
+        use crate::{StateLayout, StatePlane, StatePool};
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7]).unwrap()]).unwrap(),
+            2,
+            65536,
+        )
+        .unwrap();
+        let mut lanes = [pool.reserve().unwrap(), pool.reserve().unwrap()];
+        let access = lanes
+            .iter_mut()
+            .map(|lane| {
+                let tx = lane.begin(1).unwrap();
+                StateAccess::from_slot(&lane.bind(&tx).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input = shaped(1, DType::F32, &[1, 7]);
+        let weights = shaped(2, DType::F32, &[4, 7]);
+        let previous = shaped(20, DType::F32, &[3, 7]);
+        let next = shaped(21, DType::F32, &[3, 7]);
+        let tables = [
+            shaped(30, DType::U32, &[2, 2]),
+            shaped(31, DType::U32, &[2, 2]),
+        ];
+        let generations = shaped(32, DType::U32, &[6]);
+        let activity = shaped(33, DType::U32, &[1]);
+        let mut commands = CommandList::new();
+        for (lane, table) in tables.iter().enumerate() {
+            commands
+                .dispatch_many(
+                    Op::State(StateOp::CausalDepthwiseConv(access[0])),
+                    &[&input, &weights, &previous, table, &generations, &activity],
+                    &[
+                        &shaped(u64::try_from(lane).unwrap() + 3, DType::F32, &[1, 7]),
+                        &next,
+                    ],
+                )
+                .unwrap();
+        }
+        assert_eq!(crate::required_barriers(&commands), [false, true]);
+        let views = |base| {
+            vec![
+                (previous.clone(), shaped(base, DType::F32, &[3, 7])),
+                (next.clone(), shaped(base + 1, DType::F32, &[3, 7])),
+            ]
+        };
+        let mut bindings = ReplayBindings::default();
+        bindings
+            .state_table(tables[0].clone(), access[0], views(40))
+            .unwrap();
+        let mut other = ReplayBindings::default();
+        other
+            .state_table(tables[1].clone(), access[1], views(50))
+            .unwrap();
+        bindings.extend(other).unwrap();
+        let rebound = bindings.apply(commands).unwrap();
+        for (lane, base) in [40, 50].into_iter().enumerate() {
+            assert_eq!(
+                rebound.dispatches()[lane].inputs()[2],
+                shaped(base, DType::F32, &[3, 7])
+            );
+            assert_eq!(
+                rebound.dispatches()[lane].outputs()[1],
+                shaped(base + 1, DType::F32, &[3, 7])
+            );
+            assert_eq!(
+                rebound.dispatches()[lane].op(),
+                Op::State(StateOp::CausalDepthwiseConv(access[lane]))
+            );
+        }
+        assert_eq!(crate::required_barriers(&rebound), [false, false]);
     }
 }
