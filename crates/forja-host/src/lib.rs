@@ -3273,7 +3273,7 @@ struct PagedBinding {
 struct PagedLaneBinding {
     sequence: Mutex<Option<Arc<Mutex<PagedSequence>>>>,
     used: AtomicBool,
-    table_dirty: [AtomicBool; 2],
+    table_dirty: [Arc<AtomicBool>; 2],
 }
 
 impl PagedBinding {
@@ -3772,7 +3772,7 @@ impl<B: Backend + 'static> Host<B> {
                 .map(|_| PagedLaneBinding {
                     sequence: Mutex::new(None),
                     used: AtomicBool::new(false),
-                    table_dirty: [AtomicBool::new(false), AtomicBool::new(false)],
+                    table_dirty: std::array::from_fn(|_| Arc::new(AtomicBool::new(false))),
                 })
                 .collect(),
         });
@@ -4034,6 +4034,25 @@ impl<B: Backend + 'static> Host<B> {
                 bank,
             )
         };
+        if let Some(state) = self.state_slots.get(&slot_rep)
+            && let Some(sequence) = state.sequence_handle(lane)?
+            && sequence
+                .checkpoint_latest()
+                .map_err(invalid_handle)?
+                .position()
+                .tokens
+                != u64::from(start)
+        {
+            return Err(invalid_handle("state and KV append boundaries differ"));
+        }
+        if self.state_slots.contains_key(&slot_rep)
+            && (tokens == 0
+                || start
+                    .checked_add(tokens)
+                    .is_none_or(|end| end > max_context))
+        {
+            return Err(invalid_handle("invalid paged append span"));
+        }
         let lane_binding = binding.lane(lane)?;
         lane_binding.used.store(false, Ordering::Release);
         let sequence = {
@@ -4056,13 +4075,19 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?,
             )
         };
-        let (checkpoint, previous, table, copy, upload) = {
+        let (checkpoint, state_checkpoint, previous, table, copy, upload) = {
             let mut sequence = sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
             let checkpoint = sequence
                 .checkpoint()
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
+            let state_checkpoint = self
+                .state_slots
+                .contains_key(&slot_rep)
+                .then(|| sequence.checkpoint())
+                .transpose()
+                .map_err(paged_refusal)?;
             if sequence.logical_len() == 0 && start != 0 {
                 return Err(compute::Error::Layout(
                     "fresh paged sequences must start at zero".to_owned(),
@@ -4105,7 +4130,7 @@ impl<B: Backend + 'static> Host<B> {
                 .table()
                 .clone();
             let upload = lane_binding.table_dirty[bank].swap(false, Ordering::AcqRel);
-            (checkpoint, previous, table, copy, upload)
+            (checkpoint, state_checkpoint, previous, table, copy, upload)
         };
         if let Some(state) = self.state_slots.get_mut(&slot_rep) {
             let reserved_tokens = sequence
@@ -4123,12 +4148,22 @@ impl<B: Backend + 'static> Host<B> {
                 reserved_tokens,
                 ..state.position(lane)?
             };
-            if let Err(error) = state.begin(bank, lane, position) {
-                sequence
-                    .lock()
-                    .map_err(|_| guest_error(BackendError::ExecutionFailed))?
-                    .rollback(checkpoint)
-                    .map_err(paged_refusal)?;
+            let admitted = state.begin(bank, lane, position).and_then(|()| {
+                if let Some(checkpoint) = state_checkpoint {
+                    state
+                        .recording(bank, lane)?
+                        .pair_paged_checkpoint(
+                            Arc::clone(&sequence),
+                            checkpoint,
+                            lane_binding.table_dirty.clone(),
+                        )
+                        .map_err(invalid_handle)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = admitted {
+                state.cancel_lane(bank, lane)?;
+                rollback_paged_if_current(&sequence, checkpoint)?;
                 binding
                     .banks
                     .restore_all(lane, previous)
@@ -4152,11 +4187,7 @@ impl<B: Backend + 'static> Host<B> {
                 if let Some(state) = self.state_slots.get_mut(&slot_rep) {
                     state.cancel_lane(bank, lane)?;
                 }
-                sequence
-                    .lock()
-                    .map_err(|_| guest_error(BackendError::ExecutionFailed))?
-                    .rollback(checkpoint)
-                    .map_err(|rollback| compute::Error::Quota(rollback.to_string()))?;
+                rollback_paged_if_current(&sequence, checkpoint)?;
                 Err(error)
             }
         }
@@ -4463,11 +4494,7 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
-        sequence
-            .lock()
-            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
-            .rollback(checkpoint)
-            .map_err(|error| compute::Error::Quota(error.to_string()))?;
+        rollback_paged_if_current(&sequence, checkpoint)?;
         for dirty in &lane_binding.table_dirty {
             dirty.store(true, Ordering::Release);
         }
@@ -9169,6 +9196,22 @@ fn dispatch_work_quota() -> compute::Error {
     quota("dispatch work exceeds the guest limit")
 }
 
+fn rollback_paged_if_current(
+    sequence: &Mutex<PagedSequence>,
+    checkpoint: SequenceCheckpoint,
+) -> Result<(), compute::Error> {
+    let mut sequence = sequence
+        .lock()
+        .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
+    if !checkpoint.belongs_to(&sequence) {
+        return Err(paged_refusal(forja_core::PagePoolError::InvalidCheckpoint));
+    }
+    if sequence.logical_len() >= checkpoint.logical_len() {
+        sequence.rollback(checkpoint).map_err(paged_refusal)?;
+    }
+    Ok(())
+}
+
 fn paged_refusal(error: forja_core::PagePoolError) -> compute::Error {
     compute::Error::Layout(error.to_string())
 }
@@ -9505,15 +9548,11 @@ mod tests {
         let StateSlotFixture {
             mut host,
             slot,
+            pool,
             operands,
             output,
             ..
         } = state_slot_fixture(CpuBackend::new());
-        let position = crate::LanePosition {
-            tokens: 1,
-            reserved_tokens: 8,
-            ..crate::LanePosition::default()
-        };
         let commands = host.command_list().unwrap();
         let operation = super::paged_storage::StateOperation::CausalConvolution;
         assert!(
@@ -9546,22 +9585,59 @@ mod tests {
             .unwrap()
             .tainted
             .remove(&input_buffer);
-        host.state_slots
-            .get_mut(&slot.rep())
-            .unwrap()
-            .begin(0, 0, position)
-            .unwrap();
+        let kv = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 0);
+        host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
         let retry = host.command_list().unwrap();
         host.record_slot_state(&retry, &slot, 0, 0, operation, &operands, &output, "")
             .unwrap();
         host.prepare_submit(retry).unwrap().run().await.unwrap();
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 1);
         assert_eq!(
             host.backend
                 .read(&host.entry(&output).unwrap().tensor)
                 .unwrap(),
             2_f32.to_le_bytes().repeat(7)
         );
+    }
+
+    #[test]
+    fn paged_rollback_preserves_an_earlier_failed_state_boundary() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let stale = host.checkpoint_paged_lane(pool.rep(), 0).unwrap();
+        host.advance_paged_batch_bank(slot.rep()).unwrap();
+        host.select_paged_batch_bank(slot.rep()).unwrap();
+        host.begin_paged_lane_append(pool.rep(), 0, 1, 1).unwrap();
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .cancel_unsubmitted_bank(0)
+            .unwrap();
+        let kv = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 0);
+        host.rollback_paged_lane_append(pool.rep(), 0, stale)
+            .unwrap();
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 0);
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+        let foreign = kv
+            .sequence
+            .lock()
+            .unwrap()
+            .fork(0)
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+        assert!(
+            host.rollback_paged_lane_append(pool.rep(), 0, foreign)
+                .is_err()
+        );
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 0);
     }
 
     #[test]
@@ -10950,18 +11026,16 @@ mod tests {
                 super::PagedLaneBinding {
                     sequence: Mutex::new(Some(Arc::clone(&sequence))),
                     used: std::sync::atomic::AtomicBool::new(false),
-                    table_dirty: [
-                        std::sync::atomic::AtomicBool::new(false),
-                        std::sync::atomic::AtomicBool::new(false),
-                    ],
+                    table_dirty: std::array::from_fn(|_| {
+                        Arc::new(std::sync::atomic::AtomicBool::new(false))
+                    }),
                 },
                 super::PagedLaneBinding {
                     sequence: Mutex::new(None),
                     used: std::sync::atomic::AtomicBool::new(false),
-                    table_dirty: [
-                        std::sync::atomic::AtomicBool::new(false),
-                        std::sync::atomic::AtomicBool::new(false),
-                    ],
+                    table_dirty: std::array::from_fn(|_| {
+                        Arc::new(std::sync::atomic::AtomicBool::new(false))
+                    }),
                 },
             ],
         });
