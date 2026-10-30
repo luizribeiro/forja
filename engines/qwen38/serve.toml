@@ -1,0 +1,7 @@
+[model]
+engine = "target/engines/qwen38-27b-4bit.metal-apple-m3-ultra.q4.wasm"
+profile = "engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml"
+chat_format = "target/engines/qwen38-27b-4bit.metal-apple-m3-ultra.q4.chat-format.wasm"
+
+[serving]
+prefix-reuse = false

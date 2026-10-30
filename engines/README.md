@@ -10,6 +10,7 @@ workload limits and device choices; each engine owns its tuning.
 | [Qwen3](qwen3/) | Qwen3-0.6B | f32, bf16 |
 | [OLMoE](olmoe/) | OLMoE-1B-7B-0924 | bf16 |
 | [Qwen3-Coder](qwen3-coder/) | Qwen3-Coder-30B-A3B-Instruct | MLX 4-bit |
+| [Qwen3.8](qwen38/) | Qwen3.8-27B | Text-only MLX 4-bit, eager execution |
 
 See [serving](../docs/serving.md) for configuration and
 [benchmarking](../docs/benchmarking.md) for results and acceptance.

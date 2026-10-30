@@ -20,6 +20,7 @@ tuning; small, import-free chat components own message formatting.
 | Qwen3-0.6B | [f32 and bf16](engines/qwen3/) |
 | OLMoE-1B-7B-0924 | [bf16](engines/olmoe/) |
 | Qwen3-Coder-30B-A3B-Instruct | [MLX 4-bit](engines/qwen3-coder/) |
+| Qwen3.8-27B | [Text-only MLX 4-bit](engines/qwen38/) |
 
 Use macOS with Metal 4, Apple Silicon, Nix with flakes enabled, and a checkout of
 this repository. These commands use the Apple M3 Ultra profile. From the root, download the pinned Apache-2.0 model and build:
@@ -42,7 +43,6 @@ Read [serving and configuration](docs/serving.md),
 and [architecture and safety](docs/architecture.md). Serving configuration includes
 the prefix-cache isolation and stable-weight-file contracts.
 
-Forja is under active development. Supported models have profiles, golden-fixture
-verification and recorded benchmarks; context and precision limits are documented
-with each engine. Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+Forja is under active development. Engine guides document context and precision
+limits, correctness fixtures and available benchmark results. Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
 Model weights retain their upstream licenses.
