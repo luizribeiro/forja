@@ -51,9 +51,38 @@ impl DecoderLayer {
         quant: Option<&Variant>,
         attention: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
+        self.process(input, position, quant, attention, None, false)
+    }
+    /// Applies one canonical prompt block through both residual branches.
+    ///
+    /// # Errors
+    /// Returns invalid block geometry, positions, picks or execution failures.
+    pub fn prefill(
+        &mut self,
+        input: &Tensor<bf16>,
+        position: u32,
+        quant: Option<&Variant>,
+        attention: Option<&Variant>,
+        delta: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        self.process(input, position, quant, attention, delta, true)
+    }
+    fn process(
+        &mut self,
+        input: &Tensor<bf16>,
+        position: u32,
+        quant: Option<&Variant>,
+        attention: Option<&Variant>,
+        delta: Option<&Variant>,
+        prefill: bool,
+    ) -> Result<Tensor<bf16>> {
         let normalized = input.rms_norm(&self.input_norm, 1.0e-6)?;
         let mixed = match &mut self.mixer {
+            Mixer::Recurrent(layer) if prefill => layer.prefill(&normalized, quant, delta)?,
             Mixer::Recurrent(layer) => layer.deltanet_layer(&normalized, quant)?,
+            Mixer::Attention(layer) if prefill => {
+                layer.prefill(&normalized, position, quant, None)?
+            }
             Mixer::Attention(layer) => {
                 layer.attention_layer(&normalized, position, quant, attention)?
             }

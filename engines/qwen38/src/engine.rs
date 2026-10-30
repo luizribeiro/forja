@@ -47,11 +47,20 @@ impl Engine for Qwen38 {
     }
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         self.feedback_position = None;
-        self.model
-            .forward(&input.tokens, input.start_pos, input.taps)
+        match input.phase {
+            forja_sdk::BatchPhase::Prompt => {
+                self.model
+                    .forward(&input.tokens, input.start_pos, input.taps)
+            }
+            forja_sdk::BatchPhase::Decode => {
+                self.model
+                    .decode_token(&input.tokens, input.start_pos, input.taps)
+            }
+        }
     }
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         self.decode.select(input.sampling)?;
+        let prefill = input.phase == forja_sdk::BatchPhase::Prompt;
         let tokens = match input.tokens {
             Some(tokens) => tokens,
             None if self.feedback_position == Some(input.start_pos) => self.decode.token()?,
@@ -66,7 +75,12 @@ impl Engine for Qwen38 {
             .checked_add(sequence)
             .filter(|_| sequence > 0)
             .ok_or_else(|| Error::loading("invalid decode span"))?;
-        let logits = self.model.forward(&tokens, input.start_pos, false)?.logits;
+        let logits = if prefill {
+            self.model.forward(&tokens, input.start_pos, false)?
+        } else {
+            self.model.decode_token(&tokens, input.start_pos, false)?
+        }
+        .logits;
         let row = logits.reshape(&[1, logits.shape()[0]])?;
         let params = self.decode.sampling()?;
         let selected = match self.model.sample.as_ref() {

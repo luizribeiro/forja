@@ -344,10 +344,10 @@ fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Resul
             .forward(&Tensor::<u32>::from_slice(&[], &[0])?, 1, false)
             .is_err()
     );
-    model.forward(&token, 1, false)?;
+    model.decode_token(&token, 1, false)?;
     assert!(
         model
-            .forward(&Tensor::from_slice(&[33], &[1])?, 2, false)
+            .decode_token(&Tensor::from_slice(&[33], &[1])?, 2, false)
             .is_err()
     );
     assert!(model.forward(&token, 0, false).is_err());

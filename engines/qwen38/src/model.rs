@@ -92,11 +92,32 @@ impl Model {
                 .transpose()?,
         })
     }
-    /// Processes a prompt or contiguous continuation token by token, projecting only its last row.
+    /// Processes canonical prompt blocks, projecting only the final row.
     ///
     /// # Errors
     /// Refuses gaps, empty inputs, context overflow or use after failed execution.
     pub fn forward(&mut self, tokens: &Tensor<u32>, start: u32, taps: bool) -> Result<StepOutput> {
+        self.forward_phase(tokens, start, taps, true)
+    }
+    /// Advances one generated token with the recurrent decode reduction class.
+    ///
+    /// # Errors
+    /// Refuses gaps, invalid spans or use after failed execution.
+    pub fn decode_token(
+        &mut self,
+        tokens: &Tensor<u32>,
+        start: u32,
+        taps: bool,
+    ) -> Result<StepOutput> {
+        self.forward_phase(tokens, start, taps, false)
+    }
+    fn forward_phase(
+        &mut self,
+        tokens: &Tensor<u32>,
+        start: u32,
+        taps: bool,
+        prefill: bool,
+    ) -> Result<StepOutput> {
         let [sequence]: [u32; 1] = tokens
             .shape()
             .try_into()
@@ -116,7 +137,7 @@ impl Model {
                 layer.reset()?;
             }
         }
-        let output = self.forward_tokens(tokens, start, sequence, taps)?;
+        let output = self.forward_tokens(tokens, start, sequence, taps, prefill)?;
         forja_sdk::eval()?;
         self.position = end;
         self.usable = true;
@@ -128,6 +149,7 @@ impl Model {
         start: u32,
         sequence: u32,
         taps: bool,
+        prefill: bool,
     ) -> Result<StepOutput> {
         let layers = self.layers.len();
         let captured = if taps {
@@ -138,24 +160,38 @@ impl Model {
             Vec::new()
         };
         let mut last = None;
-        for row in 0..sequence {
-            let mut hidden = self.embedding.embed(&tokens.narrow(0, row, 1)?)?;
+        let block = if prefill { 64 } else { 1 };
+        for row in (0..sequence)
+            .step_by(usize::try_from(block).map_err(|_| Error::loading("block width overflow"))?)
+        {
+            let rows = block.min(sequence - row);
+            let mut hidden = self.embedding.embed(&tokens.narrow(0, row, rows)?)?;
             for (index, layer) in self.layers.iter_mut().enumerate() {
-                hidden = layer.forward(
-                    &hidden,
-                    start + row,
-                    self.quant.as_ref(),
-                    self.attention.as_ref(),
-                )?;
+                hidden = if prefill {
+                    layer.prefill(
+                        &hidden,
+                        start + row,
+                        self.quant.as_ref(),
+                        self.attention.as_ref(),
+                        None,
+                    )?
+                } else {
+                    layer.forward(
+                        &hidden,
+                        start + row,
+                        self.quant.as_ref(),
+                        self.attention.as_ref(),
+                    )?
+                };
                 if taps && index + 1 < layers {
-                    hidden.copy_into(&mut captured[index].narrow(0, row, 1)?)?;
+                    hidden.copy_into(&mut captured[index].narrow(0, row, rows)?)?;
                 }
             }
             hidden = hidden.rms_norm(&self.norm, 1.0e-6)?;
             if let Some(tap) = captured.last() {
-                hidden.copy_into(&mut tap.narrow(0, row, 1)?)?;
+                hidden.copy_into(&mut tap.narrow(0, row, rows)?)?;
             }
-            last = Some(hidden);
+            last = Some(hidden.narrow(0, rows - 1, 1)?);
         }
         let hidden = last.ok_or_else(|| Error::loading("empty prompt"))?;
         Ok(StepOutput {

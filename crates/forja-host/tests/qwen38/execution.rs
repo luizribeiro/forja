@@ -12,6 +12,7 @@ pub(super) trait Execution {
         tokens: &[u32],
         start: u32,
         taps: bool,
+        phase: forja_host::BatchPhase,
     ) -> Result<Output, Box<dyn Error>>;
 }
 impl Execution for qwen38::Model {
@@ -20,8 +21,9 @@ impl Execution for qwen38::Model {
         tokens: &[u32],
         start: u32,
         taps: bool,
+        phase: forja_host::BatchPhase,
     ) -> impl std::future::Future<Output = Result<Output, Box<dyn Error>>> {
-        std::future::ready(native_forward(self, tokens, start, taps))
+        std::future::ready(native_forward(self, tokens, start, taps, phase))
     }
 }
 fn native_forward(
@@ -29,13 +31,13 @@ fn native_forward(
     tokens: &[u32],
     start: u32,
     taps: bool,
+    phase: forja_host::BatchPhase,
 ) -> Result<Output, Box<dyn Error>> {
-    let output = qwen38::Model::forward(
-        model,
-        &Tensor::from_slice(tokens, &[u32::try_from(tokens.len())?])?,
-        start,
-        taps,
-    )?;
+    let tokens = Tensor::from_slice(tokens, &[u32::try_from(tokens.len())?])?;
+    let output = match phase {
+        forja_host::BatchPhase::Prompt => model.forward(&tokens, start, taps)?,
+        forja_host::BatchPhase::Decode => model.decode_token(&tokens, start, taps)?,
+    };
     Ok(Output {
         logits: output.logits.to_vec()?,
         taps: output
@@ -51,10 +53,11 @@ impl<B: Backend + Send + Sync + 'static> Execution for forja_host::EngineRunner<
         tokens: &[u32],
         start: u32,
         taps: bool,
+        phase: forja_host::BatchPhase,
     ) -> Result<Output, Box<dyn Error>> {
         let output = self
             .step(forja_host::EngineStep {
-                phase: forja_host::BatchPhase::Prompt,
+                phase,
                 tokens: tokens.to_vec(),
                 start_pos: start,
                 taps,

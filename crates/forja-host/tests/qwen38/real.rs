@@ -75,7 +75,7 @@ async fn metal_real_completion_matches_teacher_forced_transformers() -> Result<(
 async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box<dyn Error>> {
     let (mut engine, fixtures) = load().await?;
     let prompt = fixtures.prompt("hello").ok_or("missing prompt fixture")?;
-    let mut tokens = prompt
+    let tokens = prompt
         .prompt_ids()
         .iter()
         .map(|&id| u32::try_from(id))
@@ -110,13 +110,21 @@ async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box
         })
         .await??;
     let retained = golden_fixtures::decode_f32_le(&engine.read(&next.logits).await?)?;
-    tokens.push(selected);
-    let explicit = engine
+    let position = u32::try_from(tokens.len())?;
+    engine
         .step(forja_host::EngineStep {
             phase: forja_host::BatchPhase::Prompt,
             tokens,
             start_pos: 0,
             taps: false,
+        })
+        .await??;
+    let explicit = engine
+        .decode(forja_host::EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
+            tokens: Some(vec![selected]),
+            start_pos: position,
+            sampling,
         })
         .await??;
     assert_eq!(

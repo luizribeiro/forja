@@ -25,10 +25,10 @@ kv-cache = "f16"
 kind = "causal-lm"
 batch = 1
 max-context = 32768
-prefill-chunk = 1
+prefill-chunk = 64
 
 [serving]
-prompt-token-budget = 1
+prompt-token-budget = 64
 paged-cache = false
 
 [variants.fixed]

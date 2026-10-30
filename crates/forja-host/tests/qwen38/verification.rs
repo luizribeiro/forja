@@ -23,7 +23,9 @@ pub(super) async fn verify(
         .map(|&id| u32::try_from(id))
         .collect::<Result<Vec<_>, _>>()?;
     let prompt = u32::try_from(ids.len())?;
-    let mut output = model.forward(&ids, 0, true).await?;
+    let mut output = model
+        .forward(&ids, 0, true, forja_host::BatchPhase::Prompt)
+        .await?;
     assert_eq!(output.taps.len(), fixture.hidden_states().len() - 1);
     let mut maximum_layer_error = 0_f64;
     for (layer, tap) in output.taps.iter().enumerate() {
@@ -67,6 +69,7 @@ pub(super) async fn verify(
                     &[u32::try_from(expected)?],
                     prompt + u32::try_from(index)?,
                     false,
+                    forja_host::BatchPhase::Decode,
                 )
                 .await?;
         }
