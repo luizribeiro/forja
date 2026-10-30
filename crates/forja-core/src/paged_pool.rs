@@ -1112,6 +1112,14 @@ struct CheckpointTail {
     retained: bool,
 }
 
+impl SequenceCheckpoint {
+    /// Logical KV boundary retained by this checkpoint.
+    #[must_use]
+    pub const fn logical_len(&self) -> u64 {
+        self.logical_len
+    }
+}
+
 impl Drop for SequenceCheckpoint {
     fn drop(&mut self) {
         if let Some(tail) = &self.tail

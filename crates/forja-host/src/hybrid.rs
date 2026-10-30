@@ -247,3 +247,78 @@ impl<B: Backend> SubmittedWork<B> {
         )
     }
 }
+
+impl<B: Backend + 'static> Host<B> {
+    fn lane_state(
+        &self,
+        pool: u32,
+        lane: u32,
+    ) -> Result<Option<crate::StateSequenceHandle<B>>, compute::Error> {
+        let slot = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?
+            .slot;
+        slot.and_then(|slot| self.state_slots.get(&slot))
+            .map(|state| state.sequence_handle(usize::try_from(lane).map_err(invalid_handle)?))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn state_lane_checkpoint(
+        &self,
+        pool: u32,
+        lane: u32,
+    ) -> Result<Option<crate::StateLaneCheckpoint>, compute::Error> {
+        self.lane_state(pool, lane)?
+            .map(|state| state.checkpoint_latest().map_err(invalid_handle))
+            .transpose()
+    }
+
+    pub(crate) fn restore_lane_checkpoint(
+        &mut self,
+        pool: u32,
+        lane: u32,
+        state: Option<&crate::StateLaneCheckpoint>,
+        paged: forja_core::SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        let Some(sequence) = self.lane_state(pool, lane)? else {
+            return self.rollback_paged_lane_append(pool, lane, paged);
+        };
+        let state = state
+            .filter(|state| state.position().tokens == paged.logical_len())
+            .ok_or_else(|| invalid_handle("paged and state checkpoints differ"))?;
+        let prefix = self.paged_lane_prefix(pool, lane)?;
+        sequence
+            .restore_with(state, || {
+                prefix
+                    .sequence
+                    .lock()
+                    .map_err(|_| forja_core::PagePoolError::CorruptState)?
+                    .rollback(paged)
+            })
+            .map_err(invalid_handle)?;
+        self.mark_paged_tables_dirty(pool, lane)
+    }
+
+    fn mark_paged_tables_dirty(&self, pool: u32, lane: u32) -> Result<(), compute::Error> {
+        let slot = self
+            .table
+            .get(&Resource::<PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?
+            .slot
+            .ok_or_else(|| invalid_handle("paged slot is missing"))?;
+        let binding = &self
+            .table
+            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?
+            .binding;
+        for dirty in &binding
+            .lane(usize::try_from(lane).map_err(invalid_handle)?)?
+            .table_dirty
+        {
+            dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+}

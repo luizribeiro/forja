@@ -232,6 +232,16 @@ impl<B: Backend> StateSlots<B> {
         Ok(())
     }
 
+    pub(crate) fn sequence_handle(
+        &self,
+        lane: usize,
+    ) -> Result<Option<StateSequenceHandle<B>>, compute::Error> {
+        self.lanes
+            .get(lane)
+            .map(|lane| lane.sequence.clone())
+            .ok_or_else(|| invalid_handle("state lane is out of range"))
+    }
+
     /// Returns committed cursors; an inactive lane has zero cursors.
     ///
     /// # Errors

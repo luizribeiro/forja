@@ -12,7 +12,8 @@ mod native;
 mod state;
 pub use state::{
     LanePosition, StateBatch, StateBatchSubmission, StateCapture, StateCell, StateCommands,
-    StateEntry, StateRecording, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
+    StateEntry, StateLaneCheckpoint, StateRecording, StateSequenceHandle, StateSlots, StateStorage,
+    StateSubmission,
 };
 mod weights;
 
@@ -403,7 +404,7 @@ pub struct EngineBatchOutput {
     pub tokens: EngineTensor,
 }
 
-/// Reserved for scheduler-owned lane retirement; the runner does not consume it yet.
+/// Scheduler-owned lane boundary retained until acceptance or drained retirement.
 pub struct EngineLaneCheckpoint<State> {
     /// Absolute sampler position before submission.
     pub sampler_position: u32,
@@ -415,6 +416,8 @@ pub struct EngineLaneCheckpoint<State> {
     pub reserved_tokens: u64,
     /// Paged sequence boundary, including logical length and tail-page state.
     pub paged: SequenceCheckpoint,
+    /// Protected state version paired with the paged boundary, when the slot has state.
+    pub state_version: Option<StateLaneCheckpoint>,
 }
 
 impl<State> EngineLaneCheckpoint<State> {
@@ -433,6 +436,7 @@ impl<State> EngineLaneCheckpoint<State> {
             state,
             reserved_tokens,
             paged,
+            state_version: None,
         }
     }
 }
@@ -2362,6 +2366,41 @@ where
         self.page_pool
             .map(|pool| self.store.data().checkpoint_paged_lane(pool, lane))
             .transpose()
+    }
+
+    /// Retains a serving lane's latest declared recurrent boundary.
+    ///
+    /// # Errors
+    /// Refuses invalid lanes or exhausted checkpoint references.
+    pub fn checkpoint_state_lane(
+        &self,
+        lane: u32,
+    ) -> Result<Option<StateLaneCheckpoint>, compute::Error> {
+        self.page_pool
+            .map(|pool| self.store.data().state_lane_checkpoint(pool, lane))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Restores paged storage and protected state before returning the caller's checkpoint.
+    ///
+    /// # Errors
+    /// Refuses mismatched boundaries or state whose readers/writers have not drained.
+    pub fn rollback_lane<State>(
+        &mut self,
+        lane: u32,
+        checkpoint: EngineLaneCheckpoint<State>,
+    ) -> Result<State, compute::Error> {
+        let pool = self
+            .page_pool
+            .ok_or_else(|| invalid_handle("paged storage is unavailable"))?;
+        self.store.data_mut().restore_lane_checkpoint(
+            pool,
+            lane,
+            checkpoint.state_version.as_ref(),
+            checkpoint.paged,
+        )?;
+        Ok(checkpoint.state)
     }
 
     /// Restores one serving lane without changing any sibling lane.

@@ -416,13 +416,18 @@ where
                     .checkpoint_paged_lane(lane.slot)
                     .map_err(|error| batch_admission_error(&error))?
                     .ok_or_else(|| GenerationError::new("paged lane is unavailable"))?;
-                Ok(EngineLaneCheckpoint::new(
+                let mut checkpoint = EngineLaneCheckpoint::new(
                     lane.position,
                     lane.pending_token,
                     (),
                     reserved_tokens,
                     paged,
-                ))
+                );
+                checkpoint.state_version = self
+                    .runner
+                    .checkpoint_state_lane(lane.slot)
+                    .map_err(|error| batch_admission_error(&error))?;
+                Ok(checkpoint)
             })
             .collect()
     }
@@ -495,7 +500,7 @@ where
     ) {
         let rollback = self
             .runner
-            .rollback_paged_lane(retirement.slot(), checkpoint.paged)
+            .rollback_lane(retirement.slot(), checkpoint)
             .map_err(|error| batch_admission_error(&error));
         match (retirement, rollback) {
             (Retirement::Finish(lane, reason), Ok(())) => {
@@ -546,9 +551,7 @@ where
             .chain(successor.into_iter().map(|pending| (false, pending)))
         {
             if is_current || !current_slots.contains(&pending.slot) {
-                let _ = self
-                    .runner
-                    .rollback_paged_lane(pending.slot, pending.checkpoint.paged);
+                let _ = self.runner.rollback_lane(pending.slot, pending.checkpoint);
             }
             if let Some(retirement) = pending.retirement {
                 lanes.push(match retirement {
@@ -620,7 +623,7 @@ where
             Err(error) => {
                 let error = self
                     .runner
-                    .rollback_paged_lane(lane.slot, checkpoint.paged)
+                    .rollback_lane(lane.slot, checkpoint)
                     .err()
                     .map_or(error, |failure| batch_admission_error(&failure));
                 self.fail_batch_lane(lane, error);

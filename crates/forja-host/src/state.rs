@@ -21,7 +21,7 @@ mod outcome;
 mod quota_tests;
 pub use journal::LanePosition;
 mod sequence;
-pub use sequence::StateSequenceHandle;
+pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;
 pub use slots::StateSlots;
 mod submit;

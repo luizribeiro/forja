@@ -1,6 +1,21 @@
 use super::{LanePosition, StateStorage, journal::StateJournal};
-use forja_core::{Backend, PagePoolError, StateSequence, StateTransaction};
+use forja_core::{Backend, PagePoolError, StateCheckpoint, StateSequence, StateTransaction};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// A retained state version paired with its complete serving cursor boundary.
+#[derive(Clone)]
+pub struct StateLaneCheckpoint {
+    pub(super) version: StateCheckpoint,
+    pub(super) position: LanePosition,
+}
+
+impl StateLaneCheckpoint {
+    /// Returns the cursors associated with this exact state version.
+    #[must_use]
+    pub const fn position(&self) -> LanePosition {
+        self.position
+    }
+}
 
 /// Shared sequence ownership retained by every recording and completion guard.
 pub struct StateSequenceHandle<B: Backend> {
@@ -60,6 +75,22 @@ impl<B: Backend> StateSequenceHandle<B> {
     #[must_use]
     pub fn position(&self) -> LanePosition {
         self.lock().position
+    }
+
+    /// Pins the latest declared boundary, which must succeed before it can be restored.
+    ///
+    /// # Errors
+    /// Refuses exhausted checkpoint reference counts.
+    pub fn checkpoint_latest(&self) -> Result<StateLaneCheckpoint, PagePoolError> {
+        self.lock().checkpoint_latest()
+    }
+
+    pub(crate) fn restore_with(
+        &self,
+        checkpoint: &StateLaneCheckpoint,
+        action: impl FnOnce() -> Result<(), PagePoolError>,
+    ) -> Result<(), PagePoolError> {
+        self.lock().restore_with(checkpoint, action)
     }
 
     /// Selects the retained predecessor and all its serving cursors after drain.

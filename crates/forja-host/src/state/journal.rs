@@ -151,6 +151,32 @@ impl StateJournal {
             .ok_or(PagePoolError::InvalidCheckpoint)
     }
 
+    pub(super) fn checkpoint_latest(&self) -> Result<super::StateLaneCheckpoint, PagePoolError> {
+        Ok(super::StateLaneCheckpoint {
+            version: self.sequence.checkpoint_latest()?,
+            position: self
+                .pending
+                .back()
+                .map_or(self.position, |pending| pending.position),
+        })
+    }
+
+    pub(super) fn restore_with(
+        &mut self,
+        checkpoint: &super::StateLaneCheckpoint,
+        action: impl FnOnce() -> Result<(), PagePoolError>,
+    ) -> Result<(), PagePoolError> {
+        let previous = self.sequence.checkpoint()?;
+        self.sequence.rewind(&checkpoint.version)?;
+        if let Err(error) = action() {
+            self.sequence.rewind(&previous)?;
+            return Err(error);
+        }
+        self.position = checkpoint.position;
+        self.retained = None;
+        Ok(())
+    }
+
     pub(super) fn rewind(&mut self, tokens: u64) -> Result<(), PagePoolError> {
         let (checkpoint, position) = self
             .retained
@@ -186,7 +212,9 @@ mod tests {
             reserved_tokens: 128,
         };
         assert!(journal.begin(1, Some(position(129))).is_err());
+        let initial = journal.checkpoint_latest().unwrap();
         let first = journal.begin(1, Some(position(64))).unwrap();
+        let predicted = journal.checkpoint_latest().unwrap();
         journal.mark_submitted(&first).unwrap();
         let second = journal.begin(2, Some(position(65))).unwrap();
         journal.mark_submitted(&second).unwrap();
@@ -199,8 +227,19 @@ mod tests {
         pool.observe_completion(2).unwrap();
         journal.finish(&second, true).unwrap();
         assert_eq!(journal.position, position(65));
+        assert_eq!(
+            journal.restore_with(&predicted, || Err(PagePoolError::InvalidCheckpoint)),
+            Err(PagePoolError::InvalidCheckpoint)
+        );
+        assert_eq!(journal.position, position(65));
         journal.rewind(64).unwrap();
         assert_eq!(journal.position, position(64));
+        journal.restore_with(&initial, || Ok(())).unwrap();
+        assert_eq!(journal.position, LanePosition::default());
+        journal.restore_with(&predicted, || Ok(())).unwrap();
+        assert_eq!(journal.position, position(64));
+        drop(initial);
+        drop(predicted);
         let failed = journal.begin(3, Some(position(66))).unwrap();
         journal.mark_submitted(&failed).unwrap();
         let descendant = journal.begin(4, Some(position(67))).unwrap();
