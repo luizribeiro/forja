@@ -372,3 +372,24 @@ fn metal_prefill_layer_preserves_attention_variant_refusals() -> Result<(), Box<
     assert!(layer.prefill(&input, 3, None, Some(&wrong), None).is_err());
     Ok(())
 }
+
+#[test]
+fn prefill_blocks_refuse_invalid_token_and_hidden_widths() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let config = qwen38::Config::tiny();
+    let mut recurrent = qwen38::DeltaNet::load(
+        &weights.scoped("language_model.model.layers.0.linear_attn"),
+        config,
+    )?;
+    let mut attention = qwen38::Attention::load(
+        &weights.scoped("language_model.model.layers.3.self_attn"),
+        config,
+        128,
+    )?;
+    for shape in [&[65, 64][..], &[1, 7], &[1, 1, 64]] {
+        let input = Tensor::<bf16>::zeros(shape)?;
+        assert!(recurrent.prefill(&input, None, None).is_err());
+        assert!(attention.prefill(&input, 0, None, None).is_err());
+    }
+    Ok(())
+}
