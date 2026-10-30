@@ -7,7 +7,7 @@ pub use access::StateAccess;
 mod ops;
 pub use ops::StateOp;
 mod pool;
-pub use pool::{StatePool, StateSequence, StateSlot, StateTransaction};
+pub use pool::{StateCheckpoint, StatePool, StateSequence, StateSlot, StateTransaction};
 
 use crate::{BackendError, DType, MAX_RANK, PagedLayout, PagedPlane};
 

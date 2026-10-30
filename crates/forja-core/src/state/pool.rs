@@ -2,11 +2,14 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
 use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence, StateLayout};
+
+mod checkpoint;
+pub use checkpoint::StateCheckpoint;
 
 const VERSIONS: u64 = 3;
 
@@ -55,6 +58,7 @@ impl StatePool {
             storage: self.pages.reserve(VERSIONS)?,
             identity: Arc::new(()),
             committed: 0,
+            pins: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
             latest_serial: 0,
             latest_submission: 0,
             pending: VecDeque::new(),
@@ -105,6 +109,7 @@ pub struct StateSequence {
     storage: PagedSequence,
     identity: Arc<()>,
     committed: u32,
+    pins: Arc<[AtomicU32; 3]>,
     latest_serial: u64,
     latest_submission: u64,
     pending: VecDeque<StateTransaction>,
@@ -152,7 +157,11 @@ impl StateSequence {
         }
         let input = self.pending.back().map_or(self.committed, |tx| tx.output);
         let output = (0..3)
-            .find(|&version| version != self.committed && version != input)
+            .find(|&version| {
+                version != self.committed
+                    && version != input
+                    && self.pins[version as usize].load(Ordering::Acquire) == 0
+            })
             .ok_or(PagePoolError::BankInFlight)?;
         let transaction = StateTransaction {
             identity: Arc::clone(&self.identity),
