@@ -34,6 +34,8 @@ mod state_auth;
 mod state_block;
 #[path = "../state_block_grouping.rs"]
 mod state_block_grouping;
+#[path = "../state_conv_grouping.rs"]
+mod state_conv_grouping;
 #[path = "../state_decay.rs"]
 mod state_decay;
 #[path = "../top_k.rs"]
