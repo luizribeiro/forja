@@ -1,3 +1,5 @@
+mod update;
+
 use crate::{Backend, Host, compute, invalid_handle, paged_storage};
 
 pub(crate) struct StateInputBank {

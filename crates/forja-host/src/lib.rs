@@ -2060,8 +2060,13 @@ where
         }
         if let Err(error) = self
             .store
-            .data_mut()
-            .write_paged_lane_metadata(pool, &metadata)
+            .data()
+            .write_state_batch_inputs(pool, input)
+            .and_then(|()| {
+                self.store
+                    .data_mut()
+                    .write_paged_lane_metadata(pool, &metadata)
+            })
         {
             self.rollback_batch_appends(pool, &mut checkpoints)?;
             return Err(error);
@@ -9841,6 +9846,94 @@ mod tests {
             }
         }
         assert_ne!(seen[0], seen[1]);
+    }
+
+    #[test]
+    fn state_batch_inputs_stage_prompt_and_sampling_without_touching_other_bank() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        host.table.get_mut(&pool).unwrap().active_lanes = 8;
+        let slot = host
+            .open_state_slot(
+                &pool,
+                2,
+                vec![paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![7, 33],
+                }],
+                paged_storage::StateInputLayout {
+                    vocab: 33,
+                    prompt_tokens: 7,
+                },
+            )
+            .unwrap();
+        let mut input = EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 7,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 7,
+                tokens: Some(vec![1, 7, 3]),
+                start_pos: 0,
+                sampling: SamplingParams {
+                    seed: 0x1234_5678_9abc_def0,
+                    temperature: 0.7,
+                    top_k: 5,
+                    top_p: 0.9,
+                },
+            })],
+        };
+        host.write_state_batch_inputs(pool.rep(), &input).unwrap();
+        let (sampling, prompt) = {
+            let bank = &host
+                .table
+                .get(&slot)
+                .unwrap()
+                .inputs
+                .as_ref()
+                .unwrap()
+                .banks[0];
+            (bank.sampling, bank.prompt)
+        };
+        let read = |host: &Host<CpuBackend>, handle| {
+            host.backend
+                .read(&host.entry(&Resource::new_borrow(handle)).unwrap().tensor)
+                .unwrap()
+        };
+        assert_eq!(
+            read(&host, prompt),
+            [1_u32, 7, 3, 0, 0, 0, 0].map(u32::to_ne_bytes).concat()
+        );
+        let mut expected = [0, 0, 1.0_f32.to_bits(), 0, 0].repeat(7);
+        expected.extend([
+            0.7_f32.to_bits(),
+            5,
+            0.9_f32.to_bits(),
+            0x9abc_def0,
+            0x1234_5678,
+        ]);
+        assert_eq!(
+            read(&host, sampling),
+            expected
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        );
+        let before = read(&host, prompt);
+        input.lanes[0].as_mut().unwrap().tokens = Some(vec![2; 8]);
+        assert!(host.write_state_batch_inputs(pool.rep(), &input).is_err());
+        assert_eq!(read(&host, prompt), before);
+        input.lanes[0].as_mut().unwrap().tokens = Some(vec![2; 3]);
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(host.write_state_batch_inputs(pool.rep(), &input).is_err());
+        assert_eq!(read(&host, prompt), before);
+        host.limits = GENEROUS;
+        host.table.get_mut(&slot).unwrap().active_bank = 1;
+        host.write_state_batch_inputs(pool.rep(), &input).unwrap();
+        assert_eq!(read(&host, prompt), before);
     }
 
     #[test]
