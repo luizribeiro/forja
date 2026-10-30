@@ -56,10 +56,12 @@ async fn slotted_recurrent_component_matches_eager_state_bits() -> Result<(), Bo
         &weights.scoped("language_model.model.layers.0.linear_attn"),
         qwen38::Config::tiny(),
     )?;
-    for _ in 0..2 {
+    for request in 0..2 {
         native.reset()?;
-        runner.prepare_paged_request(None, 0)?;
-        runner.prepare_paged_request(None, 64)?;
+        if request == 0 {
+            runner.prepare_paged_request(None, 0)?;
+            runner.prepare_paged_request(None, 64)?;
+        }
         for (position, token) in [1_u16, 2, 7].into_iter().enumerate() {
             let input = forja_sdk::Tensor::from_slice(
                 &[forja_sdk::bf16::from_f32(f32::from(token)); 64],

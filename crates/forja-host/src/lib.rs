@@ -1460,9 +1460,7 @@ where
         if start == 0
             && let (Some(pool), Some(checkpoint)) = (self.page_pool, self.paged_origin.take())
         {
-            self.store
-                .data_mut()
-                .rollback_paged_append(pool, checkpoint)?;
+            self.reset_paged_origin(pool, checkpoint)?;
             self.paged_checkpoint = None;
         }
         if let (Some(pool), Some((checkpoint_start, checkpoint))) =
@@ -1500,6 +1498,32 @@ where
             }
             None => Ok(None),
         }
+    }
+
+    fn reset_paged_origin(
+        &mut self,
+        pool: u32,
+        checkpoint: SequenceCheckpoint,
+    ) -> Result<(), compute::Error> {
+        if self.store.data().paged_state_slot(pool)?.is_none() {
+            return self
+                .store
+                .data_mut()
+                .rollback_paged_append(pool, checkpoint);
+        }
+        let reserved = self
+            .store
+            .data()
+            .paged_lane_prefix(pool, 0)?
+            .sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .reserved_tokens();
+        self.paged_checkpoint = None;
+        drop(checkpoint);
+        self.prepare_paged_request(None, 0)?;
+        self.prepare_paged_request(None, reserved)?;
+        Ok(())
     }
 
     fn rollback_paged_append(
@@ -11999,7 +12023,10 @@ mod tests {
         for bank in 0..2 {
             binding.activity[bank][1].store(true, Ordering::Release);
         }
-        for position in 0..3 {
+        for (call, (position, token)) in [(0, 1), (1, 1), (2, 1), (0, 3), (1, 3), (2, 3)]
+            .into_iter()
+            .enumerate()
+        {
             let output = runner
                 .step(EngineStep {
                     phase: if position == 0 {
@@ -12007,20 +12034,23 @@ mod tests {
                     } else {
                         BatchPhase::Decode
                     },
-                    tokens: vec![1],
+                    tokens: vec![token],
                     start_pos: position,
                     taps: false,
                 })
                 .await
                 .unwrap()
                 .unwrap();
-            assert!((first_f32(&runner.read(&output.logits).await.unwrap()) - 1.0).abs() < 1.0e-5);
+            let expected = f32::from(u16::try_from(token).unwrap());
+            assert!(
+                (first_f32(&runner.read(&output.logits).await.unwrap()) - expected).abs() < 1.0e-5
+            );
             let host = runner.store.data();
             let slot = host
                 .table
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_id))
                 .unwrap();
-            assert_eq!(slot.active_bank, usize::try_from(position % 2).unwrap());
+            assert_eq!(slot.active_bank, call % 2);
             assert!(binding.activity[slot.active_bank][0].load(Ordering::Acquire));
             assert!(!binding.activity[slot.active_bank][1].load(Ordering::Acquire));
             let current = host.paged_lane_prefix(pool, 1).unwrap();
