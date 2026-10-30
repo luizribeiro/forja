@@ -52,6 +52,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multi_block_scan_matches_token_recurrence() {
+        for count in [65, 129, 4097] {
+            for (keys, width) in [(7, 33), (128, 128)] {
+                let data = super::super::tests::data(count, keys, width);
+                for underflow in [false, true] {
+                    let log_decay = (0..count)
+                        .map(|row| {
+                            if underflow && row % 97 == 93 {
+                                f32::NEG_INFINITY
+                            } else if underflow && row % 71 == 69 {
+                                -1000.0
+                            } else {
+                                -0.015
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let input = HeadInput {
+                        query: &data.query,
+                        key: &data.key,
+                        value: &data.value,
+                        beta: &data.beta,
+                        log_decay: &log_decay,
+                        keys,
+                        width,
+                    };
+                    for initial in [0.0, 0.125] {
+                        let state = vec![initial; keys * width];
+                        let expected = forja_testing::delta_rule::recurrent(
+                            input.query,
+                            input.key,
+                            input.value,
+                            input.log_decay,
+                            input.beta,
+                            &state,
+                            [keys, width],
+                        );
+                        let actual = input.scan(&state);
+                        for (expected, actual) in
+                            [(&expected.0, &actual.0), (&expected.1, &actual.1)]
+                        {
+                            let error = forja_testing::normwise_relative_error(expected, actual);
+                            assert!(
+                                error <= forja_testing::F32_TOLERANCE,
+                                "count={count} keys={keys} initial={initial} underflow={underflow} error={error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn canonical_blocks_are_bit_exact_across_submission_grouping() {
         for count in [1, 7, 33, 63, 64, 65, 4097] {
             let data = super::super::tests::data(count, 7, 7);
