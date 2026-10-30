@@ -26,7 +26,7 @@ impl StateInputBank {
 
 pub(crate) struct StateInputs {
     pub(crate) banks: [StateInputBank; 2],
-    pub(crate) feedback: u32,
+    pub(crate) feedback: Vec<u32>,
     pub(crate) feedback_versions: crate::state::feedback::FeedbackBinding,
 }
 
@@ -35,7 +35,7 @@ impl StateInputs {
         self.banks
             .iter()
             .flat_map(StateInputBank::handles)
-            .chain([self.feedback])
+            .chain(self.feedback.iter().copied())
     }
 }
 
@@ -127,10 +127,13 @@ impl<B: Backend + 'static> Host<B> {
                 })
             };
             let banks = [bank()?, bank()?];
+            let feedback = (0..scalars)
+                .map(|_| alloc(compute::Dtype::U32, &[1]))
+                .collect::<Result<_, _>>()?;
             Ok(StateInputs {
-                feedback_versions,
                 banks,
-                feedback: alloc(compute::Dtype::U32, &[scalars])?,
+                feedback,
+                feedback_versions,
             })
         })();
         if result.is_err() {
@@ -165,5 +168,41 @@ mod tests {
             assert!(host.allocate_state_inputs(2, layout).is_err());
             assert_eq!(host.live_bytes.load(Ordering::Acquire), 0, "limit={limit}");
         }
+    }
+    #[tokio::test]
+    async fn failed_feedback_write_preserves_other_versions() {
+        use crate::{BackendError, SubmissionAccess};
+        use std::time::Duration;
+        use wasmtime::component::Resource;
+        let mut host = Host::new(CpuBackend::new(), Limits::new(4096, 8, 4096, 64, 4096));
+        let inputs = host
+            .allocate_state_inputs(
+                2,
+                paged_storage::StateInputLayout {
+                    vocab: 33,
+                    prompt_tokens: 7,
+                },
+            )
+            .unwrap();
+        let source = Resource::new_borrow(inputs.feedback[0]);
+        let failed = Resource::new_borrow(inputs.feedback[1]);
+        host.write(&source, &17_u32.to_ne_bytes()).unwrap();
+        let failed_buffer = host.entry(&failed).unwrap().tensor.buffer();
+        let mut access = SubmissionAccess::default();
+        access.writes.insert(failed_buffer);
+        let flight = host.taints.begin(&access).unwrap();
+        assert!(
+            flight
+                .finish::<()>(Err(BackendError::ExecutionFailed), true, Duration::ZERO)
+                .is_err()
+        );
+        assert!(host.prepare_read(&failed).unwrap().run().await.is_err());
+        assert_eq!(
+            host.prepare_read(&source).unwrap().run().await.unwrap(),
+            17_u32.to_ne_bytes()
+        );
+        host.drop_paged_handles(inputs.handles().collect());
+        drop(inputs);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
     }
 }
