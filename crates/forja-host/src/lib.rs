@@ -4371,31 +4371,18 @@ impl<B: Backend + 'static> Host<B> {
             access.reads.insert(tensor.buffer());
             access.writes.insert(tensor.buffer());
         }
-        Ok(SubmitRequest {
-            backend: Arc::clone(&self.backend),
-            state_batch: None,
-            state_owners: Vec::new(),
-            work: SubmissionWork::Commands(commands),
+        Ok(self.submission_request(
+            SubmissionWork::Commands(commands),
             access,
-            retained: Vec::new(),
-            paged: vec![PagedUse {
+            Vec::new(),
+            vec![PagedUse {
                 binding,
                 bank,
                 lane,
                 ungated: false,
             }],
-            flight: None,
-            timeout: self.limits.submission_timeout,
-            gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
-            gpu_time_ns: Arc::clone(&self.gpu_time_ns),
-            queued_submissions: Arc::clone(&self.queued_submissions),
-            completed_submissions: Arc::clone(&self.completed_submissions),
-            timed_submissions: Arc::clone(&self.timed_submissions),
-            completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
-            submission_notify: Arc::clone(&self.submission_notify),
-            taints: Arc::clone(&self.taints),
-            profile: self.active_profile.clone(),
-        })
+            None,
+        ))
     }
 
     fn finish_paged_append(
@@ -6242,15 +6229,35 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(error);
             }
         };
-        Ok(SubmitRequest {
+        let mut request = self.submission_request(
+            SubmissionWork::Commands(entry.commands),
+            entry.access,
+            entry.retained,
+            entry.paged,
+            None,
+        );
+        request.state_batch = state_batch;
+        request.state_owners = state_owners;
+        Ok(request)
+    }
+
+    fn submission_request(
+        &self,
+        work: SubmissionWork,
+        access: SubmissionAccess,
+        retained: Vec<TensorEntry>,
+        paged: Vec<PagedUse>,
+        flight: Option<ReplayFlight>,
+    ) -> SubmitRequest<B> {
+        SubmitRequest {
             backend: Arc::clone(&self.backend),
-            state_batch,
-            state_owners,
-            work: SubmissionWork::Commands(entry.commands),
-            access: entry.access,
-            retained: entry.retained,
-            paged: entry.paged,
-            flight: None,
+            state_batch: None,
+            state_owners: Vec::new(),
+            work,
+            access,
+            retained,
+            paged,
+            flight,
             timeout: self.limits.submission_timeout,
             gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
             gpu_time_ns: Arc::clone(&self.gpu_time_ns),
@@ -6261,7 +6268,7 @@ impl<B: Backend + 'static> Host<B> {
             submission_notify: Arc::clone(&self.submission_notify),
             taints: Arc::clone(&self.taints),
             profile: self.active_profile.clone(),
-        })
+        }
     }
 
     #[cfg(test)]
@@ -6298,29 +6305,16 @@ impl<B: Backend + 'static> Host<B> {
             .values(values.clone())
             .map_err(|error| graph_error(&error))?;
         PagedCheck::validate_all(&entry.paged_bounds, Some(&checked))?;
-        Ok(SubmitRequest {
-            backend: Arc::clone(&self.backend),
-            state_batch: None,
-            state_owners: Vec::new(),
-            work: SubmissionWork::Replay {
+        Ok(self.submission_request(
+            SubmissionWork::Replay {
                 graph: Arc::clone(&entry.graph),
                 values,
             },
-            access: entry.access.clone(),
-            retained: Vec::new(),
-            paged: entry.paged.clone(),
-            flight: Some(flight),
-            timeout: self.limits.submission_timeout,
-            gpu_time_budget_ns: duration_ns(self.limits.gpu_time_budget),
-            gpu_time_ns: Arc::clone(&self.gpu_time_ns),
-            queued_submissions: Arc::clone(&self.queued_submissions),
-            completed_submissions: Arc::clone(&self.completed_submissions),
-            timed_submissions: Arc::clone(&self.timed_submissions),
-            completed_gpu_time_ns: Arc::clone(&self.completed_gpu_time_ns),
-            submission_notify: Arc::clone(&self.submission_notify),
-            taints: Arc::clone(&self.taints),
-            profile: self.active_profile.clone(),
-        })
+            entry.access.clone(),
+            Vec::new(),
+            entry.paged.clone(),
+            Some(flight),
+        ))
     }
 
     /// Drops a guest tensor handle and releases its buffer after the last view.
