@@ -208,6 +208,12 @@ impl<B: Backend> StateCommands<B> {
         Ok(())
     }
 
+    pub(crate) fn release_graph_scratch(&mut self) {
+        self.scratch.clear();
+        self.captured_scratch.clear();
+        self.captured_scratch_charges.clear();
+    }
+
     pub(crate) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
         let mut owners = vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),

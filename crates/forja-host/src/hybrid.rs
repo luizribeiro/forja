@@ -352,3 +352,52 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedState {
+    pub(crate) usage: StateUse,
+    pub(crate) capture: crate::StateCapture,
+}
+
+impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn capture_graph_state(
+        &mut self,
+        usages: &[StateUse],
+    ) -> Result<Vec<CapturedState>, compute::Error>
+    where
+        B: Send + Sync,
+    {
+        usages
+            .iter()
+            .map(|usage| {
+                let state = self
+                    .state_slots
+                    .get_mut(&usage.slot)
+                    .ok_or_else(|| invalid_handle("state slot is missing"))?;
+                let capture = state
+                    .commands(usage.bank, usage.lane, usage.active)?
+                    .capture()?;
+                Ok(CapturedState {
+                    usage: *usage,
+                    capture,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn release_graph_state_scratch(
+        &mut self,
+        captures: &mut [CapturedState],
+    ) -> Result<(), compute::Error> {
+        for captured in captures {
+            let usage = captured.usage;
+            self.state_slots
+                .get_mut(&usage.slot)
+                .ok_or_else(|| invalid_handle("state slot is missing"))?
+                .commands(usage.bank, usage.lane, usage.active)?
+                .release_graph_scratch();
+            captured.capture.release_graph_scratch();
+        }
+        Ok(())
+    }
+}

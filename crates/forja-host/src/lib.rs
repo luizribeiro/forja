@@ -3598,6 +3598,7 @@ impl CommandListEntry {
 /// Host-owned state behind a guest graph resource.
 #[derive(Debug)]
 pub struct GraphEntry {
+    captured_state: Vec<hybrid::CapturedState>,
     graph: Arc<PreparedGraph>,
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
@@ -6053,6 +6054,7 @@ impl<B: Backend + 'static> Host<B> {
         &mut self,
         graph: GraphTemplate,
         entry: &mut CommandListEntry,
+        captured_state: &mut [hybrid::CapturedState],
     ) -> Result<PreparedGraph, compute::Error> {
         let reachable = entry
             .retained
@@ -6063,6 +6065,7 @@ impl<B: Backend + 'static> Host<B> {
                     || entry.protected.contains(&retained.tensor.buffer())
             })
             .map(|entry| entry.tensor.buffer())
+            .chain(entry.protected.iter().copied())
             .collect::<HashSet<_>>();
         let depth = self.backend.graph_memory_depth();
         if depth == 0 {
@@ -6101,6 +6104,7 @@ impl<B: Backend + 'static> Host<B> {
         let (transient, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.retained)
             .into_iter()
             .partition(|entry| plan.contains(entry.tensor.buffer()));
+        self.release_graph_state_scratch(captured_state)?;
         self.release_retained(transient)?;
         self.live_bytes
             .fetch_add(new_charge - old_charge, Ordering::AcqRel);
@@ -6112,9 +6116,19 @@ impl<B: Backend + 'static> Host<B> {
     fn create_graph(
         &mut self,
         resource: Resource<CommandListEntry>,
-    ) -> Result<Resource<GraphEntry>, compute::Error> {
+    ) -> Result<Resource<GraphEntry>, compute::Error>
+    where
+        B: Send + Sync,
+    {
         let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
+        let mut captured_state = match self.capture_graph_state(&entry.state_uses) {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(error);
+            }
+        };
         let space = match entry.space.clone() {
             Some(space) => space,
             None => ParamSpace::new(Vec::new()).map_err(|error| graph_error(&error))?,
@@ -6146,7 +6160,7 @@ impl<B: Backend + 'static> Host<B> {
             });
         let validation_time = validation_started.elapsed();
         let graph = match built {
-            Ok(()) => self.prepare_captured_graph(graph, &mut entry),
+            Ok(()) => self.prepare_captured_graph(graph, &mut entry, &mut captured_state),
             Err(error) => Err(graph_error(&error)),
         };
         let graph = match graph {
@@ -6165,6 +6179,7 @@ impl<B: Backend + 'static> Host<B> {
                 }
             };
         let graph_entry = GraphEntry {
+            captured_state,
             graph: Arc::new(graph),
             access: entry.access,
             retained: Vec::new(),
@@ -6275,6 +6290,9 @@ impl<B: Backend + 'static> Host<B> {
         flight: ReplayFlight,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
+        if !entry.captured_state.is_empty() {
+            return Err(invalid_handle("state graphs require fresh slot bindings"));
+        }
         let checked = entry
             .graph
             .values(values.clone())
@@ -9396,9 +9414,16 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
-        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+    struct StateSlotFixture<B: Backend> {
+        host: Host<B>,
+        pool: Resource<PagePoolEntry>,
+        slot: Resource<super::BatchSlotEntry>,
+        operands: [Resource<TensorEntry>; 2],
+        output: Resource<TensorEntry>,
+    }
+
+    fn state_slot_fixture<B: Backend + 'static>(backend: B) -> StateSlotFixture<B> {
+        let mut host = Host::new(backend, GENEROUS);
         let pool = insert_test_pool(&mut host, 2, 8);
         let slot = host
             .open_state_slot(
@@ -9412,20 +9437,83 @@ mod tests {
             .unwrap();
         host.bind_paged_request(pool.rep(), None, 8).unwrap();
         host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
-        let position = crate::LanePosition {
-            tokens: 1,
-            reserved_tokens: 8,
-            ..crate::LanePosition::default()
-        };
-
         let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
         let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
         host.write(&input, &2_f32.to_le_bytes().repeat(7)).unwrap();
         host.write(&weights, &1_f32.to_le_bytes().repeat(28))
             .unwrap();
+        StateSlotFixture {
+            host,
+            pool,
+            slot,
+            operands: [input, weights],
+            output,
+        }
+    }
+
+    fn captured_slot_releases_request_leases<B: Backend + Send + Sync + 'static>(backend: B) {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture(backend);
         let commands = host.command_list().unwrap();
-        let operands = [input, weights];
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            super::paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        let prefix = host.paged_lane_prefix(pool.rep(), 0).unwrap();
+        assert!(
+            host.bind_paged_lane(pool.rep(), 0, Some(prefix), 8)
+                .is_err()
+        );
+        assert_eq!(host.table.get(&graph).unwrap().captured_state.len(), 1);
+        assert!(host.prepare_replay(&graph, Vec::new()).is_err());
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        state.cancel_unsubmitted_bank(0).unwrap();
+        state.release(0).unwrap();
+        state.admit(0).unwrap();
+        host.drop_graph(graph).unwrap();
+    }
+
+    #[test]
+    fn captured_slot_graphs_hold_storage_without_request_leases() {
+        captured_slot_releases_request_leases(CpuBackend::new());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_captured_slot_graphs_hold_storage_without_request_leases() {
+        captured_slot_releases_request_leases(forja_metal::MetalBackend::new().unwrap());
+    }
+
+    #[tokio::test]
+    async fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let position = crate::LanePosition {
+            tokens: 1,
+            reserved_tokens: 8,
+            ..crate::LanePosition::default()
+        };
+        let commands = host.command_list().unwrap();
         let operation = super::paged_storage::StateOperation::CausalConvolution;
         assert!(
             host.record_slot_state(&commands, &slot, 0, 1, operation, &operands, &output, "")
@@ -11998,7 +12086,7 @@ mod tests {
 
     fn empty_graph<B>(host: &mut Host<B>) -> Resource<super::GraphEntry>
     where
-        B: Backend + 'static,
+        B: Backend + Send + Sync + 'static,
     {
         let commands = host.command_list().unwrap();
         host.create_graph(commands).unwrap()

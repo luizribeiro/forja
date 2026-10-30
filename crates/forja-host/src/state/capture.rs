@@ -65,6 +65,11 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
 }
 
 impl StateCapture {
+    pub(crate) fn release_graph_scratch(&mut self) {
+        self.private_scratch.clear();
+        self.scratch_charges.clear();
+    }
+
     /// Binds a fresh transaction to a captured graph's protected operands.
     ///
     /// # Errors
