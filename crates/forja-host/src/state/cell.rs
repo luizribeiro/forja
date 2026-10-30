@@ -8,6 +8,7 @@ pub struct StateCell<B: Backend> {
     storage: Arc<StateStorage<B>>,
     sequence: StateSequenceHandle<B>,
     serial: u64,
+    submitted: bool,
 }
 
 impl<B: Backend> StateCell<B> {
@@ -24,6 +25,7 @@ impl<B: Backend> StateCell<B> {
             storage,
             sequence,
             serial: 0,
+            submitted: false,
         })
     }
 
@@ -56,11 +58,16 @@ impl<B: Backend> StateCell<B> {
         })
     }
 
+    pub(super) const fn was_submitted(&self) -> bool {
+        self.submitted
+    }
+
     fn update(
         &mut self,
         limits: Limits,
         record: impl FnOnce(&mut super::StateRecording<B>) -> Result<(), compute::Error>,
     ) -> Result<Option<std::time::Duration>, compute::Error> {
+        self.submitted = false;
         let serial = self
             .serial
             .checked_add(1)
@@ -79,6 +86,7 @@ impl<B: Backend> StateCell<B> {
                 }
             };
         record(&mut recording)?;
+        self.submitted = true;
         recording.submit()?.finish_with_time()
     }
 }

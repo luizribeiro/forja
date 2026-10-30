@@ -1,12 +1,109 @@
 use super::StateCell;
-use crate::{Host, compute, core_dtype, invalid_handle};
-use forja_core::{Backend, StateLayout, StatePlane};
-use std::{any::Any, future::Future};
+use crate::{
+    GpuReservation, Host, ImportKind, Limits, SubmissionAccess, TensorEntry, compute, core_dtype,
+    duration_ns, guest_error, invalid_handle, saturating_add, saturating_increment,
+};
+use forja_core::{Backend, BackendError, StateLayout, StatePlane};
+use std::{
+    any::Any,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use wasmtime::component::Resource;
 
 /// Opaque component resource; the guest can never obtain its plane tensors.
 pub struct StateEntry {
-    _cell: Box<dyn Any + Send + Sync>,
+    cell: Box<dyn Any + Send + Sync>,
+}
+
+impl<B: Backend + Send + Sync + 'static> Host<B> {
+    fn state_tensors(
+        &self,
+        resources: &[Resource<TensorEntry>],
+    ) -> Result<Vec<TensorEntry>, compute::Error> {
+        resources
+            .iter()
+            .map(|resource| {
+                let entry = self.entry(resource)?;
+                if entry.symbolic.is_some() {
+                    return Err(invalid_handle(
+                        "eager state updates require fixed tensor views",
+                    ));
+                }
+                entry
+                    .buffer
+                    .taints
+                    .wait_for_writes(entry.tensor.buffer(), self.limits.submission_timeout)
+                    .map_err(guest_error)?;
+                Ok(entry.clone())
+            })
+            .collect()
+    }
+
+    fn update_state(
+        &mut self,
+        resource: &Resource<StateEntry>,
+        inputs: &[TensorEntry],
+        output: &TensorEntry,
+        run: impl FnOnce(&mut StateCell<B>, Limits) -> Result<Option<Duration>, compute::Error>,
+    ) -> Result<(), compute::Error> {
+        let _timer = self.import_timer(ImportKind::Submit);
+        let limits = self.limits;
+        let reservation = GpuReservation::new(
+            Arc::clone(&self.gpu_time_ns),
+            duration_ns(limits.gpu_time_budget),
+            duration_ns(limits.submission_timeout).max(1),
+        )
+        .map_err(guest_error)?;
+        let taints = Arc::clone(&self.taints);
+        let cell = self.state_cell(resource)?;
+        let mut access = SubmissionAccess::default();
+        access.record(inputs, std::slice::from_ref(output));
+        let flight = taints.begin(&access).map_err(guest_error)?;
+        let started = Instant::now();
+        let result = run(cell, limits);
+        let submitted = cell.was_submitted();
+        let outcome = flight.finish(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|_| BackendError::ExecutionFailed),
+            submitted,
+            limits.submission_timeout,
+        );
+        let charged = match result {
+            Ok(time) => time
+                .map_or_else(|| duration_ns(started.elapsed()), duration_ns)
+                .max(1),
+            Err(_) if submitted => reservation.amount(),
+            Err(_) => 0,
+        };
+        let accounting = reservation.settle(charged).map_err(guest_error);
+        let time = result?;
+        accounting?;
+        outcome.map_err(guest_error)?;
+        saturating_increment(&self.queued_submissions);
+        saturating_increment(&self.completed_submissions);
+        if let Some(time) = time {
+            saturating_increment(&self.timed_submissions);
+            saturating_add(&self.completed_gpu_time_ns, duration_ns(time));
+        }
+        self.submission_notify.notify_waiters();
+        Ok(())
+    }
+
+    fn state_cell(
+        &mut self,
+        resource: &Resource<StateEntry>,
+    ) -> Result<&mut StateCell<B>, compute::Error> {
+        self.table
+            .get_mut(resource)
+            .map_err(invalid_handle)?
+            .cell
+            .downcast_mut()
+            .ok_or_else(|| invalid_handle("state backend mismatch"))
+    }
 }
 
 impl<B: Backend + Send + Sync + 'static> compute::HostStatePlane for Host<B> {
@@ -24,11 +121,55 @@ impl<B: Backend + Send + Sync + 'static> compute::HostStatePlane for Host<B> {
             let resource = self
                 .table
                 .push(StateEntry {
-                    _cell: Box::new(cell),
+                    cell: Box::new(cell),
                 })
                 .map_err(invalid_handle)?;
             self.live_handles += 1;
             Ok(resource)
+        })();
+        std::future::ready(Ok(result))
+    }
+
+    fn delta_rule(
+        &mut self,
+        resource: Resource<StateEntry>,
+        inputs: Vec<Resource<TensorEntry>>,
+        output: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let result = (|| {
+            let inputs = self.state_tensors(&inputs)?;
+            let [q, k, v, decay, beta] = inputs.as_slice() else {
+                return Err(invalid_handle("delta rule requires five ordinary inputs"));
+            };
+            let output = self.state_tensors(&[output])?;
+            self.update_state(&resource, &inputs, &output[0], |cell, limits| {
+                cell.delta_rule(
+                    [&q.tensor, &k.tensor, &v.tensor, &decay.tensor, &beta.tensor],
+                    &output[0].tensor,
+                    limits,
+                )
+            })
+        })();
+        std::future::ready(Ok(result))
+    }
+
+    fn causal_convolution(
+        &mut self,
+        resource: Resource<StateEntry>,
+        input: Resource<TensorEntry>,
+        weights: Resource<TensorEntry>,
+        output: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let result = (|| {
+            let tensors = self.state_tensors(&[input, weights, output])?;
+            self.update_state(&resource, &tensors[..2], &tensors[2], |cell, limits| {
+                cell.causal_convolution(
+                    &tensors[0].tensor,
+                    &tensors[1].tensor,
+                    &tensors[2].tensor,
+                    limits,
+                )
+            })
         })();
         std::future::ready(Ok(result))
     }
@@ -53,6 +194,83 @@ mod tests {
     use super::*;
     use crate::Limits;
     use compute::HostStatePlane;
+    #[tokio::test]
+    async fn execution_errors_take_precedence_over_settlement_errors() {
+        use std::sync::atomic::Ordering;
+        for execution_failed in [false, true] {
+            let mut host = Host::new(
+                forja_cpu::CpuBackend::new(),
+                Limits::new(65536, 8, 4096, 8, 4096),
+            );
+            let state = host
+                .create(compute::Dtype::F32, vec![1, 1])
+                .await
+                .unwrap()
+                .unwrap();
+            let y = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+            let output = host.entry(&y).unwrap().clone();
+            let total = Arc::clone(&host.gpu_time_ns);
+            let error = host
+                .update_state(&state, &[], &output, |_, _| {
+                    total.store(0, Ordering::Release);
+                    if execution_failed {
+                        Err(invalid_handle("state execution failed"))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .unwrap_err();
+            if execution_failed {
+                assert!(matches!(error, compute::Error::InvalidHandle(message)
+                    if message == "state execution failed"));
+            } else {
+                assert!(matches!(error, compute::Error::BackendExecution(_)));
+            }
+            assert_eq!(host.completed_submissions.load(Ordering::Acquire), 0);
+        }
+    }
+    async fn convolve<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
+        handles: [u32; 4],
+    ) -> Result<(), compute::Error> {
+        host.causal_convolution(
+            Resource::new_borrow(handles[0]),
+            Resource::new_borrow(handles[1]),
+            Resource::new_borrow(handles[2]),
+            Resource::new_borrow(handles[3]),
+        )
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn validation_refusals_refund_gpu_budget_before_a_valid_update() {
+        use std::sync::atomic::Ordering;
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 8, 4096)
+                .with_gpu_limits(Duration::from_secs(1), Duration::from_secs(1)),
+        );
+        let state = host
+            .create(compute::Dtype::F32, vec![1, 1])
+            .await
+            .unwrap()
+            .unwrap();
+        let x = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        let weights = host.alloc(compute::Dtype::F32, &[2, 1]).unwrap();
+        let y = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        let handles = [state.rep(), x.rep(), weights.rep(), y.rep()];
+        host.limits.work_per_dispatch = 0;
+        for _ in 0..7 {
+            assert!(matches!(
+                convolve(&mut host, handles).await,
+                Err(compute::Error::Quota(_))
+            ));
+            assert_eq!(host.gpu_time_ns.load(Ordering::Acquire), 0);
+        }
+        host.limits.work_per_dispatch = u64::MAX;
+        convolve(&mut host, handles).await.unwrap();
+        assert_eq!(host.completed_submissions.load(Ordering::Acquire), 1);
+    }
     #[tokio::test]
     async fn state_plane_handle_limit_refuses_new_resources_until_drop() {
         let mut host = Host::new(
