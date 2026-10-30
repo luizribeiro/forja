@@ -143,6 +143,7 @@ impl<B: Backend> StateSlots<B> {
                 "state bank is occupied or its cursor exceeds capacity",
             ));
         }
+        let prepared = self.storage.prepare_record_metadata(self.inactive_access)?;
         let fresh = self.lanes[lane].sequence.is_none();
         self.admit(lane)?;
         let owner = &mut self.lanes[lane];
@@ -156,7 +157,10 @@ impl<B: Backend> StateSlots<B> {
             .ok_or_else(|| invalid_handle("state lane timeline exhausted"))?;
         let transaction = sequence.begin_at(serial, position).map_err(pool_error)?;
         owner.serial = serial;
-        match self.storage.record(sequence, transaction) {
+        match self
+            .storage
+            .record_prepared(sequence, transaction, prepared)
+        {
             Ok(record) => {
                 self.padding[bank][lane] = None;
                 self.banks[bank][lane] = Some(record);

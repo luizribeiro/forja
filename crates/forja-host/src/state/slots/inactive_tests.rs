@@ -142,3 +142,64 @@ fn inactive_commands_touch_no_state_and_hold_no_lane_lease() {
 fn metal_inactive_commands_touch_no_state_and_hold_no_lane_lease() {
     poisoned_padding(forja_metal::MetalBackend::new().unwrap());
 }
+
+#[test]
+fn recording_quota_refusal_keeps_the_retained_predecessor() {
+    use std::sync::atomic::Ordering;
+    let host = Host::new(
+        forja_cpu::CpuBackend::new(),
+        Limits::new(65536, 8, 4096, 128, 4096),
+    );
+    let storage = host
+        .create_state_storage(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7]).unwrap()]).unwrap(),
+            1,
+        )
+        .unwrap();
+    let mut slots = StateSlots::new(Arc::clone(&storage), 1).unwrap();
+    let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+    let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
+    let output = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+    write_constant(host.backend.as_ref(), &input, 2.0);
+    write_constant(host.backend.as_ref(), &weights, 1.0);
+    let position = LanePosition {
+        tokens: 1,
+        reserved_tokens: 7,
+        ..LanePosition::default()
+    };
+    slots.begin(0, 0, position).unwrap();
+    slots
+        .recording(0, 0)
+        .unwrap()
+        .causal_convolution(0, &input, &weights, &output)
+        .unwrap();
+    slots.take_batch(0).unwrap().submit_and_finish().unwrap();
+    let sequence = slots.sequence_handle(0).unwrap().unwrap();
+    let checkpoint = sequence.checkpoint_latest().unwrap();
+    let live = host.live_bytes.load(Ordering::Acquire);
+    let budget = super::super::StateCharge::reserve(
+        host.backend.as_ref(),
+        Arc::clone(&host.live_bytes),
+        65536,
+        65536 - live,
+    )
+    .unwrap();
+    assert!(matches!(
+        slots.begin(
+            1,
+            0,
+            LanePosition {
+                tokens: 2,
+                ..position
+            }
+        ),
+        Err(crate::compute::Error::Quota(_))
+    ));
+    assert_eq!(slots.position(0).unwrap(), checkpoint.position());
+    assert_eq!(slots.lanes[0].serial, 1);
+    drop(budget);
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), live);
+    sequence.rewind(0).unwrap();
+    assert_eq!(sequence.position(), LanePosition::default());
+    slots.begin(1, 0, position).unwrap();
+}
