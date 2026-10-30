@@ -143,6 +143,7 @@ where
     let prompt_len = u32::try_from(prompt.len())?;
     let first = runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt),
             start_pos: 0,
             sampling,
@@ -162,6 +163,7 @@ where
                 pending.push_back(
                     runner
                         .enqueue_decode(EngineDecode {
+                            phase: forja_host::BatchPhase::Decode,
                             tokens: None,
                             start_pos: position,
                             sampling,

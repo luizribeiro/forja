@@ -275,6 +275,7 @@ async fn guest_step_stops_at_its_cpu_deadline() -> wasmtime::Result<()> {
     let started = Instant::now();
     let error = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: vec![u32::MAX],
             start_pos: 0,
             taps: false,
@@ -302,6 +303,7 @@ async fn preceding_step_outputs_are_released() -> wasmtime::Result<()> {
     for _ in 0..40 {
         runner
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![7],
                 start_pos: 0,
                 taps: false,
@@ -325,6 +327,7 @@ async fn rejects_outputs_that_disagree_with_metadata() -> wasmtime::Result<()> {
     for (token, taps) in [(100, false), (101, true), (102, true), (103, false)] {
         let error = runner
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![token],
                 start_pos: 0,
                 taps,
@@ -350,6 +353,7 @@ async fn metal_runner_rejects_a_cpu_runner_tensor() -> wasmtime::Result<()> {
     cpu.load().await??;
     let output = cpu
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: vec![7],
             start_pos: 0,
             taps: false,
@@ -382,6 +386,7 @@ async fn run_engine(component: &Path, taps: bool, fixture: &str) -> wasmtime::Re
     runner.load().await??;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: vec![7],
             start_pos: 0,
             taps,

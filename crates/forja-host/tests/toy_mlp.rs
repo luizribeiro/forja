@@ -52,6 +52,7 @@ where
     runner.load().await??;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: TOKENS.to_vec(),
             start_pos: 0,
             taps: true,
@@ -108,6 +109,7 @@ fn native_outputs(
         .map_err(wasmtime::Error::msg)?;
     let output = engine
         .step(StepInput {
+            phase: forja_sdk::BatchPhase::Prompt,
             tokens: Tensor::from_slice(&TOKENS, &[3]).map_err(wasmtime::Error::msg)?,
             start_pos: 0,
             taps: true,

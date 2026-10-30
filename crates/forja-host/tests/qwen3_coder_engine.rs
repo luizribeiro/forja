@@ -483,6 +483,7 @@ async fn populate_single_replay_catalog(
     for sequence in [9, 512, 2_048, 4_000] {
         let output = runner
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![17; sequence],
                 start_pos: position,
                 taps: false,
@@ -494,6 +495,7 @@ async fn populate_single_replay_catalog(
     assert_eq!(runner.metrics().live_graphs, 2);
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: vec![17],
             start_pos: position,
             taps: false,
@@ -513,6 +515,7 @@ async fn populate_single_replay_catalog(
     ] {
         let output = runner
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: None,
                 start_pos: position,
                 sampling,
@@ -557,6 +560,7 @@ async fn metal_first_paged_layer_matches_same_byte_reference() -> Result<(), Box
     runner.load_with_selections(Some(1), &config).await??;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens,
             start_pos: 0,
             taps: true,
@@ -585,6 +589,7 @@ async fn metal_first_paged_layer_matches_same_byte_reference() -> Result<(), Box
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+#[allow(clippy::too_many_lines)]
 async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(), Box<dyn Error>> {
     let root = model_root()?;
     let fixtures = FixtureDirectory::open(root.join("golden/Qwen3-Coder-30B-A3B-Instruct-4bit"))?;
@@ -612,6 +617,7 @@ async fn metal_hidden_states_and_routing_match_same_byte_reference() -> Result<(
         .await??;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens,
             start_pos: 0,
             taps: true,
@@ -834,6 +840,7 @@ async fn timed_continuation(
     let started = Instant::now();
     let first = runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt.clone()),
             start_pos: 0,
             sampling,
@@ -850,6 +857,7 @@ async fn timed_continuation(
             Some(
                 runner
                     .enqueue_decode(EngineDecode {
+                        phase: forja_host::BatchPhase::Decode,
                         tokens: None,
                         start_pos: position,
                         sampling,
@@ -924,6 +932,7 @@ async fn profile_masked_sample(
     let prompt = vec![17, 33, 4097];
     let first = runner
         .decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt.clone()),
             start_pos: 0,
             sampling: SamplingParams::default(),
@@ -971,6 +980,7 @@ async fn profile_rewind(
     let position = u32::try_from(prompt.len())?;
     let first = runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt),
             start_pos: 0,
             sampling: SamplingParams::default(),
@@ -979,6 +989,7 @@ async fn profile_rewind(
     runner.read_queued_token(first).await?;
     let speculative = runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: position,
             sampling: SamplingParams::default(),
@@ -1009,6 +1020,7 @@ async fn constrained_continuation(
     let prompt = vec![17, 33, 4097];
     let first = runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt.clone()),
             start_pos: 0,
             sampling,
@@ -1019,6 +1031,7 @@ async fn constrained_continuation(
     if speculate {
         let output = runner
             .enqueue_decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: None,
                 start_pos: first_position,
                 sampling,
@@ -1066,16 +1079,19 @@ async fn decode_outputs(
     };
     let inputs = [
         EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(vec![17, 33, 4097]),
             start_pos: 0,
             sampling: greedy,
         },
         EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: 3,
             sampling: greedy,
         },
         EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: 4,
             sampling: sampled,

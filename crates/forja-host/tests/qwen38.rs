@@ -252,11 +252,13 @@ fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>>
     let sampling = SamplingParams::default();
     let input = || Tensor::from_slice(&[1, 7, 32], &[3]);
     let first = retained.decode(DecodeInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens: Some(input()?),
         start_pos: 0,
         sampling,
     })?;
     let other = explicit.decode(DecodeInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens: Some(input()?),
         start_pos: 0,
         sampling,
@@ -265,11 +267,13 @@ fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>>
     let mut token = first.token.to_vec()?;
     for position in 3..10 {
         let actual = retained.decode(DecodeInput {
+            phase: forja_sdk::BatchPhase::Decode,
             tokens: None,
             start_pos: position,
             sampling,
         })?;
         let expected = explicit.decode(DecodeInput {
+            phase: forja_sdk::BatchPhase::Decode,
             tokens: Some(Tensor::from_slice(&token, &[1])?),
             start_pos: position,
             sampling,
@@ -281,6 +285,7 @@ fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>>
     assert!(
         retained
             .decode(DecodeInput {
+                phase: forja_sdk::BatchPhase::Decode,
                 tokens: None,
                 start_pos: 0,
                 sampling

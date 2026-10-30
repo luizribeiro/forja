@@ -2117,6 +2117,11 @@ async fn probe_output(
     for index in 0..steps {
         let output = runner
             .decode(EngineDecode {
+                phase: if index == 0 {
+                    forja_host::BatchPhase::Prompt
+                } else {
+                    forja_host::BatchPhase::Decode
+                },
                 tokens: (index == 0).then(|| prompt.to_vec()),
                 start_pos: if index == 0 {
                     0
@@ -2171,7 +2176,13 @@ async fn prepare_profile_prefix(
     prefix_context: usize,
 ) -> Result<(), Box<dyn Error>> {
     if prefix_context > 0 {
-        step(runner, tokens[..prefix_context].to_vec(), 0).await?;
+        step(
+            runner,
+            tokens[..prefix_context].to_vec(),
+            0,
+            forja_host::BatchPhase::Prompt,
+        )
+        .await?;
         runner.wait_for_queued_submissions().await?;
     }
     Ok(())
@@ -2185,7 +2196,13 @@ async fn measure_prefill_from(
 ) -> Result<Sample, Box<dyn Error>> {
     let before = runner.metrics();
     let started = Instant::now();
-    step(runner, tokens.to_vec(), u32::try_from(start)?).await?;
+    step(
+        runner,
+        tokens.to_vec(),
+        u32::try_from(start)?,
+        forja_host::BatchPhase::Prompt,
+    )
+    .await?;
     runner.wait_for_queued_submissions().await?;
     sample(before, runner.metrics(), started.elapsed())
 }
@@ -2302,6 +2319,7 @@ async fn measure_pipelined_tokens(
             outputs.push_back(
                 runner
                     .enqueue_decode(EngineDecode {
+                        phase: forja_host::BatchPhase::Decode,
                         tokens: None,
                         start_pos: position,
                         sampling,
@@ -2411,6 +2429,7 @@ async fn measure_pipelined_profile_step(
         outputs.push_back(
             runner
                 .enqueue_decode(EngineDecode {
+                    phase: forja_host::BatchPhase::Decode,
                     tokens: None,
                     start_pos: u32::try_from(
                         context_start
@@ -2508,9 +2527,11 @@ async fn step(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: Vec<u32>,
     start_pos: u32,
+    phase: forja_host::BatchPhase,
 ) -> Result<EngineOutput, Box<dyn Error>> {
     Ok(runner
         .step(EngineStep {
+            phase,
             tokens,
             start_pos,
             taps: false,
@@ -2527,10 +2548,11 @@ async fn select_from_tokens(
     options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
     if options.host_argmax {
-        return host_select(runner, tokens, start_pos).await;
+        return host_select(runner, tokens, start_pos, forja_host::BatchPhase::Prompt).await;
     }
     let output = runner
         .decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(tokens),
             start_pos,
             sampling: options.sampling,
@@ -2548,10 +2570,17 @@ async fn select_next(
     options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
     if options.host_argmax {
-        return host_select(runner, vec![token], start_pos).await;
+        return host_select(
+            runner,
+            vec![token],
+            start_pos,
+            forja_host::BatchPhase::Decode,
+        )
+        .await;
     }
     let output = runner
         .decode(EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos,
             sampling: options.sampling,
@@ -2566,8 +2595,9 @@ async fn host_select(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: Vec<u32>,
     start_pos: u32,
+    phase: forja_host::BatchPhase,
 ) -> Result<u32, Box<dyn Error>> {
-    let output = step(runner, tokens, start_pos).await?;
+    let output = step(runner, tokens, start_pos, phase).await?;
     argmax(&decode_f32_le(&runner.read(&output.logits).await?)?)
 }
 

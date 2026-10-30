@@ -155,6 +155,8 @@ pub struct VariantPickArm {
 
 /// Input to one unbatched engine invocation.
 pub struct StepInput {
+    /// Numerical phase, independent of token count or absolute position.
+    pub phase: BatchPhase,
     /// Token ids for this invocation.
     pub tokens: Tensor<u32>,
     /// Position assigned to the first token.
@@ -199,6 +201,8 @@ impl Default for SamplingParams {
 
 /// Input to decode with an engine-retained feedback token.
 pub struct DecodeInput {
+    /// Numerical phase, independent of explicit or retained token input.
+    pub phase: BatchPhase,
     /// Tokens to process, or `None` to reuse the preceding selected token.
     pub tokens: Option<Tensor<u32>>,
     /// Position assigned to the first token, including a reused feedback token.

@@ -79,6 +79,7 @@ interface engine {
   }
 
   record step-in {
+    phase: batch-phase,
     tokens: list<u32>,
     start-pos: u32,
     taps: bool,
@@ -91,6 +92,7 @@ interface engine {
   }
 
   record decode-in {
+    phase: batch-phase,
     tokens: option<list<u32>>,
     start-pos: u32,
     sampling: sampling-params,

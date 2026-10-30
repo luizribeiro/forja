@@ -178,6 +178,15 @@ pub enum BatchPhase {
     Decode,
 }
 
+impl From<BatchPhase> for engine_bindings::exports::l9o::gpu::engine::BatchPhase {
+    fn from(value: BatchPhase) -> Self {
+        match value {
+            BatchPhase::Prompt => Self::Prompt,
+            BatchPhase::Decode => Self::Decode,
+        }
+    }
+}
+
 /// Work performed by one serving graph.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchSelection {
@@ -292,6 +301,8 @@ pub struct VariantPickArm {
 /// Input to one unbatched engine invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineStep {
+    /// Numerical phase, independent of token count or absolute position.
+    pub phase: BatchPhase,
     /// Token ids processed by this invocation.
     pub tokens: Vec<u32>,
     /// Position of the first token.
@@ -327,6 +338,8 @@ impl Default for SamplingParams {
 /// Input to decode with an engine-retained feedback token.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineDecode {
+    /// Numerical phase, independent of explicit or retained token input.
+    pub phase: BatchPhase,
     /// Tokens to process, or `None` to reuse the preceding selected token.
     pub tokens: Option<Vec<u32>>,
     /// Position assigned to the first token, including a reused feedback token.
@@ -1539,6 +1552,7 @@ where
                     .call_step(
                         accessor,
                         StepIn {
+                            phase: input.phase.into(),
                             tokens: input.tokens,
                             start_pos: input.start_pos,
                             taps: input.taps,
@@ -2426,6 +2440,7 @@ where
                     .call_decode(
                         accessor,
                         DecodeIn {
+                            phase: input.phase.into(),
                             tokens: input.tokens,
                             start_pos: input.start_pos,
                             sampling: engine_bindings::exports::l9o::gpu::engine::SamplingParams {
@@ -10964,6 +10979,7 @@ mod tests {
             .unwrap();
         let output = runner
             .step(EngineStep {
+                phase: BatchPhase::Prompt,
                 tokens: vec![1],
                 start_pos: 0,
                 taps: false,
@@ -11013,6 +11029,7 @@ mod tests {
         runner.prepare_paged_request(None, 8).unwrap();
         let first = runner
             .step(EngineStep {
+                phase: BatchPhase::Prompt,
                 tokens: vec![1],
                 start_pos: 0,
                 taps: false,
@@ -11025,6 +11042,7 @@ mod tests {
 
         let second = runner
             .step(EngineStep {
+                phase: BatchPhase::Prompt,
                 tokens: vec![3],
                 start_pos: 1,
                 taps: false,
@@ -12274,6 +12292,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let result = runner
                 .step(EngineStep {
+                    phase: BatchPhase::Prompt,
                     tokens: (0..1_024).map(|value| value % 4).collect(),
                     start_pos: 0,
                     taps: false,

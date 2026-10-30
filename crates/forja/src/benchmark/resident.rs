@@ -247,6 +247,7 @@ mod tests {
                     runners.acquire(&options, point, component).await?;
                 runner.prepare_paged_request(None, 16)?;
                 let request = forja_host::EngineDecode {
+                    phase: forja_host::BatchPhase::Prompt,
                     tokens: Some(vec![1, 7, 33]),
                     start_pos: 0,
                     sampling: forja_host::SamplingParams::default(),

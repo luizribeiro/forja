@@ -24,6 +24,7 @@ impl Prepared {
         }
         let output = runner
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: Some(prompt.to_vec()),
                 start_pos: 0,
                 sampling: options.sampling,
@@ -61,6 +62,7 @@ impl Prepared {
             for index in 2..steps {
                 output = runner
                     .decode(EngineDecode {
+                        phase: forja_host::BatchPhase::Decode,
                         tokens: None,
                         start_pos: self
                             .tokens
@@ -95,6 +97,7 @@ impl Prepared {
         runner.prepare_paged_request(Some(prefix), reserved)?;
         let output = runner
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: Some(vec![self.feedback]),
                 start_pos: self.tokens,
                 sampling: options.sampling,
@@ -190,6 +193,7 @@ mod tests {
                     prepare_decode(&mut runner, &prompt, decode).await?;
                     let output = runner
                         .decode(EngineDecode {
+                            phase: forja_host::BatchPhase::Decode,
                             tokens: None,
                             start_pos: u32::try_from(length)?,
                             sampling: decode.sampling,

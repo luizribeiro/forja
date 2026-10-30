@@ -51,6 +51,7 @@ async fn metal_prompt_hidden_states_and_routing_match_transformers() -> Result<(
         .await??;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens,
             start_pos: 0,
             taps: true,
@@ -128,6 +129,7 @@ async fn decode_logits(
     runner.load_with_selections(None, &config).await??;
     runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: (0..8).collect(),
             start_pos: 0,
             taps: false,
@@ -137,6 +139,7 @@ async fn decode_logits(
     for step in 0..4 {
         let output = runner
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![(step * 7_919 + 17) % olmoe::VOCAB],
                 start_pos: 8 + step,
                 taps: false,

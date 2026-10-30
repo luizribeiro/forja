@@ -120,7 +120,34 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
     })
 }
 
+fn engine_step_impl() -> proc_macro2::TokenStream {
+    quote! {
+            async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
+                let tokens = token_tensor(&input.tokens)?;
+                let output = with_engine(|engine| {
+                    <ExportedEngine as ::forja_sdk::Engine>::step(
+                        engine,
+                        ::forja_sdk::StepInput {
+                            phase: phase(input.phase),
+                            tokens,
+                            start_pos: input.start_pos,
+                            taps: input.taps,
+                        },
+                    )
+                })?;
+                ::forja_sdk::eval().map_err(wit_error)?;
+                Ok(StepOut {
+                    logits: output.logits.into_guest(),
+                    taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
+                    router_logits: output.router_logits.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
+                })
+            }
+
+    }
+}
+
 fn engine_guest_impl() -> proc_macro2::TokenStream {
+    let step = engine_step_impl();
     let batch_exports = engine_batch_exports();
     let batch_helpers = engine_batch_helpers();
     let load_config = engine_load_config();
@@ -160,25 +187,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                 })
             }
 
-            async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
-                let tokens = token_tensor(&input.tokens)?;
-                let output = with_engine(|engine| {
-                    <ExportedEngine as ::forja_sdk::Engine>::step(
-                        engine,
-                        ::forja_sdk::StepInput {
-                            tokens,
-                            start_pos: input.start_pos,
-                            taps: input.taps,
-                        },
-                    )
-                })?;
-                ::forja_sdk::eval().map_err(wit_error)?;
-                Ok(StepOut {
-                    logits: output.logits.into_guest(),
-                    taps: output.taps.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
-                    router_logits: output.router_logits.into_iter().map(::forja_sdk::Tensor::into_guest).collect(),
-                })
-            }
+            #step
 
             async fn decode(input: DecodeIn) -> ::std::result::Result<DecodeOut, compute::Error> {
                 let tokens = input.tokens.as_deref().map(token_tensor).transpose()?;
@@ -186,6 +195,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
                     <ExportedEngine as ::forja_sdk::Engine>::decode(
                         engine,
                         ::forja_sdk::DecodeInput {
+                            phase: phase(input.phase),
                             tokens,
                             start_pos: input.start_pos,
                             sampling: sampling(input.sampling),
@@ -327,14 +337,18 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             }
         }
 
+        fn phase(value: bindings::exports::l9o::gpu::engine::BatchPhase) -> ::forja_sdk::BatchPhase {
+            match value {
+                bindings::exports::l9o::gpu::engine::BatchPhase::Prompt => ::forja_sdk::BatchPhase::Prompt,
+                bindings::exports::l9o::gpu::engine::BatchPhase::Decode => ::forja_sdk::BatchPhase::Decode,
+            }
+        }
+
         fn batch_shape(
             value: bindings::exports::l9o::gpu::engine::BatchShape,
         ) -> ::forja_sdk::BatchShape {
             ::forja_sdk::BatchShape {
-                phase: match value.phase {
-                    bindings::exports::l9o::gpu::engine::BatchPhase::Prompt => ::forja_sdk::BatchPhase::Prompt,
-                    bindings::exports::l9o::gpu::engine::BatchPhase::Decode => ::forja_sdk::BatchPhase::Decode,
-                },
+                phase: phase(value.phase),
                 bucket: value.bucket,
                 tokens: value.tokens,
                 selection: match value.selection {

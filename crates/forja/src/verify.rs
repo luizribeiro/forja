@@ -315,6 +315,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: tokens.clone(),
             start_pos: 0,
             taps: true,
@@ -502,6 +503,7 @@ where
     let teacher_forced = decode(runner, input, DecodeMode::TeacherForced, true).await?;
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: prompt_tokens,
             start_pos: 0,
             taps: false,
@@ -592,6 +594,7 @@ where
     );
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: prompt_tokens,
             start_pos: 0,
             taps: false,
@@ -702,6 +705,7 @@ where
                 .ok_or("decode position overflowed")?;
             let output = runner
                 .step(EngineStep {
+                    phase: forja_host::BatchPhase::Decode,
                     tokens: vec![match mode {
                         DecodeMode::FreeRunning => actual,
                         DecodeMode::TeacherForced => expected,
@@ -1004,6 +1008,7 @@ mod tests {
             ] {
                 let output = runner
                     .step(EngineStep {
+                        phase: forja_host::BatchPhase::Prompt,
                         tokens,
                         start_pos,
                         taps: false,
@@ -1050,6 +1055,11 @@ mod tests {
             for (step, &expected) in fixture.greedy_tokens().iter().enumerate() {
                 let output = runner
                     .decode(EngineDecode {
+                        phase: if step == 0 {
+                            forja_host::BatchPhase::Prompt
+                        } else {
+                            forja_host::BatchPhase::Decode
+                        },
                         tokens: (step == 0).then(|| prompt.clone()),
                         start_pos: if step == 0 {
                             0

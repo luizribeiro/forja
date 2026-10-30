@@ -83,6 +83,7 @@ async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box
     let sampling = forja_host::SamplingParams::default();
     let first = engine
         .decode(forja_host::EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(tokens.clone()),
             start_pos: 0,
             sampling,
@@ -102,6 +103,7 @@ async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box
     );
     let next = engine
         .decode(forja_host::EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: u32::try_from(tokens.len())?,
             sampling,
@@ -111,6 +113,7 @@ async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box
     tokens.push(selected);
     let explicit = engine
         .step(forja_host::EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens,
             start_pos: 0,
             taps: false,

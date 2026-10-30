@@ -370,6 +370,7 @@ impl forja_sdk::Engine for SmolLM2 {
             .ok_or_else(|| forja_sdk::Error::loading("decode position overflow"))?;
         let logits = self
             .step(forja_sdk::StepInput {
+                phase: input.phase,
                 tokens,
                 start_pos: input.start_pos,
                 taps: false,

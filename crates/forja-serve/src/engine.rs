@@ -1181,6 +1181,7 @@ where
         let first = self
             .runner
             .enqueue_decode(EngineDecode {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: Some(tokens[cached_len..].to_vec()),
                 start_pos,
                 sampling,
@@ -1844,6 +1845,7 @@ where
 {
     runner
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos,
             sampling,

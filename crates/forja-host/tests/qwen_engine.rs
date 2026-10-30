@@ -52,6 +52,7 @@ fn metal_all_layers_match_transformers() -> Result<(), Box<dyn Error>> {
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = single_token_case()?;
     let output = engine.step(forja_sdk::StepInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens,
         start_pos: 0,
         taps: true,
@@ -80,6 +81,7 @@ fn metal_chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Bo
     forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
     let (fixture, mut engine, tokens) = prompt_case("short-english", 7)?;
     let single = engine.step(forja_sdk::StepInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens,
         start_pos: 0,
         taps: true,
@@ -94,6 +96,7 @@ fn metal_chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Bo
 
     let (_, mut engine, first) = prompt_case("short-english", 3)?;
     engine.step(forja_sdk::StepInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens: first,
         start_pos: 0,
         taps: false,
@@ -103,6 +106,7 @@ fn metal_chunked_prefill_matches_single_pass_and_transformers() -> Result<(), Bo
         .map(|&token| u32::try_from(token))
         .collect::<Result<Vec<_>, _>>()?;
     let chunked = engine.step(forja_sdk::StepInput {
+        phase: forja_sdk::BatchPhase::Prompt,
         tokens: Tensor::from_slice(&suffix, &[4])?,
         start_pos: 3,
         taps: true,
@@ -252,6 +256,7 @@ where
         .ok_or("decode position overflowed")?;
     let resumed = pipelined
         .enqueue_decode(EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: None,
             start_pos: next_position,
             sampling: SamplingParams::default(),
@@ -272,6 +277,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn selected_tokens<B>(
     runner: &mut EngineRunner<B>,
     prompt: &[u32],
@@ -287,6 +293,7 @@ where
         return Ok(Vec::new());
     }
     let input = EngineDecode {
+        phase: forja_host::BatchPhase::Prompt,
         tokens: Some(prompt.to_vec()),
         start_pos: 0,
         sampling,
@@ -319,6 +326,7 @@ where
                 runner.set_profiling(replay_count > 0);
                 let output = runner
                     .enqueue_decode(EngineDecode {
+                        phase: forja_host::BatchPhase::Decode,
                         tokens: None,
                         start_pos: position,
                         sampling,
@@ -371,6 +379,7 @@ where
                 .ok_or("decode position overflowed")?;
             let output = runner
                 .decode(EngineDecode {
+                    phase: forja_host::BatchPhase::Decode,
                     tokens: None,
                     start_pos: position,
                     sampling,
@@ -419,6 +428,7 @@ where
     let prompt = (0_u32..8).collect::<Vec<_>>();
     let host_output = host
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: prompt.clone(),
             start_pos: 0,
             taps: false,
@@ -426,6 +436,7 @@ where
         .await??;
     let selected_output = selected
         .decode(EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(prompt),
             start_pos: 0,
             sampling: SamplingParams::default(),
@@ -444,6 +455,7 @@ where
         let input_token = replacement.unwrap_or(host_token);
         let host_output = host
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![input_token],
                 start_pos: position,
                 taps: false,
@@ -451,6 +463,7 @@ where
             .await??;
         let selected_output = selected
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: replacement.map(|token| vec![token]),
                 start_pos: position,
                 sampling: SamplingParams::default(),
@@ -469,6 +482,7 @@ where
     let replacement = selected_token.wrapping_add(1) % qwen3::VOCAB;
     let host_output = host
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: vec![replacement],
             start_pos: position,
             taps: false,
@@ -476,6 +490,7 @@ where
         .await??;
     let selected_output = selected
         .decode(EngineDecode {
+            phase: forja_host::BatchPhase::Decode,
             tokens: Some(vec![replacement]),
             start_pos: position,
             sampling: SamplingParams::default(),
@@ -539,6 +554,7 @@ where
     for (_, replay) in &mut replays {
         replay
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: prompt.clone(),
                 start_pos: 0,
                 taps: false,
@@ -546,6 +562,7 @@ where
             .await??;
     }
     lazy.step(EngineStep {
+        phase: forja_host::BatchPhase::Prompt,
         tokens: prompt,
         start_pos: 0,
         taps: false,
@@ -557,6 +574,7 @@ where
         let token = (step * 7_919 + 17) % qwen3::VOCAB;
         let lazy_output = lazy
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![token],
                 start_pos,
                 taps: false,
@@ -566,6 +584,7 @@ where
         for (label, replay) in &mut replays {
             let replay_output = replay
                 .step(EngineStep {
+                    phase: forja_host::BatchPhase::Prompt,
                     tokens: vec![token],
                     start_pos,
                     taps: false,

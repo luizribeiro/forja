@@ -54,6 +54,7 @@ impl<B: Backend + Send + Sync + 'static> Execution for forja_host::EngineRunner<
     ) -> Result<Output, Box<dyn Error>> {
         let output = self
             .step(forja_host::EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: tokens.to_vec(),
                 start_pos: start,
                 taps,

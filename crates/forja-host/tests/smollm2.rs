@@ -30,6 +30,7 @@ fn step(engine: &mut SmolLM2, tokens: &[u32], start_pos: u32) -> Result<Vec<f32>
     let count = u32::try_from(tokens.len())?;
     Ok(engine
         .step(forja_sdk::StepInput {
+            phase: forja_sdk::BatchPhase::Prompt,
             tokens: Tensor::from_slice(tokens, &[count])?,
             start_pos,
             taps: false,
@@ -152,6 +153,7 @@ fn compare_paths_on(
         let mut outputs = Vec::new();
         for engine in [&mut reference, &mut optimized] {
             outputs.push(engine.step(forja_sdk::StepInput {
+                phase: forja_sdk::BatchPhase::Prompt,
                 tokens: Tensor::from_slice(&tokens, &[count])?,
                 start_pos: 0,
                 taps: true,

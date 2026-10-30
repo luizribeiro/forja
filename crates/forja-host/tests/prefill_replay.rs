@@ -59,6 +59,7 @@ async fn chunked_prefill_replay_bounds_memory_and_evicts_tails() -> Result<(), B
     let tokens = patterned_tokens(32_760);
     let replay_output = replay
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: tokens.clone(),
             start_pos: 0,
             taps: true,
@@ -66,6 +67,7 @@ async fn chunked_prefill_replay_bounds_memory_and_evicts_tails() -> Result<(), B
         .await??;
     let lazy_output = lazy
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: tokens.clone(),
             start_pos: 0,
             taps: true,
@@ -142,6 +144,7 @@ async fn metal_chunked_prefill_replay_matches_a_small_lazy_shape() -> Result<(),
     let tokens = patterned_tokens(2_081);
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: tokens.clone(),
             start_pos: 0,
             taps: true,
@@ -299,6 +302,7 @@ async fn metal_qwen3_coder_reuses_prefill_graph_across_offsets() -> Result<(), B
             .map(|index| (index + offset) % qwen3_coder::VOCAB)
             .collect::<Vec<_>>();
         let input = EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(tokens),
             start_pos: offset,
             sampling: SamplingParams::default(),
@@ -363,6 +367,7 @@ async fn metal_qwen3_coder_bounds_exact_prefill_tail_graphs() -> Result<(), Box<
             .map(|index| (index.wrapping_mul(7_919).wrapping_add(17)) % qwen3_coder::VOCAB)
             .collect::<Vec<_>>();
         let input = EngineDecode {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: Some(tokens),
             start_pos: 0,
             sampling: SamplingParams::default(),
@@ -382,6 +387,7 @@ async fn metal_qwen3_coder_bounds_exact_prefill_tail_graphs() -> Result<(), Box<
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn compare_prefill<B>(
     replay_component: &Path,
     lazy_component: &Path,
@@ -415,6 +421,7 @@ where
             .collect::<Vec<_>>();
         let replay_prefill = replay
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: Some(tokens.clone()),
                 start_pos: 0,
                 sampling: SamplingParams::default(),
@@ -422,6 +429,7 @@ where
             .await??;
         let lazy_prefill = lazy
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: Some(tokens.clone()),
                 start_pos: 0,
                 sampling: SamplingParams::default(),
@@ -442,6 +450,7 @@ where
 
         reference
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: tokens.clone(),
                 start_pos: 0,
                 taps: true,
@@ -450,6 +459,7 @@ where
         let continuation_token = u32::from_le_bytes(replay_token.as_slice().try_into()?);
         let reference_next = reference
             .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
                 tokens: vec![continuation_token],
                 start_pos: length,
                 taps: true,
@@ -459,6 +469,7 @@ where
 
         let replay_next = replay
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: None,
                 start_pos: length,
                 sampling: SamplingParams::default(),
@@ -466,6 +477,7 @@ where
             .await??;
         let lazy_next = lazy
             .decode(EngineDecode {
+                phase: forja_host::BatchPhase::Decode,
                 tokens: None,
                 start_pos: length,
                 sampling: SamplingParams::default(),
@@ -515,6 +527,7 @@ where
 {
     let output = runner
         .step(EngineStep {
+            phase: forja_host::BatchPhase::Prompt,
             tokens: patterned_tokens(length),
             start_pos: 0,
             taps: false,
