@@ -57,6 +57,10 @@ fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
     assert_eq!(cost.read_bytes, 3280);
     assert_eq!(cost.write_bytes, (3 * 33 + 3 * 7 * 33) * 4);
     assert_eq!(cost.scalar_ops, 8);
+    assert_eq!(
+        (cost.state_read_bytes, cost.state_write_bytes),
+        (2772, 2772)
+    );
     assert!(
         commands
             .dispatch_many(op, &refs, &[&y, &inputs[5]])
@@ -103,4 +107,30 @@ fn block_contract_refuses_bad_grouping_scratch_and_aliases() {
             .dispatch_many(op, &refs, &[&y, &state, &scratch])
             .is_err()
     );
+}
+
+#[test]
+fn convolution_counts_history_tap_reads_and_boundary_carry() {
+    let (access, metadata, _) = delta_fixture(false);
+    for tokens in [1, 7, 33] {
+        let x = tensor(1, DType::F32, &[tokens, 7]);
+        let weights = tensor(2, DType::F32, &[4, 7]);
+        let history = tensor(3, DType::F32, &[3, 7]);
+        let y = tensor(10, DType::F32, &[tokens, 7]);
+        let next = tensor(11, DType::F32, &[3, 7]);
+        let mut inputs = vec![&x, &weights, &history];
+        inputs.extend(metadata[6..].iter());
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::State(StateOp::CausalDepthwiseConv(access)),
+                &inputs,
+                &[&y, &next],
+            )
+            .unwrap();
+        let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+        assert_eq!(cost.state_read_bytes, if tokens == 1 { 140 } else { 168 });
+        assert_eq!(cost.state_write_bytes, 84);
+        assert_eq!(cost.flops, 2 * u64::from(tokens) * 7 * 4);
+    }
 }

@@ -243,8 +243,9 @@ mod tests {
         let cost = forja_core::KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
         assert_eq!(
             (cost.flops, cost.read_bytes, cost.write_bytes),
-            (12, 60, 16)
+            (12, 88, 16)
         );
+        assert_eq!((cost.state_read_bytes, cost.state_write_bytes), (12, 8));
         assert!(
             CommandList::new()
                 .dispatch_many(op, &refs, &[&y, &inputs[2]])

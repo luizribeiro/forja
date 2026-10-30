@@ -111,18 +111,57 @@ impl StateOp {
             Self::DeltaRuleBlock(_) => return None,
             Self::DeltaRule(_) => {
                 let s = inputs[5].layout();
+                cost.state_read_bytes = s.element_count().checked_mul(4)?;
+                cost.state_write_bytes = cost.state_read_bytes;
                 s.element_count().checked_mul(7)?.checked_add(
                     u64::from(s.shape()[0])
                         .checked_mul(u64::from(s.shape()[2]))?
                         .checked_mul(2)?,
                 )?
             }
-            Self::CausalDepthwiseConv(_) => inputs[0]
-                .layout()
-                .element_count()
-                .checked_mul(u64::from(inputs[1].layout().shape()[0]))?
-                .checked_mul(2)?,
+            Self::CausalDepthwiseConv(_) => return convolution_cost(inputs, cost),
         };
         Some(cost)
     }
+}
+
+fn convolution_cost(inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCost> {
+    let tokens = u64::from(inputs[0].layout().shape()[0]);
+    let channels = u64::from(inputs[0].layout().shape()[1]);
+    let taps = u64::from(inputs[1].layout().shape()[0]);
+    let history = taps.checked_sub(1)?;
+    let covered = tokens.min(history);
+    let triangle = if covered == 0 {
+        0
+    } else {
+        covered
+            .checked_mul(covered.checked_sub(1)?)?
+            .checked_div(2)?
+    };
+    let history_convolution = covered.checked_mul(history)?.checked_sub(triangle)?;
+    let history_carry = if history > tokens {
+        history.checked_sub(tokens)?
+    } else {
+        0
+    };
+    cost.state_read_bytes = history_convolution
+        .checked_add(history_carry)?
+        .checked_mul(channels)?
+        .checked_mul(inputs[2].layout().dtype().byte_size())?;
+    cost.state_write_bytes = crate::cost::tensor_bytes(&inputs[2])?;
+    let convolution = tokens.checked_mul(taps)?;
+    let input_reads = convolution
+        .checked_sub(history_convolution)?
+        .checked_add(covered)?
+        .checked_mul(channels)?
+        .checked_mul(inputs[0].layout().dtype().byte_size())?;
+    let weight_reads = convolution
+        .checked_mul(channels)?
+        .checked_mul(inputs[1].layout().dtype().byte_size())?;
+    cost.read_bytes = input_reads
+        .checked_add(weight_reads)?
+        .checked_add(cost.state_read_bytes)?
+        .checked_add(crate::cost::bytes(&inputs[3..])?)?;
+    cost.flops = convolution.checked_mul(channels)?.checked_mul(2)?;
+    Some(cost)
 }
