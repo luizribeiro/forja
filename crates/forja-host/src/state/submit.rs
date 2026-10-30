@@ -63,8 +63,17 @@ impl<B: Backend> StateSubmission<B> {
     ///
     /// # Errors
     /// Returns a reconciliation or execution failure without publishing failed work.
-    pub fn finish(mut self) -> Result<(), compute::Error> {
-        self.complete(true)
+    pub fn finish(self) -> Result<(), compute::Error> {
+        self.finish_with_time().map(|_| ())
+    }
+
+    /// Drains and publishes state, retaining the backend's completed GPU duration.
+    ///
+    /// # Errors
+    /// Returns reconciliation, timeout or execution failures without publishing failed work.
+    pub fn finish_with_time(mut self) -> Result<Option<std::time::Duration>, compute::Error> {
+        self.complete(true)?;
+        Ok(self.submission.gpu_time())
     }
 
     /// Waits once and restores the retained checkpoint without publication.

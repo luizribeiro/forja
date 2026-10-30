@@ -8,7 +8,7 @@ use forja_core::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -17,6 +17,7 @@ use std::{
 struct Control {
     waits: AtomicUsize,
     failure: AtomicU8,
+    gpu_ns: AtomicU64,
 }
 
 struct ControlledBackend {
@@ -40,7 +41,10 @@ impl Submission for ControlledSubmission {
         }
     }
     fn gpu_time(&self) -> Option<Duration> {
-        None
+        match self.control.gpu_ns.load(Ordering::Acquire) {
+            0 => None,
+            nanos => Some(Duration::from_nanos(nanos)),
+        }
     }
 }
 
@@ -177,4 +181,17 @@ fn submission_owns_its_sequence_and_backing_through_early_drop() {
     drop(submission);
     assert_eq!(control.waits.load(Ordering::Acquire), 1);
     assert!(retained.upgrade().is_none());
+}
+
+#[test]
+fn state_completion_reports_gpu_time() {
+    let (control, storage, sequence) = setup();
+    control.gpu_ns.store(7, Ordering::Release);
+    let time = recording(&storage, &sequence, 1)
+        .submit()
+        .unwrap()
+        .finish_with_time()
+        .unwrap();
+    assert_eq!(time, Some(Duration::from_nanos(7)));
+    assert_eq!(control.waits.load(Ordering::Acquire), 1);
 }
