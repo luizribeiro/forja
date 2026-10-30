@@ -1,7 +1,9 @@
 //! Opaque state storage charged to the runner's allocation budget.
 
 mod block;
+mod capture;
 mod cell;
+pub use capture::StateCapture;
 mod guest;
 pub use guest::StateEntry;
 #[cfg(test)]
