@@ -11,7 +11,7 @@ mod native;
 mod state;
 pub use state::{
     LanePosition, StateBatch, StateBatchSubmission, StateCapture, StateCell, StateEntry,
-    StateRecording, StateSequenceHandle, StateStorage, StateSubmission,
+    StateRecording, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
 };
 mod weights;
 
