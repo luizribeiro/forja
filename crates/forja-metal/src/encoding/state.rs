@@ -136,7 +136,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metal_compiles_delta_block_transforms() {
+    fn metal_compiles_delta_block_stages_with_bounded_groups() {
         let backend = MetalBackend::new().unwrap();
         let mut pipelines = backend.pipelines.lock().unwrap();
         for name in [

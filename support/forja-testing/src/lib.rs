@@ -675,6 +675,32 @@ where
     R: Backend,
     C: Backend,
 {
+    assert_backends_agree_many_selected(
+        reference,
+        candidate,
+        op,
+        inputs,
+        outputs,
+        &(0..outputs.len()).collect::<Vec<_>>(),
+    )
+}
+
+/// Compares selected public outputs while still allocating internal scratch outputs.
+///
+/// # Errors
+/// Returns a backend, encoding, size, dtype, or tolerance error.
+pub fn assert_backends_agree_many_selected<R, C>(
+    reference: &R,
+    candidate: &C,
+    op: Op,
+    inputs: &[TensorSpec],
+    outputs: &[TensorSpec],
+    selected: &[usize],
+) -> Result<(), AgreementError>
+where
+    R: Backend,
+    C: Backend,
+{
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
     let mut reference_inputs = Vec::with_capacity(inputs.len());
     let mut candidate_inputs = Vec::with_capacity(inputs.len());
@@ -693,15 +719,18 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     run_many(reference, op, &reference_inputs, &reference_outputs)?;
     run_many(candidate, op, &candidate_inputs, &candidate_outputs)?;
-    for (spec, (expected, actual)) in outputs
+    for (index, (spec, (expected, actual))) in outputs
         .iter()
         .zip(reference_outputs.iter().zip(&candidate_outputs))
+        .enumerate()
     {
-        assert_outputs_agree(
-            spec.dtype,
-            &reference.read(expected)?,
-            &candidate.read(actual)?,
-        )?;
+        if selected.contains(&index) {
+            assert_outputs_agree(
+                spec.dtype,
+                &reference.read(expected)?,
+                &candidate.read(actual)?,
+            )?;
+        }
     }
     Ok(())
 }

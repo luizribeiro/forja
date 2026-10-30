@@ -30,6 +30,8 @@ mod row_programs;
 mod state;
 #[path = "../state_auth.rs"]
 mod state_auth;
+#[path = "../state_block.rs"]
+mod state_block;
 #[path = "../state_decay.rs"]
 mod state_decay;
 #[path = "../top_k.rs"]
