@@ -13094,6 +13094,18 @@ mod tests {
         fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
             self.inner.submit(commands)
         }
+
+        fn reclaim_completed(&self) {
+            self.inner.reclaim_completed();
+        }
+
+        fn submit_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            self.inner.submit_retained(commands, owners)
+        }
     }
 
     #[test]
@@ -13893,6 +13905,27 @@ mod tests {
     }
 
     impl AccountingBackend {
+        fn wrap_submission(
+            &self,
+            commands: CommandList,
+            inner: <CpuBackend as Backend>::Submission,
+        ) -> AccountingSubmission {
+            let sequence = self
+                .submissions
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+            AccountingSubmission {
+                inner,
+                _commands: commands,
+                gate: self.gate.clone(),
+                gpu_time: self.gpu_time,
+                delay: self.delay,
+                wait_error: self.wait_error,
+                sequence,
+                fail_submission: self.fail_submission,
+            }
+        }
+
         fn new(gate: Option<Arc<SubmitGate>>, gpu_time: Option<Duration>, delay: Duration) -> Self {
             Self {
                 inner: CpuBackend::new(),
@@ -14040,22 +14073,21 @@ mod tests {
         }
 
         fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
-            let retained = commands.clone();
-            let inner = self.inner.submit(commands)?;
-            let sequence = self
-                .submissions
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1);
-            Ok(AccountingSubmission {
-                inner,
-                _commands: retained,
-                gate: self.gate.clone(),
-                gpu_time: self.gpu_time,
-                delay: self.delay,
-                wait_error: self.wait_error,
-                sequence,
-                fail_submission: self.fail_submission,
-            })
+            let inner = self.inner.submit(commands.clone())?;
+            Ok(self.wrap_submission(commands, inner))
+        }
+
+        fn reclaim_completed(&self) {
+            self.inner.reclaim_completed();
+        }
+
+        fn submit_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            let inner = self.inner.submit_retained(commands.clone(), owners)?;
+            Ok(self.wrap_submission(commands, inner))
         }
 
         fn supports_replay_overlap(&self) -> bool {
@@ -14112,6 +14144,18 @@ mod tests {
 
         fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
             self.inner.submit(commands)
+        }
+
+        fn reclaim_completed(&self) {
+            self.inner.reclaim_completed();
+        }
+
+        fn submit_retained(
+            &self,
+            commands: CommandList,
+            owners: Vec<forja_core::CompletionResource>,
+        ) -> Result<Self::Submission, BackendError> {
+            self.inner.submit_retained(commands, owners)
         }
     }
 }

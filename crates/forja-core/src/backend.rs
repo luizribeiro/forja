@@ -1,11 +1,29 @@
 use std::{
+    any::Any,
     collections::HashMap,
     error::Error,
     fmt,
     ops::Range,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+
+/// Trusted ownership retained until submitted device work has physically completed.
+#[derive(Clone)]
+pub struct CompletionResource {
+    _owner: Arc<dyn Any + Send + Sync>,
+}
+
+impl CompletionResource {
+    /// Retains shared ownership without exposing it to an engine or device kernel.
+    #[must_use]
+    pub fn new<T: Any + Send + Sync>(owner: Arc<T>) -> Self {
+        Self { _owner: owner }
+    }
+}
 
 /// Memory attributed by a trusted backend.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -574,6 +592,9 @@ pub trait Backend {
     /// Backend state retained by a prepared scalar program.
     type ProgramHandle: Send + Sync + 'static;
 
+    /// Releases resources of physically completed work without waiting for pending work.
+    fn reclaim_completed(&self) {}
+
     /// Returns the backend and process memory visible to this backend.
     fn memory_usage(&self) -> MemoryUsage {
         MemoryUsage::default()
@@ -681,6 +702,19 @@ pub trait Backend {
     ///
     /// Returns invalid input if any tensor belongs to another backend.
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError>;
+
+    /// Submits work while retaining trusted owners through physical completion.
+    /// A caller timeout must not release these owners. Destruction occurs outside device callbacks.
+    ///
+    /// # Errors
+    /// The default refuses before execution; supporting backends preserve ownership on timeout.
+    fn submit_retained(
+        &self,
+        _commands: CommandList,
+        _owners: Vec<CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        Err(BackendError::UnsupportedOperation)
+    }
 
     /// Prepares a validated graph for repeated execution.
     ///

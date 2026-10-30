@@ -1075,6 +1075,7 @@ impl MetalProgram {
 }
 
 struct CompletionState {
+    retained: Vec<forja_core::CompletionResource>,
     feedback: Option<CommitResult>,
     event_signaled: bool,
     event_value: Option<u64>,
@@ -1584,6 +1585,27 @@ unsafe impl Send for CommitRetention {}
 unsafe impl Sync for CommitRetention {}
 
 impl Completion {
+    fn retain_resources(&self, owners: Vec<forja_core::CompletionResource>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.event_signaled && state.feedback.is_some() {
+            drop(state);
+            drop(owners);
+        } else {
+            state.retained.extend(owners);
+        }
+    }
+
+    fn take_retained(&self) -> Vec<forja_core::CompletionResource> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut state.retained)
+    }
+
     fn new(
         resources: CommandResources,
         event: InFlightEvent,
@@ -1615,6 +1637,7 @@ impl Completion {
             }
             Self {
                 state: Mutex::new(CompletionState {
+                    retained: Vec::new(),
                     feedback: None,
                     event_signaled: false,
                     event_value: None,
@@ -2243,6 +2266,7 @@ impl InFlightTracker {
         }
         for completed in &done {
             completed.completion.resolve_timestamps();
+            drop(completed.completion.take_retained());
         }
         let mut pool = self
             .pool
@@ -2321,6 +2345,12 @@ pub struct MetalSubmission {
     profile: Option<Mutex<SubmissionProfile>>,
     dispatch_profiles: Vec<DispatchProfile>,
     internal_profiles: Vec<InternalDispatchProfile>,
+}
+
+impl MetalSubmission {
+    pub(super) fn retain_resources(&self, owners: Vec<forja_core::CompletionResource>) {
+        self.completion.retain_resources(owners);
+    }
 }
 
 /// Timestamp granularity used for per-dispatch GPU profiling.
@@ -11832,6 +11862,75 @@ mod tests {
     fn metal_empty_command_list_completes() {
         let backend = MetalBackend::new().unwrap();
         backend.submit(CommandList::new()).unwrap().wait().unwrap();
+    }
+
+    fn retained_owners_release_after_completion(backend: &impl Backend) {
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                assert_not_in_metal_callback();
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let owner = forja_core::CompletionResource::new(Arc::new(Owner(Arc::clone(&released))));
+        let input = backend.alloc(DType::F32, &[4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[4097]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let submission = backend.submit_retained(commands, vec![owner]).unwrap();
+        submission.wait().unwrap();
+        assert_eq!(released.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cpu_retained_owners_release_after_completion() {
+        retained_owners_release_after_completion(&CpuBackend::new());
+    }
+
+    #[test]
+    fn metal_retained_owners_release_outside_callbacks_after_completion() {
+        retained_owners_release_after_completion(&MetalBackend::new().unwrap());
+    }
+
+    #[test]
+    fn metal_allocation_reclaims_completed_owners_after_caller_timeout() {
+        struct Owner(Arc<MetalBackend>, Tensor);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.release(&self.1).unwrap();
+            }
+        }
+        let backend = Arc::new(MetalBackend::with_pool_capacity(0).unwrap());
+        let input = backend.alloc(DType::F32, &[1024, 4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[1024, 4097]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let private = backend.alloc(DType::F32, &[1024, 4097]).unwrap();
+        let owner = Arc::new(Owner(Arc::clone(&backend), private));
+        let retained = Arc::downgrade(&owner);
+        let submission = backend
+            .submit_retained(commands, vec![forja_core::CompletionResource::new(owner)])
+            .unwrap();
+        assert_eq!(
+            submission.wait_timeout(Duration::ZERO),
+            Err(BackendError::Timeout)
+        );
+        drop(submission);
+        backend.set_memory_limit(backend.memory_usage().charged_bytes);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.in_flight.len() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(retained.upgrade().is_some());
+        let next = backend.alloc(DType::F32, &[1]);
+        assert!(retained.upgrade().is_none());
+        let next = next.unwrap();
+        assert!(retained.upgrade().is_none());
+        backend.release(&next).unwrap();
+        backend.release(&input).unwrap();
+        backend.release(&output).unwrap();
     }
 
     #[test]

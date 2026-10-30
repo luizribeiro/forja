@@ -1035,6 +1035,10 @@ impl Backend for MetalBackend {
     type Submission = MetalSubmission;
     type ProgramHandle = MetalProgramHandle;
 
+    fn reclaim_completed(&self) {
+        self.in_flight.drain_done();
+    }
+
     fn memory_usage(&self) -> MemoryUsage {
         let (physical_footprint, peak_physical_footprint) = crate::memory::physical_footprint()
             .map_or((None, None), |(current, peak)| (Some(current), peak));
@@ -1081,6 +1085,7 @@ impl Backend for MetalBackend {
     }
 
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
+        self.reclaim_completed();
         let byte_len = element_count(shape)?
             .checked_mul(dtype.byte_size())
             .ok_or(BackendError::AllocationFailed)?;
@@ -1235,6 +1240,16 @@ impl Backend for MetalBackend {
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands(commands)
+    }
+
+    fn submit_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<forja_core::CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        let submission = self.submit_commands(commands)?;
+        submission.retain_resources(owners);
+        Ok(submission)
     }
 
     fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {

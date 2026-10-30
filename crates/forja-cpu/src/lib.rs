@@ -1336,6 +1336,16 @@ impl Backend for CpuBackend {
     type Submission = CpuSubmission;
     type ProgramHandle = ();
 
+    fn submit_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<forja_core::CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        let completed = self.submit(commands);
+        drop(owners);
+        completed
+    }
+
     fn prepare_program(
         &self,
         _program: &ValidatedProgram,
