@@ -2433,11 +2433,11 @@ where
         Ok(checkpoint.state)
     }
 
-    /// Restores one serving lane without changing any sibling lane.
+    /// Restores paged storage for a lane without protected state.
     ///
     /// # Errors
     ///
-    /// Returns an error for a foreign or stale checkpoint.
+    /// Refuses foreign or stale checkpoints and lanes requiring [`Self::rollback_lane`].
     pub fn rollback_paged_lane(
         &mut self,
         lane: u32,
@@ -2446,6 +2446,11 @@ where
         let pool = self
             .page_pool
             .ok_or_else(|| invalid_handle("paged storage is unavailable"))?;
+        if self.store.data().paged_state_slot(pool)?.is_some() {
+            return Err(invalid_handle(
+                "protected state requires a paired lane checkpoint",
+            ));
+        }
         self.store
             .data_mut()
             .rollback_paged_lane_append(pool, lane, checkpoint)
@@ -4581,11 +4586,6 @@ impl<B: Backend + 'static> Host<B> {
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
-        if let Some(state) = self.state_slots.get_mut(&slot_rep) {
-            for bank in 0..2 {
-                state.cancel_lane(bank, lane)?;
-            }
-        }
         let binding = Arc::clone(
             &self
                 .table
@@ -4601,6 +4601,22 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        if !checkpoint.belongs_to(
+            &*sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?,
+        ) {
+            return Err(invalid_handle(
+                "paged checkpoint belongs to another sequence",
+            ));
+        }
+        self.drain_slot_state(slot_rep, lane)?;
+        let target = sequence
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+            .logical_len()
+            .min(checkpoint.logical_len());
+        self.rewind_slot_state(slot_rep, lane, target)?;
         rollback_paged_if_current(&sequence, checkpoint)?;
         for dirty in &lane_binding.table_dirty {
             dirty.store(true, Ordering::Release);
@@ -4634,11 +4650,24 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
+        self.drain_slot_state(slot_rep, 0)?;
+        if u64::from(logical_len)
+            > sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                .logical_len()
+        {
+            return Err(invalid_handle(
+                "paged rewind exceeds its committed boundary",
+            ));
+        }
+        self.rewind_slot_state(slot_rep, 0, u64::from(logical_len))?;
         sequence
             .lock()
             .map_err(|_| guest_error(BackendError::ExecutionFailed))?
             .rewind_private(u64::from(logical_len))
-            .map_err(|error| compute::Error::Quota(error.to_string()))
+            .map_err(paged_refusal)?;
+        self.mark_paged_tables_dirty(pool_rep, 0)
     }
 
     fn paged_prefix(&self, pool_rep: u32) -> Result<PagedPrefix, compute::Error> {
@@ -10046,6 +10075,124 @@ mod tests {
         );
     }
 
+    fn convolution_slot_host() -> (
+        Host<CpuBackend>,
+        Resource<PagePoolEntry>,
+        Resource<BatchSlotEntry>,
+    ) {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 16);
+        let slot = host
+            .open_state_slot(
+                &pool,
+                2,
+                vec![paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![3, 7],
+                }],
+                paged_storage::StateInputLayout {
+                    vocab: 33,
+                    prompt_tokens: 7,
+                },
+            )
+            .unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        (host, pool, slot)
+    }
+
+    #[tokio::test]
+    async fn private_paged_rollback_restores_the_retained_carry_boundary() {
+        let (mut host, pool, slot) = convolution_slot_host();
+        let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+        let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+        host.write(&weights, &1_f32.to_ne_bytes().repeat(28))
+            .unwrap();
+        let mut retained = None;
+        for (start, value, expected) in [(0, 2_f32, 2_f32), (1, 5_f32, 7_f32), (1, 5_f32, 7_f32)] {
+            if start == 1 && retained.is_some() {
+                host.rollback_paged_lane_append(pool.rep(), 0, retained.take().unwrap())
+                    .unwrap();
+                assert_eq!(
+                    host.state_lane_checkpoint(pool.rep(), 0)
+                        .unwrap()
+                        .unwrap()
+                        .position()
+                        .tokens,
+                    1
+                );
+            }
+            let checkpoint = host
+                .begin_paged_append(pool.rep(), start, 1)
+                .unwrap()
+                .0
+                .unwrap();
+            host.write(&input, &value.to_ne_bytes().repeat(7)).unwrap();
+            let commands = host.command_list().unwrap();
+            host.record_slot_state(
+                &commands,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &[
+                    Resource::new_borrow(input.rep()),
+                    Resource::new_borrow(weights.rep()),
+                ],
+                &output,
+                "",
+            )
+            .unwrap();
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            assert_eq!(
+                host.backend
+                    .read(&host.entry(&output).unwrap().tensor)
+                    .unwrap(),
+                expected.to_ne_bytes().repeat(7)
+            );
+            let checkpoint = host
+                .finish_paged_append(pool.rep(), checkpoint)
+                .unwrap()
+                .unwrap();
+            if start == 1 && retained.is_none() {
+                retained = Some(checkpoint);
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_paged_checkpoint_preserves_the_pending_state_boundary() {
+        let (mut host, pool, _slot) = convolution_slot_host();
+        let foreign_sequence = host.table.get(&pool).unwrap().pool.reserve(1).unwrap();
+        let foreign = foreign_sequence.checkpoint().unwrap();
+        let own = host
+            .begin_paged_append(pool.rep(), 0, 1)
+            .unwrap()
+            .0
+            .unwrap();
+        assert!(
+            host.rollback_paged_lane_append(pool.rep(), 0, foreign)
+                .is_err()
+        );
+        assert_eq!(
+            host.state_lane_checkpoint(pool.rep(), 0)
+                .unwrap()
+                .unwrap()
+                .position()
+                .tokens,
+            1
+        );
+        host.rollback_paged_lane_append(pool.rep(), 0, own).unwrap();
+        assert_eq!(
+            host.state_lane_checkpoint(pool.rep(), 0)
+                .unwrap()
+                .unwrap()
+                .position()
+                .tokens,
+            0
+        );
+    }
+
     #[test]
     fn paged_pool_fixture_tracks_its_initial_charge() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
@@ -11880,6 +12027,17 @@ mod tests {
             assert!(Arc::ptr_eq(&peer.sequence, &current.sequence));
             assert_eq!(current.sequence.lock().unwrap().logical_len(), 0);
         }
+        let checkpoint = runner.checkpoint_paged_lane(0).unwrap().unwrap();
+        assert!(runner.rollback_paged_lane(0, checkpoint).is_err());
+        assert_eq!(
+            runner
+                .checkpoint_state_lane(0)
+                .unwrap()
+                .unwrap()
+                .position()
+                .tokens,
+            3
+        );
         fs::remove_file(weights).unwrap();
     }
 

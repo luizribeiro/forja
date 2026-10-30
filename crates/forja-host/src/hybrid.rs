@@ -360,7 +360,11 @@ impl<B: Backend + 'static> Host<B> {
         self.mark_paged_tables_dirty(pool, lane)
     }
 
-    fn mark_paged_tables_dirty(&self, pool: u32, lane: u32) -> Result<(), compute::Error> {
+    pub(crate) fn mark_paged_tables_dirty(
+        &self,
+        pool: u32,
+        lane: u32,
+    ) -> Result<(), compute::Error> {
         let slot = self
             .table
             .get(&Resource::<PagePoolEntry>::new_borrow(pool))
@@ -396,6 +400,28 @@ impl<B: Backend + 'static> Host<B> {
                 sequence
                     .wait_drained(self.limits.submission_timeout)
                     .map_err(crate::guest_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rewind_slot_state(
+        &self,
+        slot: u32,
+        lane: usize,
+        tokens: u64,
+    ) -> Result<(), compute::Error> {
+        if let Some(state) = self.state_slots.get(&slot)
+            && let Some(sequence) = state.sequence_handle(lane)?
+        {
+            let current = sequence.position().tokens;
+            if current < tokens {
+                return Err(invalid_handle(
+                    "state rewind exceeds its committed boundary",
+                ));
+            }
+            if current > tokens {
+                sequence.rewind(tokens).map_err(invalid_handle)?;
             }
         }
         Ok(())
