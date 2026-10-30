@@ -355,6 +355,43 @@ mod tests {
         assert_eq!(host.completed_submissions.load(Ordering::Acquire), 1);
     }
     #[tokio::test]
+    async fn failed_state_outputs_are_tainted_and_tainted_inputs_are_refused() {
+        use std::sync::atomic::Ordering;
+        for input_tainted in [false, true] {
+            let (control, mut host) = super::super::lifecycle_tests::controlled_host();
+            let state = host
+                .create(compute::Dtype::F32, vec![1, 1])
+                .await
+                .unwrap()
+                .unwrap();
+            let x = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+            let weights = host.alloc(compute::Dtype::F32, &[2, 1]).unwrap();
+            let y = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+            if input_tainted {
+                let id = host.entry(&x).unwrap().tensor.buffer();
+                host.taints
+                    .state
+                    .lock()
+                    .unwrap()
+                    .tainted
+                    .insert(id, BackendError::ExecutionFailed);
+            } else {
+                control.failure.store(2, Ordering::Release);
+            }
+            assert!(
+                convolve(&mut host, [state.rep(), x.rep(), weights.rep(), y.rep()])
+                    .await
+                    .is_err()
+            );
+            if !input_tainted {
+                assert!(
+                    host.state_tensors(&[Resource::new_borrow(y.rep())])
+                        .is_err()
+                );
+            }
+        }
+    }
+    #[tokio::test]
     async fn state_plane_handle_limit_refuses_new_resources_until_drop() {
         let mut host = Host::new(
             forja_cpu::CpuBackend::new(),

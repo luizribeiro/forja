@@ -14,19 +14,19 @@ use std::{
 };
 
 #[derive(Default)]
-struct Control {
+pub(super) struct Control {
     waits: AtomicUsize,
-    failure: AtomicU8,
+    pub(super) failure: AtomicU8,
     timeout_ns: AtomicU64,
     gpu_ns: AtomicU64,
 }
 
-struct ControlledBackend {
+pub(super) struct ControlledBackend {
     cpu: forja_cpu::CpuBackend,
     control: Arc<Control>,
 }
 
-struct ControlledSubmission {
+pub(super) struct ControlledSubmission {
     inner: forja_cpu::CpuSubmission,
     control: Arc<Control>,
     failure: u8,
@@ -98,7 +98,7 @@ type Setup = (
     Arc<StateStorage<ControlledBackend>>,
     StateSequenceHandle<ControlledBackend>,
 );
-fn setup() -> Setup {
+pub(super) fn controlled_host() -> (Arc<Control>, Host<ControlledBackend>) {
     let control = Arc::new(Control::default());
     let host = Host::new(
         ControlledBackend {
@@ -107,6 +107,10 @@ fn setup() -> Setup {
         },
         Limits::new(65536, 8, 4096, 128, 4096),
     );
+    (control, host)
+}
+fn setup() -> Setup {
+    let (control, host) = controlled_host();
     let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
     let storage = host.create_state_storage(layout, 1).unwrap();
     let sequence = storage.reserve().unwrap();
