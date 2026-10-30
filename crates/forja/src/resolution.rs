@@ -206,6 +206,21 @@ fn build_chat_component(
     Ok(())
 }
 
+fn chat_library_name(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let manifest: toml::Value = toml::from_str(source)?;
+    manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|package| package.get("name"))
+        })
+        .and_then(toml::Value::as_str)
+        .map(|name| name.replace('-', "_"))
+        .ok_or_else(|| "chat manifest has no library or package name".into())
+}
+
 fn build_custom_chat_format(
     name: &str,
     build_dir: &Path,
@@ -218,7 +233,7 @@ fn build_custom_chat_format(
         &target_dir,
         &[],
         &[],
-        &name.replace('-', "_"),
+        &chat_library_name(&fs::read_to_string(&manifest)?)?,
         engine_output,
     )
 }
@@ -405,5 +420,23 @@ mod tests {
         let mismatch = verify_chat_input(&path, expected, "chat template").unwrap_err();
         assert!(mismatch.to_string().contains("chat template hash mismatch"));
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod chat_library_tests {
+    use super::chat_library_name;
+    #[test]
+    fn custom_chat_artifacts_follow_library_and_package_names() {
+        assert_eq!(
+            chat_library_name("[package]\nname='chat-package'\n[lib]\nname='distinct_chat'\n")
+                .unwrap(),
+            "distinct_chat"
+        );
+        assert_eq!(
+            chat_library_name("[package]\nname='chat-package'\n").unwrap(),
+            "chat_package"
+        );
+        assert!(chat_library_name("[package]\nversion='0.0.0'\n").is_err());
     }
 }
