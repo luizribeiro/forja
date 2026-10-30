@@ -28,6 +28,23 @@ interface paged-storage {
     open-state-slot: func(planes: u32, state-planes: list<state-plane-descriptor>) -> result<batch-slot, error>;
   }
 
+  enum state-operation {
+    causal-convolution,
+    delta-rule,
+    delta-rule-block,
+  }
+
+  record-state: func(
+    cmds: borrow<command-list>,
+    slot: borrow<batch-slot>,
+    lane: u32,
+    plane: u32,
+    operation: state-operation,
+    inputs: list<borrow<tensor>>,
+    output: borrow<tensor>,
+    algorithm: string,
+  ) -> result<_, error>;
+
   enum copy-direction {
     into-pages,
     out-of-pages,

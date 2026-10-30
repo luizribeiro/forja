@@ -3529,6 +3529,7 @@ pub struct CommandListEntry {
     retained: Vec<TensorEntry>,
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
+    state_uses: Vec<hybrid::StateUse>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
 }
@@ -5576,6 +5577,7 @@ impl<B: Backend + 'static> Host<B> {
                 retained_epilogues: Vec::new(),
                 paged: Vec::new(),
                 paged_bounds: Vec::new(),
+                state_uses: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -8286,6 +8288,22 @@ impl<B> paged_storage::Host for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn record_state(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+        plane: u32,
+        operation: paged_storage::StateOperation,
+        inputs: Vec<Resource<TensorEntry>>,
+        output: Resource<TensorEntry>,
+        algorithm: String,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(self.record_slot_state(
+            &commands, &slot, lane, plane, operation, &inputs, &output, &algorithm,
+        )))
+    }
+
     fn record_paged_copy(
         &mut self,
         commands: Resource<CommandListEntry>,
@@ -9242,6 +9260,71 @@ mod tests {
                 live_bytes: Arc::clone(&host.live_bytes),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host
+            .open_state_slot(
+                &pool,
+                2,
+                vec![super::paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![3, 7],
+                }],
+            )
+            .unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .begin(
+                0,
+                0,
+                crate::LanePosition {
+                    tokens: 1,
+                    reserved_tokens: 8,
+                    ..crate::LanePosition::default()
+                },
+            )
+            .unwrap();
+        let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+        let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+        host.write(&input, &2_f32.to_le_bytes().repeat(7)).unwrap();
+        host.write(&weights, &1_f32.to_le_bytes().repeat(28))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        let operands = [input, weights];
+        let operation = super::paged_storage::StateOperation::CausalConvolution;
+        assert!(
+            host.record_slot_state(&commands, &slot, 0, 1, operation, &operands, &output, "")
+                .is_err()
+        );
+        host.record_slot_state(&commands, &slot, 0, 0, operation, &operands, &output, "")
+            .unwrap();
+        let entry = host.table.delete(commands).unwrap();
+        assert_eq!(entry.state_uses.len(), 1);
+        assert!(
+            entry
+                .protected
+                .iter()
+                .all(|buffer| !entry.access.reads.contains(buffer)
+                    && !entry.access.writes.contains(buffer))
+        );
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        state.recording(0, 0).unwrap().commands = entry.commands;
+        state.take_batch(0).unwrap().submit_and_finish().unwrap();
+        host.release_retained(entry.retained).unwrap();
+        assert_eq!(
+            host.backend
+                .read(&host.entry(&output).unwrap().tensor)
+                .unwrap(),
+            2_f32.to_le_bytes().repeat(7)
+        );
     }
 
     #[test]

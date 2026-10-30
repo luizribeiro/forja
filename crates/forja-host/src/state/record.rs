@@ -32,7 +32,7 @@ pub struct StateCommands<B: Backend> {
     pub(super) access: StateAccess,
     pub(super) scratch: Vec<super::block::StateScratch<B>>,
     pub(super) metadata: Arc<StateMetadata<B>>,
-    pub(super) commands: CommandList,
+    pub(crate) commands: CommandList,
     pub(super) updated: Vec<bool>,
     pub(super) limits: Limits,
 }
@@ -204,7 +204,7 @@ impl<B: Backend> StateCommands<B> {
         Ok(())
     }
 
-    pub(super) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
+    pub(crate) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
         let mut owners = vec![
             forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
             forja_core::CompletionResource::new(Arc::clone(&self.metadata.charge)),
@@ -215,6 +215,14 @@ impl<B: Backend> StateCommands<B> {
                 .map(super::block::StateScratch::retained_resource),
         );
         owners
+    }
+
+    pub(crate) fn protected_buffers(&self) -> impl Iterator<Item = forja_core::BufferId> + '_ {
+        self.storage
+            .planes
+            .iter()
+            .chain(self.metadata.iter())
+            .map(Tensor::buffer)
     }
 
     /// Records one plane's delta-rule update from Q, K, V, decay and beta.
