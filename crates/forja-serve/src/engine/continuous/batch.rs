@@ -994,7 +994,7 @@ where
             barrier.note_finish(lane.is_constrained());
         }
         let completion = lane.completion(reason).await;
-        let publish = if completion.is_ok() && lane.prefix_reuse() {
+        let publish = if completion.is_ok() && lane.prefix_reuse() && self.prefix_index.is_some() {
             self.runner
                 .paged_lane_prefix(lane.slot)
                 .map_err(|error| batch_admission_error(&error))

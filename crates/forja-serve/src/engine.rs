@@ -990,6 +990,7 @@ where
         let prefix_index = info
             .serving
             .as_ref()
+            .filter(|_| runner.supports_prefix_reuse())
             .map(|serving| {
                 let limits = prefix_limits(serving, &config, max_context)?;
                 PrefixIndex::new(limits).map_err(|error| GenerationError::new(error.to_string()))
@@ -1567,7 +1568,9 @@ where
         )
         .await;
         let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
-        let ledger = self.config.serving.prefix_reuse.then_some(ledger).flatten();
+        let ledger = (self.config.serving.prefix_reuse && self.prefix_index.is_some())
+            .then_some(ledger)
+            .flatten();
         if paged && let Some(ledger) = ledger {
             let publish = self
                 .runner

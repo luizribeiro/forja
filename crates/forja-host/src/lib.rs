@@ -2332,6 +2332,12 @@ where
         Ok(true)
     }
 
+    /// Whether paged prefixes include every state capability used by this engine.
+    #[must_use]
+    pub fn supports_prefix_reuse(&self) -> bool {
+        self.store.data().state_slots.is_empty()
+    }
+
     /// Returns the active paged sequence as a shareable prefix capability.
     ///
     /// # Errors
@@ -11430,6 +11436,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(!runner.supports_prefix_reuse());
         let output = runner
             .step(EngineStep {
                 phase: BatchPhase::Prompt,
