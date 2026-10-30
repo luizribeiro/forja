@@ -20,6 +20,7 @@ pub struct StateSlots<B: Backend> {
     inactive_access: StateAccess,
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
+    padding: [Vec<Option<StateCommands<B>>>; 2],
 }
 
 impl<B: Backend> StateSlots<B> {
@@ -49,11 +50,13 @@ impl<B: Backend> StateSlots<B> {
             })
             .collect::<Vec<_>>();
         let banks = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
+        let padding = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         Ok(Self {
             storage,
             inactive_access,
             lanes,
             banks,
+            padding,
         })
     }
 
@@ -140,7 +143,10 @@ impl<B: Backend> StateSlots<B> {
         let transaction = sequence.begin_at(serial, position).map_err(pool_error)?;
         owner.serial = serial;
         match self.storage.record(sequence, transaction) {
-            Ok(record) => self.banks[bank][lane] = Some(record),
+            Ok(record) => {
+                self.padding[bank][lane] = None;
+                self.banks[bank][lane] = Some(record);
+            }
             Err(error) => {
                 if fresh {
                     owner.sequence = None;
@@ -165,6 +171,38 @@ impl<B: Backend> StateSlots<B> {
             .and_then(|bank| bank.get_mut(lane))
             .and_then(Option::as_mut)
             .ok_or_else(|| invalid_handle("state lane is not admitted in this bank"))
+    }
+
+    /// Borrows authenticated commands for an active lane or poisoned commands for padding.
+    ///
+    /// # Errors
+    /// Refuses invalid geometry or an activity flag inconsistent with the admitted bank.
+    pub fn commands(
+        &mut self,
+        bank: usize,
+        lane: usize,
+        active: bool,
+    ) -> Result<&mut StateCommands<B>, compute::Error> {
+        let admitted = self
+            .banks
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .ok_or_else(|| invalid_handle("state bank or lane is out of range"))?
+            .is_some();
+        if active != admitted {
+            return Err(invalid_handle(
+                "state activity differs from its transaction",
+            ));
+        }
+        if active {
+            return self.recording(bank, lane).map(|record| &mut **record);
+        }
+        if self.padding[bank][lane].is_none() {
+            self.padding[bank][lane] = Some(self.inactive()?);
+        }
+        self.padding[bank][lane]
+            .as_mut()
+            .ok_or_else(|| invalid_handle("inactive state bindings are missing"))
     }
 
     /// Transfers complete lane transactions to one submission owner.
@@ -250,6 +288,11 @@ mod tests {
             bytes
         );
         let mut slots = StateSlots::new(storage, 2).unwrap();
+        assert!(slots.commands(0, 0, true).is_err());
+        assert!(slots.commands(2, 0, false).is_err());
+        assert!(slots.commands(0, 2, false).is_err());
+        slots.commands(0, 0, false).unwrap();
+        slots.commands(1, 0, false).unwrap();
         let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
         let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
         let outputs = [
