@@ -701,6 +701,30 @@ where
     R: Backend,
     C: Backend,
 {
+    assert_backends_agree_many_selected_with(
+        reference,
+        candidate,
+        op,
+        inputs,
+        outputs,
+        selected,
+        |_| {},
+    )
+}
+
+/// Compares selected public outputs after configuring the validated candidate command list.
+///
+/// # Errors
+/// Returns a backend, encoding, size, dtype, or tolerance error.
+pub fn assert_backends_agree_many_selected_with<R: Backend, C: Backend>(
+    reference: &R,
+    candidate: &C,
+    op: Op,
+    inputs: &[TensorSpec],
+    outputs: &[TensorSpec],
+    selected: &[usize],
+    configure: impl FnOnce(&mut CommandList),
+) -> Result<(), AgreementError> {
     let mut values = DeterministicValues::new(0x6a09_e667_f3bc_c909);
     let mut reference_inputs = Vec::with_capacity(inputs.len());
     let mut candidate_inputs = Vec::with_capacity(inputs.len());
@@ -718,7 +742,13 @@ where
         .map(|output| allocate(candidate, output))
         .collect::<Result<Vec<_>, _>>()?;
     run_many(reference, op, &reference_inputs, &reference_outputs)?;
-    run_many(candidate, op, &candidate_inputs, &candidate_outputs)?;
+    run_many_with(
+        candidate,
+        op,
+        &candidate_inputs,
+        &candidate_outputs,
+        configure,
+    )?;
     for (index, (spec, (expected, actual))) in outputs
         .iter()
         .zip(reference_outputs.iter().zip(&candidate_outputs))
@@ -963,12 +993,23 @@ fn run_many<B: Backend>(
     inputs: &[Tensor],
     outputs: &[Tensor],
 ) -> Result<(), AgreementError> {
+    run_many_with(backend, op, inputs, outputs, |_| {})
+}
+
+fn run_many_with<B: Backend>(
+    backend: &B,
+    op: Op,
+    inputs: &[Tensor],
+    outputs: &[Tensor],
+    configure: impl FnOnce(&mut CommandList),
+) -> Result<(), AgreementError> {
     let mut commands = forja_core::CommandList::new();
     let inputs = inputs.iter().collect::<Vec<_>>();
     let outputs = outputs.iter().collect::<Vec<_>>();
     commands
         .dispatch_many(op, &inputs, &outputs)
         .map_err(|_| BackendError::InvalidInput)?;
+    configure(&mut commands);
     backend.submit(commands)?.wait()?;
     Ok(())
 }

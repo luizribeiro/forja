@@ -1,5 +1,5 @@
 use forja_core::{DType, DeltaBlockScratch, Op, StateOp};
-use forja_testing::{TensorSpec, assert_backends_agree_many_selected, state_test_metadata};
+use forja_testing::{TensorSpec, assert_backends_agree_many_selected_with, state_test_metadata};
 
 fn filled(shape: &[u32], value: f32) -> TensorSpec {
     let count = shape.iter().map(|&item| u64::from(item)).product::<u64>();
@@ -19,6 +19,16 @@ fn compare(
     initial: f32,
     underflow: bool,
 ) {
+    compare_using(
+        [tokens, heads, query_heads, keys, values],
+        initial,
+        underflow,
+        None,
+    );
+}
+
+fn compare_using(shape: [u32; 5], initial: f32, underflow: bool, variant: Option<&str>) {
+    let [tokens, heads, query_heads, keys, values] = shape;
     let (access, metadata) = state_test_metadata().unwrap();
     let scratch = DeltaBlockScratch::new(tokens, heads, keys, values).unwrap();
     let mut inputs = vec![
@@ -43,9 +53,7 @@ fn compare(
         filled(&[heads, keys, values], initial),
     ];
     inputs.extend(metadata);
-    assert_backends_agree_many_selected(
-        &forja_cpu::CpuBackend::new(),
-        &forja_metal::MetalBackend::new().unwrap(),
+    compare_specs(
         Op::State(StateOp::DeltaRuleBlock(access)),
         &inputs,
         &[
@@ -53,9 +61,90 @@ fn compare(
             TensorSpec::contiguous(DType::F32, &[heads, keys, values]),
             TensorSpec::contiguous(DType::F32, &[scratch.elements()]),
         ],
+        variant,
+    );
+}
+
+fn compare_specs(op: Op, inputs: &[TensorSpec], outputs: &[TensorSpec], variant: Option<&str>) {
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    assert_backends_agree_many_selected_with(
+        &forja_cpu::CpuBackend::new(),
+        &metal,
+        op,
+        inputs,
+        outputs,
         &[0, 1],
+        |commands| {
+            if let Some(name) = variant {
+                let pick = metal
+                    .validate_variant(commands.last_dispatch().unwrap(), name)
+                    .unwrap();
+                assert!(commands.set_last_backend_data(forja_core::BackendDispatchData::new(pick)));
+            }
+        },
     )
     .unwrap();
+}
+
+#[test]
+fn metal_mma_delta_blocks_mask_future_nan_values_before_output_arithmetic() {
+    for nan_row in [1, 7, 8, 31, 32, 63] {
+        let (access, metadata) = state_test_metadata().unwrap();
+        let mut inputs = vec![
+            filled(&[64, 1, 7], 0.125),
+            filled(&[64, 1, 7], 0.125),
+            TensorSpec::initialized(
+                DType::F32,
+                &[64, 3, 33],
+                (0..64 * 3 * 33)
+                    .flat_map(|index| {
+                        (if index / (3 * 33) == nan_row {
+                            f32::NAN
+                        } else {
+                            1.0
+                        })
+                        .to_le_bytes()
+                    })
+                    .collect(),
+            ),
+            filled(&[64, 3], -0.015),
+            filled(&[64, 3], 0.25),
+            filled(&[3, 7, 33], 0.125),
+        ];
+        inputs.extend(metadata);
+        let scratch = DeltaBlockScratch::new(64, 3, 7, 33).unwrap();
+        let outputs = [
+            TensorSpec::contiguous(DType::F32, &[64, 3, 33]),
+            TensorSpec::contiguous(DType::F32, &[3, 7, 33]),
+            TensorSpec::contiguous(DType::F32, &[scratch.elements()]),
+        ];
+        for name in [
+            "delta-rule-block.wy64-mma-v16",
+            "delta-rule-block.wy64-mma-v32",
+        ] {
+            compare_specs(
+                Op::State(StateOp::DeltaRuleBlock(access)),
+                &inputs,
+                &outputs,
+                Some(name),
+            );
+        }
+    }
+}
+
+#[test]
+fn metal_mma_delta_blocks_match_cpu_across_tails_and_underflow() {
+    for name in [
+        "delta-rule-block.wy64-mma-v16",
+        "delta-rule-block.wy64-mma-v32",
+    ] {
+        for tokens in [1, 7, 33, 63, 64, 65, 4097] {
+            for initial in [0.0, 0.125] {
+                compare_using([tokens, 3, 1, 7, 33], initial, true, Some(name));
+            }
+        }
+        compare_using([65, 6, 2, 128, 128], 0.125, false, Some(name));
+    }
 }
 
 #[test]
