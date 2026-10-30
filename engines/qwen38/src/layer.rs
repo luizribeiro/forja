@@ -81,7 +81,7 @@ impl DecoderLayer {
             Mixer::Recurrent(layer) if prefill => layer.prefill(&normalized, quant, delta)?,
             Mixer::Recurrent(layer) => layer.deltanet_layer(&normalized, quant)?,
             Mixer::Attention(layer) if prefill => {
-                layer.prefill(&normalized, position, quant, None)?
+                layer.prefill(&normalized, position, quant, attention)?
             }
             Mixer::Attention(layer) => {
                 layer.attention_layer(&normalized, position, quant, attention)?

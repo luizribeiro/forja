@@ -353,3 +353,22 @@ fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Resul
     assert!(model.forward(&token, 0, false).is_err());
     Ok(())
 }
+
+#[test]
+fn metal_prefill_layer_preserves_attention_variant_refusals() -> Result<(), Box<dyn Error>> {
+    use forja_sdk::target::metal::Variant;
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let input = Tensor::from_slice(&[bf16::from_f32(0.125); 3 * 64], &[3, 64])?;
+    let mut layer = qwen38::DecoderLayer::load(
+        &weights.scoped("language_model.model.layers.3"),
+        qwen38::Config::tiny(),
+        3,
+        64,
+    )?;
+    let valid = Variant::new("sdpa.decomposed")?;
+    layer.prefill(&input, 0, None, Some(&valid), None)?;
+    let wrong = Variant::new("matmul.portable")?;
+    assert!(layer.prefill(&input, 3, None, Some(&wrong), None).is_err());
+    Ok(())
+}
