@@ -10,14 +10,35 @@ fn filled(shape: &[u32], value: f32) -> TensorSpec {
     )
 }
 
-fn compare(tokens: u32, heads: u32, query_heads: u32, keys: u32, values: u32, initial: f32) {
+fn compare(
+    tokens: u32,
+    heads: u32,
+    query_heads: u32,
+    keys: u32,
+    values: u32,
+    initial: f32,
+    underflow: bool,
+) {
     let (access, metadata) = state_test_metadata().unwrap();
     let scratch = DeltaBlockScratch::new(tokens, heads, keys, values).unwrap();
     let mut inputs = vec![
         TensorSpec::permuted(DType::F32, &[keys, query_heads, tokens], &[2, 1, 0]),
         TensorSpec::permuted(DType::F32, &[keys, query_heads, tokens], &[2, 1, 0]),
         TensorSpec::contiguous(DType::F32, &[tokens, heads, values]),
-        filled(&[tokens, heads], -0.015),
+        TensorSpec::initialized(
+            DType::F32,
+            &[tokens, heads],
+            (0..tokens * heads)
+                .flat_map(|index| {
+                    (if underflow && index / heads % 17 == 9 {
+                        f32::NEG_INFINITY
+                    } else {
+                        -0.015_f32
+                    })
+                    .to_le_bytes()
+                })
+                .collect(),
+        ),
         filled(&[tokens, heads], 0.25),
         filled(&[heads, keys, values], initial),
     ];
@@ -41,9 +62,20 @@ fn compare(tokens: u32, heads: u32, query_heads: u32, keys: u32, values: u32, in
 fn metal_delta_block_matches_cpu_on_odd_and_partial_blocks() {
     for tokens in [1, 7, 33, 63, 64, 65] {
         for initial in [0.0, 0.125] {
-            compare(tokens, 6, 2, 7, 33, initial);
+            compare(tokens, 6, 2, 7, 33, initial, false);
         }
     }
+}
+
+#[test]
+fn metal_delta_block_survives_underflow_and_realistic_head_widths() {
+    compare(65, 6, 2, 7, 33, 0.125, true);
+    compare(7, 6, 2, 128, 128, 0.125, false);
+}
+
+#[test]
+fn metal_delta_block_preserves_a_long_canonical_scan() {
+    compare(4097, 1, 1, 7, 7, 0.125, true);
 }
 
 #[test]
