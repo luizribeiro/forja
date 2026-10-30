@@ -12,8 +12,9 @@ async fn load() -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn E
         golden_fixtures::sha256_file(&weights)?,
         fixtures.model_sha256()
     );
-    let component = test_guests::qwen38();
-    let profile = forja_config::read_profile(&std::fs::read(component)?)?;
+    let component = env::var_os("FORJA_QWEN38_COMPONENT")
+        .map_or_else(|| test_guests::qwen38().to_path_buf(), PathBuf::from);
+    let profile = forja_config::read_profile(&std::fs::read(&component)?)?;
     assert_eq!(
         profile.model().weights_sha256,
         format!("sha256:{}", fixtures.model_sha256())
@@ -21,7 +22,7 @@ async fn load() -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn E
     eprintln!(
         "component={} component-sha256={} weights-sha256={} profile-sha256={}",
         component.display(),
-        golden_fixtures::sha256_file(component)?,
+        golden_fixtures::sha256_file(&component)?,
         fixtures.model_sha256(),
         profile.sha256()?
     );
@@ -34,13 +35,13 @@ async fn load() -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn E
     )
     .with_gpu_limits(Duration::from_secs(10), Duration::from_secs(3600));
     let mut engine = forja_host::EngineRunner::new(
-        component,
+        &component,
         forja_metal::MetalBackend::new()?,
         limits,
         weights,
     )
     .await?;
-    let mut config = crate::common::load_config(component)?;
+    let mut config = crate::common::load_config(&component)?;
     config.replay = false;
     engine.load_with_selections(None, &config).await??;
     Ok((engine, fixtures))
