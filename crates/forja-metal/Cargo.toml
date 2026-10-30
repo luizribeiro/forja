@@ -57,7 +57,7 @@ unsafe_op_in_unsafe_fn = "deny"
 pedantic = "warn"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-forja-cpu = { path = "../forja-cpu" }
+forja-cpu = { path = "../forja-cpu", features = ["test-oracles"] }
 forja-testing = { path = "../../support/forja-testing" }
 half = "2"
 proptest = "1.9"

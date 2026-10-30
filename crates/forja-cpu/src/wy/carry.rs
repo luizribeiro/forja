@@ -43,6 +43,42 @@ impl<'a> Prepared<'a> {
         }
     }
 
+    #[cfg(feature = "test-oracles")]
+    pub(super) fn reference(&self, initial: &[f32]) -> [Vec<f32>; 3] {
+        let (output, next) = self.advance(initial);
+        let mut delta = vec![0.0; BLOCK * self.width];
+        let mut base = delta.clone();
+        for row in 0..self.gram.rows {
+            for column in 0..self.width {
+                let index = row * self.width + column;
+                delta[index] = self.solved_values[index]
+                    - tree_sum(self.keys, |key| {
+                        self.solved_keys[row * self.keys + key] * initial[key * self.width + column]
+                    });
+                base[index] = self.gram.prefix_decay[row]
+                    * tree_sum(self.keys, |key| {
+                        self.q[row * self.keys + key] * initial[key * self.width + column]
+                    });
+            }
+        }
+        let mut values = self.solved_values.clone();
+        values.resize(BLOCK * self.width, 0.0);
+        let mut keys = self.solved_keys.clone();
+        keys.resize(BLOCK * self.keys, 0.0);
+        let scratch = [
+            &self.gram.lower[..],
+            &self.gram.query_key,
+            &self.gram.prefix_decay,
+            &self.gram.tail_decay,
+            &values,
+            &keys,
+            &delta,
+            &base,
+        ]
+        .concat();
+        [scratch, output, next]
+    }
+
     pub(super) fn advance(&self, state: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let rows = self.gram.rows;
         let mut delta = vec![0.0; rows * self.width];

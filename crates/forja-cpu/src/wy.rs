@@ -25,6 +25,35 @@ fn tree_sum(count: usize, value: impl Fn(usize) -> f32) -> f32 {
     partial[0]
 }
 
+/// Returns padded WY scratch, public output and final state for one head/block.
+/// Inputs are contiguous query, key, value, log-decay and beta rows; shape gives key/value widths.
+///
+/// # Errors
+/// Refuses inconsistent widths, lengths or more than one canonical block.
+#[cfg(feature = "test-oracles")]
+pub fn block_reference(
+    inputs: [&[f32]; 5],
+    initial: &[f32],
+    shape: [u32; 2],
+) -> Result<[Vec<f32>; 3], forja_core::BackendError> {
+    let bad = forja_core::BackendError::InvalidInput;
+    let [keys, width] = shape.map(|value| usize::try_from(value).map_err(|_| bad));
+    let (keys, width) = (keys?, width?);
+    let [q, k, v, g, beta] = inputs;
+    if !(1..=BLOCK).contains(&g.len())
+        || keys == 0
+        || width == 0
+        || Some(q.len()) != g.len().checked_mul(keys)
+        || k.len() != q.len()
+        || Some(v.len()) != g.len().checked_mul(width)
+        || beta.len() != g.len()
+        || Some(initial.len()) != keys.checked_mul(width)
+    {
+        return Err(bad);
+    }
+    Ok(carry::Prepared::new(q, k, v, g, beta, keys, width).reference(initial))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +82,22 @@ mod tests {
             value: (0..rows * width).map(|_| rng.next_f32()).collect(),
             beta: vec![0.25; rows],
         }
+    }
+
+    #[cfg(feature = "test-oracles")]
+    #[test]
+    fn block_stage_reference_checks_geometry_and_known_recurrence() {
+        let [scratch, output, state] = super::block_reference(
+            [&[1.0, 2.0], &[0.5, 1.0], &[3.0], &[0.5_f32.ln()], &[0.25]],
+            &[2.0, 4.0],
+            [2, 1],
+        )
+        .unwrap();
+        assert_eq!(scratch[0], 1.0);
+        assert_eq!(output, [5.3125]);
+        assert_eq!(state, [1.0625, 2.125]);
+        assert!(super::block_reference([&[]; 5], &[], [0, 1]).is_err());
+        assert!(super::block_reference([&[1.0]; 5], &[0.0], [2, 1]).is_err());
     }
 
     #[test]

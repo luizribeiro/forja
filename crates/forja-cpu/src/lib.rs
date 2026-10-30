@@ -4,6 +4,8 @@ pub mod interpreter;
 pub mod paged;
 mod state;
 mod wy;
+#[cfg(feature = "test-oracles")]
+pub use wy::block_reference;
 
 use std::{ops::Range, sync::Mutex, time::Duration};
 
