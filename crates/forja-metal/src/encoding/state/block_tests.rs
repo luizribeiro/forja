@@ -202,3 +202,10 @@ fn mma_gram_matches_cpu_stage_oracle() {
 fn mma_output_matches_cpu_stage_oracle() {
     check(3, "state_block_output_mma", Some(32), 128).unwrap();
 }
+
+#[test]
+fn mma_carry_matches_cpu_stage_oracle() {
+    for panel in [16, 32] {
+        check(2, "state_block_carry_mma", Some(panel), 128).unwrap();
+    }
+}

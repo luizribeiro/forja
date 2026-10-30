@@ -8,6 +8,7 @@ struct DeltaBlockParams {
     uint blocks;
     uint stride;
     uint offsets[8];
+    uint panel;
 };
 
 uint delta_block_base(constant DeltaBlockParams &params, uint block, uint head) {
