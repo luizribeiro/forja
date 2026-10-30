@@ -4294,6 +4294,8 @@ impl<B: Backend + 'static> Host<B> {
         }
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
+            state_batch: None,
+            state_owners: Vec::new(),
             work: SubmissionWork::Commands(commands),
             access,
             retained: Vec::new(),
@@ -6126,8 +6128,17 @@ impl<B: Backend + 'static> Host<B> {
             self.release_retained(entry.retained)?;
             return Err(error);
         }
+        let (state_batch, state_owners) = match self.prepare_state_work(&entry.state_uses) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(error);
+            }
+        };
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
+            state_batch,
+            state_owners,
             work: SubmissionWork::Commands(entry.commands),
             access: entry.access,
             retained: entry.retained,
@@ -6179,6 +6190,8 @@ impl<B: Backend + 'static> Host<B> {
         PagedCheck::validate_all(&entry.paged_bounds, Some(&checked))?;
         Ok(SubmitRequest {
             backend: Arc::clone(&self.backend),
+            state_batch: None,
+            state_owners: Vec::new(),
             work: SubmissionWork::Replay {
                 graph: Arc::clone(&entry.graph),
                 values,
@@ -6936,6 +6949,8 @@ struct ReadRequest<B: Backend> {
 struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
     work: SubmissionWork,
+    state_batch: Option<StateBatch<B>>,
+    state_owners: Vec<forja_core::CompletionResource>,
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
     paged: Vec<PagedUse>,
@@ -7360,20 +7375,26 @@ struct TaintFlight {
 }
 
 impl TaintFlight {
+    fn check_dependencies<T>(
+        &self,
+        result: Result<T, BackendError>,
+        timeout: Duration,
+    ) -> Result<T, BackendError> {
+        result.and_then(|value| {
+            for dependency in &self.dependencies {
+                dependency.wait(timeout)?;
+            }
+            Ok(value)
+        })
+    }
+
     fn finish<T>(
         mut self,
         mut result: Result<T, BackendError>,
         committed: bool,
         timeout: Duration,
     ) -> Result<T, BackendError> {
-        if result.is_ok() {
-            for dependency in &self.dependencies {
-                if let Err(error) = dependency.wait(timeout) {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
+        result = self.check_dependencies(result, timeout);
         if committed
             && let Err(error) = result
             && let Ok(mut state) = self.owner.state.lock()
@@ -7574,6 +7595,8 @@ where
             let Self {
                 backend,
                 work,
+                state_batch,
+                state_owners,
                 access,
                 retained,
                 paged,
@@ -7593,7 +7616,11 @@ where
                 Err(error) => Err(error),
                 Ok(reservation) => match taints.begin(&access) {
                     Err(error) => Err(error),
-                    Ok(taint) => match submit_work(backend.as_ref(), work, profile.is_some()) {
+                    Ok(taint) => match hybrid::SubmittedWork::<B>::queue(
+                        state_batch,
+                        state_owners,
+                        |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
+                    ) {
                         Err(error) => {
                             let error = taint
                                 .finish::<()>(Err(error), false, self.timeout)
@@ -7602,7 +7629,7 @@ where
                             Err(error)
                         }
                         Ok(submission) => {
-                            let serial = submission.completion_serial();
+                            let serial = submission.backend().completion_serial();
                             let marked = PagedUse::mark_all(&paged, serial);
                             Ok((submission, reservation, taint, serial, marked))
                         }
@@ -7629,12 +7656,12 @@ where
                 }
             };
             let wait_started = Instant::now();
-            let wait = submission.wait_timeout(timeout);
+            let wait = submission.backend().wait_timeout(timeout);
             let observed =
                 PagedUse::observe_all(&paged, serial, wait != Err(BackendError::Timeout));
             let wall_time = duration_ns(wait_started.elapsed()).max(1);
-            let gpu_time = submission.gpu_time().map(duration_ns);
-            let submission_profile = submission.profile();
+            let gpu_time = submission.backend().gpu_time().map(duration_ns);
+            let submission_profile = submission.backend().profile();
             let charged = submission_charge(&wait, reservation.amount(), gpu_time, wall_time);
             let accounting = reservation.settle(charged);
             let result = combine_submission_results(wait, accounting, marked, observed).map(|()| {
@@ -7647,7 +7674,7 @@ where
                 Some(flight) => flight.finish(result),
                 None => result,
             };
-            let result = taint.finish(result, true, timeout);
+            let result = submission.finish(taint, result, timeout);
             drop(flight);
             if let Ok(gpu_time) = result {
                 if let Some(gpu_time) = gpu_time {
@@ -7677,15 +7704,28 @@ fn record_submission_profile(
 fn submit_work<B: Backend>(
     backend: &B,
     work: SubmissionWork,
+    owners: Vec<forja_core::CompletionResource>,
     profiled: bool,
 ) -> Result<B::Submission, BackendError> {
     match work {
-        SubmissionWork::Commands(commands) if profiled => backend.submit_profiled(commands),
-        SubmissionWork::Commands(commands) => backend.submit(commands),
-        SubmissionWork::Replay { graph, values } if profiled => {
-            backend.replay_profiled(&graph, values)
+        SubmissionWork::Commands(commands) if profiled => {
+            backend.submit_profiled_retained(commands, owners)
         }
-        SubmissionWork::Replay { graph, values } => backend.replay(&graph, values),
+        SubmissionWork::Commands(commands) => backend.submit_retained(commands, owners),
+        SubmissionWork::Replay { graph, values } if owners.is_empty() => {
+            if profiled {
+                backend.replay_profiled(&graph, values)
+            } else {
+                backend.replay(&graph, values)
+            }
+        }
+        SubmissionWork::Replay { graph, values } => backend.replay_bound_retained(
+            &graph,
+            values,
+            &forja_core::ReplayBindings::default(),
+            owners,
+            profiled,
+        ),
     }
 }
 
@@ -9262,8 +9302,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
+    #[tokio::test]
+    async fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 2, 8);
         let slot = host
@@ -9278,18 +9318,15 @@ mod tests {
             .unwrap();
         host.bind_paged_request(pool.rep(), None, 8).unwrap();
         host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
+        let position = crate::LanePosition {
+            tokens: 1,
+            reserved_tokens: 8,
+            ..crate::LanePosition::default()
+        };
         host.state_slots
             .get_mut(&slot.rep())
             .unwrap()
-            .begin(
-                0,
-                0,
-                crate::LanePosition {
-                    tokens: 1,
-                    reserved_tokens: 8,
-                    ..crate::LanePosition::default()
-                },
-            )
+            .begin(0, 0, position)
             .unwrap();
         let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
         let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
@@ -9306,7 +9343,7 @@ mod tests {
         );
         host.record_slot_state(&commands, &slot, 0, 0, operation, &operands, &output, "")
             .unwrap();
-        let entry = host.table.delete(commands).unwrap();
+        let entry = host.table.get(&commands).unwrap();
         assert_eq!(entry.state_uses.len(), 1);
         assert!(
             entry
@@ -9315,10 +9352,31 @@ mod tests {
                 .all(|buffer| !entry.access.reads.contains(buffer)
                     && !entry.access.writes.contains(buffer))
         );
-        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
-        state.recording(0, 0).unwrap().commands = entry.commands;
-        state.take_batch(0).unwrap().submit_and_finish().unwrap();
-        host.release_retained(entry.retained).unwrap();
+        let input_buffer = host.entry(&operands[0]).unwrap().tensor.buffer();
+        host.taints
+            .state
+            .lock()
+            .unwrap()
+            .tainted
+            .insert(input_buffer, BackendError::ExecutionFailed);
+        assert!(host.prepare_submit(commands).unwrap().run().await.is_err());
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+        host.taints
+            .state
+            .lock()
+            .unwrap()
+            .tainted
+            .remove(&input_buffer);
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .begin(0, 0, position)
+            .unwrap();
+        let retry = host.command_list().unwrap();
+        host.record_slot_state(&retry, &slot, 0, 0, operation, &operands, &output, "")
+            .unwrap();
+        host.prepare_submit(retry).unwrap().run().await.unwrap();
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
         assert_eq!(
             host.backend
                 .read(&host.entry(&output).unwrap().tensor)

@@ -28,11 +28,30 @@ impl<B: Backend> StateBatchSubmission<B> {
         self.complete(false)
     }
 
+    pub(crate) fn submission(&self) -> &B::Submission {
+        &self.submission
+    }
+
+    pub(crate) fn finish_after(
+        mut self,
+        execution: Result<(), BackendError>,
+    ) -> Result<(), compute::Error> {
+        self.reconcile_after(execution, true)
+    }
+
     fn complete(&mut self, publish: bool) -> Result<(), compute::Error> {
-        self.reconciled = true;
-        let mut execution = self
+        let execution = self
             .submission
             .wait_timeout(self.batch.recordings[0].limits.submission_timeout);
+        self.reconcile_after(execution, publish)
+    }
+
+    fn reconcile_after(
+        &mut self,
+        mut execution: Result<(), BackendError>,
+        publish: bool,
+    ) -> Result<(), compute::Error> {
+        self.reconciled = true;
         if execution != Err(BackendError::Timeout) {
             for recording in &self.batch.recordings {
                 if let Some(predecessor) = &recording.predecessor {

@@ -33,6 +33,7 @@ pub(crate) struct StateUse {
     pub(crate) slot: u32,
     pub(crate) bank: usize,
     pub(crate) lane: usize,
+    pub(crate) active: bool,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -141,10 +142,108 @@ impl<B: Backend + 'static> Host<B> {
             slot: slot.rep(),
             bank,
             lane,
+            active,
         };
         if !entry.state_uses.contains(&usage) {
             entry.state_uses.push(usage);
         }
         Ok(())
+    }
+}
+
+impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn prepare_state_work(
+        &mut self,
+        usages: &[StateUse],
+    ) -> Result<
+        (
+            Option<crate::StateBatch<B>>,
+            Vec<forja_core::CompletionResource>,
+        ),
+        compute::Error,
+    > {
+        let Some(first) = usages.first() else {
+            return Ok((None, Vec::new()));
+        };
+        if usages
+            .iter()
+            .any(|usage| usage.slot != first.slot || usage.bank != first.bank)
+        {
+            return Err(invalid_handle("state commands mix slot banks"));
+        }
+        let state = self
+            .state_slots
+            .get_mut(&first.slot)
+            .ok_or_else(|| invalid_handle("state slot is missing"))?;
+        let mut owners = Vec::new();
+        for usage in usages {
+            owners.extend(
+                state
+                    .commands(usage.bank, usage.lane, usage.active)?
+                    .retained_resources(),
+            );
+        }
+        let batch = if usages.iter().any(|usage| usage.active) {
+            Some(state.take_batch(first.bank)?)
+        } else {
+            None
+        };
+        Ok((batch, owners))
+    }
+}
+
+pub(crate) enum SubmittedWork<B: Backend> {
+    Plain(B::Submission),
+    State(crate::StateBatchSubmission<B>),
+}
+
+impl<B: Backend> SubmittedWork<B> {
+    pub(crate) fn queue(
+        batch: Option<crate::StateBatch<B>>,
+        mut owners: Vec<forja_core::CompletionResource>,
+        submit: impl FnOnce(
+            Vec<forja_core::CompletionResource>,
+        ) -> Result<B::Submission, forja_core::BackendError>,
+    ) -> Result<Self, forja_core::BackendError> {
+        match batch {
+            None => submit(owners).map(Self::Plain),
+            Some(batch) => batch
+                .submit_using(|retained| {
+                    owners.extend(retained);
+                    submit(owners)
+                })
+                .map(Self::State)
+                .map_err(|_| forja_core::BackendError::ExecutionFailed),
+        }
+    }
+
+    pub(crate) fn backend(&self) -> &B::Submission {
+        match self {
+            Self::Plain(submission) => submission,
+            Self::State(batch) => batch.submission(),
+        }
+    }
+
+    pub(crate) fn finish<T>(
+        self,
+        taint: crate::TaintFlight,
+        result: Result<T, forja_core::BackendError>,
+        timeout: std::time::Duration,
+    ) -> Result<T, forja_core::BackendError> {
+        let result = taint.check_dependencies(result, timeout);
+        let execution = result.as_ref().map(|_| ()).map_err(|error| *error);
+        let state = match self {
+            Self::Plain(_) => execution,
+            Self::State(batch) => batch.finish_after(execution).map_err(|_| {
+                execution
+                    .err()
+                    .unwrap_or(forja_core::BackendError::ExecutionFailed)
+            }),
+        };
+        taint.finish(
+            result.and_then(|value| state.map(|()| value)),
+            true,
+            timeout,
+        )
     }
 }
