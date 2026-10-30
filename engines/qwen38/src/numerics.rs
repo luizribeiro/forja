@@ -1,5 +1,5 @@
 mod decay;
-pub(crate) use decay::decay;
+pub(crate) use decay::{decay, log_decay};
 use forja_sdk::{Result, Tensor, bf16};
 
 #[forja_sdk::kernel(map)]

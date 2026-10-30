@@ -67,6 +67,51 @@ fn recurrent_block_matches_transformers_token_by_token() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn recurrent_prefill_matches_transformers_block_outputs() -> Result<(), Box<dyn Error>> {
+    check_recurrent_prefill(None)
+}
+
+#[test]
+fn metal_recurrent_prefill_matches_transformers_block_outputs() -> Result<(), Box<dyn Error>> {
+    forja_sdk::set_native_device(forja_sdk::NativeDevice::Metal);
+    check_recurrent_prefill(Some(&forja_sdk::target::metal::Variant::new(
+        "delta-rule-block.wy64-fixed",
+    )?))
+}
+
+fn check_recurrent_prefill(
+    pick: Option<&forja_sdk::target::metal::Variant>,
+) -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let reference = Weights::open(fixture("blocks.safetensors"))?;
+    let input = reference
+        .tensor::<f32>("block_input_0", &[3, 64])?
+        .to_dtype::<bf16>()?;
+    let expected = reference
+        .tensor::<f32>("block_output_0", &[3, 64])?
+        .to_vec()?;
+    let mut block = qwen38::DeltaNet::load(
+        &weights.scoped("language_model.model.layers.0.linear_attn"),
+        qwen38::Config::tiny(),
+    )?;
+    agree(
+        &expected,
+        &block
+            .prefill(&input, None, pick)?
+            .to_dtype::<f32>()?
+            .to_vec()?,
+    )?;
+    block.reset()?;
+    agree(
+        &expected,
+        &block
+            .prefill(&input, None, pick)?
+            .to_dtype::<f32>()?
+            .to_vec()?,
+    )
+}
+
+#[test]
 fn attention_block_matches_transformers_with_per_head_gates() -> Result<(), Box<dyn Error>> {
     let weights = Weights::open(fixture("model.safetensors"))?;
     let reference = Weights::open(fixture("blocks.safetensors"))?;

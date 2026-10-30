@@ -15,6 +15,20 @@ fn coefficient(
 ) -> forja_sdk::kernel::Elem {
     (-log_a.exp_rounded() * softplus).exp_rounded()
 }
+#[forja_sdk::kernel(map)]
+fn log_coefficient(
+    softplus: forja_sdk::kernel::Elem,
+    log_a: forja_sdk::kernel::Elem,
+) -> forja_sdk::kernel::Elem {
+    -log_a.exp_rounded() * softplus
+}
+pub(crate) fn log_decay(
+    a: &Tensor<f32>,
+    bias: &Tensor<f32>,
+    log_a: &Tensor<f32>,
+) -> Result<Tensor<f32>> {
+    log_coefficient(&softplus(a, bias)?, log_a)
+}
 pub(crate) fn decay(
     a: &Tensor<f32>,
     bias: &Tensor<f32>,

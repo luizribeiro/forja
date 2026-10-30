@@ -79,12 +79,38 @@ impl DeltaNet {
         input: &Tensor<bf16>,
         pick: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
+        self.forward(input, pick, false, None)
+    }
+    /// Applies a canonical prefill block, including its masked final tail.
+    ///
+    /// # Errors
+    /// Refuses empty or oversized blocks, invalid picks or failed state operations.
+    pub fn prefill(
+        &mut self,
+        input: &Tensor<bf16>,
+        quant: Option<&Variant>,
+        delta: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        self.forward(input, quant, true, delta)
+    }
+    fn forward(
+        &mut self,
+        input: &Tensor<bf16>,
+        pick: Option<&Variant>,
+        prefill: bool,
+        delta: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
         let c = self.config;
-        if input.shape() != [1, c.hidden] {
-            return Err(forja_sdk::Error::loading(
-                "DeltaNet requires one normalized token",
-            ));
+        let tokens = input.shape().first().copied().unwrap_or(0);
+        if input.shape() != [tokens, c.hidden]
+            || tokens == 0
+            || tokens > 64
+            || (!prefill && tokens != 1)
+        {
+            return Err(forja_sdk::Error::loading("invalid delta layer token span"));
         }
+        let key_rows = rows(tokens, c.key_heads)?;
+        let value_rows = rows(tokens, c.value_heads)?;
         let projected = self.qkv.forward(input, pick)?;
         let convolved = self
             .history
@@ -93,35 +119,64 @@ impl DeltaNet {
         let keys = c.key_heads * c.key_dim;
         let query = mixed
             .narrow(1, 0, keys)?
-            .reshape(&[c.key_heads, c.key_dim])?
+            .contiguous()?
+            .reshape(&[key_rows, c.key_dim])?
             .to_dtype::<f32>()?;
         let key = mixed
             .narrow(1, keys, keys)?
-            .reshape(&[c.key_heads, c.key_dim])?
+            .contiguous()?
+            .reshape(&[key_rows, c.key_dim])?
             .to_dtype::<f32>()?;
         let scale = numerics::inverse_sqrt_width(c.key_dim)?;
         let query = numerics::l2(&query, scale)?;
         let key = numerics::l2(&key, 1.0)?;
         let value = mixed
             .narrow(1, 2 * keys, c.value_heads * c.value_dim)?
-            .reshape(&[c.value_heads, c.value_dim])?;
-        let beta =
-            numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(&[c.value_heads])?;
+            .contiguous()?
+            .reshape(&[value_rows, c.value_dim])?;
+        let gate_shape = if prefill {
+            vec![tokens, c.value_heads]
+        } else {
+            vec![c.value_heads]
+        };
+        let beta = numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(&gate_shape)?;
         let a = self
             .a
             .forward(input, pick)?
-            .reshape(&[c.value_heads])?
+            .reshape(&gate_shape)?
             .to_dtype::<f32>()?;
-        let decay = numerics::decay(&a, &self.dt_bias, &self.log_a)?;
-        let y = self
-            .recurrent
-            .delta_rule(&query, &key, &value, &decay, &beta)?;
+        let y = if prefill {
+            let bias = self.dt_bias.broadcast_as(&gate_shape)?;
+            let log_a = self.log_a.broadcast_as(&gate_shape)?;
+            let log_decay = numerics::log_decay(&a, &bias, &log_a)?;
+            self.recurrent
+                .delta_rule_block(
+                    &query.reshape(&[tokens, c.key_heads, c.key_dim])?,
+                    &key.reshape(&[tokens, c.key_heads, c.key_dim])?,
+                    &value.reshape(&[tokens, c.value_heads, c.value_dim])?,
+                    &log_decay,
+                    &beta,
+                    delta,
+                )?
+                .reshape(&[value_rows, c.value_dim])?
+        } else {
+            let decay = numerics::decay(&a, &self.dt_bias, &self.log_a)?;
+            self.recurrent
+                .delta_rule(&query, &key, &value, &decay, &beta)?
+        };
         let z = self
             .z
             .forward(input, pick)?
-            .reshape(&[c.value_heads, c.value_dim])?;
-        let gated =
-            numerics::gated_norm(&y, &self.norm, &z)?.reshape(&[1, c.value_heads * c.value_dim])?;
+            .reshape(&[value_rows, c.value_dim])?;
+        let gated = numerics::gated_norm(&y, &self.norm, &z)?
+            .reshape(&[tokens, c.value_heads * c.value_dim])?;
         self.out.forward(&gated, pick)
     }
+}
+
+fn rows(tokens: u32, heads: u32) -> Result<u32> {
+    u64::from(tokens)
+        .checked_mul(u64::from(heads))
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| forja_sdk::Error::loading("delta panel row count overflow"))
 }

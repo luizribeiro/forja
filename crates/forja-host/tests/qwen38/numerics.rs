@@ -76,6 +76,10 @@ fn negative_softplus_retains_transformers_decay() -> Result<(), Box<dyn Error>> 
     let bias = Tensor::<f32>::zeros(&[15])?;
     let log_a = Tensor::from_slice(&[20.0_f32; 15], &[15])?;
     let actual = guest::decay(&inputs()?, &bias, &log_a)?.to_vec()?;
+    let log_decay = guest::log_decay(&inputs()?, &bias, &log_a)?.to_vec()?;
+    let expected_log = SOFTPLUS.map(|bits| -20.0_f32.exp() * f32::from_bits(bits));
+    let error = golden_fixtures::normwise_relative_error(&expected_log, &log_decay)?;
+    assert!(error <= 1.0e-5, "log decay reference error {error}");
     for (expected, actual) in DECAY.iter().zip(actual) {
         agree(std::slice::from_ref(expected), &[actual])?;
     }
