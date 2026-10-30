@@ -97,6 +97,7 @@ pub(crate) fn report(
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
             "Scalar/SFU and integer throughput are uncalibrated; MMA percentages use matrix-product FLOPs only.",
+            "Persistent f32 carry panels risk register spills; register residency and occupancy require device profiling.",
             "Calibration bound envelopes combine per-probe CI endpoints, not a joint 95% interval; resource flags use raw GPU intervals.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
         "whole_model": model::summaries(profile, calibration, scale, target)?,

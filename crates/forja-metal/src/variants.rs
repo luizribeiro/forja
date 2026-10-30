@@ -1462,14 +1462,14 @@ pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
         DELTA_BLOCK_KEYS,
         &["f32 block transforms with 16-column persistent carry panels."],
         &["small transforms dominated by dispatch setup."],
-        &["Ordered 8x8 f32 MMA fragments, fixed-tree solves and causal diagonal output masks."]
+        &["Ordered 8x8 f32 MMA fragments, fixed-tree solves and causal diagonal output masks. Persistent f32 carry may spill registers; occupancy is uncalibrated."]
     ),
     batch_invariant_variant!(@class "delta-rule-block.wy64-mma";
         "delta-rule-block.wy64-mma-v32", DeltaRuleBlock, DeltaBlockWy64Mma32,
         DELTA_BLOCK_KEYS,
         &["f32 block transforms with 32-column persistent carry panels."],
         &["register pressure that favors a narrower carry panel."],
-        &["Ordered 8x8 f32 MMA fragments; shares arithmetic with the 16-column carry panel."]
+        &["Ordered 8x8 f32 MMA fragments; shares arithmetic with the 16-column carry panel. Persistent f32 carry may spill registers; occupancy is uncalibrated."]
     ),
     batch_invariant_variant!(
         "causal-depthwise-conv.direct",
