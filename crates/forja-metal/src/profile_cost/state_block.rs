@@ -100,3 +100,60 @@ pub(crate) fn composite(dispatch: &Dispatch) -> Option<KernelCost> {
         .iter()
         .try_fold(KernelCost::default(), |sum, cost| sum.checked_add(*cost))
 }
+
+pub(crate) fn padded_flops(dispatch: &Dispatch) -> Option<[u64; 2]> {
+    let panel = u64::from(crate::encoding::delta_block_mma_panel(dispatch)?);
+    let inputs = dispatch.primitive_inputs();
+    let shape = inputs[5].layout().shape();
+    let [heads, keys, values] = [
+        u64::from(shape[0]),
+        u64::from(shape[1]),
+        u64::from(shape[2]),
+    ];
+    let tokens = u64::from(inputs[0].layout().shape()[0]);
+    let block_heads = mul(&[tokens.div_ceil(64), heads])?;
+    let rows = mul(&[tokens, heads])?;
+    let pairs = across(tokens, heads, triangle)?;
+    let strict = pairs.checked_sub(rows)?;
+    let key_width = keys.div_ceil(32).checked_mul(32)?;
+    let value_panels = values.div_ceil(panel);
+    let value_width = value_panels.checked_mul(panel)?;
+    let rhs_width = keys.checked_add(values)?.div_ceil(32).checked_mul(32)?;
+    let active_gram_tiles = across(tokens, heads, |n| {
+        Some(if n == 0 {
+            0
+        } else if n <= 32 {
+            1
+        } else {
+            3
+        })
+    })?;
+    let padded_rows = across(tokens, heads, |n| n.div_ceil(32).checked_mul(32))?;
+    let diagonal = across(tokens, heads, |n| {
+        mul(&[n / 8, 36])?.checked_add(triangle(n % 8)?)
+    })?;
+    let gram = add(&[
+        mul(&[4, 1024, key_width, active_gram_tiles])?,
+        mul(&[2, strict])?,
+        pairs,
+    ])?;
+    let solve = add(&[
+        mul(&[2, strict, rhs_width])?,
+        mul(&[32, rows, rhs_width])?,
+        mul(&[rows, values])?,
+        mul(&[2, rows, keys])?,
+    ])?;
+    let carry = add(&[
+        mul(&[4, 64, key_width, value_width, block_heads])?,
+        mul(&[2, key_width, value_width, padded_rows])?,
+        mul(&[rows, keys, value_panels])?,
+        mul(&[2, rows, values])?,
+        mul(&[2, block_heads, keys, values])?,
+    ])?;
+    let output = add(&[
+        mul(&[3584, values.div_ceil(32), 32, block_heads])?,
+        mul(&[diagonal, values])?,
+        mul(&[9, rows, values])?,
+    ])?;
+    Some([add(&[gram, solve, carry, output])?; 2])
+}

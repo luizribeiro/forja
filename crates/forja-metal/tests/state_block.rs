@@ -253,6 +253,8 @@ fn assert_block_profile(variant: Option<&str>) {
             4096 * 4 * 3 * 2 + 21 * 7 * 4
         );
         assert_ne!(sum.read_bytes, expected.read_bytes);
+        assert!(dispatch.padded_flops[0] > sum.flops);
+        assert_eq!(dispatch.padded_flops[0], dispatch.padded_flops[1]);
     } else {
         assert_eq!(sum, expected);
     }
