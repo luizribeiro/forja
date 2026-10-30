@@ -17,6 +17,32 @@ pub struct Attention {
     cache: KvCache<f16>,
 }
 impl Attention {
+    /// Processes a canonical prompt block using the pinned per-row attention reduction.
+    ///
+    /// # Errors
+    /// Refuses invalid spans, cache ranges or failed tensor operations.
+    pub fn prefill(
+        &mut self,
+        input: &Tensor<bf16>,
+        position: u32,
+        quant: Option<&Variant>,
+        attention: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        let tokens = input.shape().first().copied().unwrap_or(0);
+        if input.shape() != [tokens, self.config.hidden] || !(1..=64).contains(&tokens) {
+            return Err(Error::loading("invalid attention prefill block"));
+        }
+        let output = Tensor::zeros(input.shape())?;
+        for row in 0..tokens {
+            let absolute = position
+                .checked_add(row)
+                .ok_or_else(|| Error::loading("attention position overflow"))?;
+            self.attention_layer(&input.narrow(0, row, 1)?, absolute, quant, attention)?
+                .copy_into(&mut output.narrow(0, row, 1)?)?;
+        }
+        Ok(output)
+    }
+
     /// Loads a full attention layer and allocates a contiguous reduced-precision cache.
     ///
     /// # Errors

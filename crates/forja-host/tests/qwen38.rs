@@ -138,6 +138,30 @@ fn attention_block_matches_transformers_with_per_head_gates() -> Result<(), Box<
 }
 
 #[test]
+fn attention_prefill_preserves_per_row_reference_outputs() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let reference = Weights::open(fixture("blocks.safetensors"))?;
+    let input = reference
+        .tensor::<f32>("block_input_3", &[3, 64])?
+        .to_dtype::<bf16>()?;
+    let expected = reference
+        .tensor::<f32>("block_output_3", &[3, 64])?
+        .to_vec()?;
+    let mut block = qwen38::Attention::load(
+        &weights.scoped("language_model.model.layers.3.self_attn"),
+        qwen38::Config::tiny(),
+        64,
+    )?;
+    agree(
+        &expected,
+        &block
+            .prefill(&input, 0, None, None)?
+            .to_dtype::<f32>()?
+            .to_vec()?,
+    )
+}
+
+#[test]
 fn feed_forward_preserves_the_bf16_silu_boundary() -> Result<(), Box<dyn Error>> {
     let mut source = weights::Weights::default();
     for (name, input, output) in [
