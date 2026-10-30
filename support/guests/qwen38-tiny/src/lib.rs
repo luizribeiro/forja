@@ -51,8 +51,16 @@ impl Engine for Tiny {
         let Some(pool) = pool else {
             return Self::load(weights, load);
         };
+        let prompt_tokens = load.max_context.unwrap_or(64).min(64);
         let config = qwen38::Config::tiny();
-        let cache = std::rc::Rc::new(pool.cache_set_with_state(1, &config.state_planes()?[..2])?);
+        let cache = std::rc::Rc::new(pool.cache_set_with_state(
+            1,
+            &config.state_planes()?[..2],
+            forja_sdk::PagedInputLayout {
+                vocab: 33,
+                prompt_tokens,
+            },
+        )?);
         qwen38::DeltaNet::load_paged(
             &weights.scoped("language_model.model.layers.0.linear_attn"),
             config,

@@ -8,8 +8,18 @@ impl<B: Backend + 'static> Host<B> {
         pool: &Resource<PagePoolEntry>,
         planes: u32,
         descriptors: Vec<paged_storage::StatePlaneDescriptor>,
+        inputs: paged_storage::StateInputLayout,
     ) -> Result<Resource<crate::BatchSlotEntry>, compute::Error> {
-        let lanes = self.table.get(pool).map_err(invalid_handle)?.active_lanes;
+        let entry = self.table.get(pool).map_err(invalid_handle)?;
+        if inputs.vocab == 0
+            || inputs.prompt_tokens == 0
+            || inputs.prompt_tokens > entry.max_context
+        {
+            return Err(invalid_handle("invalid state input layout"));
+        }
+        let lanes = entry.active_lanes;
+        self.limits.check_tensor_shape(&[lanes, inputs.vocab])?;
+        self.limits.check_tensor_shape(&[inputs.prompt_tokens])?;
         let layout = StateLayout::new(
             descriptors
                 .into_iter()
@@ -23,8 +33,46 @@ impl<B: Backend + 'static> Host<B> {
         let storage = self.create_state_storage(layout, lanes)?;
         let state = StateSlots::new(storage, lanes)?;
         let slot = self.open_paged_slot(pool, planes)?;
+        self.table
+            .get_mut(&slot)
+            .map_err(invalid_handle)?
+            .input_layout = Some(inputs);
         self.state_slots.insert(slot.rep(), state);
         Ok(slot)
+    }
+}
+
+impl crate::BatchSlotEntry {
+    fn validate_state_span(
+        &self,
+        bank: usize,
+        lane: usize,
+        active: bool,
+        tokens: u64,
+    ) -> Result<(), compute::Error> {
+        if tokens
+            > self
+                .input_layout
+                .as_ref()
+                .ok_or_else(|| invalid_handle("state input layout is missing"))?
+                .prompt_tokens
+                .into()
+        {
+            return Err(invalid_handle("state update exceeds its prompt budget"));
+        }
+        if active {
+            let window = self
+                .binding
+                .banks
+                .append_window(bank, lane)
+                .map_err(invalid_handle)?;
+            if tokens == 0 || window.end.checked_sub(window.start) != Some(tokens) {
+                return Err(invalid_handle(
+                    "state update differs from its admitted token span",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -80,18 +128,7 @@ impl<B: Backend + 'static> Host<B> {
                 .copied()
                 .map_or(0, u64::from),
         };
-        if active {
-            let window = slot_entry
-                .binding
-                .banks
-                .append_window(bank, lane)
-                .map_err(invalid_handle)?;
-            if tokens == 0 || window.end.checked_sub(window.start) != Some(tokens) {
-                return Err(invalid_handle(
-                    "state update differs from its admitted token span",
-                ));
-            }
-        }
+        slot_entry.validate_state_span(bank, lane, active, tokens)?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(crate::quota(
@@ -525,6 +562,15 @@ impl<B: Backend + 'static> Host<B> {
                 ))
                 .map_err(invalid_handle)?;
             let bank = slot.active_bank;
+            if slot
+                .input_layout
+                .as_ref()
+                .is_none_or(|inputs| original.tokens > u64::from(inputs.prompt_tokens))
+            {
+                return Err(invalid_handle(
+                    "captured state exceeds the slot prompt budget",
+                ));
+            }
             if slots.insert(original.slot) {
                 if captures.iter().any(|capture| {
                     capture.usage.slot == original.slot && capture.usage.bank != original.bank

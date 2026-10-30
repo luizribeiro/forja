@@ -27,6 +27,15 @@ pub struct PagedStateDescriptor {
     pub shape: Vec<u32>,
 }
 
+/// Geometry of host-filled sampling and token buffers for a stateful slot.
+#[derive(Clone, Copy)]
+pub struct PagedInputLayout {
+    /// Number of output token ids.
+    pub vocab: u32,
+    /// Largest prompt piece accepted by the slot.
+    pub prompt_tokens: u32,
+}
+
 /// Host-filled lane metadata used by serving graphs.
 pub struct PagedSlotTensors {
     /// Per-lane logical sequence lengths.
@@ -85,7 +94,7 @@ impl PagedPool<'_> {
     ///
     /// Returns an error when the layer count overflows or the host refuses the slot.
     pub fn cache_set(self, layers: u32) -> Result<PagedCacheSet> {
-        self.cache_set_with_state(layers, &[])
+        self.open_cache_set(layers, &[], None)
     }
 
     /// Allocates attention caches and opaque state planes within the same serving slot.
@@ -96,6 +105,16 @@ impl PagedPool<'_> {
         self,
         layers: u32,
         state: &[PagedStateDescriptor],
+        inputs: PagedInputLayout,
+    ) -> Result<PagedCacheSet> {
+        self.open_cache_set(layers, state, Some(inputs))
+    }
+
+    fn open_cache_set(
+        self,
+        layers: u32,
+        state: &[PagedStateDescriptor],
+        inputs: Option<PagedInputLayout>,
     ) -> Result<PagedCacheSet> {
         let planes = layers
             .checked_mul(2)
@@ -116,11 +135,19 @@ impl PagedPool<'_> {
                     },
                 )
                 .collect::<Vec<_>>();
-            self.raw.open_state_slot(planes, &descriptors)
+            let inputs = inputs.ok_or_else(|| Error::loading("state input layout is missing"))?;
+            self.raw.open_state_slot(
+                planes,
+                &descriptors,
+                crate::sys::guest::paged_storage::StateInputLayout {
+                    vocab: inputs.vocab,
+                    prompt_tokens: inputs.prompt_tokens,
+                },
+            )
         }
         .map_err(|error| Error::loading(format!("{error:?}")))?;
         #[cfg(not(target_family = "wasm"))]
-        let _ = state;
+        let _ = (self, inputs);
         Ok(PagedCacheSet {
             #[cfg(target_family = "wasm")]
             _slot: slot,

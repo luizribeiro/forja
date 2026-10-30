@@ -3255,6 +3255,7 @@ pub struct PagedSequenceEntry;
 
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
+    input_layout: Option<paged_storage::StateInputLayout>,
     binding: Arc<PagedBinding>,
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
@@ -3787,6 +3788,7 @@ impl<B: Backend + 'static> Host<B> {
         cleanup.push(backing.generations);
         cleanup.extend(backing.metadata.into_iter().flatten());
         let slot = match self.table.push(BatchSlotEntry {
+            input_layout: None,
             binding,
             planes: backing.planes,
             tables: backing.tables,
@@ -8383,9 +8385,15 @@ where
         resource: Resource<PagePoolEntry>,
         planes: u32,
         state_planes: Vec<paged_storage::StatePlaneDescriptor>,
+        inputs: paged_storage::StateInputLayout,
     ) -> impl Future<Output = wasmtime::Result<Result<Resource<BatchSlotEntry>, compute::Error>>> + Send
     {
-        std::future::ready(Ok(self.open_state_slot(&resource, planes, state_planes)))
+        std::future::ready(Ok(self.open_state_slot(
+            &resource,
+            planes,
+            state_planes,
+            inputs,
+        )))
     }
 
     fn drop(
@@ -9509,6 +9517,10 @@ mod tests {
                     dtype: compute::Dtype::F32,
                     shape: vec![3, 7],
                 }],
+                super::paged_storage::StateInputLayout {
+                    vocab: 7,
+                    prompt_tokens: 8,
+                },
             )
             .unwrap();
         host.bind_paged_request(pool.rep(), None, 8).unwrap();
@@ -9691,18 +9703,53 @@ mod tests {
             dtype: compute::Dtype::F32,
             shape: vec![3, 7],
         };
-        assert!(host.open_state_slot(&pool, 3, vec![descriptor()]).is_err());
+        let inputs = || super::paged_storage::StateInputLayout {
+            vocab: 7,
+            prompt_tokens: 8,
+        };
+        for bad in [
+            super::paged_storage::StateInputLayout {
+                vocab: 0,
+                ..inputs()
+            },
+            super::paged_storage::StateInputLayout {
+                prompt_tokens: 0,
+                ..inputs()
+            },
+            super::paged_storage::StateInputLayout {
+                prompt_tokens: 9,
+                ..inputs()
+            },
+        ] {
+            assert!(
+                host.open_state_slot(&pool, 2, vec![descriptor()], bad)
+                    .is_err()
+            );
+            assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        }
+        assert!(
+            host.open_state_slot(&pool, 3, vec![descriptor()], inputs())
+                .is_err()
+        );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
         assert!(host.state_slots.is_empty());
         host.limits.live_bytes = before;
-        assert!(host.open_state_slot(&pool, 2, vec![descriptor()]).is_err());
+        assert!(
+            host.open_state_slot(&pool, 2, vec![descriptor()], inputs())
+                .is_err()
+        );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
         host.limits = GENEROUS;
-        let slot = host.open_state_slot(&pool, 2, vec![descriptor()]).unwrap();
+        let slot = host
+            .open_state_slot(&pool, 2, vec![descriptor()], inputs())
+            .unwrap();
         assert!(host.state_slots.contains_key(&slot.rep()));
         let charge = host.live_bytes.load(Ordering::Acquire);
         assert!(charge > before);
-        assert!(host.open_state_slot(&pool, 2, vec![descriptor()]).is_err());
+        assert!(
+            host.open_state_slot(&pool, 2, vec![descriptor()], inputs())
+                .is_err()
+        );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charge);
     }
 

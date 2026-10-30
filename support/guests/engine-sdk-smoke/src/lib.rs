@@ -80,6 +80,7 @@ impl Engine for ConstantEngine {
         pool: Option<PagedPool<'_>>,
         config: EngineLoadConfig,
     ) -> Result<Self> {
+        let prompt_tokens = config.max_context.unwrap_or(32).min(32);
         let mut engine = Self::load(weights, config)?;
         engine.paged = pool
             .map(|pool| {
@@ -89,6 +90,10 @@ impl Engine for ConstantEngine {
                         dtype: forja_sdk::DType::F32,
                         shape: vec![1, 64],
                     }],
+                    forja_sdk::PagedInputLayout {
+                        vocab: 4,
+                        prompt_tokens,
+                    },
                 )
             })
             .transpose()?;

@@ -23,9 +23,13 @@ interface paged-storage {
     dtype: dtype,
     shape: list<u32>,
   }
+  record state-input-layout {
+    vocab: u32,
+    prompt-tokens: u32,
+  }
   resource page-pool {
     open-slot: func(planes: u32) -> result<batch-slot, error>;
-    open-state-slot: func(planes: u32, state-planes: list<state-plane-descriptor>) -> result<batch-slot, error>;
+    open-state-slot: func(planes: u32, state-planes: list<state-plane-descriptor>, inputs: state-input-layout) -> result<batch-slot, error>;
   }
 
   enum state-operation {

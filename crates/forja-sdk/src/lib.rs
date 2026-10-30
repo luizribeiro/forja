@@ -133,8 +133,8 @@ pub use graph::{Dim, Graph, GraphResult, Param, Pos, capture, eval, profile_scop
 pub use half::{bf16, f16};
 pub use load::{Load, Weights};
 pub use paged::{
-    PagedCache, PagedCacheSet, PagedPool, PagedSlot, PagedSlotTensors, PagedState,
-    PagedStateDescriptor,
+    PagedCache, PagedCacheSet, PagedInputLayout, PagedPool, PagedSlot, PagedSlotTensors,
+    PagedState, PagedStateDescriptor,
 };
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;
