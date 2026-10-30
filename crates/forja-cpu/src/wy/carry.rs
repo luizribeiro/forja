@@ -130,21 +130,8 @@ mod tests {
     fn block_outputs_and_carry_match_recurrence_through_decay_underflow() {
         for rows in [1, 7, 33, 63, BLOCK] {
             for (keys, width) in [(7, 33), (128, 128)] {
-                let mut rng = forja_testing::DeterministicValues::new(73);
-                let q = (0..rows * keys)
-                    .map(|_| rng.next_f32() * 0.125)
-                    .collect::<Vec<_>>();
-                let mut k = q.clone();
-                for row in k.chunks_mut(keys) {
-                    let norm = (row.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
-                    for value in row {
-                        *value /= norm;
-                    }
-                }
-                let v = (0..rows * width)
-                    .map(|_| rng.next_f32())
-                    .collect::<Vec<_>>();
-                let beta = vec![0.25; rows];
+                let data = super::super::tests::data(rows, keys, width);
+                let (q, k, v, beta) = (&data.query, &data.key, &data.value, &data.beta);
                 for (initial, underflow) in [(0.0, false), (0.125, false), (0.125, true)] {
                     let state = vec![initial; keys * width];
                     let g = (0..rows)
@@ -156,8 +143,8 @@ mod tests {
                             }
                         })
                         .collect::<Vec<_>>();
-                    let expected = recurrent(&q, &k, &v, &g, &beta, &state, [keys, width]);
-                    let actual = Prepared::new(&q, &k, &v, &g, &beta, keys, width).advance(&state);
+                    let expected = recurrent(q, k, v, &g, beta, &state, [keys, width]);
+                    let actual = Prepared::new(q, k, v, &g, beta, keys, width).advance(&state);
                     for (expected, actual) in [(&expected.0, &actual.0), (&expected.1, &actual.1)] {
                         let error = forja_testing::normwise_relative_error(expected, actual);
                         assert!(

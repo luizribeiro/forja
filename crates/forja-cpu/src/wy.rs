@@ -1,5 +1,6 @@
 mod carry;
 mod gram;
+mod scan;
 mod solve;
 
 const BLOCK: usize = 64;
@@ -26,6 +27,32 @@ fn tree_sum(count: usize, value: impl Fn(usize) -> f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) struct Fixture {
+        pub(super) query: Vec<f32>,
+        pub(super) key: Vec<f32>,
+        pub(super) value: Vec<f32>,
+        pub(super) beta: Vec<f32>,
+    }
+    pub(super) fn data(rows: usize, keys: usize, width: usize) -> Fixture {
+        let mut rng = forja_testing::DeterministicValues::new(73);
+        let query = (0..rows * keys)
+            .map(|_| rng.next_f32() * 0.125)
+            .collect::<Vec<_>>();
+        let mut key = query.clone();
+        for row in key.chunks_mut(keys) {
+            let norm = (row.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+            for value in row {
+                *value /= norm;
+            }
+        }
+        Fixture {
+            query,
+            key,
+            value: (0..rows * width).map(|_| rng.next_f32()).collect(),
+            beta: vec![0.25; rows],
+        }
+    }
 
     #[test]
     fn tree_reduction_masks_odd_tails_before_reading() {
