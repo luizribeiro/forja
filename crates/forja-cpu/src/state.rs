@@ -1,3 +1,5 @@
+mod block;
+
 use forja_core::{BackendError, Dispatch, StateOp, Tensor};
 
 use super::{CpuBackend, cpu_page_table, decode, decode_u32, execution_usize};
@@ -38,7 +40,7 @@ impl CpuBackend {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (output, state) = match operation {
-            StateOp::DeltaRuleBlock(_) => return Err(BackendError::UnsupportedOperation),
+            StateOp::DeltaRuleBlock(_) => block::execute(&values, inputs)?,
             StateOp::DeltaRule(_) => delta_rule(&values, &inputs[5])?,
             StateOp::CausalDepthwiseConv(_) => causal_conv(&values, &inputs[0])?,
         };
@@ -177,6 +179,50 @@ mod tests {
         assert_eq!(backend.read(&y).unwrap(), [0; 4]);
         assert_eq!(before, backend.read(&state).unwrap());
     }
+    #[test]
+    fn block_execution_authenticates_before_private_state_access() {
+        let backend = CpuBackend::new();
+        let (access, inputs) = state_inputs(
+            &backend,
+            &[
+                (&[2, 1, 1], vec![1.0, 2.0]),
+                (&[2, 1, 1], vec![0.5, 0.25]),
+                (&[2, 1, 1], vec![3.0, 4.0]),
+                (&[2, 1], vec![0.5_f32.ln(); 2]),
+                (&[2, 1], vec![0.25, 0.5]),
+                (&[1, 1, 1], vec![2.0]),
+            ],
+        );
+        let output = backend.alloc(DType::F32, &[2, 1, 1]).unwrap();
+        let state = backend.alloc(DType::F32, &[1, 1, 1]).unwrap();
+        let layout = forja_core::DeltaBlockScratch::new(2, 1, 1, 1).unwrap();
+        let scratch = backend.alloc(DType::F32, &[layout.elements()]).unwrap();
+        let run = || {
+            let mut commands = CommandList::new();
+            commands
+                .dispatch_many(
+                    Op::State(StateOp::DeltaRuleBlock(access)),
+                    &inputs.iter().collect::<Vec<_>>(),
+                    &[&output, &state, &scratch],
+                )
+                .unwrap();
+            backend.submit(commands).unwrap().wait()
+        };
+        run().unwrap();
+        assert_eq!(
+            decode(&backend.read(&output).unwrap(), DType::F32).unwrap(),
+            vec![21.0 / 16.0, 1163.0 / 512.0]
+        );
+        assert_eq!(
+            decode(&backend.read(&state).unwrap(), DType::F32).unwrap(),
+            vec![1163.0 / 1024.0]
+        );
+        let before = backend.read(&state).unwrap();
+        backend.write(&inputs[7], &[0; 12]).unwrap();
+        assert!(run().is_err());
+        assert_eq!(backend.read(&state).unwrap(), before);
+    }
+
     #[test]
     fn causal_convolution_carries_raw_history_and_declares_its_cost() {
         let backend = CpuBackend::new();

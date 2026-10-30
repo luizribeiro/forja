@@ -1,6 +1,7 @@
 mod carry;
 mod gram;
 mod scan;
+pub(crate) use scan::HeadInput;
 mod solve;
 
 const BLOCK: usize = forja_core::DeltaBlockScratch::TOKENS;

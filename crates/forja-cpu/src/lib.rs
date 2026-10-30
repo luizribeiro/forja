@@ -3,7 +3,6 @@
 pub mod interpreter;
 pub mod paged;
 mod state;
-#[cfg(test)]
 mod wy;
 
 use std::{ops::Range, sync::Mutex, time::Duration};
