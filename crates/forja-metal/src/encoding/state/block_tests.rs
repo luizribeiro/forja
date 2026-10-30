@@ -187,3 +187,8 @@ fn scalar_solve_matches_cpu_stage_oracle() {
 fn scalar_carry_matches_cpu_stage_oracle() {
     check(2, "state_block_carry", None, 128).unwrap();
 }
+
+#[test]
+fn scalar_output_matches_cpu_stage_oracle() {
+    check(3, "state_block_output", None, 128).unwrap();
+}
