@@ -29,7 +29,9 @@ impl Attention {
         attention: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
         let tokens = input.shape().first().copied().unwrap_or(0);
-        if input.shape() != [tokens, self.config.hidden] || !(1..=64).contains(&tokens) {
+        if input.shape() != [tokens, self.config.hidden]
+            || !(1..=crate::PREFILL_BLOCK_TOKENS).contains(&tokens)
+        {
             return Err(Error::loading("invalid attention prefill block"));
         }
         let output = Tensor::zeros(input.shape())?;

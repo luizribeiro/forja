@@ -131,7 +131,9 @@ impl Model {
             .checked_add(sequence)
             .filter(|&end| sequence > 0 && end <= self.context)
             .ok_or_else(|| Error::loading("invalid token span"))?;
-        if (prefill && !start.is_multiple_of(64)) || (!prefill && sequence != 1) {
+        if (prefill && !start.is_multiple_of(crate::PREFILL_BLOCK_TOKENS))
+            || (!prefill && sequence != 1)
+        {
             return Err(Error::loading("token span splits a canonical prompt block"));
         }
         if !self.usable || (start != 0 && start != self.position) {
@@ -168,7 +170,11 @@ impl Model {
             Vec::new()
         };
         let mut last = None;
-        let block = if prefill { 64 } else { 1 };
+        let block = if prefill {
+            crate::PREFILL_BLOCK_TOKENS
+        } else {
+            1
+        };
         for row in (0..sequence)
             .step_by(usize::try_from(block).map_err(|_| Error::loading("block width overflow"))?)
         {

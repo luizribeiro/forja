@@ -20,6 +20,9 @@ pub use ffn::FeedForward;
 mod layer;
 pub use layer::DecoderLayer;
 
+// All delta-rule-block.wy64-* picks require this numerical prompt block width.
+pub(crate) const PREFILL_BLOCK_TOKENS: u32 = 64;
+
 mod model;
 pub use model::Model;
 

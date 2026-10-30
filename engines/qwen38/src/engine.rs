@@ -35,7 +35,7 @@ impl Engine for Qwen38 {
     fn describe() -> EngineInfo {
         let c = Config::model();
         EngineInfo {
-            prompt_block_tokens: std::num::NonZeroU32::new(64),
+            prompt_block_tokens: std::num::NonZeroU32::new(crate::PREFILL_BLOCK_TOKENS),
             vocab: c.vocab,
             max_context: 262_144,
             tap_layers: (1..=c.layers).collect(),

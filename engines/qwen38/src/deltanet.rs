@@ -104,7 +104,7 @@ impl DeltaNet {
         let tokens = input.shape().first().copied().unwrap_or(0);
         if input.shape() != [tokens, c.hidden]
             || tokens == 0
-            || tokens > 64
+            || tokens > crate::PREFILL_BLOCK_TOKENS
             || (!prefill && tokens != 1)
         {
             return Err(forja_sdk::Error::loading("invalid delta layer token span"));
