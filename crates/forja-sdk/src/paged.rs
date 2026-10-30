@@ -44,6 +44,41 @@ pub struct PagedSlotTensors {
     pub query_starts: Tensor<u32>,
     /// Per-lane absolute sampling positions.
     pub absolute_positions: Tensor<u32>,
+    /// Banked stateful serving inputs and results, when declared by the slot.
+    pub inputs: Option<PagedInputTensors>,
+}
+
+/// Host-owned ordinary inputs and result buffers for the currently selected slot bank.
+pub struct PagedInputTensors {
+    /// Five sampling words per lane.
+    pub sampling: Tensor<u32>,
+    /// Explicit decode tokens, indexed by lane.
+    pub tokens: Tensor<u32>,
+    /// Flags indicating which lanes supply an explicit decode token.
+    pub explicit: Tensor<u32>,
+    /// Prompt token storage up to the declared piece budget.
+    pub prompt: Tensor<u32>,
+    /// Packed vocabulary allow bits per lane.
+    pub allow: Tensor<u32>,
+    /// Logit result rows indexed by physical lane.
+    pub logits: Tensor<f32>,
+    /// Selected result tokens indexed by physical lane.
+    pub selected: Tensor<u32>,
+}
+
+#[cfg(target_family = "wasm")]
+impl PagedInputTensors {
+    fn from_guest(raw: crate::sys::guest::paged_storage::StateInputTensors, lanes: u32) -> Self {
+        Self {
+            sampling: Tensor::from_guest(raw.sampling, vec![lanes, 5]),
+            tokens: Tensor::from_guest(raw.tokens, vec![lanes]),
+            explicit: Tensor::from_guest(raw.explicit, vec![lanes]),
+            prompt: Tensor::from_guest(raw.prompt, vec![raw.prompt_tokens]),
+            allow: Tensor::from_guest(raw.allow, vec![lanes, raw.vocab.div_ceil(32)]),
+            logits: Tensor::from_guest(raw.logits, vec![lanes, raw.vocab]),
+            selected: Tensor::from_guest(raw.selected, vec![lanes]),
+        }
+    }
 }
 
 impl PagedSlot<'_> {
@@ -73,6 +108,9 @@ impl PagedSlot<'_> {
             logical_lengths: Tensor::from_guest(tensors.logical_lengths, shape.clone()),
             query_starts: Tensor::from_guest(tensors.query_starts, shape.clone()),
             absolute_positions: Tensor::from_guest(tensors.absolute_positions, shape),
+            inputs: tensors
+                .inputs
+                .map(|raw| PagedInputTensors::from_guest(raw, tensors.lanes)),
         })
     }
 }

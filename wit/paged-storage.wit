@@ -15,6 +15,18 @@ interface paged-storage {
     logical-lengths: tensor,
     query-starts: tensor,
     absolute-positions: tensor,
+    inputs: option<state-input-tensors>,
+  }
+  record state-input-tensors {
+    vocab: u32,
+    prompt-tokens: u32,
+    sampling: tensor,
+    tokens: tensor,
+    explicit: tensor,
+    prompt: tensor,
+    allow: tensor,
+    logits: tensor,
+    selected: tensor,
   }
   resource batch-slot {
     tensors: func() -> result<slot-tensors, error>;

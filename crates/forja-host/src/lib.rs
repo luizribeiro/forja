@@ -8451,20 +8451,16 @@ where
                     [logical_lengths, query_starts, absolute_positions],
                 )
             };
-            let mut aliases = Vec::with_capacity(handles.len());
-            for handle in handles {
-                let resource = Resource::new_borrow(handle);
-                let shape = self.entry(&resource)?.tensor.layout().shape().to_vec();
-                match self.view(&resource, compute::ViewOp::Reshape(shape)) {
-                    Ok(alias) => aliases.push(alias),
-                    Err(error) => {
-                        for alias in aliases {
-                            let _ = self.drop_tensor(alias);
-                        }
-                        return Err(error);
+            let aliases = self.alias_paged_tensors(&handles)?;
+            let inputs = match self.state_input_tensors(resource.rep()) {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    for alias in aliases {
+                        let _ = self.drop_tensor(alias);
                     }
+                    return Err(error);
                 }
-            }
+            };
             let mut aliases = aliases.into_iter();
             let logical_lengths = aliases
                 .next()
@@ -8480,6 +8476,7 @@ where
                 logical_lengths,
                 query_starts,
                 absolute_positions,
+                inputs,
             })
         })();
         std::future::ready(Ok(result))
@@ -9760,6 +9757,90 @@ mod tests {
                 .is_err()
         );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charge);
+    }
+
+    #[tokio::test]
+    async fn state_slot_input_aliases_follow_the_selected_bank() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        let slot = host
+            .open_state_slot(
+                &pool,
+                2,
+                vec![paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![7, 33],
+                }],
+                paged_storage::StateInputLayout {
+                    vocab: 33,
+                    prompt_tokens: 7,
+                },
+            )
+            .unwrap();
+        let handles_before = host.live_handles;
+        for available in 0..10 {
+            host.limits.live_tensor_handles = handles_before + available;
+            assert!(
+                <Host<CpuBackend> as paged_storage::HostBatchSlot>::tensors(
+                    &mut host,
+                    Resource::new_borrow(slot.rep()),
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert_eq!(host.live_handles, handles_before);
+        }
+        host.limits = GENEROUS;
+        let mut seen = Vec::new();
+        for bank in 0..2 {
+            host.table.get_mut(&slot).unwrap().active_bank = bank;
+            let tensors = <Host<CpuBackend> as paged_storage::HostBatchSlot>::tensors(
+                &mut host,
+                Resource::new_borrow(slot.rep()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let inputs = tensors.inputs.unwrap();
+            assert_eq!((inputs.vocab, inputs.prompt_tokens), (33, 7));
+            assert_eq!(
+                host.entry(&inputs.allow).unwrap().tensor.layout().shape(),
+                [1, 2]
+            );
+            seen.push(host.entry(&inputs.logits).unwrap().tensor.buffer());
+            let expected = host
+                .table
+                .get(&slot)
+                .unwrap()
+                .inputs
+                .as_ref()
+                .unwrap()
+                .banks[bank]
+                .logits;
+            assert_eq!(
+                seen[bank],
+                host.entry(&Resource::new_borrow(expected))
+                    .unwrap()
+                    .tensor
+                    .buffer()
+            );
+            for handle in [
+                tensors.logical_lengths,
+                tensors.query_starts,
+                tensors.absolute_positions,
+                inputs.sampling,
+                inputs.tokens,
+                inputs.explicit,
+                inputs.prompt,
+                inputs.allow,
+                inputs.logits,
+                inputs.selected,
+            ] {
+                host.drop_tensor(handle).unwrap();
+            }
+        }
+        assert_ne!(seen[0], seen[1]);
     }
 
     #[test]

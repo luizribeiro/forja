@@ -39,6 +39,65 @@ impl StateInputs {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn alias_paged_tensors(
+        &mut self,
+        handles: &[u32],
+    ) -> Result<Vec<wasmtime::component::Resource<crate::TensorEntry>>, compute::Error> {
+        use wasmtime::component::Resource;
+        let mut aliases = Vec::with_capacity(handles.len());
+        for &handle in handles {
+            let result = (|| {
+                let resource = Resource::new_borrow(handle);
+                let shape = self.entry(&resource)?.tensor.layout().shape().to_vec();
+                self.view(&resource, compute::ViewOp::Reshape(shape))
+            })();
+            match result {
+                Ok(alias) => aliases.push(alias),
+                Err(error) => {
+                    for alias in aliases {
+                        let _ = self.drop_tensor(alias);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(aliases)
+    }
+
+    pub(crate) fn state_input_tensors(
+        &mut self,
+        slot: u32,
+    ) -> Result<Option<paged_storage::StateInputTensors>, compute::Error> {
+        let entry = self
+            .table
+            .get(&wasmtime::component::Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?;
+        let Some(inputs) = &entry.inputs else {
+            return Ok(None);
+        };
+        let handles = inputs.banks[entry.active_bank].handles();
+        let layout = entry
+            .input_layout
+            .as_ref()
+            .ok_or_else(|| invalid_handle("state input layout is missing"))?;
+        let (vocab, prompt_tokens) = (layout.vocab, layout.prompt_tokens);
+        let [sampling, tokens, explicit, prompt, allow, logits, selected] = self
+            .alias_paged_tensors(&handles)?
+            .try_into()
+            .map_err(|_| invalid_handle("state input aliases are incomplete"))?;
+        Ok(Some(paged_storage::StateInputTensors {
+            vocab,
+            prompt_tokens,
+            sampling,
+            tokens,
+            explicit,
+            prompt,
+            allow,
+            logits,
+            selected,
+        }))
+    }
+
     pub(crate) fn allocate_state_inputs(
         &mut self,
         lanes: u32,
