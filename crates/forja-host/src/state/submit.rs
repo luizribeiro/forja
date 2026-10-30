@@ -19,7 +19,14 @@ impl<B: Backend> StateRecording<B> {
     /// # Errors
     /// Refuses incomplete updates, stale capabilities or exhausted queue positions.
     /// A backend submission failure invalidates the storage until reload.
-    pub fn submit(mut self) -> Result<StateSubmission<B>, compute::Error> {
+    pub fn submit(self) -> Result<StateSubmission<B>, compute::Error> {
+        self.submit_with_profiling(false)
+    }
+
+    pub(super) fn submit_with_profiling(
+        mut self,
+        profiled: bool,
+    ) -> Result<StateSubmission<B>, compute::Error> {
         self.storage.check_usable()?;
         if self.updated.iter().any(|&updated| !updated) {
             return Err(invalid_handle(
@@ -41,13 +48,15 @@ impl<B: Backend> StateRecording<B> {
         *last = queue_position;
         let commands = std::mem::take(&mut self.commands);
         let retained = self.retained_resources();
-        let submission = storage
-            .backend
-            .submit_retained(commands, retained)
-            .inspect_err(|_| {
-                storage.poisoned.store(true, Ordering::Release);
-            })
-            .map_err(guest_error)?;
+        let submission = if profiled {
+            storage.backend.submit_profiled_retained(commands, retained)
+        } else {
+            storage.backend.submit_retained(commands, retained)
+        }
+        .inspect_err(|_| {
+            storage.poisoned.store(true, Ordering::Release);
+        })
+        .map_err(guest_error)?;
         self.handed_off = true;
         Ok(StateSubmission {
             recording: self,
@@ -72,9 +81,21 @@ impl<B: Backend> StateSubmission<B> {
     ///
     /// # Errors
     /// Returns reconciliation, timeout or execution failures without publishing failed work.
-    pub fn finish_with_time(mut self) -> Result<Option<std::time::Duration>, compute::Error> {
+    pub fn finish_with_time(self) -> Result<Option<std::time::Duration>, compute::Error> {
+        self.finish_with_profile().map(|(time, _)| time)
+    }
+
+    pub(super) fn finish_with_profile(
+        mut self,
+    ) -> Result<
+        (
+            Option<std::time::Duration>,
+            Option<forja_core::SubmissionProfile>,
+        ),
+        compute::Error,
+    > {
         self.complete(true)?;
-        Ok(self.submission.gpu_time())
+        Ok((self.submission.gpu_time(), self.submission.profile()))
     }
 
     /// Waits once and restores the retained checkpoint without publication.

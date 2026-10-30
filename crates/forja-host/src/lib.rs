@@ -3590,6 +3590,7 @@ pub struct Host<B: Backend> {
     replay: Arc<ReplayState>,
     taints: Arc<BufferTaints>,
     active_profile: Option<Arc<Mutex<EngineStepProfile>>>,
+    current_profile_scope: Option<Arc<forja_core::ProfileScope>>,
     epoch_registration: Option<Arc<()>>,
     explicit_metal_variants: bool,
 }
@@ -3632,6 +3633,7 @@ impl<B: Backend + 'static> Host<B> {
             replay,
             taints: Arc::new(BufferTaints::default()),
             active_profile: None,
+            current_profile_scope: None,
             epoch_registration: None,
             explicit_metal_variants: false,
         }
@@ -4749,6 +4751,7 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn begin_profile_step(&mut self) {
+        self.current_profile_scope = None;
         self.active_profile = Some(Arc::new(Mutex::new(EngineStepProfile::default())));
     }
 
@@ -7882,7 +7885,8 @@ where
             entry
                 .profile_scopes
                 .insert(entry.recorded.len(), Arc::clone(&scope));
-            entry.commands.set_profile_scope(Some(scope));
+            entry.commands.set_profile_scope(Some(Arc::clone(&scope)));
+            self.current_profile_scope = Some(scope);
             Ok(())
         })();
         std::future::ready(Ok(result))

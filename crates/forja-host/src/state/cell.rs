@@ -9,6 +9,9 @@ pub struct StateCell<B: Backend> {
     sequence: StateSequenceHandle<B>,
     serial: u64,
     submitted: bool,
+    profiled: bool,
+    profile_scope: Option<Arc<forja_core::ProfileScope>>,
+    profile: Option<forja_core::SubmissionProfile>,
 }
 
 impl<B: Backend> StateCell<B> {
@@ -26,6 +29,9 @@ impl<B: Backend> StateCell<B> {
             sequence,
             serial: 0,
             submitted: false,
+            profiled: false,
+            profile_scope: None,
+            profile: None,
         })
     }
 
@@ -62,12 +68,26 @@ impl<B: Backend> StateCell<B> {
         self.submitted
     }
 
+    pub(super) fn set_profile_context(
+        &mut self,
+        enabled: bool,
+        scope: Option<Arc<forja_core::ProfileScope>>,
+    ) {
+        self.profiled = enabled;
+        self.profile_scope = scope;
+    }
+
+    pub(super) fn take_profile(&mut self) -> Option<forja_core::SubmissionProfile> {
+        self.profile.take()
+    }
+
     pub(super) fn update(
         &mut self,
         limits: Limits,
         record: impl FnOnce(&mut super::StateRecording<B>) -> Result<(), compute::Error>,
     ) -> Result<Option<std::time::Duration>, compute::Error> {
         self.submitted = false;
+        self.profile = None;
         let serial = self
             .serial
             .checked_add(1)
@@ -85,8 +105,15 @@ impl<B: Backend> StateCell<B> {
                     return Err(error);
                 }
             };
+        recording
+            .commands
+            .set_profile_scope(self.profile_scope.clone());
         record(&mut recording)?;
         self.submitted = true;
-        recording.submit()?.finish_with_time()
+        let (time, profile) = recording
+            .submit_with_profiling(self.profiled)?
+            .finish_with_profile()?;
+        self.profile = profile;
+        Ok(time)
     }
 }

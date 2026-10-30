@@ -57,13 +57,17 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         )
         .map_err(guest_error)?;
         let taints = Arc::clone(&self.taints);
+        let profile = self.active_profile.clone();
+        let scope = self.current_profile_scope.clone();
         let cell = self.state_cell(resource)?;
+        cell.set_profile_context(profile.is_some(), scope);
         let mut access = SubmissionAccess::default();
         access.record(inputs, std::slice::from_ref(output));
         let flight = taints.begin(&access).map_err(guest_error)?;
         let started = Instant::now();
         let result = run(cell, limits);
         let submitted = cell.was_submitted();
+        crate::record_submission_profile(profile.as_ref(), cell.take_profile());
         let outcome = flight.finish(
             result
                 .as_ref()
@@ -502,3 +506,7 @@ mod tests {
         assert_eq!(host.live_handles, 0);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "profile_tests.rs"]
+mod profile_tests;
