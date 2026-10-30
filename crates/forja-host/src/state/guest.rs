@@ -104,6 +104,28 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
             .downcast_mut()
             .ok_or_else(|| invalid_handle("state backend mismatch"))
     }
+
+    fn update_delta_state(
+        &mut self,
+        resource: &Resource<StateEntry>,
+        inputs: &[Resource<TensorEntry>],
+        output: Resource<TensorEntry>,
+        variant: Option<&str>,
+    ) -> Result<(), compute::Error> {
+        let inputs = self.state_tensors(inputs)?;
+        let [q, k, v, decay, beta] = inputs.as_slice() else {
+            return Err(invalid_handle("delta rule requires five ordinary inputs"));
+        };
+        let output = self.state_tensors(&[output])?;
+        self.update_state(resource, &inputs, &output[0], |cell, limits| {
+            let operands = [&q.tensor, &k.tensor, &v.tensor, &decay.tensor, &beta.tensor];
+            if let Some(variant) = variant {
+                cell.delta_rule_block(operands, &output[0].tensor, limits, Some(variant))
+            } else {
+                cell.delta_rule(operands, &output[0].tensor, limits)
+            }
+        })
+    }
 }
 
 impl<B: Backend + Send + Sync + 'static> compute::HostStatePlane for Host<B> {
@@ -136,20 +158,18 @@ impl<B: Backend + Send + Sync + 'static> compute::HostStatePlane for Host<B> {
         inputs: Vec<Resource<TensorEntry>>,
         output: Resource<TensorEntry>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        let result = (|| {
-            let inputs = self.state_tensors(&inputs)?;
-            let [q, k, v, decay, beta] = inputs.as_slice() else {
-                return Err(invalid_handle("delta rule requires five ordinary inputs"));
-            };
-            let output = self.state_tensors(&[output])?;
-            self.update_state(&resource, &inputs, &output[0], |cell, limits| {
-                cell.delta_rule(
-                    [&q.tensor, &k.tensor, &v.tensor, &decay.tensor, &beta.tensor],
-                    &output[0].tensor,
-                    limits,
-                )
-            })
-        })();
+        let result = self.update_delta_state(&resource, &inputs, output, None);
+        std::future::ready(Ok(result))
+    }
+
+    fn delta_rule_block(
+        &mut self,
+        resource: Resource<StateEntry>,
+        inputs: Vec<Resource<TensorEntry>>,
+        output: Resource<TensorEntry>,
+        variant: String,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        let result = self.update_delta_state(&resource, &inputs, output, Some(&variant));
         std::future::ready(Ok(result))
     }
 
@@ -226,6 +246,72 @@ mod tests {
                 .await
                 .unwrap()
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_block_import_publishes_with_current_limits() {
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(1_048_576, 8, 1_048_576, 128, 1_048_576),
+        );
+        let state = host
+            .create(compute::Dtype::F32, vec![1, 1, 1])
+            .await
+            .unwrap()
+            .unwrap();
+        let mut inputs = Vec::new();
+        for shape in [
+            vec![2, 1, 1],
+            vec![2, 1, 1],
+            vec![2, 1, 1],
+            vec![2, 1],
+            vec![2, 1],
+        ] {
+            inputs.push(host.alloc(compute::Dtype::F32, &shape).unwrap());
+        }
+        let output = host.alloc(compute::Dtype::F32, &[2, 1, 1]).unwrap();
+        let before = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let invoke_inputs = || {
+            inputs
+                .iter()
+                .map(|input| Resource::new_borrow(input.rep()))
+                .collect()
+        };
+        host.limits.work_per_dispatch = 0;
+        assert!(
+            host.delta_rule_block(
+                Resource::new_borrow(state.rep()),
+                invoke_inputs(),
+                Resource::new_borrow(output.rep()),
+                "delta-rule-block.wy64-fixed".to_owned()
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            before
+        );
+        host.limits.work_per_dispatch = 1_048_576;
+        host.delta_rule_block(
+            Resource::new_borrow(state.rep()),
+            invoke_inputs(),
+            Resource::new_borrow(output.rep()),
+            "delta-rule-block.wy64-fixed".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            host.completed_submissions
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            before
         );
     }
     #[tokio::test]

@@ -205,6 +205,7 @@ interface compute {
   resource state-plane {
     create: static func(dt: dtype, shape: list<u32>) -> result<state-plane, error>;
     delta-rule: func(inputs: list<borrow<tensor>>, output: borrow<tensor>) -> result<_, error>;
+    delta-rule-block: func(inputs: list<borrow<tensor>>, output: borrow<tensor>, pick: string) -> result<_, error>;
     causal-convolution: func(input: borrow<tensor>, weights: borrow<tensor>, output: borrow<tensor>) -> result<_, error>;
   }
 

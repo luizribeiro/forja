@@ -95,6 +95,33 @@ impl<B: Backend> NativeState<B> {
     }
 }
 
+impl<B: Backend + 'static> NativeState<B> {
+    /// Applies canonical block transforms with an explicit Metal catalog identity.
+    ///
+    /// # Errors
+    /// Refuses foreign tensors, invalid geometry, picks, quotas or failed execution.
+    pub fn delta_rule_block(
+        &mut self,
+        inputs: [&NativeTensor<B>; 5],
+        output: &NativeTensor<B>,
+        variant: &str,
+    ) -> Result<(), compute::Error> {
+        let inputs = inputs
+            .map(|input| self.tensor(input))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = self.tensor(output)?;
+        self.cell
+            .delta_rule_block(
+                [inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]],
+                output,
+                state_limits(),
+                Some(variant),
+            )
+            .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
