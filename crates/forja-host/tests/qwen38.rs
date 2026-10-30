@@ -252,6 +252,9 @@ fn component_metadata_declares_the_text_only_single_lane_contract() -> Result<()
 #[path = "qwen38/real.rs"]
 mod real;
 
+#[path = "qwen38/lifecycle.rs"]
+mod lifecycle;
+
 #[test]
 fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Result<(), Box<dyn Error>>
 {
