@@ -1,3 +1,5 @@
+mod gram;
+
 const BLOCK: usize = 64;
 
 fn tree_sum(count: usize, value: impl Fn(usize) -> f32) -> f32 {
