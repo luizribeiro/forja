@@ -22,6 +22,24 @@ impl DeltaNet {
     /// Returns configuration, weight, quota or allocation errors.
     pub fn load(weights: &Weights<'_>, config: Config) -> Result<Self> {
         config.validate()?;
+        Self::load_with_carry(weights, config, Carry::new(config)?)
+    }
+
+    /// Loads weights with a lane-local pair of host-owned serving planes.
+    ///
+    /// # Errors
+    /// Refuses invalid planes, geometry or weights.
+    pub fn load_paged(
+        weights: &Weights<'_>,
+        config: Config,
+        cache: std::rc::Rc<forja_sdk::PagedCacheSet>,
+        first: u32,
+    ) -> Result<Self> {
+        config.validate()?;
+        Self::load_with_carry(weights, config, Carry::slotted(cache, first)?)
+    }
+
+    fn load_with_carry(weights: &Weights<'_>, config: Config, carry: Carry) -> Result<Self> {
         let channels = config.qkv()?;
         let values = config.value_heads * config.value_dim;
         let convolution = weights
@@ -52,7 +70,7 @@ impl DeltaNet {
             dt_bias: weights
                 .tensor::<bf16>("dt_bias", &[config.value_heads])?
                 .to_dtype()?,
-            carry: Carry::new(config)?,
+            carry,
         })
     }
     /// Starts a new sequence with zero convolution history and recurrent state.
@@ -60,6 +78,11 @@ impl DeltaNet {
     /// # Errors
     /// Returns host quota or allocation errors.
     pub fn reset(&mut self) -> Result<()> {
+        if self.carry.is_slotted() {
+            return Err(forja_sdk::Error::loading(
+                "serving state reset belongs to the host",
+            ));
+        }
         self.carry = Carry::new(self.config)?;
         Ok(())
     }
@@ -97,7 +120,12 @@ impl DeltaNet {
         let tokens = input.shape().first().copied().unwrap_or(0);
         if input.shape() != [tokens, c.hidden]
             || tokens == 0
-            || tokens > crate::PREFILL_BLOCK_TOKENS
+            || tokens
+                > if self.carry.is_slotted() {
+                    2048
+                } else {
+                    crate::PREFILL_BLOCK_TOKENS
+                }
             || (!prefill && tokens != 1)
         {
             return Err(forja_sdk::Error::loading("invalid delta layer token span"));

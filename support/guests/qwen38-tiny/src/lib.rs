@@ -9,7 +9,10 @@ use forja_sdk::{
     Weights, export_engine,
 };
 
-struct Tiny(qwen38::Qwen38);
+enum Tiny {
+    Full(qwen38::Qwen38),
+    Recurrent(qwen38::DeltaNet),
+}
 
 #[export_engine]
 impl Engine for Tiny {
@@ -20,16 +23,73 @@ impl Engine for Tiny {
             tap_layers: (1..=4).collect(),
             router_layers: Vec::new(),
             prompt_block_tokens: std::num::NonZeroU32::new(64),
-            serving: None,
+            serving: Some(forja_sdk::ServingInfo {
+                page_tokens: 64,
+                active_lanes: 8,
+                max_context: 64,
+                prefill_chunk_multiple: None,
+                batch_shapes: Vec::new(),
+                planes: ["key", "value"]
+                    .into_iter()
+                    .map(|label| forja_sdk::CachePlane {
+                        elements_per_token: 32,
+                        alignment: 256,
+                        label: label.into(),
+                    })
+                    .collect(),
+            }),
         }
     }
     fn load(weights: &Weights<'_>, load: EngineLoadConfig) -> Result<Self> {
-        qwen38::Qwen38::with_config(weights, &load, qwen38::Config::tiny()).map(Self)
+        qwen38::Qwen38::with_config(weights, &load, qwen38::Config::tiny()).map(Self::Full)
+    }
+    fn load_paged(
+        weights: &Weights<'_>,
+        pool: Option<forja_sdk::PagedPool<'_>>,
+        load: EngineLoadConfig,
+    ) -> Result<Self> {
+        let Some(pool) = pool else {
+            return Self::load(weights, load);
+        };
+        let config = qwen38::Config::tiny();
+        let cache = std::rc::Rc::new(pool.cache_set_with_state(1, &config.state_planes()?[..2])?);
+        qwen38::DeltaNet::load_paged(
+            &weights.scoped("language_model.model.layers.0.linear_attn"),
+            config,
+            cache,
+            0,
+        )
+        .map(Self::Recurrent)
     }
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
-        self.0.step(input)
+        match self {
+            Self::Full(engine) => engine.step(input),
+            Self::Recurrent(layer) => {
+                let [token]: [u32; 1] = input.tokens.to_vec()?.try_into().map_err(|_| {
+                    forja_sdk::Error::loading("recurrent fixture requires one token")
+                })?;
+                let x = forja_sdk::Tensor::constant(
+                    &[forja_sdk::bf16::from_f64(f64::from(token)); 64],
+                    &[1, 64],
+                )?;
+                let logits = layer
+                    .deltanet_layer(&x, None)?
+                    .narrow(1, 0, 33)?
+                    .to_dtype()?
+                    .reshape(&[33])?;
+                forja_sdk::eval()?;
+                Ok(StepOutput {
+                    logits,
+                    taps: Vec::new(),
+                    router_logits: Vec::new(),
+                })
+            }
+        }
     }
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
-        self.0.decode(input)
+        match self {
+            Self::Full(engine) => engine.decode(input),
+            Self::Recurrent(_) => Err(forja_sdk::Error::loading("recurrent fixture uses step")),
+        }
     }
 }
