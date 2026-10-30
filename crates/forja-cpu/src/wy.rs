@@ -1,4 +1,5 @@
 mod gram;
+mod solve;
 
 const BLOCK: usize = 64;
 
