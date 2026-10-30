@@ -9619,12 +9619,22 @@ mod tests {
             .remove(&input_buffer);
         let kv = host.paged_lane_prefix(pool.rep(), 0).unwrap();
         assert_eq!(kv.sequence.lock().unwrap().logical_len(), 0);
-        host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
+        let checkpoint = host
+            .begin_paged_lane_append(pool.rep(), 0, 0, 1)
+            .unwrap()
+            .0
+            .unwrap();
         let retry = host.command_list().unwrap();
         host.record_slot_state(&retry, &slot, 0, 0, operation, &operands, &output, "")
             .unwrap();
         host.prepare_submit(retry).unwrap().run().await.unwrap();
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
+        assert_eq!(kv.sequence.lock().unwrap().logical_len(), 1);
+        assert!(
+            host.finish_paged_lane_append(pool.rep(), 0, checkpoint)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(kv.sequence.lock().unwrap().logical_len(), 1);
         assert_eq!(
             host.backend

@@ -173,6 +173,13 @@ impl<B: Backend + 'static> Host<B> {
         {
             return Err(invalid_handle("state commands mix slot banks"));
         }
+        let binding = std::sync::Arc::clone(
+            &self
+                .table
+                .get(&Resource::<crate::BatchSlotEntry>::new_borrow(first.slot))
+                .map_err(invalid_handle)?
+                .binding,
+        );
         let state = self
             .state_slots
             .get_mut(&first.slot)
@@ -190,6 +197,12 @@ impl<B: Backend + 'static> Host<B> {
         } else {
             None
         };
+        for usage in usages.iter().filter(|usage| usage.active) {
+            binding
+                .lane(usage.lane)?
+                .used
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok((batch, owners))
     }
 }
