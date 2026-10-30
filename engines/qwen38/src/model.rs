@@ -15,6 +15,7 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     quant: Option<Variant>,
     attention: Option<Variant>,
+    delta: Option<Variant>,
     pub(crate) sample: Option<Variant>,
 }
 impl Model {
@@ -54,7 +55,7 @@ impl Model {
             Some(EngineSelections::new(
                 load,
                 &[],
-                &["quant", "attention", "sample"],
+                &["quant", "attention", "sample", "delta-prefill"],
                 context,
             )?)
         };
@@ -85,6 +86,10 @@ impl Model {
             attention: picks
                 .as_ref()
                 .map(|picks| picks.at("attention", 0))
+                .transpose()?,
+            delta: picks
+                .as_ref()
+                .map(|picks| picks.at("delta-prefill", 0))
                 .transpose()?,
             sample: picks
                 .as_ref()
@@ -173,7 +178,7 @@ impl Model {
                         start + row,
                         self.quant.as_ref(),
                         self.attention.as_ref(),
-                        None,
+                        self.delta.as_ref(),
                     )?
                 } else {
                     layer.forward(

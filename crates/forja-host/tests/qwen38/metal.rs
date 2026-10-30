@@ -6,6 +6,7 @@ pub(super) fn tiny_load() -> forja_sdk::EngineLoadConfig {
         ("quant", "quant-matmul.portable"),
         ("attention", "sdpa.decomposed"),
         ("sample", "sample.parallel"),
+        ("delta-prefill", "delta-rule-block.wy64-fixed"),
     ]
     .map(|(site, name)| forja_sdk::FixedVariantPick {
         site: site.to_owned(),
