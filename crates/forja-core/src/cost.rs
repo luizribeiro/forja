@@ -34,6 +34,10 @@ pub struct KernelCost {
     pub state_read_bytes: u64,
     /// Private state bytes written, included in total writes.
     pub state_write_bytes: u64,
+    /// Internal block scratch bytes read, included in total reads.
+    pub scratch_read_bytes: u64,
+    /// Internal block scratch bytes written, included in total writes.
+    pub scratch_write_bytes: u64,
     /// Weight bytes included in reads, before data-dependent expert reuse.
     pub weight_bytes: u64,
     /// Minimum footprint for distinct per-row routes; zero for non-routed operations.
@@ -52,6 +56,7 @@ impl KernelCost {
         serde_json::json!({"read_bytes": self.read_bytes, "write_bytes": self.write_bytes,
             "flops": self.flops, "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops,
             "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
+            "scratch_read_bytes": self.scratch_read_bytes, "scratch_write_bytes": self.scratch_write_bytes,
             "weight_bytes": self.weight_bytes, "kv_bytes": self.kv_bytes,
             "minimum_weight_bytes": self.minimum_weight_bytes,
             "maximum_weight_bytes": self.maximum_weight_bytes})

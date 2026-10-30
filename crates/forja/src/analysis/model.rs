@@ -20,6 +20,8 @@ struct Totals {
     sfu_ops: u64,
     state_read_bytes: u64,
     state_write_bytes: u64,
+    scratch_read_bytes: u64,
+    scratch_write_bytes: u64,
     compute: [f64; 3],
     dispatches: u64,
     attributed: f64,
@@ -81,6 +83,14 @@ impl Totals {
             .state_write_bytes
             .checked_add(cost.state_write_bytes)
             .ok_or("state write total overflow")?;
+        self.scratch_read_bytes = self
+            .scratch_read_bytes
+            .checked_add(cost.scratch_read_bytes)
+            .ok_or("scratch read total overflow")?;
+        self.scratch_write_bytes = self
+            .scratch_write_bytes
+            .checked_add(cost.scratch_write_bytes)
+            .ok_or("scratch write total overflow")?;
         self.dispatches = self
             .dispatches
             .checked_add(count)
@@ -173,6 +183,7 @@ impl Totals {
             json!({"bound_kind": if mode == "decode" { "matrix-weights-plus-KV-once" } else { "aggregate-prefill-roofline" },
             "weight_bytes_range": self.weights, "kv_bytes": self.kv, "logical_read_bytes_range": self.read, "write_bytes": self.write,
             "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
+            "scratch_read_bytes": self.scratch_read_bytes, "scratch_write_bytes": self.scratch_write_bytes,
             "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops, "scalar_sfu_ceiling": "uncalibrated",
             "matrix_product_flops": self.flops, "physical_dispatches": self.dispatches, "layers": self.layers, "layer_count": self.layers.len(),
             "streaming_bound_seconds_range": memory, "compute_bound_seconds": self.compute[1],
@@ -279,6 +290,8 @@ mod tests {
                     sfu_ops: 7,
                     state_read_bytes: 132,
                     state_write_bytes: 132,
+                    scratch_read_bytes: 4096,
+                    scratch_write_bytes: 2048,
                     ..KernelCost::default()
                 },
                 1,
@@ -291,6 +304,8 @@ mod tests {
         assert_eq!(within["sfu_ops"], 7);
         assert_eq!(within["state_read_bytes"], 132);
         assert_eq!(within["state_write_bytes"], 132);
+        assert_eq!(within["scratch_read_bytes"], 4096);
+        assert_eq!(within["scratch_write_bytes"], 2048);
         assert_eq!(within["scalar_sfu_ceiling"], "uncalibrated");
         assert_eq!(within["over_100_percent"], true);
         assert_eq!(within["bound_exceeds_observed"], false);
