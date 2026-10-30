@@ -6226,6 +6226,7 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn check_byte_allocation(&self, byte_len: u64) -> Result<(), compute::Error> {
+        self.backend.reclaim_completed();
         if self
             .live_bytes
             .load(Ordering::Acquire)

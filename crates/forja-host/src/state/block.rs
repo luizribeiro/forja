@@ -6,7 +6,13 @@ use std::sync::Arc;
 pub(super) struct StateScratch<B: Backend> {
     backend: Arc<B>,
     tensor: Tensor,
-    _charge: StateCharge,
+    charge: Arc<StateCharge>,
+}
+
+impl<B: Backend> StateScratch<B> {
+    pub(super) fn retained_resource(&self) -> forja_core::CompletionResource {
+        forja_core::CompletionResource::new(Arc::clone(&self.charge))
+    }
 }
 
 impl<B: Backend> Drop for StateScratch<B> {
@@ -49,6 +55,7 @@ impl<B: Backend + 'static> StateRecording<B> {
             .checked_mul(4)
             .ok_or_else(|| quota("state scratch size overflow"))?;
         let charge = StateCharge::reserve(
+            self.storage.backend.as_ref(),
             Arc::clone(&self.storage.charge.live),
             self.storage.limit.min(self.limits.live_bytes),
             bytes,
@@ -60,7 +67,7 @@ impl<B: Backend + 'static> StateRecording<B> {
                 .backend
                 .alloc(forja_core::DType::F32, &[layout.elements()])
                 .map_err(guest_error)?,
-            _charge: charge,
+            charge: Arc::new(charge),
         };
         let mut dispatch = self.prepare_update(
             plane,
@@ -158,5 +165,36 @@ mod tests {
                 .any(|&byte| byte != 0)
         );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn timeout_retains_backing_and_scratch_charges_until_physical_completion() {
+        let (control, mut host) = super::super::lifecycle_tests::controlled_host();
+        host.limits.tensor_elements = 65536;
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1, 1]).unwrap()])
+                    .unwrap(),
+                1,
+            )
+            .unwrap();
+        let mut cell = StateCell::new(Arc::clone(&storage)).unwrap();
+        let inputs = [&[2, 1, 1][..], &[2, 1, 1], &[2, 1, 1], &[2, 1], &[2, 1]]
+            .map(|shape| host.backend.alloc(DType::F32, shape).unwrap());
+        let output = host.backend.alloc(DType::F32, &[2, 1, 1]).unwrap();
+        let live = Arc::clone(&host.live_bytes);
+        let before = live.load(Ordering::Acquire);
+        control.failure.store(1, Ordering::Release);
+        assert!(
+            cell.delta_rule_block(inputs.each_ref(), &output, host.limits, None)
+                .is_err()
+        );
+        assert!(live.load(Ordering::Acquire) > before);
+        drop(cell);
+        drop(storage);
+        drop(host);
+        assert!(live.load(Ordering::Acquire) > before);
+        control.complete();
+        assert_eq!(live.load(Ordering::Acquire), 0);
     }
 }

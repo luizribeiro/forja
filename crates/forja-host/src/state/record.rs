@@ -14,7 +14,7 @@ pub struct StateRecording<B: Backend> {
     pub(super) access: StateAccess,
     pub(super) scratch: Vec<super::block::StateScratch<B>>,
     metadata: Vec<Tensor>,
-    _charge: StateCharge,
+    charge: Arc<StateCharge>,
     pub(super) commands: CommandList,
     pub(super) updated: Vec<bool>,
     pub(super) limits: Limits,
@@ -50,6 +50,7 @@ impl<B: Backend> StateStorage<B> {
             .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
             .ok_or_else(|| quota("state recording size overflow"))?;
         let charge = StateCharge::reserve(
+            self.backend.as_ref(),
             Arc::clone(&self.charge.live),
             self.limit.min(limits.live_bytes),
             bytes,
@@ -65,7 +66,7 @@ impl<B: Backend> StateStorage<B> {
             access,
             scratch: Vec::new(),
             metadata: Vec::new(),
-            _charge: charge,
+            charge: Arc::new(charge),
             commands: CommandList::new(),
             updated: vec![false; self.planes.len()],
             limits,
@@ -97,6 +98,19 @@ impl<B: Backend> StateStorage<B> {
 }
 
 impl<B: Backend> StateRecording<B> {
+    pub(super) fn retained_resources(&self) -> Vec<forja_core::CompletionResource> {
+        let mut owners = vec![
+            forja_core::CompletionResource::new(Arc::clone(&self.storage.charge)),
+            forja_core::CompletionResource::new(Arc::clone(&self.charge)),
+        ];
+        owners.extend(
+            self.scratch
+                .iter()
+                .map(super::block::StateScratch::retained_resource),
+        );
+        owners
+    }
+
     /// Serial of the version whose publication this recording requests.
     #[must_use]
     pub fn serial(&self) -> u64 {

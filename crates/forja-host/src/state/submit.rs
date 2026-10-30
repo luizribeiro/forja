@@ -40,9 +40,10 @@ impl<B: Backend> StateRecording<B> {
             .map_err(pool_error)?;
         *last = queue_position;
         let commands = std::mem::take(&mut self.commands);
+        let retained = self.retained_resources();
         let submission = storage
             .backend
-            .submit(commands)
+            .submit_retained(commands, retained)
             .inspect_err(|_| {
                 storage.poisoned.store(true, Ordering::Release);
             })

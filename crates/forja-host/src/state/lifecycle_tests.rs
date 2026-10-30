@@ -1,24 +1,35 @@
 use super::{StateRecording, StateSequenceHandle, StateStorage};
 use crate::{Host, Limits, compute};
 use forja_core::{
-    Backend, BackendError, BufferId, CommandList, DType, Layout, PagePoolError, StateLayout,
-    StatePlane, Submission, Tensor, ViewOp,
+    Backend, BackendError, BufferId, CommandList, CompletionResource, DType, Layout, PagePoolError,
+    StateLayout, StatePlane, Submission, Tensor, ViewOp,
     program::{KernelSignature, ValidatedProgram},
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
+type Retained = Arc<Mutex<Vec<CompletionResource>>>;
+
 #[derive(Default)]
 pub(super) struct Control {
+    retained: Mutex<Vec<Retained>>,
     waits: AtomicUsize,
     pub(super) failure: AtomicU8,
     timeout_ns: AtomicU64,
     gpu_ns: AtomicU64,
+}
+
+impl Control {
+    pub(super) fn complete(&self) {
+        for owners in std::mem::take(&mut *self.retained.lock().unwrap()) {
+            owners.lock().unwrap().clear();
+        }
+    }
 }
 
 pub(super) struct ControlledBackend {
@@ -27,6 +38,7 @@ pub(super) struct ControlledBackend {
 }
 
 pub(super) struct ControlledSubmission {
+    retained: Retained,
     inner: forja_cpu::CpuSubmission,
     control: Arc<Control>,
     failure: u8,
@@ -35,11 +47,15 @@ pub(super) struct ControlledSubmission {
 impl Submission for ControlledSubmission {
     fn wait(&self) -> Result<(), BackendError> {
         self.control.waits.fetch_add(1, Ordering::AcqRel);
-        match self.failure {
+        let result = match self.failure {
             1 => Err(BackendError::Timeout),
             2 => Err(BackendError::ExecutionFailed),
             _ => self.inner.wait(),
+        };
+        if result != Err(BackendError::Timeout) {
+            self.retained.lock().unwrap().clear();
         }
+        result
     }
     fn wait_timeout(&self, timeout: Duration) -> Result<(), BackendError> {
         self.control.timeout_ns.store(
@@ -86,10 +102,26 @@ impl Backend for ControlledBackend {
     }
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         Ok(ControlledSubmission {
+            retained: Arc::default(),
             inner: self.cpu.submit(commands)?,
             control: Arc::clone(&self.control),
             failure: self.control.failure.load(Ordering::Acquire),
         })
+    }
+
+    fn submit_retained(
+        &self,
+        commands: CommandList,
+        owners: Vec<CompletionResource>,
+    ) -> Result<Self::Submission, BackendError> {
+        let submission = self.submit(commands)?;
+        submission.retained.lock().unwrap().extend(owners);
+        self.control
+            .retained
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&submission.retained));
+        Ok(submission)
     }
 }
 

@@ -35,7 +35,13 @@ struct StateCharge {
 }
 
 impl StateCharge {
-    fn reserve(live: Arc<AtomicU64>, limit: u64, bytes: u64) -> Result<Self, compute::Error> {
+    fn reserve(
+        backend: &impl Backend,
+        live: Arc<AtomicU64>,
+        limit: u64,
+        bytes: u64,
+    ) -> Result<Self, compute::Error> {
+        backend.reclaim_completed();
         live.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|&sum| sum <= limit)
         })
@@ -56,7 +62,7 @@ pub struct StateStorage<B: Backend> {
     backend: Arc<B>,
     pool: StatePool,
     planes: Vec<Tensor>,
-    charge: StateCharge,
+    charge: Arc<StateCharge>,
     limit: u64,
     limits: Limits,
     queue_position: Mutex<u64>,
@@ -123,13 +129,13 @@ impl<B: Backend> StateStorage<B> {
             .and_then(|n| n.checked_add(u64::from(sequences) * SEQUENCE_METADATA_RESERVE))
             .and_then(|n| n.checked_add(descriptor_bytes))
             .ok_or_else(|| quota("state byte count overflow"))?;
-        let charge = StateCharge::reserve(live_bytes, limits.live_bytes, bytes)?;
+        let charge = StateCharge::reserve(backend.as_ref(), live_bytes, limits.live_bytes, bytes)?;
         let pool = StatePool::new(layout, sequences, bytes).map_err(pool_error)?;
         let mut storage = StateStorage {
             backend,
             pool,
             planes: Vec::new(),
-            charge,
+            charge: Arc::new(charge),
             limit: limits.live_bytes,
             limits,
             queue_position: Mutex::new(0),
@@ -163,8 +169,12 @@ impl<B: Backend> StateStorage<B> {
                 .elements()
                 .checked_mul(descriptor.dtype().byte_size())
                 .ok_or_else(|| quota("state initialization size overflow"))?;
-            let _initialization_charge =
-                StateCharge::reserve(Arc::clone(&self.charge.live), self.limit, size)?;
+            let _initialization_charge = StateCharge::reserve(
+                self.backend.as_ref(),
+                Arc::clone(&self.charge.live),
+                self.limit,
+                size,
+            )?;
             let size = usize::try_from(size)
                 .map_err(|_| quota("state initialization exceeds addressable memory"))?;
             let mut zeros = Vec::new();
@@ -219,7 +229,7 @@ impl<B: Backend> StateStorage<B> {
 
     /// Bytes retained by the backing and its conservatively reserved allocator metadata.
     #[must_use]
-    pub const fn charged_bytes(&self) -> u64 {
+    pub fn charged_bytes(&self) -> u64 {
         self.charge.bytes
     }
 
