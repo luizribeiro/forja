@@ -26,6 +26,9 @@ device choices; the host validates generic operations and memory capabilities.
    working example. Expect a component under `target/engines/`.
    Validate dimensions and checked offsets before allocation: invalid views must
    fail at construction, before they can reach a kernel.
+   Keep authored code unsafe-denied (and native builds unsafe-forbidden). Only the
+   wasm module containing wit-bindgen exports needs `allow(unsafe_code)` for its
+   generated ABI shim; see [the engine boundary](../engines/qwen38/src/lib.rs).
 
 3. **Make the plain model correct.** Follow
    [`reference.rs`](../engines/smollm2/src/reference.rs): embedding, decoder layer,
@@ -36,6 +39,13 @@ device choices; the host validates generic operations and memory capabilities.
    Expect reference and optimized logits and every layer tap to agree under the
    shared normwise f32 tolerance, including cache continuations. This CPU check
    needs no model download. Run Metal cases through nextest's serialized group.
+   Recurrent engines use [`state::StatePlane`](../crates/forja-sdk/src/state.rs):
+   create a float32 recurrent plane and an activation-typed convolution-history plane,
+   then call `delta_rule` and `causal_convolution`. These eager calls drain tensor
+   work and publish on successful completion; private backing has no ordinary view.
+   Native and component imports must share current tensor/live-byte limits, GPU
+   budget, write dependencies and taints with ordinary submissions. Refusals before
+   submission refund reserved GPU time; execution failure requires reset/reload.
 
 4. **Record independent goldens.** Run
    `uv run --locked --project support/golden support/golden/smollm2.py --model "$FORJA_MODELS/SmolLM2-135M-Instruct" --out "$FORJA_MODELS/golden/smollm2-135m-instruct"`.
@@ -62,9 +72,14 @@ device choices; the host validates generic operations and memory capabilities.
    Pin model revision/hash, storage precision, context and workload. A different
    precision is a different performance baseline. Path selection belongs in a
    profile, so both implementations remain compiled and testable in one artifact.
+   Keep `prompt-token-budget <= prefill-chunk`, including single-lane eager profiles.
    Pair the instruction engine with
    [its chat component](../chat-formats/smollm2-chat/src/lib.rs); test exact template
    bytes, stop ids and malformed/unsupported requests before serving.
+   Give custom chat packages and libraries distinct names from engine crates;
+   `[lib].name` controls the built wasm filename, not the containing directory.
+   For example, package `qwen38-chat` uses library `qwen38_chat`, while its engine
+   library is `qwen38`. Shared native library names collide in Cargo's output.
 
 6. **Choose a measured optimization.** Use `forja profile` and `forja analyze`,
    then `forja bench-kernel` as described in [benchmarking](benchmarking.md).
