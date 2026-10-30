@@ -18,6 +18,10 @@ impl<B: Backend> Clone for StateSequenceHandle<B> {
 }
 
 impl<B: Backend> StateSequenceHandle<B> {
+    pub(super) fn order_key(&self) -> usize {
+        Arc::as_ptr(&self.inner).addr()
+    }
+
     pub(super) fn new(storage: Arc<StateStorage<B>>, sequence: StateSequence) -> Self {
         Self {
             inner: Arc::new(Mutex::new(StateJournal::new(sequence))),
