@@ -10,6 +10,7 @@ mod fuzz_tests;
 mod hybrid;
 mod native;
 mod state;
+mod state_inputs;
 pub use state::{
     LanePosition, StateBatch, StateBatchSubmission, StateCapture, StateCell, StateCommands,
     StateEntry, StateLaneCheckpoint, StateRecording, StateSequenceHandle, StateSlots, StateStorage,
@@ -3256,6 +3257,7 @@ pub struct PagedSequenceEntry;
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
     input_layout: Option<paged_storage::StateInputLayout>,
+    inputs: Option<state_inputs::StateInputs>,
     binding: Arc<PagedBinding>,
     planes: Vec<u32>,
     tables: [Vec<u32>; 2],
@@ -3789,6 +3791,7 @@ impl<B: Backend + 'static> Host<B> {
         cleanup.extend(backing.metadata.into_iter().flatten());
         let slot = match self.table.push(BatchSlotEntry {
             input_layout: None,
+            inputs: None,
             binding,
             planes: backing.planes,
             tables: backing.tables,
@@ -8493,6 +8496,12 @@ where
             .map_err(invalid_handle)
             .map(|entry| {
                 let mut resources = entry.planes;
+                resources.extend(
+                    entry
+                        .inputs
+                        .iter()
+                        .flat_map(state_inputs::StateInputs::handles),
+                );
                 resources.extend(entry.tables.into_iter().flatten());
                 resources.push(entry.generations);
                 resources.extend(entry.metadata.into_iter().flatten());

@@ -32,11 +32,17 @@ impl<B: Backend + 'static> Host<B> {
         .map_err(invalid_handle)?;
         let storage = self.create_state_storage(layout, lanes)?;
         let state = StateSlots::new(storage, lanes)?;
-        let slot = self.open_paged_slot(pool, planes)?;
-        self.table
-            .get_mut(&slot)
-            .map_err(invalid_handle)?
-            .input_layout = Some(inputs);
+        let backing = self.allocate_state_inputs(lanes, inputs)?;
+        let slot = match self.open_paged_slot(pool, planes) {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.drop_paged_handles(backing.handles().collect());
+                return Err(error);
+            }
+        };
+        let entry = self.table.get_mut(&slot).map_err(invalid_handle)?;
+        entry.input_layout = Some(inputs);
+        entry.inputs = Some(backing);
         self.state_slots.insert(slot.rep(), state);
         Ok(slot)
     }
