@@ -57,6 +57,7 @@ impl MetalBackend {
             access.source(),
             access.destination(),
             input[7].layout().shape()[0],
+            u32::from(access.is_active()),
             query[0],
             query[1],
             state[0],

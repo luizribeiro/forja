@@ -21,10 +21,11 @@ impl CpuBackend {
         }
         let table = cpu_page_table(self, &inputs[metadata], &inputs[metadata + 1])?;
         let access = operation.access();
-        if table
-            .resolve(0)
-            .map_err(|_| BackendError::ExecutionFailed)?
-            != access.source()
+        if !access.is_active()
+            || table
+                .resolve(0)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                != access.source()
             || table
                 .resolve(1)
                 .map_err(|_| BackendError::ExecutionFailed)?

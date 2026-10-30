@@ -121,8 +121,12 @@ impl<B: Backend> StateStorage<B> {
         access: StateAccess,
     ) -> Result<StateCommands<B>, compute::Error> {
         self.check_usable()?;
-        let mut commands =
-            StateCommands::empty(self, access, self.command_charge(self.limits)?, self.limits);
+        let mut commands = StateCommands::empty(
+            self,
+            access.inactive(),
+            self.command_charge(self.limits)?,
+            self.limits,
+        );
         let records = usize::try_from(self.planes[0].layout().shape()[0])
             .map_err(|_| quota("state metadata exceeds addressable memory"))?;
         commands.initialize_metadata(vec![u32::MAX; 4], vec![u32::MAX; records], false)?;

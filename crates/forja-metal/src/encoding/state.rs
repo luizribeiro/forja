@@ -54,6 +54,7 @@ impl MetalBackend {
             access.source(),
             access.destination(),
             input[input.len() - 2].layout().shape()[0],
+            u32::from(access.is_active()),
         ]
         .into_iter()
         .chain(geometry)

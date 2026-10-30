@@ -2,6 +2,7 @@ struct StateAuth {
     uint source;
     uint destination;
     uint records;
+    uint active;
 };
 
 struct StateParams {
@@ -17,7 +18,7 @@ bool authenticate_state(
     constant StateAuth &params, device atomic_uint *error_flag) {
     uint2 source = table[0];
     uint2 destination = table[1];
-    bool valid = source.x == params.source && destination.x == params.destination
+    bool valid = params.active != 0 && source.x == params.source && destination.x == params.destination
         && source.x != destination.x && source.x < params.records && destination.x < params.records;
     if (valid) {
         valid = generations[source.x] == source.y && generations[destination.x] == destination.y;

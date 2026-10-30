@@ -3,6 +3,38 @@ use crate::{Host, Limits};
 use forja_core::{DType, StateLayout, StatePlane, Submission};
 use std::time::Duration;
 
+fn forge_activity<B: Backend>(backend: &B, commands: &StateCommands<B>) {
+    let table = [
+        commands.access.source(),
+        u32::MAX,
+        commands.access.destination(),
+        u32::MAX,
+    ];
+    backend
+        .write(
+            &commands.metadata[0],
+            &table
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    backend
+        .write(&commands.metadata[2], &1_u32.to_le_bytes())
+        .unwrap();
+}
+
+fn write_constant<B: Backend>(backend: &B, tensor: &forja_core::Tensor, value: f32) {
+    backend
+        .write(
+            tensor,
+            &value
+                .to_le_bytes()
+                .repeat(usize::try_from(tensor.layout().element_count()).unwrap()),
+        )
+        .unwrap();
+}
+
 fn poisoned_padding<B: Backend + Send + Sync + 'static>(backend: B) {
     let host = Host::new(backend, Limits::new(131_072, 8, 4096, 128, 4096));
     let storage = host
@@ -21,30 +53,19 @@ fn poisoned_padding<B: Backend + Send + Sync + 'static>(backend: B) {
     let next = storage
         .version_view(0, slots.inactive_access.destination())
         .unwrap();
-    host.backend
-        .write(&input, &2_f32.to_le_bytes().repeat(7))
-        .unwrap();
-    host.backend
-        .write(&weights, &1_f32.to_le_bytes().repeat(28))
-        .unwrap();
-    host.backend
-        .write(&previous, &9_f32.to_le_bytes().repeat(21))
-        .unwrap();
-    host.backend
-        .write(&next, &13_f32.to_le_bytes().repeat(21))
-        .unwrap();
+    write_constant(host.backend.as_ref(), &input, 2.0);
+    write_constant(host.backend.as_ref(), &weights, 1.0);
+    write_constant(host.backend.as_ref(), &previous, 9.0);
+    write_constant(host.backend.as_ref(), &next, 13.0);
+    let mut completed = Vec::new();
     for corrupt in [false, true] {
         let mut commands = slots.inactive().unwrap();
         commands
             .causal_convolution(0, &input, &weights, &output)
             .unwrap();
-        host.backend
-            .write(&output, &9_f32.to_le_bytes().repeat(7))
-            .unwrap();
+        write_constant(host.backend.as_ref(), &output, 9.0);
         if corrupt {
-            host.backend
-                .write(&commands.metadata[2], &1_u32.to_le_bytes())
-                .unwrap();
+            forge_activity(host.backend.as_ref(), &commands);
         }
         let submission = host
             .backend
@@ -67,11 +88,12 @@ fn poisoned_padding<B: Backend + Send + Sync + 'static>(backend: B) {
                 host.backend.read(&output).unwrap(),
                 0_f32.to_le_bytes().repeat(7)
             );
-            assert_eq!(
-                host.backend.read(&next).unwrap(),
-                13_f32.to_le_bytes().repeat(21)
-            );
         }
+        assert_eq!(
+            host.backend.read(&next).unwrap(),
+            13_f32.to_le_bytes().repeat(21)
+        );
+        completed.push(submission);
     }
     let mut commands = slots.inactive().unwrap();
     commands
@@ -94,11 +116,15 @@ fn poisoned_padding<B: Backend + Send + Sync + 'static>(backend: B) {
         )
         .unwrap();
     let recording = slots.recording(0, 0).unwrap();
-    let bindings = capture.bind(recording).unwrap();
+    let active_output = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+    let mut bindings = capture.bind(recording).unwrap();
+    bindings
+        .buffer(output.buffer(), active_output.buffer())
+        .unwrap();
     recording.commands = bindings.apply(template).unwrap();
     slots.take_batch(0).unwrap().submit_and_finish().unwrap();
     assert_eq!(
-        host.backend.read(&output).unwrap(),
+        host.backend.read(&active_output).unwrap(),
         2_f32.to_le_bytes().repeat(7)
     );
     drop(capture);

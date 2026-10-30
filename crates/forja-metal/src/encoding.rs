@@ -2826,26 +2826,14 @@ impl MetalBackend {
         }) {
             return Err(BackendError::UnsupportedOperation);
         }
+        let tensors = dispatches
+            .iter()
+            .flat_map(|dispatch| dispatch.inputs().iter().chain(dispatch.outputs()))
+            .cloned()
+            .collect::<Vec<_>>();
         let accesses = dispatches
             .iter()
-            .flat_map(|dispatch| {
-                dispatch
-                    .inputs()
-                    .iter()
-                    .cloned()
-                    .map(|tensor| (tensor, false))
-                    .chain(
-                        dispatch
-                            .outputs()
-                            .iter()
-                            .cloned()
-                            .map(|tensor| (tensor, true)),
-                    )
-            })
-            .collect::<Vec<_>>();
-        let tensors = accesses
-            .iter()
-            .map(|(tensor, _)| tensor.clone())
+            .flat_map(completion_accesses)
             .collect::<Vec<_>>();
         if !retained_tensors_validated {
             for tensor in &tensors {
@@ -10325,6 +10313,24 @@ fn program_compile_failed(hash: ProgramHash) -> BackendError {
     }
     eprintln!("Metal program compilation failed: {encoded}");
     BackendError::ExecutionFailed
+}
+
+fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = (Tensor, bool)> + '_ {
+    let inactive = matches!(dispatch.op(), Op::State(op) if !op.access().is_active());
+    dispatch
+        .inputs()
+        .iter()
+        .enumerate()
+        .filter(move |(index, _)| !inactive || index + 4 != dispatch.inputs().len())
+        .map(|(_, tensor)| (tensor.clone(), false))
+        .chain(
+            dispatch
+                .outputs()
+                .iter()
+                .enumerate()
+                .filter(move |(index, _)| !inactive || *index != 1)
+                .map(|(_, tensor)| (tensor.clone(), true)),
+        )
 }
 
 #[cfg(test)]

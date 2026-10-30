@@ -3,6 +3,7 @@ use crate::{PagePoolError, StateSlot};
 /// Authorized input and output version identities supplied only by the trusted host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateAccess {
+    active: bool,
     source: u32,
     destination: u32,
 }
@@ -28,9 +29,23 @@ impl StateAccess {
             return Err(PagePoolError::SharedTail);
         }
         Ok(Self {
+            active: true,
             source,
             destination,
         })
+    }
+
+    /// Prevents private data access for a padded lane regardless of device metadata.
+    #[must_use]
+    pub const fn inactive(mut self) -> Self {
+        self.active = false;
+        self
+    }
+
+    /// Whether the host authorizes private data access for this lane.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        self.active
     }
 
     /// Expected physical input identity for backend authentication, never a guest address.
