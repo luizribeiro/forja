@@ -11,6 +11,8 @@ pub struct StateCapture {
     metadata: Vec<Tensor>,
     updated: Vec<bool>,
     _owner: CompletionResource,
+    private_scratch: Vec<CompletionResource>,
+    scratch_charges: Vec<CompletionResource>,
 }
 
 impl std::fmt::Debug for StateCapture {
@@ -42,6 +44,18 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
             planes,
             metadata: self.metadata.to_vec(),
             updated: self.updated.clone(),
+            scratch_charges: self
+                .scratch
+                .iter()
+                .map(|scratch| scratch.retained_resource())
+                .chain(self.captured_scratch_charges.iter().cloned())
+                .collect(),
+            private_scratch: self
+                .scratch
+                .iter()
+                .map(|scratch| CompletionResource::new(Arc::clone(scratch)))
+                .chain(self.captured_scratch.iter().cloned())
+                .collect(),
             _owner: CompletionResource::new(Arc::new((
                 Arc::clone(&self.storage),
                 Arc::clone(&self.metadata),
@@ -91,6 +105,12 @@ impl StateCapture {
                 .buffer(old.buffer(), new.buffer())
                 .map_err(invalid_handle)?;
         }
+        recording
+            .captured_scratch
+            .extend(self.private_scratch.iter().cloned());
+        recording
+            .captured_scratch_charges
+            .extend(self.scratch_charges.iter().cloned());
         for (current, updated) in recording.updated.iter_mut().zip(&self.updated) {
             *current |= updated;
         }
@@ -167,6 +187,82 @@ mod tests {
         let replacement = storage.reserve().unwrap();
         drop(replacement);
         drop(capture);
+    }
+
+    #[test]
+    fn captured_blocks_keep_private_scratch_after_recording_retirement() {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(1_048_576, 8, 1_048_576, 128, 1_048_576),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 16, 16]).unwrap()])
+                    .unwrap(),
+                1,
+            )
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        let inputs = [
+            [7, 1, 16].as_slice(),
+            &[7, 1, 16],
+            &[7, 1, 16],
+            &[7, 1],
+            &[7, 1],
+        ]
+        .iter()
+        .map(|shape| host.backend.alloc(DType::F32, shape).unwrap())
+        .collect::<Vec<_>>();
+        for (index, input) in inputs.iter().enumerate() {
+            let value = if index == 3 { -0.1_f32 } else { 0.1 };
+            host.backend
+                .write(
+                    input,
+                    &value
+                        .to_le_bytes()
+                        .repeat(usize::try_from(input.layout().element_count()).unwrap()),
+                )
+                .unwrap();
+        }
+        let output = host.backend.alloc(DType::F32, &[7, 1, 16]).unwrap();
+        let mut recording = storage
+            .record(&sequence, sequence.begin(1).unwrap())
+            .unwrap();
+        recording
+            .delta_rule_block(
+                0,
+                inputs.iter().collect::<Vec<_>>().try_into().unwrap(),
+                &output,
+                None,
+            )
+            .unwrap();
+        let capture = recording.capture().unwrap();
+        let template = recording.commands.clone();
+        let scratch = template.dispatches()[0].outputs()[2].clone();
+        let charged = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
+        recording.submit().unwrap().finish().unwrap();
+        assert_eq!(
+            host.live_bytes.load(std::sync::atomic::Ordering::Acquire),
+            charged
+        );
+        let mut next = storage
+            .record(&sequence, sequence.begin(2).unwrap())
+            .unwrap();
+        next.commands = capture.bind(&mut next).unwrap().apply(template).unwrap();
+        drop(capture);
+        assert!(host.backend.read(&scratch).is_ok());
+        next.submit().unwrap().finish().unwrap();
+        let actual = host.backend.read(&output).unwrap();
+        assert!(
+            actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .all(f32::is_finite)
+        );
+        assert!(host.backend.read(&scratch).is_err());
+        assert!(host.live_bytes.load(std::sync::atomic::Ordering::Acquire) < charged);
     }
 
     #[test]

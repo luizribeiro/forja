@@ -90,7 +90,7 @@ impl<B: Backend + 'static> StateCommands<B> {
         #[cfg(not(target_os = "macos"))]
         let _ = variant;
         self.record_update(plane, dispatch)?;
-        self.scratch.push(scratch);
+        self.scratch.push(Arc::new(scratch));
         Ok(())
     }
 }

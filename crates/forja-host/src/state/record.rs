@@ -30,7 +30,9 @@ impl<B: Backend> Drop for StateMetadata<B> {
 pub struct StateCommands<B: Backend> {
     pub(super) storage: Arc<StateStorage<B>>,
     pub(super) access: StateAccess,
-    pub(super) scratch: Vec<super::block::StateScratch<B>>,
+    pub(super) scratch: Vec<Arc<super::block::StateScratch<B>>>,
+    pub(super) captured_scratch: Vec<forja_core::CompletionResource>,
+    pub(super) captured_scratch_charges: Vec<forja_core::CompletionResource>,
     pub(super) metadata: Arc<StateMetadata<B>>,
     pub(crate) commands: CommandList,
     pub(super) updated: Vec<bool>,
@@ -155,6 +157,8 @@ impl<B: Backend> StateCommands<B> {
             storage: Arc::clone(storage),
             access,
             scratch: Vec::new(),
+            captured_scratch: Vec::new(),
+            captured_scratch_charges: Vec::new(),
             metadata: Arc::new(StateMetadata {
                 backend: Arc::clone(&storage.backend),
                 tensors: Vec::new(),
@@ -212,8 +216,9 @@ impl<B: Backend> StateCommands<B> {
         owners.extend(
             self.scratch
                 .iter()
-                .map(super::block::StateScratch::retained_resource),
+                .map(|scratch| scratch.retained_resource()),
         );
+        owners.extend(self.captured_scratch_charges.iter().cloned());
         owners
     }
 
