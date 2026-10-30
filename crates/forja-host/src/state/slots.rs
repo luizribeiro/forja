@@ -133,6 +133,16 @@ impl<B: Backend> StateSlots<B> {
         lane: usize,
         position: LanePosition,
     ) -> Result<(), compute::Error> {
+        self.begin_action(bank, lane, position, None)
+    }
+
+    pub(crate) fn begin_action(
+        &mut self,
+        bank: usize,
+        lane: usize,
+        position: LanePosition,
+        action: Option<super::StateAction>,
+    ) -> Result<(), compute::Error> {
         let record = self
             .banks
             .get(bank)
@@ -155,7 +165,11 @@ impl<B: Backend> StateSlots<B> {
             .serial
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state lane timeline exhausted"))?;
-        let transaction = sequence.begin_at(serial, position).map_err(pool_error)?;
+        let transaction = match action {
+            Some(action) => sequence.begin_action_at(serial, position, action),
+            None => sequence.begin_at(serial, position),
+        }
+        .map_err(pool_error)?;
         owner.serial = serial;
         match self
             .storage

@@ -1455,6 +1455,7 @@ where
         &mut self,
         start: u32,
         tokens: u32,
+        action: StateAction,
     ) -> Result<Option<SequenceCheckpoint>, compute::Error> {
         if start == 0
             && let (Some(pool), Some(checkpoint)) = (self.page_pool, self.paged_origin.take())
@@ -1477,10 +1478,10 @@ where
         }
         match self.page_pool {
             Some(pool) => {
-                let (checkpoint, copy) = self
-                    .store
-                    .data_mut()
-                    .begin_paged_append(pool, start, tokens)?;
+                let (checkpoint, copy) =
+                    self.store
+                        .data_mut()
+                        .begin_paged_update(pool, start, tokens, Some(action))?;
                 if let Some(copy) = copy
                     && let Err(error) = copy.run().await
                 {
@@ -1557,7 +1558,10 @@ where
         let Ok(sequence) = u32::try_from(input.tokens.len()) else {
             return Ok(Err(quota("token count exceeds u32")));
         };
-        let checkpoint = match self.prepare_paged_append(input.start_pos, sequence).await {
+        let checkpoint = match self
+            .prepare_paged_append(input.start_pos, sequence, StateAction::Step)
+            .await
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -1615,10 +1619,8 @@ where
             &router_logits,
         ) {
             self.rollback_paged_append(checkpoint)?;
-            return Ok(Err(match self.release_handles(handles) {
-                Ok(()) => error,
-                Err(release_error) => release_error,
-            }));
+            let error = self.release_handles(handles).err().unwrap_or(error);
+            return Ok(Err(error));
         }
         self.finish_paged_append(input.start_pos, checkpoint)?;
         self.output_handles = handles;
@@ -2021,11 +2023,16 @@ where
                 continue;
             };
             let lane = input_lane.slot;
-            let prepared = self.store.data_mut().begin_paged_lane_append(
+            let prepared = self.store.data_mut().begin_paged_lane_update(
                 pool,
                 lane,
                 input_lane.start_pos,
                 tokens,
+                Some(if input.shape.selection == BatchSelection::Forward {
+                    StateAction::Forward
+                } else {
+                    StateAction::Combined
+                }),
             );
             let (checkpoint, copy) = match prepared {
                 Ok(prepared) => prepared,
@@ -2127,7 +2134,10 @@ where
             .tokens
             .as_ref()
             .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self.prepare_paged_append(input.start_pos, appended).await {
+        let checkpoint = match self
+            .prepare_paged_append(input.start_pos, appended, StateAction::Forward)
+            .await
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -2492,7 +2502,10 @@ where
             .tokens
             .as_ref()
             .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self.prepare_paged_append(input.start_pos, appended).await {
+        let checkpoint = match self
+            .prepare_paged_append(input.start_pos, appended, StateAction::Combined)
+            .await
+        {
             Ok(checkpoint) => checkpoint,
             Err(error) => return Ok(Err(error)),
         };
@@ -3972,14 +3985,25 @@ impl<B: Backend + 'static> Host<B> {
         clippy::too_many_lines,
         reason = "checkpoint rollback must cover table rebinding and COW preparation"
     )]
+    #[cfg(test)]
     fn begin_paged_append(
+        &mut self,
+        pool: u32,
+        start: u32,
+        tokens: u32,
+    ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
+        self.begin_paged_update(pool, start, tokens, None)
+    }
+
+    fn begin_paged_update(
         &mut self,
         pool_rep: u32,
         start: u32,
         tokens: u32,
+        action: Option<StateAction>,
     ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
         self.activate_default_paged_lane(pool_rep)?;
-        self.begin_paged_lane_append(pool_rep, 0, start, tokens)
+        self.begin_paged_lane_update(pool_rep, 0, start, tokens, action)
     }
 
     fn activate_default_paged_lane(&self, pool_rep: u32) -> Result<(), compute::Error> {
@@ -4009,16 +4033,28 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn begin_paged_lane_append(
+        &mut self,
+        pool: u32,
+        lane: u32,
+        start: u32,
+        tokens: u32,
+    ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
+        self.begin_paged_lane_update(pool, lane, start, tokens, None)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "checkpoint rollback must cover table rebinding and COW preparation"
     )]
-    fn begin_paged_lane_append(
+    fn begin_paged_lane_update(
         &mut self,
         pool_rep: u32,
         lane: u32,
         start: u32,
         tokens: u32,
+        action: Option<StateAction>,
     ) -> Result<(Option<SequenceCheckpoint>, Option<SubmitRequest<B>>), compute::Error> {
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
@@ -4052,12 +4088,7 @@ impl<B: Backend + 'static> Host<B> {
         };
         if let Some(state) = self.state_slots.get(&slot_rep)
             && let Some(sequence) = state.sequence_handle(lane)?
-            && sequence
-                .checkpoint_latest()
-                .map_err(invalid_handle)?
-                .position()
-                .tokens
-                != u64::from(start)
+            && sequence.latest_position().map_err(invalid_handle)?.tokens != u64::from(start)
         {
             return Err(invalid_handle("state and KV append boundaries differ"));
         }
@@ -4187,19 +4218,21 @@ impl<B: Backend + 'static> Host<B> {
                 reserved_tokens,
                 ..state.position(lane)?
             };
-            let admitted = state.begin(bank, lane, position).and_then(|()| {
-                if let Some(checkpoint) = state_checkpoint {
-                    state
-                        .recording(bank, lane)?
-                        .pair_paged_checkpoint(
-                            Arc::clone(&sequence),
-                            checkpoint,
-                            lane_binding.table_dirty.clone(),
-                        )
-                        .map_err(invalid_handle)?;
-                }
-                Ok(())
-            });
+            let admitted = state
+                .begin_action(bank, lane, position, action)
+                .and_then(|()| {
+                    if let Some(checkpoint) = state_checkpoint {
+                        state
+                            .recording(bank, lane)?
+                            .pair_paged_checkpoint(
+                                Arc::clone(&sequence),
+                                checkpoint,
+                                lane_binding.table_dirty.clone(),
+                            )
+                            .map_err(invalid_handle)?;
+                    }
+                    Ok(())
+                });
             if let Err(error) = admitted {
                 state.cancel_lane(bank, lane)?;
                 rollback_paged_if_current(&sequence, checkpoint)?;
@@ -9390,7 +9423,7 @@ mod tests {
         EngineMetrics, EngineRunner, EngineStep, EngineStepProfile, Grants, Host, ImportKind,
         ImportTimer, Limits, MAX_INSTRUCTIONS, MAX_OUTPUTS, PAGED_LANE_RELEASE_REQUIRED,
         PagePoolEntry, PagePoolError, PagedSequenceEntry, ParamsEntry, ReplayFlight, ReplayState,
-        SamplingParams, ServingInfo, SubmissionOutcome, TensorEntry,
+        SamplingParams, ServingInfo, StateAction, SubmissionOutcome, TensorEntry,
         bindings::l9o::gpu::{compute, paged_storage},
         core_op, core_program, expected_layer_outputs, is_paged_bank_in_flight,
         is_paged_lane_release_required, page_pool_pages, paged_backing_pages,
@@ -9934,6 +9967,48 @@ mod tests {
         host.table.get_mut(&slot).unwrap().active_bank = 1;
         host.write_state_batch_inputs(pool.rep(), &input).unwrap();
         assert_eq!(read(&host, prompt), before);
+    }
+
+    #[test]
+    fn paged_admission_reserves_the_entry_point_selection_action() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 8);
+        host.open_state_slot(
+            &pool,
+            2,
+            vec![paged_storage::StatePlaneDescriptor {
+                dtype: compute::Dtype::F32,
+                shape: vec![3, 7],
+            }],
+            paged_storage::StateInputLayout {
+                vocab: 33,
+                prompt_tokens: 7,
+            },
+        )
+        .unwrap();
+        host.bind_paged_lane(pool.rep(), 0, None, 8).unwrap();
+        let (checkpoint, _) = host
+            .begin_paged_lane_update(pool.rep(), 0, 0, 1, Some(StateAction::Forward))
+            .unwrap();
+        assert!(host.state_lane_checkpoint(pool.rep(), 0).is_err());
+        host.rollback_paged_lane_append(pool.rep(), 0, checkpoint.unwrap())
+            .unwrap();
+        host.begin_paged_lane_update(pool.rep(), 0, 0, 1, Some(StateAction::Combined))
+            .unwrap();
+        let position = host
+            .state_lane_checkpoint(pool.rep(), 0)
+            .unwrap()
+            .unwrap()
+            .position();
+        assert_eq!(
+            (
+                position.tokens,
+                position.sampler,
+                position.grammar,
+                position.parser
+            ),
+            (1, 0, 1, 1)
+        );
     }
 
     #[test]
@@ -11913,7 +11988,10 @@ mod tests {
             .unwrap()
             .unwrap();
         runner.prepare_paged_request(None, 8).unwrap();
-        let checkpoint = runner.prepare_paged_append(0, 3).await.unwrap();
+        let checkpoint = runner
+            .prepare_paged_append(0, 3, StateAction::Step)
+            .await
+            .unwrap();
         let pool_rep = runner.page_pool.unwrap();
         let binding = {
             let host = runner.store.data();
@@ -11958,7 +12036,7 @@ mod tests {
         };
 
         assert!(matches!(
-            runner.prepare_paged_append(3, 1).await,
+            runner.prepare_paged_append(3, 1, StateAction::Step).await,
             Err(compute::Error::BackendExecution(_))
         ));
 
