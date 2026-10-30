@@ -4055,7 +4055,7 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| guest_error(BackendError::ExecutionFailed))?,
             )
         };
-        let (checkpoint, table, copy, upload) = {
+        let (checkpoint, previous, table, copy, upload) = {
             let mut sequence = sequence
                 .lock()
                 .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
@@ -4072,6 +4072,10 @@ impl<B: Backend + 'static> Host<B> {
                     "paged append start does not match the sequence".to_owned(),
                 ));
             }
+            let previous = [
+                binding.banks.slot(0, lane).map_err(paged_refusal)?,
+                binding.banks.slot(1, lane).map_err(paged_refusal)?,
+            ];
             let copy = sequence
                 .cow_tail()
                 .map_err(|error| compute::Error::Quota(error.to_string()))?;
@@ -4100,8 +4104,40 @@ impl<B: Backend + 'static> Host<B> {
                 .table()
                 .clone();
             let upload = lane_binding.table_dirty[bank].swap(false, Ordering::AcqRel);
-            (checkpoint, table, copy, upload)
+            (checkpoint, previous, table, copy, upload)
         };
+        if let Some(state) = self.state_slots.get_mut(&slot_rep) {
+            let reserved_tokens = sequence
+                .lock()
+                .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                .reserved_tokens();
+            let position = LanePosition {
+                tokens: u64::from(start)
+                    .checked_add(u64::from(tokens))
+                    .ok_or_else(|| quota("state token position overflow"))?,
+                sampler: u64::from(start)
+                    .checked_add(u64::from(tokens))
+                    .and_then(|end| end.checked_sub(1))
+                    .ok_or_else(|| invalid_handle("state append is empty"))?,
+                reserved_tokens,
+                ..state.position(lane)?
+            };
+            if let Err(error) = state.begin(bank, lane, position) {
+                sequence
+                    .lock()
+                    .map_err(|_| guest_error(BackendError::ExecutionFailed))?
+                    .rollback(checkpoint)
+                    .map_err(paged_refusal)?;
+                binding
+                    .banks
+                    .restore_all(lane, previous)
+                    .map_err(paged_refusal)?;
+                for dirty in &lane_binding.table_dirty {
+                    dirty.store(true, Ordering::Release);
+                }
+                return Err(error);
+            }
+        }
         let prepared = (|| {
             if upload {
                 self.upload_paged_table(table_rep, generation_rep, generation_pages, &table)?;
@@ -4112,6 +4148,9 @@ impl<B: Backend + 'static> Host<B> {
         match prepared {
             Ok(copy) => Ok((Some(checkpoint), copy)),
             Err(error) => {
+                if let Some(state) = self.state_slots.get_mut(&slot_rep) {
+                    state.cancel_lane(bank, lane)?;
+                }
                 sequence
                     .lock()
                     .map_err(|_| guest_error(BackendError::ExecutionFailed))?
@@ -4416,6 +4455,11 @@ impl<B: Backend + 'static> Host<B> {
             .ok_or_else(|| invalid_handle("paged slot is not open"))?;
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
+        if let Some(state) = self.state_slots.get_mut(&slot_rep) {
+            for bank in 0..2 {
+                state.cancel_lane(bank, lane)?;
+            }
+        }
         let binding = Arc::clone(
             &self
                 .table
@@ -4586,6 +4630,11 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| invalid_handle("paged slot is not open"))?,
             )
         };
+        if prefix.is_some() && self.state_slots.contains_key(&slot_rep) {
+            return Err(invalid_handle(
+                "prefix reuse is unavailable for a slot with state",
+            ));
+        }
         if reserved_tokens > u64::from(max_context) {
             return Err(compute::Error::Quota(
                 "paged request exceeds the context ceiling".to_owned(),
@@ -4660,6 +4709,7 @@ impl<B: Backend + 'static> Host<B> {
                 };
             }
         }
+        self.bind_slot_state(slot_rep, lane, release, &binding, previous)?;
         drop(locked);
         self.publish_paged_lane_binding(&binding, lane_binding, lane, sequence, metadata, release)
     }
@@ -4703,6 +4753,9 @@ impl<B: Backend + 'static> Host<B> {
             .get_mut(&Resource::<BatchSlotEntry>::new_borrow(slot_rep))
             .map_err(invalid_handle)?;
         slot.active_bank = slot.next_bank;
+        if let Some(state) = self.state_slots.get_mut(&slot_rep) {
+            state.clear_padding(slot.active_bank)?;
+        }
         Ok(())
     }
 
@@ -9232,6 +9285,8 @@ mod tests {
         validate_batch_select_lanes, validate_batch_shapes,
     };
 
+    include!("state/paged_lifecycle_tests.rs");
+
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -9362,11 +9417,7 @@ mod tests {
             reserved_tokens: 8,
             ..crate::LanePosition::default()
         };
-        host.state_slots
-            .get_mut(&slot.rep())
-            .unwrap()
-            .begin(0, 0, position)
-            .unwrap();
+
         let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
         let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();

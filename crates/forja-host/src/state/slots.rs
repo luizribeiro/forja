@@ -217,6 +217,26 @@ impl<B: Backend> StateSlots<B> {
         StateBatch::new(bank.iter_mut().filter_map(Option::take).collect())
     }
 
+    pub(crate) fn cancel_lane(&mut self, bank: usize, lane: usize) -> Result<(), compute::Error> {
+        *self
+            .banks
+            .get_mut(bank)
+            .and_then(|bank| bank.get_mut(lane))
+            .ok_or_else(|| invalid_handle("state bank or lane is out of range"))? = None;
+        Ok(())
+    }
+
+    pub(crate) fn clear_padding(&mut self, bank: usize) -> Result<(), compute::Error> {
+        for padding in self
+            .padding
+            .get_mut(bank)
+            .ok_or_else(|| invalid_handle("state bank is out of range"))?
+        {
+            *padding = None;
+        }
+        Ok(())
+    }
+
     /// Releases unsubmitted reservations; submitted owners retain their own versions until drain.
     ///
     /// # Errors
