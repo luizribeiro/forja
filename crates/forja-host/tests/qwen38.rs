@@ -230,6 +230,25 @@ mod metal;
 mod execution;
 
 #[test]
+fn component_metadata_declares_the_text_only_single_lane_contract() -> Result<(), Box<dyn Error>> {
+    use forja_sdk::Engine;
+    let profile = forja_config::read_profile(&std::fs::read(test_guests::qwen38())?)?;
+    assert_eq!(profile.family(), "qwen38");
+    assert_eq!(profile.workload().max_context.get(), 32768);
+    assert!(
+        !profile
+            .serving()
+            .ok_or("missing serving settings")?
+            .paged_cache
+    );
+    let info = qwen38::Qwen38::describe();
+    assert_eq!(info.vocab, 248_320);
+    assert_eq!(info.tap_layers.len(), 64);
+    assert!(info.serving.is_none());
+    Ok(())
+}
+
+#[test]
 fn invalid_spans_refuse_cleanly_and_execution_failure_requires_reload() -> Result<(), Box<dyn Error>>
 {
     let weights = Weights::open(fixture("model.safetensors"))?;

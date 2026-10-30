@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &out_dir,
     )?;
     build_smollm2_profiles(&repository, &guest_target_dir, &out_dir)?;
+    build_qwen38_profile(&repository, &guest_target_dir, &out_dir)?;
     let release_dir = guest_target_dir.join("wasm32-wasip2/release");
     let olmoe = build_olmoe_profile(&olmoe_manifest, &guest_target_dir, &out_dir)?;
     let qwen3_coder =
@@ -327,6 +328,21 @@ fn build_smollm2_profiles(repository: &Path, target: &Path, out: &Path) -> io::R
             copy_profiled_component(&component, &profile, out, &format!("smollm2-{suffix}.wasm"))?;
         emit_guest_path(variable, &output);
     }
+    println!("cargo::rerun-if-changed={}", engine.display());
+    Ok(())
+}
+
+fn build_qwen38_profile(repository: &Path, target: &Path, out: &Path) -> io::Result<()> {
+    let engine = repository.join("engines/qwen38");
+    forja_build::build_component(&engine.join("Cargo.toml"), target, &[])?;
+    let profile = engine.join("profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml");
+    let output = copy_profiled_component(
+        &target.join("wasm32-wasip2/release/qwen38.wasm"),
+        &profile,
+        out,
+        "qwen38.wasm",
+    )?;
+    emit_guest_path("QWEN38_COMPONENT", &output);
     println!("cargo::rerun-if-changed={}", engine.display());
     Ok(())
 }

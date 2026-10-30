@@ -141,6 +141,12 @@ pub fn smollm2_reference() -> &'static Path {
     Path::new(env!("SMOLLM2_REFERENCE_COMPONENT"))
 }
 
+/// Returns the eager text-only Qwen3.8 engine component.
+#[must_use]
+pub fn qwen38() -> &'static Path {
+    Path::new(env!("QWEN38_COMPONENT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};
