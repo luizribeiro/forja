@@ -1,5 +1,7 @@
 //! Validated geometry for opaque per-sequence state.
 
+mod block;
+pub use block::DeltaBlockScratch;
 mod access;
 pub use access::StateAccess;
 mod ops;

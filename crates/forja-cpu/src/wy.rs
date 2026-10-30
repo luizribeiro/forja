@@ -3,7 +3,7 @@ mod gram;
 mod scan;
 mod solve;
 
-const BLOCK: usize = 64;
+const BLOCK: usize = forja_core::DeltaBlockScratch::TOKENS;
 
 fn tree_sum(count: usize, value: impl Fn(usize) -> f32) -> f32 {
     let per_lane = count.div_ceil(32);
