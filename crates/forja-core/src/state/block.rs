@@ -1,4 +1,4 @@
-use crate::OpError;
+use crate::{DType, OpError, Tensor};
 
 /// Checked float32 scratch geometry for a fixed-size delta-rule block transform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +78,39 @@ impl DeltaBlockScratch {
     pub const fn offsets(self) -> [u32; 8] {
         self.offsets
     }
+}
+
+pub(super) fn validate(inputs: &[&Tensor], outputs: &[&Tensor]) -> Result<(), OpError> {
+    let state = inputs[5];
+    let bad = OpError::InvalidKernelParameter;
+    let [heads, keys, values]: [u32; 3] =
+        state.layout().shape().try_into().map_err(|_| bad.clone())?;
+    let query = inputs[0].layout().shape();
+    if query.len() != 3 || query[1] == 0 || !heads.is_multiple_of(query[1]) || query[2] != keys {
+        return Err(bad);
+    }
+    let tokens = query[0];
+    let scratch = DeltaBlockScratch::new(tokens, heads, keys, values)?;
+    if inputs[1].layout().shape() != query
+        || inputs[2].layout().shape() != [tokens, heads, values]
+        || inputs[3].layout().shape() != [tokens, heads]
+        || inputs[4].layout().shape() != [tokens, heads]
+        || outputs[0].layout().shape() != inputs[2].layout().shape()
+        || inputs[..2]
+            .iter()
+            .chain([&inputs[3]])
+            .any(|t| t.layout().dtype() != DType::F32)
+        || state.layout().dtype() != DType::F32
+        || outputs[2].layout().dtype() != DType::F32
+        || !outputs[2].layout().is_contiguous()
+        || outputs[2].layout().shape() != [scratch.elements()]
+        || inputs[4].layout().dtype() != inputs[2].layout().dtype()
+        || outputs[0].layout().dtype() != inputs[2].layout().dtype()
+    {
+        return Err(bad);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

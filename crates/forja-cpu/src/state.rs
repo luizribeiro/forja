@@ -38,6 +38,7 @@ impl CpuBackend {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (output, state) = match operation {
+            StateOp::DeltaRuleBlock(_) => return Err(BackendError::UnsupportedOperation),
             StateOp::DeltaRule(_) => delta_rule(&values, &inputs[5])?,
             StateOp::CausalDepthwiseConv(_) => causal_conv(&values, &inputs[0])?,
         };

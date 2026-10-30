@@ -8482,6 +8482,7 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             }
         }
         Op::State(forja_core::StateOp::DeltaRule(_)) => "state_delta_rule",
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_)) => "state_delta_rule_block",
         Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => "state_causal_conv",
         Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",

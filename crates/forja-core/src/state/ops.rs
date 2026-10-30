@@ -8,6 +8,9 @@ const AUTHENTICATION_SCALAR_OPS: u64 = 1 + 2 + 1 + 2 + 2;
 pub enum StateOp {
     /// One gated delta-rule update; inputs are Q, K, V, decay, beta, state and metadata.
     DeltaRule(StateAccess),
+    /// Fixed-size WY blocks; inputs use log decay, with private float32 scratch as output three.
+    /// Scratch contents after execution are unspecified.
+    DeltaRuleBlock(StateAccess),
     /// Causal depthwise convolution; inputs are tokens, tap weights, history and metadata.
     CausalDepthwiseConv(StateAccess),
 }
@@ -17,13 +20,15 @@ impl StateOp {
     #[must_use]
     pub const fn access(self) -> StateAccess {
         match self {
-            Self::DeltaRule(access) | Self::CausalDepthwiseConv(access) => access,
+            Self::DeltaRule(access)
+            | Self::DeltaRuleBlock(access)
+            | Self::CausalDepthwiseConv(access) => access,
         }
     }
 
     pub(crate) fn validate(self, inputs: &[&Tensor], outputs: &[&Tensor]) -> Result<(), OpError> {
         let expected = match self {
-            Self::DeltaRule(_) => 9,
+            Self::DeltaRule(_) | Self::DeltaRuleBlock(_) => 9,
             Self::CausalDepthwiseConv(_) => 6,
         };
         if inputs.len() != expected {
@@ -77,6 +82,7 @@ impl StateOp {
                     return Err(bad);
                 }
             }
+            Self::DeltaRuleBlock(_) => super::block::validate(inputs, outputs)?,
             Self::CausalDepthwiseConv(_) => {
                 let [tokens, channels]: [u32; 2] = inputs[0]
                     .layout()
@@ -102,6 +108,7 @@ impl StateOp {
     pub(crate) fn cost(self, inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCost> {
         cost.scalar_ops = AUTHENTICATION_SCALAR_OPS;
         cost.flops = match self {
+            Self::DeltaRuleBlock(_) => return None,
             Self::DeltaRule(_) => {
                 let s = inputs[5].layout();
                 s.element_count().checked_mul(7)?.checked_add(

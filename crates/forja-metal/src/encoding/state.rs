@@ -91,6 +91,7 @@ fn state_geometry(
         depth: 1,
     };
     match operation {
+        StateOp::DeltaRuleBlock(_) => Err(BackendError::UnsupportedOperation),
         StateOp::DeltaRule(_) => {
             let s = input[5].layout().shape();
             if u64::from(s[1]) > crate::geometry::DELTA_RULE_MAX_KEYS {

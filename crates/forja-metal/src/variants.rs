@@ -1514,7 +1514,7 @@ pub(crate) const fn portable_name(operation: OperationKind) -> Option<&'static s
         OperationKind::PagedSdpaAppend => Some("paged-sdpa-append.vector-gqa-two-pass-32"),
         OperationKind::DeltaRule => Some("delta-rule.simd"),
         OperationKind::CausalDepthwiseConv => Some("causal-depthwise-conv.direct"),
-        OperationKind::Other => None,
+        OperationKind::DeltaRuleBlock | OperationKind::Other => None,
     }
 }
 
@@ -1530,7 +1530,7 @@ pub(crate) const fn portable_implementation(operation: OperationKind) -> Option<
         OperationKind::PagedSdpaAppend => Some(MetalVariant::PagedSdpaAppendGqa32),
         OperationKind::DeltaRule => Some(MetalVariant::DeltaRule),
         OperationKind::CausalDepthwiseConv => Some(MetalVariant::CausalDepthwiseConv),
-        OperationKind::Other => None,
+        OperationKind::DeltaRuleBlock | OperationKind::Other => None,
     }
 }
 

@@ -2,10 +2,10 @@ use super::tests::tensor;
 
 use crate::{
     CommandList, DType, KernelCost, Op, StateAccess, StateLayout, StateOp, StatePlane, StatePool,
+    Tensor,
 };
 
-#[test]
-fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
+fn delta_fixture(block: bool) -> (StateAccess, Vec<Tensor>, [Tensor; 2]) {
     let pool = StatePool::new(
         StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7, 33]).unwrap()]).unwrap(),
         1,
@@ -15,12 +15,15 @@ fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
     let mut sequence = pool.reserve().unwrap();
     let tx = sequence.begin(1).unwrap();
     let access = StateAccess::from_slot(&sequence.bind(&tx).unwrap()).unwrap();
+    let query = if block { vec![7, 1, 7] } else { vec![1, 7] };
+    let value = if block { vec![7, 3, 33] } else { vec![3, 33] };
+    let gate = if block { vec![7, 3] } else { vec![3] };
     let shapes: &[&[u32]] = &[
-        &[1, 7],
-        &[1, 7],
-        &[3, 33],
-        &[3],
-        &[3],
+        &query,
+        &query,
+        &value,
+        &gate,
+        &gate,
         &[3, 7, 33],
         &[2, 2],
         &[3],
@@ -37,9 +40,15 @@ fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
             )
         })
         .collect();
-    let refs: Vec<_> = inputs.iter().collect();
-    let y = tensor(10, DType::F32, &[3, 33]);
+    let y = tensor(10, DType::F32, &value);
     let state = tensor(11, DType::F32, &[3, 7, 33]);
+    (access, inputs, [y, state])
+}
+
+#[test]
+fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
+    let (access, inputs, [y, state]) = delta_fixture(false);
+    let refs: Vec<_> = inputs.iter().collect();
     let op = Op::State(StateOp::DeltaRule(access));
     let mut commands = CommandList::new();
     commands.dispatch_many(op, &refs, &[&y, &state]).unwrap();
@@ -59,4 +68,39 @@ fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
             .is_err()
     );
     assert!(commands.dispatch_many(op, &refs, &[&state, &y]).is_err());
+}
+
+#[test]
+fn block_contract_refuses_bad_grouping_scratch_and_aliases() {
+    let (access, inputs, [y, state]) = delta_fixture(true);
+    let mut refs: Vec<_> = inputs.iter().collect();
+    let layout = crate::DeltaBlockScratch::new(7, 3, 7, 33).unwrap();
+    let scratch = tensor(12, DType::F32, &[layout.elements()]);
+    let op = Op::State(StateOp::DeltaRuleBlock(access));
+    CommandList::new()
+        .dispatch_many(op, &refs, &[&y, &state, &scratch])
+        .unwrap();
+    assert!(
+        CommandList::new()
+            .dispatch_many(op, &refs, &[&y, &state])
+            .is_err()
+    );
+    assert!(
+        CommandList::new()
+            .dispatch_many(op, &refs, &[&y, &state, &y])
+            .is_err()
+    );
+    let wrong_scratch = tensor(13, DType::F32, &[layout.elements() - 1]);
+    assert!(
+        CommandList::new()
+            .dispatch_many(op, &refs, &[&y, &state, &wrong_scratch])
+            .is_err()
+    );
+    let wrong_query = tensor(14, DType::F32, &[7, 2, 7]);
+    refs[0] = &wrong_query;
+    assert!(
+        CommandList::new()
+            .dispatch_many(op, &refs, &[&y, &state, &scratch])
+            .is_err()
+    );
 }

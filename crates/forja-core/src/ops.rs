@@ -558,8 +558,8 @@ impl Dispatch {
     ) -> Result<Self, OpError> {
         check_common(inputs, outputs)?;
         let expected_outputs = match op {
+            Op::State(crate::StateOp::DeltaRuleBlock(_)) | Op::PagedSdpaAppend { .. } => 3,
             Op::TopK { .. } | Op::State(_) => 2,
-            Op::PagedSdpaAppend { .. } => 3,
             _ => 1,
         };
         if outputs.len() != expected_outputs {

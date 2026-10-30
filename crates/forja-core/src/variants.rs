@@ -7,6 +7,8 @@ use crate::{DType, Op};
 pub enum OperationKind {
     /// Gated delta-rule recurrent update.
     DeltaRule,
+    /// Chunked delta-rule transforms and serial block carry.
+    DeltaRuleBlock,
     /// Causal depthwise convolution with retained history.
     CausalDepthwiseConv,
     /// Dense matrix multiplication.
@@ -35,6 +37,7 @@ impl OperationKind {
     pub const fn of(op: Op) -> Self {
         match op {
             Op::State(crate::StateOp::DeltaRule(_)) => Self::DeltaRule,
+            Op::State(crate::StateOp::DeltaRuleBlock(_)) => Self::DeltaRuleBlock,
             Op::State(crate::StateOp::CausalDepthwiseConv(_)) => Self::CausalDepthwiseConv,
             Op::Matmul => Self::Matmul,
             Op::QuantMatmul { .. } => Self::QuantMatmul,
@@ -53,6 +56,7 @@ impl fmt::Display for OperationKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::DeltaRule => "delta-rule",
+            Self::DeltaRuleBlock => "delta-rule-block",
             Self::CausalDepthwiseConv => "causal-depthwise-conv",
             Self::Matmul => "matmul",
             Self::QuantMatmul => "quant-matmul",

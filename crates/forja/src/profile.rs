@@ -128,6 +128,7 @@ fn op_name(operation: Op) -> &'static str {
         Op::PagedSdpaAppend { .. } => "paged-sdpa-append",
         Op::PagedSdpa { .. } => "paged-sdpa",
         Op::State(forja_core::StateOp::DeltaRule(_)) => "delta-rule",
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_)) => "delta-rule-block",
         Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => "causal-depthwise-conv",
     }
 }
