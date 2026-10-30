@@ -139,7 +139,7 @@ mod tests {
     fn metal_compiles_delta_block_transforms() {
         let backend = MetalBackend::new().unwrap();
         let mut pipelines = backend.pipelines.lock().unwrap();
-        for name in ["state_block_gram", "state_block_solve"] {
+        for name in ["state_block_gram", "state_block_solve", "state_block_carry"] {
             let pipeline = pipelines
                 .get(name, &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 0), (5, 2)])
                 .unwrap();
