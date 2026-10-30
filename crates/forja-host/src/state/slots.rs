@@ -6,7 +6,7 @@ use forja_core::Backend;
 use std::sync::Arc;
 
 struct Lane<B: Backend> {
-    sequence: StateSequenceHandle<B>,
+    sequence: Option<StateSequenceHandle<B>>,
     serial: u64,
 }
 
@@ -18,7 +18,7 @@ pub struct StateSlots<B: Backend> {
 }
 
 impl<B: Backend> StateSlots<B> {
-    /// Reserves every lane's complete three-version state before serving admission.
+    /// Creates banks within the pool's available lane capacity.
     ///
     /// # Errors
     /// Refuses empty geometry, insufficient capacity or failed initialization.
@@ -26,20 +26,63 @@ impl<B: Backend> StateSlots<B> {
         if lanes == 0 {
             return Err(invalid_handle("state slots require active lane capacity"));
         }
-        let lanes = (0..lanes)
-            .map(|_| {
-                Ok(Lane {
-                    sequence: storage.reserve()?,
-                    serial: 0,
-                })
+        let reserved = (0..lanes)
+            .map(|_| storage.pool.reserve().map_err(pool_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lanes = reserved
+            .into_iter()
+            .map(|_reservation| Lane {
+                sequence: None,
+                serial: 0,
             })
-            .collect::<Result<Vec<_>, compute::Error>>()?;
+            .collect::<Vec<_>>();
         let banks = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         Ok(Self {
             storage,
             lanes,
             banks,
         })
+    }
+
+    /// Reserves and zeroes all three versions before admitting a new request.
+    ///
+    /// # Errors
+    /// Refuses invalid lanes, quota or failed initialization without replacing an active lease.
+    pub fn admit(&mut self, lane: usize) -> Result<(), compute::Error> {
+        let lane = self
+            .lanes
+            .get_mut(lane)
+            .ok_or_else(|| invalid_handle("state lane is out of range"))?;
+        if lane.sequence.is_none() {
+            lane.sequence = Some(self.storage.reserve()?);
+            lane.serial = 0;
+        }
+        Ok(())
+    }
+
+    /// Releases a request lease after its final reader/writer and speculative descendants drain.
+    ///
+    /// # Errors
+    /// Refuses invalid lanes or pending reservations/execution; committed state stays unchanged.
+    pub fn release(&mut self, lane: usize) -> Result<(), compute::Error> {
+        if self
+            .banks
+            .iter()
+            .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+        {
+            return Err(invalid_handle("state lane has an unsubmitted transaction"));
+        }
+        let lane = self
+            .lanes
+            .get_mut(lane)
+            .ok_or_else(|| invalid_handle("state lane is out of range"))?;
+        if let Some(sequence) = &lane.sequence {
+            let mut journal = sequence.lock();
+            let checkpoint = journal.checkpoint().map_err(pool_error)?;
+            forja_core::StateSequence::rewind(&mut journal, &checkpoint).map_err(pool_error)?;
+        }
+        lane.sequence = None;
+        Ok(())
     }
 
     /// Reserves a fresh transaction in one free bank position.
@@ -54,26 +97,36 @@ impl<B: Backend> StateSlots<B> {
     ) -> Result<(), compute::Error> {
         let record = self
             .banks
-            .get_mut(bank)
-            .and_then(|bank| bank.get_mut(lane))
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
             .ok_or_else(|| invalid_handle("state bank or lane is out of range"))?;
-        if record.is_some() {
-            return Err(invalid_handle("state bank already has a lane transaction"));
+        if record.is_some() || position.tokens > position.reserved_tokens {
+            return Err(invalid_handle(
+                "state bank is occupied or its cursor exceeds capacity",
+            ));
         }
-        let lane = self
-            .lanes
-            .get_mut(lane)
-            .ok_or_else(|| invalid_handle("state lane is out of range"))?;
-        let serial = lane
+        let fresh = self.lanes[lane].sequence.is_none();
+        self.admit(lane)?;
+        let owner = &mut self.lanes[lane];
+        let sequence = owner
+            .sequence
+            .as_ref()
+            .ok_or_else(|| invalid_handle("state lane has no lease"))?;
+        let serial = owner
             .serial
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state lane timeline exhausted"))?;
-        let transaction = lane
-            .sequence
-            .begin_at(serial, position)
-            .map_err(pool_error)?;
-        lane.serial = serial;
-        *record = Some(self.storage.record(&lane.sequence, transaction)?);
+        let transaction = sequence.begin_at(serial, position).map_err(pool_error)?;
+        owner.serial = serial;
+        match self.storage.record(sequence, transaction) {
+            Ok(record) => self.banks[bank][lane] = Some(record),
+            Err(error) => {
+                if fresh {
+                    owner.sequence = None;
+                }
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -120,14 +173,18 @@ impl<B: Backend> StateSlots<B> {
         Ok(())
     }
 
-    /// Returns the cursors committed with one lane's current state version.
+    /// Returns committed cursors; an inactive lane has zero cursors.
     ///
     /// # Errors
     /// Refuses an invalid lane index.
     pub fn position(&self, lane: usize) -> Result<LanePosition, compute::Error> {
         self.lanes
             .get(lane)
-            .map(|lane| lane.sequence.position())
+            .map(|lane| {
+                lane.sequence
+                    .as_ref()
+                    .map_or_else(LanePosition::default, StateSequenceHandle::position)
+            })
             .ok_or_else(|| invalid_handle("state lane is out of range"))
     }
 
@@ -140,6 +197,8 @@ impl<B: Backend> StateSlots<B> {
             .get(lane)
             .ok_or_else(|| invalid_handle("state lane is out of range"))?
             .sequence
+            .as_ref()
+            .ok_or_else(|| invalid_handle("state lane is not admitted"))?
             .rewind(tokens)
             .map_err(pool_error)
     }
@@ -224,5 +283,24 @@ mod tests {
         assert!(slots.position(2).is_err());
         assert!(slots.recording(2, 0).is_err());
         slots.cancel_unsubmitted_bank(1).unwrap();
+        slots.release(0).unwrap();
+        slots.release(1).unwrap();
+        assert_eq!(slots.position(0).unwrap(), LanePosition::default());
+        slots.admit(0).unwrap();
+        slots.begin(1, 0, position(1)).unwrap();
+        assert!(slots.release(0).is_err());
+        slots
+            .recording(1, 0)
+            .unwrap()
+            .causal_convolution(0, &input, &weights, &outputs[0])
+            .unwrap();
+        let pending = slots.take_batch(1).unwrap().submit().unwrap();
+        assert!(slots.release(0).is_err());
+        pending.finish().unwrap();
+        assert_eq!(
+            host.backend.read(&outputs[0]).unwrap(),
+            2_f32.to_le_bytes().repeat(7)
+        );
+        slots.release(0).unwrap();
     }
 }
