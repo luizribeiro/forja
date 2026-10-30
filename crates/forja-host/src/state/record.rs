@@ -114,6 +114,19 @@ impl<B: Backend> StateStorage<B> {
         recording.initialize_metadata(table, slot.table().generations().to_vec(), true)?;
         Ok(recording)
     }
+    pub(super) fn inactive_commands(
+        self: &Arc<Self>,
+        access: StateAccess,
+    ) -> Result<StateCommands<B>, compute::Error> {
+        self.check_usable()?;
+        let mut commands =
+            StateCommands::empty(self, access, self.command_charge(self.limits)?, self.limits);
+        let records = usize::try_from(self.planes[0].layout().shape()[0])
+            .map_err(|_| quota("state metadata exceeds addressable memory"))?;
+        commands.initialize_metadata(vec![u32::MAX; 4], vec![u32::MAX; records], false)?;
+        Ok(commands)
+    }
+
     fn command_charge(&self, limits: Limits) -> Result<Arc<StateCharge>, compute::Error> {
         let records = self.planes[0].layout().shape()[0];
         let bytes = u64::from(records)

@@ -1,8 +1,12 @@
+#[cfg(test)]
+mod inactive_tests;
+
 use super::{
-    LanePosition, StateBatch, StateRecording, StateSequenceHandle, StateStorage, pool_error,
+    LanePosition, StateBatch, StateCommands, StateRecording, StateSequenceHandle, StateStorage,
+    pool_error,
 };
 use crate::{compute, invalid_handle};
-use forja_core::Backend;
+use forja_core::{Backend, StateAccess};
 use std::sync::Arc;
 
 struct Lane<B: Backend> {
@@ -13,6 +17,7 @@ struct Lane<B: Backend> {
 /// Two rebinding banks of lane transactions over one private state pool.
 pub struct StateSlots<B: Backend> {
     storage: Arc<StateStorage<B>>,
+    inactive_access: StateAccess,
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
 }
@@ -26,9 +31,16 @@ impl<B: Backend> StateSlots<B> {
         if lanes == 0 {
             return Err(invalid_handle("state slots require active lane capacity"));
         }
-        let reserved = (0..lanes)
+        let mut reserved = (0..lanes)
             .map(|_| storage.pool.reserve().map_err(pool_error))
             .collect::<Result<Vec<_>, _>>()?;
+        let transaction = reserved[0].begin(1).map_err(pool_error)?;
+        let inactive_access =
+            StateAccess::from_slot(&reserved[0].bind(&transaction).map_err(pool_error)?)
+                .map_err(pool_error)?;
+        reserved[0]
+            .cancel_unsubmitted(&transaction)
+            .map_err(pool_error)?;
         let lanes = reserved
             .into_iter()
             .map(|_reservation| Lane {
@@ -39,9 +51,18 @@ impl<B: Backend> StateSlots<B> {
         let banks = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         Ok(Self {
             storage,
+            inactive_access,
             lanes,
             banks,
         })
+    }
+
+    /// Creates poisoned, inactive command bindings without reserving a request lease.
+    ///
+    /// # Errors
+    /// Refuses quota or metadata allocation failure.
+    pub fn inactive(&self) -> Result<StateCommands<B>, compute::Error> {
+        self.storage.inactive_commands(self.inactive_access)
     }
 
     /// Reserves and zeroes all three versions before admitting a new request.
