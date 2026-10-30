@@ -326,6 +326,24 @@ impl<B: Backend + 'static> Host<B> {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn drain_slot_state(
+        &mut self,
+        slot: u32,
+        lane: usize,
+    ) -> Result<(), compute::Error> {
+        if let Some(state) = self.state_slots.get_mut(&slot) {
+            for bank in 0..2 {
+                state.cancel_lane(bank, lane)?;
+            }
+            if let Some(sequence) = state.sequence_handle(lane)? {
+                sequence
+                    .wait_drained(self.limits.submission_timeout)
+                    .map_err(crate::guest_error)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_slot_state(
         &mut self,
         slot: u32,

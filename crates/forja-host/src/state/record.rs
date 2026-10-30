@@ -46,6 +46,7 @@ pub struct StateRecording<B: Backend> {
     pub(super) sequence: StateSequenceHandle<B>,
     pub(super) handed_off: bool,
     pub(super) predecessor: Option<Arc<super::outcome::StateOutcome>>,
+    _drain: super::sequence::RecordingGuard,
 }
 
 impl<B: Backend> std::ops::Deref for StateRecording<B> {
@@ -112,6 +113,7 @@ impl<B: Backend> StateStorage<B> {
             sequence: sequence.clone(),
             handed_off: false,
             predecessor,
+            _drain: sequence.recording_guard().map_err(guest_error)?,
         };
         recording.initialize_metadata(table, slot.table().generations().to_vec(), true)?;
         Ok(recording)

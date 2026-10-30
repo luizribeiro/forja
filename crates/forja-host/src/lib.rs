@@ -4672,6 +4672,9 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let lane_binding = binding.lane(lane)?;
         let release = prefix.is_none() && reserved_tokens == 0;
+        if release {
+            self.drain_slot_state(slot_rep, lane)?;
+        }
         if !release && lane_binding.used.load(Ordering::Acquire) {
             return Err(compute::Error::Quota(
                 PAGED_LANE_RELEASE_REQUIRED.to_owned(),

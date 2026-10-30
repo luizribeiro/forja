@@ -1,6 +1,11 @@
 use super::{LanePosition, StateStorage, journal::StateJournal};
-use forja_core::{Backend, PagePoolError, StateCheckpoint, StateSequence, StateTransaction};
-use std::sync::{Arc, Mutex, MutexGuard};
+use forja_core::{
+    Backend, BackendError, PagePoolError, StateCheckpoint, StateSequence, StateTransaction,
+};
+use std::{
+    sync::{Arc, Condvar, Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
 
 /// A retained state version paired with its complete serving cursor boundary.
 #[derive(Clone)]
@@ -17,9 +22,29 @@ impl StateLaneCheckpoint {
     }
 }
 
+#[derive(Default)]
+struct RecordingDrain {
+    count: Mutex<u32>,
+    ready: Condvar,
+}
+
+pub(super) struct RecordingGuard(Arc<RecordingDrain>);
+
+impl Drop for RecordingGuard {
+    fn drop(&mut self) {
+        let mut count = match self.0.count.lock() {
+            Ok(count) => count,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *count = count.checked_sub(1).unwrap_or(u32::MAX);
+        self.0.ready.notify_all();
+    }
+}
+
 /// Shared sequence ownership retained by every recording and completion guard.
 pub struct StateSequenceHandle<B: Backend> {
     inner: Arc<Mutex<StateJournal>>,
+    drain: Arc<RecordingDrain>,
     pub(super) storage: Arc<StateStorage<B>>,
 }
 
@@ -27,6 +52,7 @@ impl<B: Backend> Clone for StateSequenceHandle<B> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            drain: Arc::clone(&self.drain),
             storage: Arc::clone(&self.storage),
         }
     }
@@ -40,8 +66,50 @@ impl<B: Backend> StateSequenceHandle<B> {
     pub(super) fn new(storage: Arc<StateStorage<B>>, sequence: StateSequence) -> Self {
         Self {
             inner: Arc::new(Mutex::new(StateJournal::new(sequence))),
+            drain: Arc::default(),
             storage,
         }
+    }
+
+    pub(super) fn recording_guard(&self) -> Result<RecordingGuard, BackendError> {
+        let mut count = self
+            .drain
+            .count
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        *count = count.checked_add(1).ok_or(BackendError::AllocationFailed)?;
+        Ok(RecordingGuard(Arc::clone(&self.drain)))
+    }
+
+    /// Waits until all recordings release their request leases after completion or cancellation.
+    ///
+    /// # Errors
+    /// Returns timeout for outstanding owners or failure for an unrecorded pending transaction.
+    pub fn wait_drained(&self, timeout: Duration) -> Result<(), BackendError> {
+        let started = Instant::now();
+        let mut count = self
+            .drain
+            .count
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        while *count != 0 {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(BackendError::Timeout);
+            }
+            count = self
+                .drain
+                .ready
+                .wait_timeout(count, remaining)
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .0;
+        }
+        drop(count);
+        let mut journal = self.lock();
+        let checkpoint = journal
+            .checkpoint()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        StateSequence::rewind(&mut journal, &checkpoint).map_err(|_| BackendError::ExecutionFailed)
     }
 
     pub(super) fn lock(&self) -> MutexGuard<'_, StateJournal> {
@@ -107,5 +175,59 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Refuses stale capabilities and reservations already sealed for submission.
     pub fn cancel(&self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
         self.lock().cancel_unsubmitted(transaction)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Host, Limits};
+    use forja_core::{DType, StateLayout, StatePlane};
+
+    #[test]
+    fn lane_drain_waits_for_recording_owners_before_reusing_storage() {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, 4096, 128, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+                1,
+            )
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        let first = storage
+            .record(&sequence, sequence.begin(1).unwrap())
+            .unwrap();
+        let second = storage
+            .record(&sequence, sequence.begin(2).unwrap())
+            .unwrap();
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let sequence = &sequence;
+            let waiter = scope.spawn(move || {
+                sender
+                    .send(sequence.wait_drained(Duration::from_secs(10)))
+                    .unwrap();
+            });
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(first);
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(second);
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            waiter.join().unwrap();
+        });
+        drop(sequence);
+        storage.reserve().unwrap();
     }
 }
