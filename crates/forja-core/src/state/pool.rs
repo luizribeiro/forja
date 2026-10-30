@@ -194,6 +194,23 @@ impl StateSequence {
         transaction: &StateTransaction,
         queue_serial: u64,
     ) -> Result<(), PagePoolError> {
+        self.validate_submission_at(transaction, queue_serial)?;
+        self.storage.mark_submitted(queue_serial)?;
+        self.latest_submission = queue_serial;
+        transaction.submitted.store(queue_serial, Ordering::Release);
+        Ok(())
+    }
+
+    /// Checks one lane before atomically sealing every lane of a submission.
+    /// The caller must hold the lane lock until sealing completes.
+    ///
+    /// # Errors
+    /// Refuses quarantined, stale, duplicate or unordered submissions without mutation.
+    pub fn validate_submission_at(
+        &self,
+        transaction: &StateTransaction,
+        queue_serial: u64,
+    ) -> Result<(), PagePoolError> {
         if self.pool.completed.load(Ordering::Acquire) < self.quarantine_until {
             return Err(PagePoolError::BankInFlight);
         }
@@ -208,9 +225,6 @@ impl StateSequence {
         {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        self.storage.mark_submitted(queue_serial)?;
-        self.latest_submission = queue_serial;
-        transaction.submitted.store(queue_serial, Ordering::Release);
         Ok(())
     }
 
@@ -268,16 +282,7 @@ impl StateSequence {
         transaction: &StateTransaction,
         success: bool,
     ) -> Result<(), PagePoolError> {
-        if self.pending_index(transaction)? != 0 {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
-        let submitted = transaction.submitted.load(Ordering::Acquire);
-        if success && submitted == 0 {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
-        if submitted != 0 && self.pool.completed.load(Ordering::Acquire) < submitted {
-            return Err(PagePoolError::BankInFlight);
-        }
+        self.validate_finish(transaction, success)?;
         if success {
             self.committed = transaction.output;
             self.pending.pop_front();
@@ -289,6 +294,27 @@ impl StateSequence {
                 .max()
                 .unwrap_or(0);
             self.pending.clear();
+        }
+        Ok(())
+    }
+    /// Checks publication while a caller holds every participating lane lock.
+    ///
+    /// # Errors
+    /// Refuses stale/out-of-order completion or publication before physical drain.
+    pub fn validate_finish(
+        &self,
+        transaction: &StateTransaction,
+        success: bool,
+    ) -> Result<(), PagePoolError> {
+        if self.pending_index(transaction)? != 0 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let submitted = transaction.submitted.load(Ordering::Acquire);
+        if success && submitted == 0 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        if submitted != 0 && self.pool.completed.load(Ordering::Acquire) < submitted {
+            return Err(PagePoolError::BankInFlight);
         }
         Ok(())
     }
@@ -508,6 +534,33 @@ mod tests {
         );
         assert!(replacement.bind(&transaction).is_err());
     }
+    #[test]
+    fn transition_preflights_do_not_seal_or_publish_a_lane() {
+        let layout =
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 65536).unwrap();
+        let mut lane = pool.reserve().unwrap();
+        let foreign = pool.reserve().unwrap();
+        let tx = lane.begin(1).unwrap();
+        assert!(lane.validate_submission_at(&tx, 0).is_err());
+        assert!(foreign.validate_submission_at(&tx, 7).is_err());
+        for _ in 0..2 {
+            lane.validate_submission_at(&tx, 7).unwrap();
+        }
+        lane.mark_submitted_at(&tx, 7).unwrap();
+        assert!(lane.validate_submission_at(&tx, 8).is_err());
+        assert_eq!(
+            lane.validate_finish(&tx, true),
+            Err(PagePoolError::BankInFlight)
+        );
+        pool.observe_completion(7).unwrap();
+        for _ in 0..2 {
+            lane.validate_finish(&tx, true).unwrap();
+        }
+        lane.finish(&tx, true).unwrap();
+        assert_eq!(lane.begin(2).unwrap().input_version(), tx.output);
+    }
+
     #[test]
     fn an_unsubmitted_cancellation_needs_no_synthetic_gpu_completion() {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
