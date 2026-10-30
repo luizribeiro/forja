@@ -6,6 +6,7 @@ enum Mixer {
 }
 /// A pre-normalized hybrid decoder layer with bf16 residual boundaries.
 pub struct DecoderLayer {
+    index: u32,
     mixer: Mixer,
     ffn: FeedForward,
     input_norm: Tensor<bf16>,
@@ -34,6 +35,7 @@ impl DecoderLayer {
             )?))
         };
         Ok(Self {
+            index,
             mixer,
             ffn: FeedForward::load(&weights.scoped("mlp"), config)?,
             input_norm: weights.tensor("input_layernorm.weight", &[config.hidden])?,
@@ -76,6 +78,11 @@ impl DecoderLayer {
         delta: Option<&Variant>,
         prefill: bool,
     ) -> Result<Tensor<bf16>> {
+        let layer_type = match &self.mixer {
+            Mixer::Recurrent(_) => "recurrent",
+            Mixer::Attention(_) => "attention",
+        };
+        forja_sdk::profile_scope("mixer", layer_type, Some(self.index))?;
         let normalized = input.rms_norm(&self.input_norm, 1.0e-6)?;
         let mixed = match &mut self.mixer {
             Mixer::Recurrent(layer) if prefill => layer.prefill(&normalized, quant, delta)?,
@@ -88,6 +95,7 @@ impl DecoderLayer {
             }
         };
         let residual = (input + &mixed)?;
+        forja_sdk::profile_scope("ffn", "ffn", Some(self.index))?;
         let normalized = residual.rms_norm(&self.post_norm, 1.0e-6)?;
         &residual + &self.ffn.ffn(&normalized, quant)?
     }

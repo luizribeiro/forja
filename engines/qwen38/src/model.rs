@@ -173,6 +173,7 @@ impl Model {
             .step_by(usize::try_from(block).map_err(|_| Error::loading("block width overflow"))?)
         {
             let rows = block.min(sequence - row);
+            forja_sdk::profile_scope("embedding", "global", None)?;
             let mut hidden = self.embedding.embed(&tokens.narrow(0, row, rows)?)?;
             for (index, layer) in self.layers.iter_mut().enumerate() {
                 hidden = if prefill {
@@ -195,6 +196,7 @@ impl Model {
                     hidden.copy_into(&mut captured[index].narrow(0, row, rows)?)?;
                 }
             }
+            forja_sdk::profile_scope("output", "global", None)?;
             hidden = hidden.rms_norm(&self.norm, 1.0e-6)?;
             if let Some(tap) = captured.last() {
                 hidden.copy_into(&mut tap.narrow(0, row, rows)?)?;
