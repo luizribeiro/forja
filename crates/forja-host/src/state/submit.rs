@@ -107,7 +107,9 @@ impl<B: Backend> StateSubmission<B> {
         if let Some(result) = self.completion {
             return result;
         }
-        let result = self.submission.wait();
+        let result = self
+            .submission
+            .wait_timeout(self.recording.storage.limits.submission_timeout);
         self.completion = Some(result);
         if matches!(result, Err(BackendError::Timeout)) {
             self.recording

@@ -17,6 +17,7 @@ use std::{
 struct Control {
     waits: AtomicUsize,
     failure: AtomicU8,
+    timeout_ns: AtomicU64,
     gpu_ns: AtomicU64,
 }
 
@@ -39,6 +40,13 @@ impl Submission for ControlledSubmission {
             2 => Err(BackendError::ExecutionFailed),
             _ => self.inner.wait(),
         }
+    }
+    fn wait_timeout(&self, timeout: Duration) -> Result<(), BackendError> {
+        self.control.timeout_ns.store(
+            u64::try_from(timeout.as_nanos()).unwrap(),
+            Ordering::Release,
+        );
+        self.wait()
     }
     fn gpu_time(&self) -> Option<Duration> {
         match self.control.gpu_ns.load(Ordering::Acquire) {
@@ -184,7 +192,7 @@ fn submission_owns_its_sequence_and_backing_through_early_drop() {
 }
 
 #[test]
-fn state_completion_reports_gpu_time() {
+fn state_completion_uses_the_configured_deadline_and_reports_gpu_time() {
     let (control, storage, sequence) = setup();
     control.gpu_ns.store(7, Ordering::Release);
     let time = recording(&storage, &sequence, 1)
@@ -194,4 +202,8 @@ fn state_completion_reports_gpu_time() {
         .unwrap();
     assert_eq!(time, Some(Duration::from_nanos(7)));
     assert_eq!(control.waits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        control.timeout_ns.load(Ordering::Acquire),
+        u64::try_from(storage.limits.submission_timeout.as_nanos()).unwrap()
+    );
 }
