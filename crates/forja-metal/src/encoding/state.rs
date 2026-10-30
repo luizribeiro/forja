@@ -139,10 +139,11 @@ mod tests {
     fn metal_compiles_delta_block_transforms() {
         let backend = MetalBackend::new().unwrap();
         let mut pipelines = backend.pipelines.lock().unwrap();
-        let name = "state_block_gram";
-        let pipeline = pipelines
-            .get(name, &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 0), (5, 2)])
-            .unwrap();
-        assert!(pipeline.maxTotalThreadsPerThreadgroup() >= 128);
+        for name in ["state_block_gram", "state_block_solve"] {
+            let pipeline = pipelines
+                .get(name, &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 0), (5, 2)])
+                .unwrap();
+            assert!(pipeline.maxTotalThreadsPerThreadgroup() >= 128);
+        }
     }
 }

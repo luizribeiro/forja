@@ -96,3 +96,67 @@ kernel void state_block_gram(
         scratch[base+params.offsets[2]+row] = f32_exp_rounded(prefix);
     }
 }
+
+float delta_block_solve_tree(device const float *scratch, uint base, uint lower_offset,
+    uint panel_offset, uint width, uint row, uint column) {
+    float lanes[32];
+    for (uint lane=0; lane<32; ++lane) {
+        float sum = 0.0f;
+        for (uint item=0; item<2; ++item) {
+            uint previous = lane*2+item;
+            if (previous < row) {
+                sum += scratch[base+lower_offset+row*FORJA_DELTA_BLOCK_TOKENS+previous]
+                    * scratch[base+panel_offset+previous*width+column];
+            }
+        }
+        lanes[lane] = sum;
+    }
+    for (uint offset=16; offset>0; offset>>=1) {
+        for (uint lane=0; lane<offset; ++lane) { lanes[lane] += lanes[lane+offset]; }
+    }
+    return lanes[0];
+}
+
+kernel void state_block_solve(
+    device const uchar *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
+    device const uchar *value [[buffer(2)]], device const uchar *log_decay [[buffer(3)]],
+    device const uchar *beta [[buffer(4)]], device const float *previous [[buffer(5)]],
+    device const uint2 *table [[buffer(6)]], device const uint *generations [[buffer(7)]],
+    device const uint *activity [[buffer(8)]], device uchar *output [[buffer(9)]],
+    device float *next [[buffer(10)]], device float *scratch [[buffer(11)]],
+    constant TensorLayout *layouts [[buffer(12)]],
+    constant DeltaBlockParams &params [[buffer(13)]], device atomic_uint *error_flag [[buffer(14)]],
+    uint index [[thread_position_in_grid]]) {
+    uint panel_width = params.values + params.keys;
+    uint block_head = index / panel_width;
+    if (block_head >= params.blocks*params.heads || activity[0] == 0) { return; }
+    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
+    scratch += layouts[8].offset;
+    uint column = index % panel_width;
+    uint block = block_head / params.heads;
+    uint head = block_head % params.heads;
+    uint rows = delta_block_rows(params,block);
+    uint base = delta_block_base(params,block,head);
+    bool key_panel = column >= params.values;
+    uint width = key_panel ? params.keys : params.values;
+    column -= key_panel ? params.values : 0;
+    uint panel_offset = params.offsets[key_panel ? 5 : 4];
+    uint query_head = head / (params.heads / params.query_heads);
+    for (uint row=0; row<FORJA_DELTA_BLOCK_TOKENS; ++row) {
+        uint slot = base+panel_offset+row*width+column;
+        if (row >= rows) { scratch[slot] = 0.0f; continue; }
+        uint absolute_row = block*FORJA_DELTA_BLOCK_TOKENS+row;
+        float coefficient = load_float(beta,physical_index(layouts[4],absolute_row*params.heads+head),program_input4_dtype);
+        float rhs;
+        if (key_panel) {
+            uint source = (absolute_row*params.query_heads+query_head)*params.keys+column;
+            rhs = coefficient * scratch[base+params.offsets[2]+row]
+                * load_float(key,physical_index(layouts[1],source),input1_dtype);
+        } else {
+            uint source = (absolute_row*params.heads+head)*params.values+column;
+            rhs = coefficient * load_float(value,physical_index(layouts[2],source),input2_dtype);
+        }
+        scratch[slot] = rhs - delta_block_solve_tree(scratch,base,params.offsets[0],
+            panel_offset,width,row,column);
+    }
+}
