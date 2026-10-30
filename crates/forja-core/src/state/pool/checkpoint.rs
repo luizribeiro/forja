@@ -1,4 +1,4 @@
-use super::{Arc, AtomicU32, Ordering, PagePoolError, StateSequence};
+use super::{Arc, AtomicU32, Ordering, PagePoolError, StateSequence, StateTransaction};
 
 struct VersionPin {
     counts: Arc<[AtomicU32; 3]>,
@@ -32,7 +32,23 @@ impl StateSequence {
     /// # Errors
     /// Refuses exhausted checkpoint reference counts.
     pub fn checkpoint(&self) -> Result<StateCheckpoint, PagePoolError> {
-        self.pins[self.committed as usize]
+        self.pin(self.committed)
+    }
+
+    /// Retains the input version of a live speculative transaction.
+    ///
+    /// # Errors
+    /// Refuses foreign/retired transactions or exhausted checkpoint reference counts.
+    pub fn predecessor(
+        &self,
+        transaction: &StateTransaction,
+    ) -> Result<StateCheckpoint, PagePoolError> {
+        self.pending_index(transaction)?;
+        self.pin(transaction.input)
+    }
+
+    fn pin(&self, version: u32) -> Result<StateCheckpoint, PagePoolError> {
+        self.pins[version as usize]
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_add(1)
             })
@@ -41,7 +57,7 @@ impl StateSequence {
             identity: Arc::clone(&self.identity),
             pin: Arc::new(VersionPin {
                 counts: Arc::clone(&self.pins),
-                version: self.committed,
+                version,
             }),
         })
     }
@@ -69,6 +85,32 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn queued_descendants_retain_their_own_input_boundary() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted(&first).unwrap();
+        let second = sequence.begin(2).unwrap();
+        let predecessor = sequence.predecessor(&second).unwrap();
+        sequence.mark_submitted(&second).unwrap();
+        assert_eq!(
+            sequence.rewind(&predecessor),
+            Err(PagePoolError::BankInFlight)
+        );
+        pool.observe_completion(2).unwrap();
+        sequence.finish(&first, true).unwrap();
+        sequence.finish(&second, true).unwrap();
+        sequence.rewind(&predecessor).unwrap();
+        assert_eq!(sequence.begin(3).unwrap().input_version(), first.output);
+        assert!(sequence.predecessor(&second).is_err());
+    }
 
     #[test]
     fn retained_predecessors_survive_updates_and_refuse_early_reuse() {
