@@ -1,4 +1,6 @@
 //! Independent projection and hybrid architecture coverage.
+#[path = "qwen38/numerics.rs"]
+mod numerics;
 #[path = "qwen38/weights.rs"]
 mod weights;
 use forja_sdk::{Tensor, Weights, bf16};
