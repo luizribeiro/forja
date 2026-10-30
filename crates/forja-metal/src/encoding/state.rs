@@ -155,6 +155,7 @@ mod tests {
             "state_block_solve",
             "state_block_carry",
             "state_block_output",
+            "state_block_output_mma",
         ] {
             let pipeline = pipelines
                 .get(name, &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 0), (5, 2)])
