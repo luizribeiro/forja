@@ -34,6 +34,8 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
+        timestamps: Option<&super::super::GpuTimestamps>,
+        internal_timestamp: &mut usize,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
         let input = dispatch.inputs();
         let query = input[0].layout().shape();
@@ -108,6 +110,7 @@ impl MetalBackend {
             };
             if stage > 0 {
                 super::super::encode_dispatch_barrier(encoder);
+                super::super::write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
             }
             let pipeline = self
                 .pipelines

@@ -11,6 +11,17 @@ pub(crate) fn internal(
     kernel: &str,
     blocks: Option<u32>,
 ) -> Option<KernelCost> {
+    if let Some(stages) = KernelCost::delta_block_stages(dispatch) {
+        let index = [
+            "state_block_gram",
+            "state_block_solve",
+            "state_block_carry",
+            "state_block_output",
+        ]
+        .iter()
+        .position(|name| *name == kernel)?;
+        return Some(stages[index]);
+    }
     let mut cost = KernelCost::of(dispatch)?;
     let input = dispatch.primitive_inputs();
     if let Some(blocks) = blocks {

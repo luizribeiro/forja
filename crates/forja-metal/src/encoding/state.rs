@@ -19,12 +19,22 @@ impl MetalBackend {
         dispatch: &Dispatch,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
+        timestamps: Option<&super::GpuTimestamps>,
+        internal_timestamp: &mut usize,
     ) -> Result<(Vec<BufferBinding>, BufferBinding), BackendError> {
         let Op::State(operation) = dispatch.op() else {
             return Err(BackendError::InvalidInput);
         };
         if matches!(operation, StateOp::DeltaRuleBlock(_)) {
-            return self.encode_delta_block(encoder, table, dispatch, bindings, arguments);
+            return self.encode_delta_block(
+                encoder,
+                table,
+                dispatch,
+                bindings,
+                arguments,
+                timestamps,
+                internal_timestamp,
+            );
         }
         let input = dispatch.inputs();
         let ordinary = input.len() - 3;

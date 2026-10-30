@@ -3305,8 +3305,15 @@ impl MetalBackend {
                 buffers
             }
             Op::State(_) => {
-                let (buffers, flag) =
-                    self.encode_state(encoder, table, dispatch, bindings, arguments)?;
+                let (buffers, flag) = self.encode_state(
+                    encoder,
+                    table,
+                    dispatch,
+                    bindings,
+                    arguments,
+                    timestamps,
+                    internal_timestamp,
+                )?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "state"));
                 buffers
             }
@@ -8377,6 +8384,17 @@ fn dispatch_profile(
 }
 
 fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
+    if matches!(
+        dispatch.op(),
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_))
+    ) {
+        return vec![
+            "state_block_gram",
+            "state_block_solve",
+            "state_block_carry",
+            "state_block_output",
+        ];
+    }
     if matches!(
         dispatch.op(),
         Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
