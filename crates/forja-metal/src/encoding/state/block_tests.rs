@@ -192,3 +192,8 @@ fn scalar_carry_matches_cpu_stage_oracle() {
 fn scalar_output_matches_cpu_stage_oracle() {
     check(3, "state_block_output", None, 128).unwrap();
 }
+
+#[test]
+fn mma_gram_matches_cpu_stage_oracle() {
+    check(0, "state_block_gram_mma", Some(32), 128).unwrap();
+}

@@ -151,6 +151,7 @@ mod tests {
         let mut pipelines = backend.pipelines.lock().unwrap();
         for name in [
             "state_block_gram",
+            "state_block_gram_mma",
             "state_block_solve",
             "state_block_carry",
             "state_block_output",
@@ -159,6 +160,7 @@ mod tests {
                 .get(name, &[(0, 0), (1, 0), (2, 2), (3, 2), (4, 0), (5, 2)])
                 .unwrap();
             assert!(pipeline.maxTotalThreadsPerThreadgroup() >= 128);
+            assert!(pipeline.staticThreadgroupMemoryLength() <= 32 * 1024);
         }
     }
 }
