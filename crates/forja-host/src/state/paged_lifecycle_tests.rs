@@ -111,3 +111,35 @@ fn bank_swap_replaces_only_selected_padding_metadata() {
     assert_eq!(ids(&mut host, 0), before[0]);
     assert_ne!(ids(&mut host, 1), before[1]);
 }
+
+#[test]
+fn refused_append_preserves_the_already_parked_state_transaction() {
+    let (mut host, pool, slot, _storage) = lifecycle_fixture();
+    host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
+    let binding = Arc::clone(&host.table.get(&slot).unwrap().binding);
+    let previous = binding.banks.slot(0, 0).unwrap();
+    assert!(host.begin_paged_lane_append(pool.rep(), 0, 1, 1).is_err());
+    assert!(
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .recording(0, 0)
+            .is_ok()
+    );
+    assert_eq!(binding.banks.slot(0, 0).unwrap(), previous);
+    assert_eq!(
+        binding
+            .lane(0)
+            .unwrap()
+            .sequence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .logical_len(),
+        1
+    );
+    host.bind_paged_lane(pool.rep(), 0, None, 0).unwrap();
+}

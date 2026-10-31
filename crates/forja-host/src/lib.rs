@@ -4506,32 +4506,33 @@ impl<B: Backend + 'static> Host<B> {
                 reserved_tokens,
                 ..state.position(lane)?
             };
-            let admitted = state
-                .begin_action(bank, lane, position, action)
-                .and_then(|()| {
-                    if let Some(checkpoint) = state_checkpoint {
-                        state
-                            .recording(bank, lane)?
-                            .pair_paged_checkpoint(
-                                Arc::clone(&sequence),
-                                checkpoint,
-                                lane_binding.table_dirty.clone(),
-                            )
-                            .map_err(invalid_handle)?;
-                    }
-                    Ok(())
-                });
-            if let Err(error) = admitted {
-                state.cancel_lane(bank, lane)?;
-                rollback_paged_if_current(&sequence, checkpoint)?;
-                binding
-                    .banks
-                    .restore_all(lane, previous)
-                    .map_err(paged_refusal)?;
-                for dirty in &lane_binding.table_dirty {
-                    dirty.store(true, Ordering::Release);
+            let began = state.begin_action(bank, lane, position, action);
+            let started = began.is_ok();
+            let admitted = began.and_then(|()| {
+                if let Some(checkpoint) = state_checkpoint {
+                    state
+                        .recording(bank, lane)?
+                        .pair_paged_checkpoint(
+                            Arc::clone(&sequence),
+                            checkpoint,
+                            lane_binding.table_dirty.clone(),
+                        )
+                        .map_err(invalid_handle)?;
                 }
-                return Err(error);
+                Ok(())
+            });
+            if let Err(error) = admitted {
+                let canceled = if started {
+                    state.cancel_lane(bank, lane)
+                } else {
+                    Ok(())
+                };
+                let canceled = recovery::finish(Err(error), canceled)
+                    .map_err(recovery::RecoveryError::into_compute);
+                let restored =
+                    recovery::finish(canceled, rollback_paged_if_current(&sequence, checkpoint))
+                        .map_err(recovery::RecoveryError::into_compute);
+                return restore_paged_banks(restored, &binding, lane, previous);
             }
         }
         let prepared = (|| {
