@@ -28,6 +28,7 @@ use crate::request::{ToolChoice, validate_chat_input, validate_completion_input,
 use crate::tool_output::{GeneratedToolCall, ToolDelta, ToolOutput};
 use crate::{ChatCompletionRequest, ChatFormat, CompletionRequest, ResolvedParams, StopMatcher};
 
+mod canonical;
 mod continuous;
 
 static NEXT_CHAT_STREAM: AtomicU64 = AtomicU64::new(1);
@@ -458,6 +459,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     guidance: GuidanceWorker,
     prefix_namespace: PrefixNamespace,
     prefix_index: Option<PrefixIndex>,
+    canonical_cache: Option<canonical::CanonicalCache<B>>,
     metrics: ServingMetrics,
     config_generation: u64,
     scheduler: SchedulerConfig,
@@ -1012,6 +1014,7 @@ where
             guidance,
             prefix_namespace: prefix_identity.into_namespace(),
             prefix_index,
+            canonical_cache: None,
             metrics: ServingMetrics::default(),
             config_generation: 0,
             scheduler,
@@ -1058,6 +1061,7 @@ where
                 .reconfigure(limits, config.serving.prefix_reuse)
                 .map_err(|error| GenerationError::new(error.to_string()))?;
         }
+        self.configure_canonical_cache(&config)?;
         self.runner.update_time_limits(
             config.limits.guest_call_timeout.get(),
             config.limits.submission_timeout.get(),

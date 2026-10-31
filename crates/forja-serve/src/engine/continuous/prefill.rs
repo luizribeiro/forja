@@ -278,6 +278,12 @@ where
             .unwrap_or(usize::MAX)
             .min(largest)
             .min(remaining.len());
+        let count = usize::try_from(self.canonical_piece(
+            prefill.position,
+            prefill.request.prompt_tokens,
+            u32::try_from(count).map_err(|_| GenerationError::new("prompt piece overflow"))?,
+        )?)
+        .map_err(|_| GenerationError::new("prompt piece exceeds usize"))?;
         #[cfg(test)]
         if let Some(barrier) = &self.batch_test_barrier {
             barrier.prompt_pieces.lock().unwrap().push(count);

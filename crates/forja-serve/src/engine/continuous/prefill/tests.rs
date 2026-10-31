@@ -154,3 +154,34 @@ async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> R
     );
     Ok(())
 }
+
+fn canonical_profile() -> Result<forja_config::Profile, TestError> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "schema-version": 1, "family": "hybrid",
+        "model": { "id": "test/hybrid", "revision": "0".repeat(40), "weights-sha256": format!("sha256:{}", "0".repeat(64)) },
+        "target": { "component": "wasm32-wasip2", "backend": "metal", "device-family": "test" },
+        "numerics": { "activations": "f32", "weights": "f32" },
+        "workload": { "kind": "causal-lm", "batch": 1, "max-context": 128, "prefill-chunk": 64 },
+        "serving": { "prompt-token-budget": 64, "paged-cache": true, "state-snapshot-bytes": 268_435_456_u64, "state-snapshot-interval": 4096 },
+        "variants": { "fixed": { "recurrent": "fixed" } }
+    }))?)
+}
+
+#[tokio::test]
+async fn paired_cache_configuration_honors_operator_disable_and_restore() -> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    assert!(engine.canonical_cache.is_some());
+    let mut config = engine.config.clone();
+    config.serving.state_snapshot_bytes =
+        forja_config::Choice::Fixed(forja_config::ByteSize::new(0));
+    engine.update_policy(1, config.clone())?;
+    config.serving.state_snapshot_bytes = forja_config::Choice::Auto;
+    engine.update_policy(2, config.clone())?;
+    config.serving.state_snapshot_bytes =
+        forja_config::Choice::Fixed(forja_config::ByteSize::new(268_435_457));
+    assert!(engine.update_policy(3, config).is_err());
+    assert_eq!(engine.config_generation, 2);
+    Ok(())
+}
