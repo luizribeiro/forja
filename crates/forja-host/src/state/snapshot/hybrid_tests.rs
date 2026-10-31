@@ -528,3 +528,47 @@ async fn hybrid_forks_keep_attention_backing_alive_after_guest_resources_close()
     assert!(fixture.host.backend.read(&tensor).is_err());
     assert!(fixture.host.live_bytes.load(Ordering::Acquire) < before);
 }
+
+#[test]
+fn hybrid_backing_refuses_a_slot_from_an_identically_shaped_foreign_pool() {
+    let mut fixture = hybrid_fixture(262_144);
+    let foreign = PagePool::new_fixed(fixture.pool.layout().clone(), 16, 131_072).unwrap();
+    let slot = fixture
+        .host
+        .table
+        .get(&fixture.resource)
+        .unwrap()
+        .slot
+        .unwrap();
+    let entry = fixture
+        .host
+        .table
+        .get_mut(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+        .unwrap();
+    Arc::get_mut(&mut entry.binding).unwrap().pool = foreign;
+    let before = fixture.host.live_bytes.load(Ordering::Acquire);
+    assert!(
+        fixture
+            .host
+            .hybrid_prefix(
+                &fixture.resource,
+                &fixture.source,
+                fixture.image.clone(),
+                fixture.image.tokens()
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .host
+            .create_hybrid_prefix_store(
+                &fixture.resource,
+                fixture.image.namespace(),
+                SnapshotAllowance::new(65_536, None).unwrap(),
+                65_536,
+                8
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.host.live_bytes.load(Ordering::Acquire), before);
+}

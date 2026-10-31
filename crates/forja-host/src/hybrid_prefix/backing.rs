@@ -34,9 +34,11 @@ impl<B: Backend> Host<B> {
             .table
             .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
             .map_err(invalid_handle)?;
-        if slot.planes.len() != owner.pool.layout().planes().len() {
+        if !slot.binding.pool.same_pool(&owner.pool)
+            || slot.planes.len() != owner.pool.layout().planes().len()
+        {
             return Err(invalid_handle(
-                "hybrid entries require every attention plane",
+                "hybrid entries require every plane from the owning attention pool",
             ));
         }
         let bytes = u64::try_from(slot.planes.len())

@@ -281,7 +281,9 @@ impl PagePool {
         self.same_pool(&sequence.pool)
     }
 
-    fn same_pool(&self, other: &Self) -> bool {
+    /// Whether both handles refer to the same physical allocator namespace.
+    #[must_use]
+    pub fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
@@ -1705,6 +1707,8 @@ mod tests {
     fn ownership_distinguishes_identically_shaped_page_pools() {
         let primary = pool(4_096);
         let sequence = primary.reserve(7).unwrap();
+        assert!(primary.same_pool(&primary.clone()));
+        assert!(!primary.same_pool(&pool(4_096)));
         assert!(primary.clone().owns_sequence(&sequence));
         assert!(!pool(4_096).owns_sequence(&sequence));
     }
