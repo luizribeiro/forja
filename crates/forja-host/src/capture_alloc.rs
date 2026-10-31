@@ -183,4 +183,71 @@ mod tests {
         );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
     }
+    #[test]
+    fn private_state_planes_and_read_only_owners_are_never_scratch() {
+        use crate::{BufferHandle, BufferKind};
+        use forja_core::{DType, StateLayout, StatePlane};
+        use std::sync::atomic::AtomicUsize;
+
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(131_072, 8, 4096, 128, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7]).unwrap()]).unwrap(),
+                1,
+            )
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        let mut recording = storage
+            .record(&sequence, sequence.begin(1).unwrap())
+            .unwrap();
+        let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
+        let output = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+        recording
+            .causal_convolution(0, &input, &weights, &output)
+            .unwrap();
+        let plane = recording.commands.dispatches()[0].outputs()[1].clone();
+        assert_eq!(plane.layout().shape(), [3, 7]);
+        for protected in [true, false] {
+            let owner = if protected {
+                plane.clone()
+            } else {
+                plane.read_only()
+            };
+            let commands = host.command_list().unwrap();
+            let charge = host.reserve_reference().unwrap();
+            let entry = host.table.get_mut(&commands).unwrap();
+            if protected {
+                entry.protected.insert(owner.buffer());
+            }
+            entry.scratch_allocations.push((owner.buffer(), charge));
+            entry.retained.push(TensorEntry {
+                tensor: owner.clone(),
+                symbolic: None,
+                reference_charge: None,
+                slot_token: None,
+                buffer: Arc::new(BufferHandle {
+                    owner,
+                    kind: BufferKind::Allocated {
+                        byte_len: 0,
+                        live_bytes: Arc::clone(&host.live_bytes),
+                    },
+                    taints: Arc::clone(&host.taints),
+                    guest_handles: AtomicUsize::new(0),
+                }),
+            });
+            let scratch = host
+                .allocate_command_scratch(&commands, compute::Dtype::F32, &[3, 7])
+                .unwrap();
+            assert_ne!(id(&host, &scratch), plane.buffer());
+            host.table.get_mut(&commands).unwrap().retained.clear();
+            host.drop_tensor(scratch).unwrap();
+        }
+        for tensor in [&input, &weights, &output] {
+            host.backend.release(tensor).unwrap();
+        }
+    }
 }
