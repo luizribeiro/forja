@@ -357,3 +357,27 @@ fn lookup_never_shortens_a_later_image_or_accepts_a_changed_ledger() {
         128
     );
 }
+
+#[test]
+fn publication_cancellation_races_keep_whole_entries() {
+    let fixture = hybrid_fixture(262_144);
+    let next = fixture.advance(128);
+    for _ in 0..16 {
+        let cache = fixture.cache(65_536, 65_536, 1);
+        let first = fixture.entry();
+        let old = Arc::downgrade(&first);
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        cache.publish(first, &cancelled).unwrap();
+        let start = std::sync::Barrier::new(2);
+        let accepted = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                cancelled.store(true, Ordering::Release);
+            });
+            start.wait();
+            cache.publish(next.clone(), &cancelled).unwrap()
+        });
+        assert_eq!(old.upgrade().is_none(), accepted);
+        assert_eq!(cache.usage().unwrap().entries, 1);
+    }
+}
