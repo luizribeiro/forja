@@ -10,7 +10,7 @@ impl<B: Backend + 'static> Host<B> {
         bucket: u32,
         active: impl Iterator<Item = usize>,
     ) -> Result<Option<crate::SubmitRequest<B>>, compute::Error> {
-        let Some((_, slot, _)) = self.input_slot(pool)? else {
+        let Some((slot_rep, slot, _)) = self.input_slot(pool)? else {
             return Ok(None);
         };
         let Some(inputs) = &slot.inputs else {
@@ -21,9 +21,15 @@ impl<B: Backend + 'static> Host<B> {
             .ok_or_else(|| invalid_handle("state input layout is missing"))?
             .vocab;
         let count = usize::try_from(bucket).map_err(invalid_handle)?;
+        let state = self
+            .state_slots
+            .get(&slot_rep)
+            .ok_or_else(|| invalid_handle("state slot is missing"))?;
+        let scopes = state.selection_count(slot.active_bank)?;
         let snapshot = self.reserve_references(
             count
                 .checked_add(2)
+                .and_then(|references| references.checked_add(scopes))
                 .ok_or_else(|| invalid_handle("selection reference count overflowed"))?,
         )?;
         let active = active
@@ -33,14 +39,7 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| invalid_handle("selection lane count overflowed"))?,
             )
             .collect::<Vec<_>>();
-        if count > slot.binding.lanes.len()
-            || active.is_empty()
-            || active.len() > count
-            || active.iter().any(|&lane| lane >= count)
-            || active.windows(2).any(|pair| pair[0] >= pair[1])
-        {
-            return Err(invalid_handle("selection lane geometry is invalid"));
-        }
+        validate_selection_lanes(count, slot.binding.lanes.len(), &active)?;
         let source = self.entry(logits)?.clone();
         self.taints
             .check(source.tensor.buffer())
@@ -104,8 +103,25 @@ impl<B: Backend + 'static> Host<B> {
             None,
         );
         request.snapshot = Some(snapshot);
+        request.recording_scopes = state.selection_owners(slot.active_bank)?;
         Ok(Some(request))
     }
+}
+
+fn validate_selection_lanes(
+    count: usize,
+    capacity: usize,
+    active: &[usize],
+) -> Result<(), compute::Error> {
+    if count > capacity
+        || active.is_empty()
+        || active.len() > count
+        || active.iter().any(|&lane| lane >= count)
+        || active.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(invalid_handle("selection lane geometry is invalid"));
+    }
+    Ok(())
 }
 
 fn logit_row<B: Backend>(

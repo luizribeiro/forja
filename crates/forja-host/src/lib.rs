@@ -6653,6 +6653,7 @@ impl<B: Backend + 'static> Host<B> {
         SubmitRequest {
             backend: Arc::clone(&self.backend),
             snapshot: None,
+            recording_scopes: Vec::new(),
             captured_state: Vec::new(),
             protected_batch: None,
             state_owners: Vec::new(),
@@ -7475,6 +7476,7 @@ struct SubmitRequest<B: Backend> {
     submission_notify: Arc<tokio::sync::Notify>,
     taints: Arc<BufferTaints>,
     profile: Option<Arc<Mutex<EngineStepProfile>>>,
+    recording_scopes: Vec<StateSelectionLease<B>>,
 }
 
 enum SubmissionWork {
@@ -8235,17 +8237,22 @@ where
         started.map(|()| None).map_err(guest_error)
     }
 
+    fn reserve_gpu(&self) -> Result<GpuReservation, BackendError> {
+        GpuReservation::new(
+            Arc::clone(&self.gpu_time_ns),
+            self.gpu_time_budget_ns,
+            duration_ns(self.timeout).max(1),
+        )
+    }
+
     fn spawn(
         self,
         started: Option<tokio::sync::oneshot::Sender<Result<(), BackendError>>>,
     ) -> tokio::task::JoinHandle<Result<Option<u64>, BackendError>> {
-        let reservation = GpuReservation::new(
-            Arc::clone(&self.gpu_time_ns),
-            self.gpu_time_budget_ns,
-            duration_ns(self.timeout).max(1),
-        );
+        let reservation = self.reserve_gpu();
         tokio::task::spawn_blocking(move || {
             let Self {
+                recording_scopes: _recording_scopes,
                 backend,
                 snapshot: _snapshot,
                 work,
@@ -10801,6 +10808,50 @@ mod tests {
                 .is_none()
         );
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_logit_copies_retain_their_unsubmitted_selection_scope() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Forward));
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let lease = host
+            .state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .begin_shared_selection(0, 0, 0)
+            .unwrap();
+        let logits = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let copy = host
+            .prepare_selection_logits(pool.rep(), &logits, 1, std::iter::once(0))
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        assert_eq!(state.selection_count(0).unwrap(), 1);
+        assert!(state.begin_shared_selection(1, 0, 0).is_err());
+        drop(copy);
+        assert_eq!(state.selection_count(0).unwrap(), 0);
+        let retry = state.begin_shared_selection(1, 0, 0).unwrap();
+        drop(retry);
+        assert_eq!(state.position(0).unwrap().grammar, 0);
     }
 
     #[tokio::test]

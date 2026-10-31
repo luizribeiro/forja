@@ -1,4 +1,4 @@
-use super::super::StateSelection;
+use super::super::{StateSelection, StateSelectionLease};
 use crate::{compute, invalid_handle};
 use forja_core::Backend;
 use std::sync::{Mutex, Weak};
@@ -24,6 +24,17 @@ impl<B: Backend> SelectionFrame<B> {
                     .map_err(|_| invalid_handle("selection ownership is poisoned"))?;
                 guard.as_ref().map(action).transpose()
             }
+        }
+    }
+
+    pub(super) fn owner(&self) -> Result<Option<StateSelectionLease<B>>, compute::Error> {
+        match self {
+            Self::Owned(_) => Ok(None),
+            Self::Shared(weak) => weak
+                .upgrade()
+                .map(StateSelectionLease::borrow)
+                .transpose()
+                .map(Option::flatten),
         }
     }
 

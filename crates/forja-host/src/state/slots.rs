@@ -460,6 +460,23 @@ impl<B: Backend> StateSlots<B> {
         })
     }
 
+    pub(crate) fn selection_owners(
+        &self,
+        bank: usize,
+    ) -> Result<Vec<super::StateSelectionLease<B>>, compute::Error> {
+        let bank = self
+            .selections
+            .get(bank)
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))?;
+        let mut owners = Vec::new();
+        for frame in bank.iter().flatten() {
+            if let Some(owner) = frame.owner()? {
+                owners.push(owner);
+            }
+        }
+        Ok(owners)
+    }
+
     /// Transfers all selected lanes to one completion owner without publishing them.
     ///
     /// # Errors

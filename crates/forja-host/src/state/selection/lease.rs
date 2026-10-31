@@ -18,6 +18,24 @@ impl<B: Backend> StateSelectionLease<B> {
         }
     }
 
+    pub(in crate::state) fn borrow(
+        inner: Arc<Mutex<Option<StateSelection<B>>>>,
+    ) -> Result<Option<Self>, compute::Error> {
+        let charge = {
+            let guard = inner
+                .lock()
+                .map_err(|_| invalid_handle("selection ownership is poisoned"))?;
+            let Some(selection) = guard.as_ref() else {
+                return Ok(None);
+            };
+            Arc::clone(&selection.charge)
+        };
+        Ok(Some(Self {
+            inner,
+            _charge: charge,
+        }))
+    }
+
     /// Returns whether the scope still owns an unsubmitted selection guard.
     ///
     /// # Errors
