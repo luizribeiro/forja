@@ -185,3 +185,44 @@ async fn paired_cache_configuration_honors_operator_disable_and_restore() -> Res
     assert_eq!(engine.config_generation, 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn paired_serving_admission_resumes_the_longest_boundary_and_replays_tail()
+-> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let mut initial = request();
+    initial.prefix_reuse = true;
+    let mut cold = engine
+        .begin_batch_prefill(initial, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert!(!engine.advance_batch_prefill(&mut cold, 64).await?);
+    let entry = engine
+        .runner
+        .capture_canonical_prefix(0, forja_host::SnapshotAllowance::new(1 << 28, None)?)?;
+    engine
+        .canonical_cache
+        .as_ref()
+        .unwrap()
+        .store
+        .as_ref()
+        .unwrap()
+        .publish(entry, &std::sync::atomic::AtomicBool::new(false))?;
+    assert!(engine.advance_batch_prefill(&mut cold, 64).await?);
+    let expected = engine.runner.state_lane_fingerprint(0)?.1;
+    assert!(engine.release_failed_lane(0).is_none());
+    let mut next = request();
+    next.prefix_reuse = true;
+    let mut hit = engine
+        .begin_batch_prefill(next, 7)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert_eq!((hit.cached, hit.position, hit.consumed), (64, 64, 64));
+    assert!(engine.advance_batch_prefill(&mut hit, 64).await?);
+    assert_eq!(hit.selected, cold.selected);
+    assert_eq!(engine.runner.state_lane_fingerprint(7)?.1, expected);
+    assert_eq!((engine.metrics.hits, engine.metrics.reused_tokens), (1, 64));
+    Ok(())
+}

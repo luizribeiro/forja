@@ -1,14 +1,16 @@
 use super::{GenerationError, ServingEngine, prefix_limits};
 use forja_config::Profile;
 use forja_core::{Backend, CanonicalPrefixSchedule, HybridPrefixNamespace};
-use forja_host::{HybridPrefixStore, SnapshotAllowance};
+use forja_host::{CanonicalPrompt, HybridPrefix, HybridPrefixStore, SnapshotAllowance};
+use std::sync::Arc;
+type Admission<B> = (Arc<CanonicalPrompt>, Option<Arc<HybridPrefix<B>>>);
 
 pub(super) struct CanonicalCache<B: Backend> {
     pub(super) schedule: CanonicalPrefixSchedule,
     namespace: HybridPrefixNamespace,
     allowance: SnapshotAllowance,
     declared: u64,
-    store: Option<HybridPrefixStore<B>>,
+    pub(super) store: Option<HybridPrefixStore<B>>,
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
@@ -127,6 +129,42 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         }
         cache.allowance = effective;
         Ok(())
+    }
+
+    pub(super) fn canonical_admission(
+        &self,
+        tokens: &[u32],
+        reuse: bool,
+    ) -> Result<Option<Admission<B>>, GenerationError> {
+        let Some(cache) = &self.canonical_cache else {
+            return Ok(None);
+        };
+        if tokens.len() < 2 {
+            return Ok(None);
+        }
+        let hit = cache
+            .store
+            .as_ref()
+            .filter(|_| reuse && self.config.serving.prefix_reuse)
+            .map(|store| store.lookup(cache.namespace, tokens))
+            .transpose()
+            .map_err(cache_error)?
+            .flatten();
+        let prompt = self
+            .runner
+            .canonical_prompt(cache.namespace, tokens.to_vec())
+            .map_err(cache_error)?;
+        Ok(Some((prompt, hit)))
+    }
+
+    pub(super) fn evict_canonical_prefix(&self) -> Result<bool, GenerationError> {
+        self.canonical_cache
+            .as_ref()
+            .and_then(|cache| cache.store.as_ref())
+            .map(HybridPrefixStore::evict_lru)
+            .transpose()
+            .map_err(cache_error)
+            .map(|evicted| evicted.unwrap_or(false))
     }
 
     pub(super) fn canonical_piece(

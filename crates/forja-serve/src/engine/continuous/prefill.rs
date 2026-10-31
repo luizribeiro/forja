@@ -151,7 +151,17 @@ where
                 return Err((request, GenerationError::unavailable(error.to_string())));
             }
         };
-        let cached = hit.as_ref().map_or(0, |hit| hit.cached_tokens);
+        let canonical = match self.canonical_admission(&request.tokens, request.prefix_reuse) {
+            Ok(canonical) => canonical,
+            Err(error) => return Err((request, error)),
+        };
+        let cached = canonical
+            .as_ref()
+            .and_then(|(_, hit)| hit.as_ref())
+            .map_or_else(
+                || hit.as_ref().map_or(0, |hit| hit.cached_tokens),
+                |hit| hit.tokens().len(),
+            );
         self.metrics.requests = self.metrics.requests.saturating_add(1);
         observe(&mut self.metrics.match_time, match_started.elapsed());
         if cached == 0 {
@@ -182,12 +192,17 @@ where
                 Err(forja_host::bindings::l9o::gpu::compute::Error::Quota(
                     forja_host::PAGED_LANE_RELEASE_REQUIRED.to_owned(),
                 ))
+            } else if let Some((prompt, hit)) = &canonical {
+                self.runner
+                    .prepare_canonical_lane(slot, prompt.clone(), hit.as_ref(), reserved)
+                    .map(|_| ())
             } else {
                 self.runner
                     .prepare_paged_lane(slot, prefix.clone(), reserved)
+                    .map(|_| ())
             };
             match binding {
-                Ok(_) => break,
+                Ok(()) => break,
                 Err(error) if forja_host::is_paged_lane_release_required(&error) => {
                     // WHY: Fixed-bucket graph capture records padded lanes as paged users, so first admission must release their capture occupant.
                     if let Err(error) = self.runner.prepare_paged_lane(slot, None, 0) {
@@ -195,6 +210,10 @@ where
                     }
                 }
                 Err(error) if prefix.is_none() => {
+                    let canonical_eviction = match self.evict_canonical_prefix() {
+                        Ok(evicted) => evicted,
+                        Err(error) => return Err((request, error)),
+                    };
                     let evicted = match self
                         .prefix_index
                         .as_mut()
@@ -209,7 +228,7 @@ where
                             ));
                         }
                     };
-                    if !evicted {
+                    if !evicted && !canonical_eviction {
                         return Err((request, batch_admission_error(&error)));
                     }
                 }
