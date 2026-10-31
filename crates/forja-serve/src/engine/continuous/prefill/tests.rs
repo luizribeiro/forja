@@ -439,3 +439,105 @@ async fn sparse_boundaries_consume_the_allocated_prompt_budget() -> Result<(), T
     assert_eq!(pending.position, 257);
     Ok(())
 }
+
+#[tokio::test]
+async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
+-> Result<(), TestError> {
+    use forja_host::{
+        BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchSelect,
+        EngineBatchSelectLane, EngineLaneCheckpoint, SamplingParams, TokenIds,
+    };
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let mut initial = request();
+    initial.prefix_reuse = true;
+    let _cold = engine
+        .begin_batch_prefill(initial, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    let _parent = engine
+        .runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 64,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 0,
+                tokens: Some(vec![0; 64]),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            })],
+        })
+        .await??;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.publish_canonical_boundary(0, 64, 65, true, &control)?;
+    let parent_bits = engine.runner.state_lane_fingerprint(0)?;
+    let mut input = request();
+    input.prefix_reuse = true;
+    let hit = engine
+        .begin_batch_prefill(input, 7)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert_eq!((hit.cached, hit.position), (64, 64));
+    let before = engine.runner.state_lane_fingerprint(7)?;
+    let mut checkpoint = EngineLaneCheckpoint::new(
+        63,
+        0,
+        (),
+        hit.reserved,
+        engine.runner.checkpoint_paged_lane(7)?.unwrap(),
+    );
+    checkpoint.state_version = engine.runner.checkpoint_state_lane(7)?;
+    let tail = engine
+        .runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 64,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 7,
+                tokens: Some(vec![0]),
+                start_pos: 64,
+                sampling: SamplingParams::default(),
+            })],
+        })
+        .await??;
+    let mut lanes = vec![None; 8];
+    lanes[7] = Some(EngineBatchSelectLane {
+        start_pos: 64,
+        sampling: SamplingParams::default(),
+        allow: TokenIds::new(vec![1]),
+    });
+    let selected = engine
+        .runner
+        .batch_select(
+            &tail.logits,
+            EngineBatchSelect {
+                shape: BatchShape {
+                    phase: BatchPhase::Decode,
+                    bucket: 8,
+                    tokens: 1,
+                    selection: BatchSelection::Masked,
+                },
+                lanes,
+            },
+        )
+        .await??;
+    let selected = engine.runner.read_queued_batch_tokens(selected).await?;
+    assert_eq!(super::super::read_batch_tokens(&selected)?[7], 1);
+    engine.runner.rollback_lane(7, checkpoint)?;
+    assert_eq!(engine.runner.state_lane_fingerprint(7)?, before);
+    assert_eq!(
+        engine.runner.paged_lane_prefix(7)?.unwrap().logical_len()?,
+        64
+    );
+    assert_eq!(engine.runner.state_lane_fingerprint(0)?, parent_bits);
+    Ok(())
+}
