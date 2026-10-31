@@ -635,8 +635,11 @@ impl<B: Backend + 'static> Host<B> {
             )?;
         }
         bound.rebind_paged(&mut paged, &mut checks);
+        let rows = self.bind_prompt_rows(remap, &retained, &checked, &mut bound.bindings)?;
+        retained.extend(rows);
         retained.extend(bound.retained);
-        let sources = self.bind_graph_token_sources(&retained, &checked, &mut bound.bindings)?;
+        let sources =
+            self.bind_graph_token_sources(&retained, &checked, remap, &mut bound.bindings)?;
         retained.extend(sources);
         let feedback = self.bind_graph_feedback(
             &feedback,

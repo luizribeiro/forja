@@ -54,6 +54,22 @@ impl StateInputs {
     }
 }
 
+impl crate::TensorEntry {
+    pub(crate) fn replay_layout(
+        &self,
+        values: &forja_core::ParamValues,
+    ) -> Result<forja_core::Layout, compute::Error> {
+        self.symbolic.as_ref().map_or_else(
+            || Ok(self.tensor.layout().clone()),
+            |layout| {
+                layout
+                    .instantiate(values)
+                    .map_err(|error| crate::graph_error(&error))
+            },
+        )
+    }
+}
+
 impl<B: Backend + 'static> Host<B> {
     pub(crate) fn validate_slot_token_captures(
         &self,
@@ -91,6 +107,7 @@ impl<B: Backend + 'static> Host<B> {
         &mut self,
         entries: &[crate::TensorEntry],
         values: &forja_core::ParamValues,
+        remap: Option<crate::slot_capture::PromptReplayLane>,
         bindings: &mut forja_core::ReplayBindings,
     ) -> Result<Vec<crate::TensorEntry>, compute::Error> {
         let mut seen = std::collections::HashSet::new();
@@ -99,14 +116,7 @@ impl<B: Backend + 'static> Host<B> {
             let Some(source) = entry.slot_token else {
                 continue;
             };
-            let layout = entry.symbolic.as_ref().map_or_else(
-                || Ok(entry.tensor.layout().clone()),
-                |layout| {
-                    layout
-                        .instantiate(values)
-                        .map_err(|error| crate::graph_error(&error))
-                },
-            )?;
+            let layout = entry.replay_layout(values)?;
             if !seen.insert((
                 entry.tensor.buffer(),
                 layout.offset(),
@@ -120,7 +130,13 @@ impl<B: Backend + 'static> Host<B> {
                 .tensor(entry.tensor.buffer(), layout.clone())
                 .map_err(crate::guest_error)?
                 .read_only();
-            let loan = self.state_input_token(source.slot, source.lane)?;
+            let lane = crate::slot_capture::PromptReplayLane::map(
+                remap,
+                source.slot,
+                usize::try_from(source.lane).map_err(invalid_handle)?,
+            );
+            let loan =
+                self.state_input_token(source.slot, u32::try_from(lane).map_err(invalid_handle)?)?;
             let fresh = self.entry(&loan).cloned();
             self.drop_tensor(loan)?;
             let mut fresh = fresh?;

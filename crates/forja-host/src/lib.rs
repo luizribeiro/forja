@@ -11822,15 +11822,91 @@ mod tests {
         .unwrap();
     }
 
+    fn record_prompt_row_probes<B: Backend + 'static>(
+        host: &mut Host<B>,
+        commands: &Resource<super::CommandListEntry>,
+        slot: &Resource<BatchSlotEntry>,
+        selected: &Resource<TensorEntry>,
+    ) -> Resource<TensorEntry> {
+        let handle = host.table.get(slot).unwrap().inputs.as_ref().unwrap().banks[0].selected;
+        let row = host
+            .lend_view(
+                &Resource::new_borrow(handle),
+                compute::ViewOp::Slice(vec![compute::SliceSpec {
+                    start: 0,
+                    len: 1,
+                    step: 1,
+                }]),
+                false,
+            )
+            .unwrap();
+        host.dispatch(
+            commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(selected.rep())],
+            &row,
+        )
+        .unwrap();
+        host.drop_tensor(row).unwrap();
+        let token = host
+            .state_input_token_in_bank(slot.rep(), 0, Some(0))
+            .unwrap();
+        let sink = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+        host.dispatch(
+            commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(token.rep())],
+            &sink,
+        )
+        .unwrap();
+        host.drop_tensor(token).unwrap();
+        sink
+    }
+
+    async fn assert_prompt_row_probes<B: Backend + Send + Sync + 'static>(
+        host: &Host<B>,
+        slot: &Resource<BatchSlotEntry>,
+        probe: &Resource<TensorEntry>,
+    ) {
+        assert_eq!(
+            host.prepare_read(probe).unwrap().run().await.unwrap(),
+            3_u32.to_ne_bytes()
+        );
+        let entry = host.table.get(slot).unwrap();
+        let handle = entry.inputs.as_ref().unwrap().banks[entry.active_bank].selected;
+        assert_eq!(
+            host.prepare_read(&Resource::new_borrow(handle))
+                .unwrap()
+                .run()
+                .await
+                .unwrap(),
+            [0_u32; 7]
+                .into_iter()
+                .chain([5])
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn prompt_state_replay_targets_one_physical_lane_across_banks() {
+        assert_prompt_state_replay(CpuBackend::new()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_prompt_state_replay_targets_one_physical_lane_across_banks() {
+        assert_prompt_state_replay(forja_metal::MetalBackend::new().unwrap()).await;
+    }
+
+    async fn assert_prompt_state_replay<B: Backend + Send + Sync + 'static>(backend: B) {
         let StateSlotFixture {
             mut host,
             pool,
             slot,
             operands,
             output,
-        } = state_slot_fixture_lanes(CpuBackend::new(), Some(StateAction::Combined), 8);
+        } = state_slot_fixture_lanes(backend, Some(StateAction::Combined), 8);
         host.state_slots
             .get_mut(&slot.rep())
             .unwrap()
@@ -11867,6 +11943,7 @@ mod tests {
         .unwrap();
         host.record_slot_feedback(&commands, &slot, 0, &selected)
             .unwrap();
+        let probe = record_prompt_row_probes(&mut host, &commands, &slot, &selected);
         let graph = host.create_graph(commands).unwrap();
         for step in 0..2 {
             host.select_paged_batch_bank(slot.rep()).unwrap();
@@ -11903,6 +11980,7 @@ mod tests {
                 (u64::from(step + 1), u64::from(step + 1))
             );
             assert_feedback_scalar(&host, &slot, destination, 5).await;
+            assert_prompt_row_probes(&host, &slot, &probe).await;
             host.finish_paged_lane_append(pool.rep(), 7, checkpoint)
                 .unwrap();
             host.advance_paged_batch_bank(slot.rep()).unwrap();

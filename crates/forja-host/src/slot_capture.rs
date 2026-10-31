@@ -1,3 +1,5 @@
+mod rows;
+
 use crate::{
     Backend, BatchSlotEntry, CommandListEntry, Host, PagedBinding, SharedStateTrace, compute,
     invalid_handle, state::StateCharge,
