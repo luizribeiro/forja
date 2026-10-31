@@ -34,6 +34,7 @@ pub struct StateCommands<B: Backend> {
     pub(super) captured_scratch: Vec<forja_core::CompletionResource>,
     pub(super) captured_scratch_charges: Vec<forja_core::CompletionResource>,
     pub(super) metadata: Arc<StateMetadata<B>>,
+    pub(super) feedback: Option<super::feedback::FeedbackUse>,
     pub(crate) commands: CommandList,
     pub(super) updated: Vec<bool>,
     pub(super) limits: Limits,
@@ -138,8 +139,17 @@ impl<B: Backend> StateStorage<B> {
             .iter()
             .flat_map(|entry| [entry.page(), entry.generation()])
             .collect::<Vec<_>>();
+        let mut body = prepare(access)?;
+        body.feedback = sequence
+            .lock()
+            .feedback_use(
+                &transaction,
+                access.destination(),
+                Arc::clone(&body.metadata.charge),
+            )
+            .map_err(pool_error)?;
         let mut recording = StateRecording {
-            body: prepare(access)?,
+            body,
             transaction,
             sequence: sequence.clone(),
             handed_off: false,
@@ -176,6 +186,7 @@ impl<B: Backend> StateStorage<B> {
         let bytes = u64::from(records)
             .checked_mul(8)
             .and_then(|n| n.checked_add(1024))
+            .and_then(|n| n.checked_add(super::feedback::FEEDBACK_USE_BYTES))
             .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
             .ok_or_else(|| quota("state recording size overflow"))?;
         StateCharge::reserve(
@@ -199,6 +210,7 @@ impl<B: Backend> StateCommands<B> {
             storage: Arc::clone(storage),
             access,
             scratch: Vec::new(),
+            feedback: None,
             captured_scratch: Vec::new(),
             captured_scratch_charges: Vec::new(),
             metadata: Arc::new(StateMetadata {
@@ -285,6 +297,11 @@ impl<B: Backend> StateCommands<B> {
                 .map(|scratch| scratch.retained_resource()),
         );
         owners.extend(self.captured_scratch_charges.iter().cloned());
+        owners.extend(
+            self.feedback
+                .iter()
+                .flat_map(super::feedback::FeedbackUse::retained_resources),
+        );
         owners
     }
 

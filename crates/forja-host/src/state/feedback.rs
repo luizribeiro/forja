@@ -1,6 +1,9 @@
 use super::StateCharge;
 use crate::{Host, compute, invalid_handle};
-use forja_core::{Backend, FeedbackCheckpoint, FeedbackVersions, PagePoolError, StateSequence};
+use forja_core::{
+    Backend, CompletionResource, FeedbackCheckpoint, FeedbackPin, FeedbackVersions, PagePoolError,
+    StateSequence,
+};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -37,6 +40,25 @@ impl FeedbackBinding {
             )),
             _charge: Arc::new(charge),
         })
+    }
+}
+
+pub(super) struct FeedbackUse {
+    pub(super) source: Option<FeedbackPin>,
+    pub(super) destination: FeedbackPin,
+    pub(super) charge: Arc<StateCharge>,
+}
+
+pub(super) const FEEDBACK_USE_BYTES: u64 = (size_of::<FeedbackUse>()
+    + 2 * (size_of::<(FeedbackPin, Arc<StateCharge>)>() + 2 * size_of::<usize>()))
+    as u64;
+
+impl FeedbackUse {
+    pub(super) fn retained_resources(&self) -> impl Iterator<Item = CompletionResource> + '_ {
+        self.source
+            .iter()
+            .chain(std::iter::once(&self.destination))
+            .map(|pin| CompletionResource::new(Arc::new((pin.clone(), Arc::clone(&self.charge)))))
     }
 }
 
@@ -82,6 +104,18 @@ impl LaneFeedback {
         })
     }
 
+    pub(super) fn destination(&self, record: u32) -> Result<FeedbackPin, PagePoolError> {
+        if !self.records.contains(&record) {
+            return Err(PagePoolError::ForeignResource);
+        }
+        self.binding
+            .versions
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?
+            .checkpoint(record)
+            .map(|checkpoint| checkpoint.scalar().clone())
+    }
+
     pub(super) fn validate(
         &self,
         boundary: Option<&FeedbackBoundary>,
@@ -110,8 +144,12 @@ mod tests {
     use crate::{Limits, state::journal::StateJournal};
     use forja_core::{DType, StateLayout, StatePlane, StatePool};
 
-    #[test]
-    fn lane_restore_preserves_feedback_when_paged_restore_refuses() {
+    fn fixture() -> (
+        Host<forja_cpu::CpuBackend>,
+        FeedbackBinding,
+        StatePool,
+        StateJournal,
+    ) {
         let host = Host::new(
             forja_cpu::CpuBackend::new(),
             Limits::new(65536, 8, 4096, 128, 4096),
@@ -125,6 +163,72 @@ mod tests {
         .unwrap();
         let mut journal = StateJournal::new(pool.reserve().unwrap());
         journal.attach_feedback(binding.clone()).unwrap();
+        (host, binding, pool, journal)
+    }
+
+    #[test]
+    fn feedback_uses_bind_ready_inputs_and_keep_their_charge_through_retirement() {
+        use crate::{LanePosition, StateAction};
+        use forja_core::StateAccess;
+        use std::sync::atomic::Ordering;
+        let (host, _binding, pool, mut journal) = fixture();
+        let before = host.live_bytes.load(Ordering::Acquire);
+        let charge = Arc::new(
+            StateCharge::reserve(
+                host.backend.as_ref(),
+                Arc::clone(&host.live_bytes),
+                host.limits.live_bytes,
+                FEEDBACK_USE_BYTES,
+            )
+            .unwrap(),
+        );
+        let position = |tokens| LanePosition {
+            tokens,
+            reserved_tokens: 3,
+            ..LanePosition::default()
+        };
+        let first = journal
+            .begin_action(1, Some(position(1)), Some(StateAction::Combined))
+            .unwrap();
+        let access = StateAccess::from_slot(&journal.bind(&first).unwrap()).unwrap();
+        let initial = journal
+            .feedback_use(&first, access.destination(), Arc::clone(&charge))
+            .unwrap()
+            .unwrap();
+        assert!(initial.source.is_none());
+        journal.mark_submitted(&first).unwrap();
+        pool.observe_completion(1).unwrap();
+        journal.finish(&first, true).unwrap();
+        let second = journal
+            .begin_action(2, Some(position(2)), Some(StateAction::Forward))
+            .unwrap();
+        let access = StateAccess::from_slot(&journal.bind(&second).unwrap()).unwrap();
+        let next = journal
+            .feedback_use(&second, access.destination(), Arc::clone(&charge))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.source.as_ref().unwrap().index(),
+            initial.destination.index()
+        );
+        assert_ne!(next.destination.index(), initial.destination.index());
+        let retained = next.retained_resources().collect::<Vec<_>>();
+        drop(next);
+        drop(initial);
+        drop(charge);
+        assert_eq!(
+            host.live_bytes.load(Ordering::Acquire),
+            before + FEEDBACK_USE_BYTES
+        );
+        drop(retained);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        journal.cancel_unsubmitted(&second).unwrap();
+        assert_eq!(journal.position.tokens, 1);
+    }
+
+    #[test]
+    fn lane_restore_preserves_feedback_when_paged_restore_refuses() {
+        let (_host, binding, _pool, mut journal) = fixture();
         let input = journal.checkpoint_latest().unwrap();
         let before = input.feedback.as_ref().unwrap().checkpoint.scalar().index();
         let mut map = binding.versions.lock().unwrap();

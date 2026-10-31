@@ -297,6 +297,41 @@ impl StateJournal {
             .ok_or(PagePoolError::InvalidCheckpoint)
     }
 
+    pub(super) fn feedback_use(
+        &self,
+        transaction: &StateTransaction,
+        destination: u32,
+        charge: Arc<super::StateCharge>,
+    ) -> Result<Option<super::feedback::FeedbackUse>, PagePoolError> {
+        let Some(feedback) = &self.feedback else {
+            return Ok(None);
+        };
+        let input = &self
+            .pending
+            .iter()
+            .find(|entry| entry.serial == transaction.serial())
+            .ok_or(PagePoolError::InvalidCheckpoint)?
+            .predecessor;
+        let source = if input.phase == SelectionPhase::Ready {
+            Some(
+                input
+                    .feedback
+                    .as_ref()
+                    .ok_or(PagePoolError::CorruptState)?
+                    .checkpoint
+                    .scalar()
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        Ok(Some(super::feedback::FeedbackUse {
+            source,
+            destination: feedback.destination(destination)?,
+            charge,
+        }))
+    }
+
     pub(super) fn checkpoint_latest(&self) -> Result<super::StateLaneCheckpoint, PagePoolError> {
         let version = self.sequence.checkpoint_latest()?;
         let feedback = self
