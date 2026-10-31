@@ -1,3 +1,5 @@
+mod background;
+
 use super::{BatchConstraint, PendingPrefill, PreparedRequest};
 use crate::{CompletionParams, GenerationControl, ResolvedParams, ServingEngine};
 use forja_host::{EngineLoadConfig, EngineRunner, KvCacheFormat, Limits};
