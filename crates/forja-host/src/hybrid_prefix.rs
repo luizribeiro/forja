@@ -1,5 +1,5 @@
 mod entry;
-pub use entry::HybridPrefix;
+pub use entry::{HybridAttachment, HybridPrefix};
 
 use crate::{compute, quota};
 

@@ -1,5 +1,6 @@
 use crate::{
-    Host, PagePoolEntry, PagedPrefix, StateSnapshot, compute, invalid_handle, state::StateCharge,
+    Host, PagePoolEntry, PagedPrefix, StateSequenceHandle, StateSnapshot, compute, invalid_handle,
+    state::StateCharge,
 };
 use forja_core::{Backend, HybridPrefixNamespace, PagePool};
 use std::sync::Arc;
@@ -59,6 +60,53 @@ impl<B: Backend> HybridPrefix<B> {
     #[must_use]
     pub fn attention_layout(&self) -> &forja_core::PagedLayout {
         self.pool.layout()
+    }
+}
+
+impl<B: Backend> HybridPrefix<B> {
+    /// Attaches both halves, pinning this complete entry throughout the attachment lifetime.
+    ///
+    /// # Errors
+    /// Refuses incompatible carry or insufficient page capacity without modifying the state sequence.
+    pub fn attach(
+        self: &Arc<Self>,
+        sequence: &StateSequenceHandle<B>,
+        reserved_tokens: u64,
+    ) -> Result<HybridAttachment<B>, compute::Error> {
+        let attention = self
+            .attention
+            .fork_reserved(self.image.position().tokens, reserved_tokens)
+            .map_err(invalid_handle)?;
+        sequence.attach_snapshot(Arc::clone(&self.image), self.namespace(), reserved_tokens)?;
+        Ok(HybridAttachment {
+            entry: Arc::clone(self),
+            attention,
+            state: sequence.clone(),
+        })
+    }
+}
+
+/// A live request's paired attention/carry ownership; its parent remains pinned against eviction.
+pub struct HybridAttachment<B: Backend> {
+    entry: Arc<HybridPrefix<B>>,
+    attention: PagedPrefix,
+    state: StateSequenceHandle<B>,
+}
+impl<B: Backend> HybridAttachment<B> {
+    /// Private request attention sequence, initially sharing immutable cached pages.
+    #[must_use]
+    pub const fn attention(&self) -> &PagedPrefix {
+        &self.attention
+    }
+    /// Request carry sequence, materialized only on its first update.
+    #[must_use]
+    pub const fn state(&self) -> &StateSequenceHandle<B> {
+        &self.state
+    }
+    /// Exact matched ledger.
+    #[must_use]
+    pub fn tokens(&self) -> &[u32] {
+        self.entry.tokens()
     }
 }
 

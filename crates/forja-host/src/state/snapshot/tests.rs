@@ -220,6 +220,18 @@ fn hybrid_entries_pair_exact_ledgers_and_reject_foreign_pages_atomically() {
             + entry.reference_bytes()
             + pool.layout().total_page_bytes()
     );
+    let child = parent.storage.reserve().unwrap();
+    let before = pool.memory_usage().unwrap().0;
+    assert!(entry.attach(&parent, 257).is_err());
+    assert_eq!(pool.memory_usage().unwrap().0, before);
+    assert!(child.has_pristine_state().unwrap());
+    let attached = entry.attach(&child, 257).unwrap();
+    assert_eq!(attached.attention().logical_len().unwrap(), 64);
+    assert_eq!(attached.state().position().tokens, 64);
+    assert_eq!(attached.tokens(), entry.tokens());
+    assert_eq!(Arc::strong_count(&entry), 2);
+    drop(attached);
+    assert_eq!(Arc::strong_count(&entry), 1);
     assert_eq!(entry.attention_tokens().unwrap(), 64);
     assert_eq!(entry.attention_layout(), pool.layout());
 }
