@@ -30,7 +30,10 @@ impl Engine for Tiny {
                 active_lanes: 8,
                 max_context: 64,
                 prefill_chunk_multiple: None,
-                batch_shapes: Vec::new(),
+                batch_shapes: qwen38::Qwen38::serving_shapes()
+                    .into_iter()
+                    .filter(|shape| shape.tokens <= 64)
+                    .collect(),
                 planes: ["key", "value"]
                     .into_iter()
                     .map(|label| forja_sdk::CachePlane {
@@ -153,6 +156,12 @@ impl Engine for Tiny {
                     router_logits: Vec::new(),
                 })
             }
+        }
+    }
+    fn batch_step(&mut self, input: forja_sdk::BatchInput<'_>) -> Result<forja_sdk::BatchOutput> {
+        match self {
+            Self::Full(engine) => engine.batch_step(input),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
         }
     }
     fn begin_decode(

@@ -133,6 +133,11 @@ impl Engine for Qwen38 {
         }
     }
     #[cfg(target_family = "wasm")]
+    fn batch_step(&mut self, input: forja_sdk::BatchInput<'_>) -> Result<forja_sdk::BatchOutput> {
+        paged::batch_step(&mut self.model, &input)
+    }
+
+    #[cfg(target_family = "wasm")]
     fn begin_decode(
         &mut self,
         input: forja_sdk::BeginDecodeInput,
@@ -157,7 +162,7 @@ impl Engine for Qwen38 {
         _sampling: forja_sdk::SamplingParams,
         _allow: &[u32],
     ) -> Result<DecodeOutput> {
-        let token = paged::select(&self.model, 0, &start_pos.into())?;
+        let token = paged::select(&self.model, 0, &start_pos.into(), true)?;
         let inputs = self
             .model
             .serving_set()?
@@ -200,7 +205,7 @@ impl Engine for Qwen38 {
                         0,
                         input.phase,
                     )?;
-                    let token = paged::select(&self.model, 0, &position.into())?;
+                    let token = paged::select(&self.model, 0, &position.into(), true)?;
                     forja_sdk::eval()?;
                     Ok(DecodeOutput {
                         logits: logits.reshape(&[logits.shape()[1]])?,

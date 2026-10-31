@@ -174,3 +174,6 @@ async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
     }
     Ok(())
 }
+
+#[path = "serving/batches.rs"]
+mod batches;
