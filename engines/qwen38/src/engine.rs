@@ -1,4 +1,6 @@
 mod eager;
+#[cfg(target_family = "wasm")]
+mod paged;
 use crate::{Config, Model};
 use eager::EagerFeedback;
 use forja_sdk::{
@@ -133,7 +135,34 @@ impl Engine for Qwen38 {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match &mut self.feedback {
             Feedback::Eager(feedback) => feedback.decode(&mut self.model, input),
-            Feedback::Paged => Err(Error::loading("paged decode requires banked sampling")),
+            Feedback::Paged => {
+                #[cfg(target_family = "wasm")]
+                {
+                    let rows = paged::row_count(input.tokens.as_ref())?;
+                    let position = input
+                        .start_pos
+                        .checked_add(rows)
+                        .and_then(|end| end.checked_sub(1))
+                        .ok_or_else(|| Error::loading("decode position overflowed"))?;
+                    let logits = paged::forward(
+                        &mut self.model,
+                        rows,
+                        &input.start_pos.into(),
+                        0,
+                        input.phase,
+                    )?;
+                    let token = paged::select(&self.model, 0, &position.into())?;
+                    forja_sdk::eval()?;
+                    Ok(DecodeOutput {
+                        logits: logits.reshape(&[logits.shape()[1]])?,
+                        token,
+                    })
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    Err(Error::loading("paged sampling requires a component host"))
+                }
+            }
         }
     }
 }

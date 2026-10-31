@@ -467,3 +467,6 @@ fn private_serving_planes_cover_each_recurrent_layer() {
 
 #[path = "qwen38/component.rs"]
 mod component;
+
+#[path = "qwen38/serving.rs"]
+mod serving;

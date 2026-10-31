@@ -43,6 +43,14 @@ impl PagedModel {
     }
 }
 impl Model {
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn serving_set(&self) -> Result<Rc<PagedCacheSet>> {
+        self.paged
+            .as_ref()
+            .map(|paged| Rc::clone(&paged.set))
+            .ok_or_else(|| Error::loading("model has no serving slot"))
+    }
+
     /// Loads the complete hybrid model into a shared host serving slot.
     ///
     /// # Errors
