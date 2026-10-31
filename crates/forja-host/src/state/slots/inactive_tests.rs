@@ -145,7 +145,15 @@ fn metal_inactive_commands_touch_no_state_and_hold_no_lane_lease() {
 
 #[test]
 fn recording_quota_refusal_keeps_the_retained_predecessor() {
-    use std::sync::atomic::Ordering;
+    quota_refusal_keeps_predecessor(false);
+}
+
+#[test]
+fn staging_quota_refusal_restores_a_recycled_predecessor() {
+    quota_refusal_keeps_predecessor(true);
+}
+
+fn quota_refusal_keeps_predecessor(after_reservation: bool) {
     let host = Host::new(
         forja_cpu::CpuBackend::new(),
         Limits::new(65536, 8, 4096, 128, 4096),
@@ -176,29 +184,9 @@ fn recording_quota_refusal_keeps_the_retained_predecessor() {
     slots.take_batch(0).unwrap().submit_and_finish().unwrap();
     let sequence = slots.sequence_handle(0).unwrap().unwrap();
     let checkpoint = sequence.checkpoint_latest().unwrap();
-    let live = host.live_bytes.load(Ordering::Acquire);
-    let budget = super::super::StateCharge::reserve(
-        host.backend.as_ref(),
-        Arc::clone(&host.live_bytes),
-        65536,
-        65536 - live,
-    )
-    .unwrap();
-    assert!(matches!(
-        slots.begin(
-            1,
-            0,
-            LanePosition {
-                tokens: 2,
-                ..position
-            }
-        ),
-        Err(crate::compute::Error::Quota(_))
-    ));
+    refuse_next_recording(&host, &mut slots, position, after_reservation);
     assert_eq!(slots.position(0).unwrap(), checkpoint.position());
-    assert_eq!(slots.lanes[0].serial, 1);
-    drop(budget);
-    assert_eq!(host.live_bytes.load(Ordering::Acquire), live);
+    assert_eq!(slots.lanes[0].serial, if after_reservation { 2 } else { 1 });
     sequence.rewind(0).unwrap();
     assert_eq!(
         sequence.position(),
@@ -208,4 +196,58 @@ fn recording_quota_refusal_keeps_the_retained_predecessor() {
         }
     );
     slots.begin(1, 0, position).unwrap();
+    slots
+        .recording(1, 0)
+        .unwrap()
+        .causal_convolution(0, &input, &weights, &output)
+        .unwrap();
+    slots.take_batch(1).unwrap().submit_and_finish().unwrap();
+    assert_eq!(
+        host.backend.read(&output).unwrap(),
+        2_f32.to_ne_bytes().repeat(7)
+    );
+}
+
+fn refuse_next_recording(
+    host: &Host<forja_cpu::CpuBackend>,
+    slots: &mut StateSlots<forja_cpu::CpuBackend>,
+    position: LanePosition,
+    after_reservation: bool,
+) {
+    use std::sync::atomic::Ordering;
+    let before = host.live_bytes.load(Ordering::Acquire);
+    let next = LanePosition {
+        tokens: 2,
+        ..position
+    };
+    if after_reservation {
+        slots.begin(1, 0, next).unwrap();
+    }
+    let live = host.live_bytes.load(Ordering::Acquire);
+    let budget = super::super::StateCharge::reserve(
+        host.backend.as_ref(),
+        Arc::clone(&host.live_bytes),
+        65536,
+        65536 - live,
+    )
+    .unwrap();
+    if after_reservation {
+        assert!(matches!(
+            super::super::StateCharge::reserve(
+                host.backend.as_ref(),
+                Arc::clone(&host.live_bytes),
+                65536,
+                4
+            ),
+            Err(crate::compute::Error::Quota(_))
+        ));
+        slots.cancel_unsubmitted_bank(1).unwrap();
+    } else {
+        assert!(matches!(
+            slots.begin(1, 0, next),
+            Err(crate::compute::Error::Quota(_))
+        ));
+    }
+    drop(budget);
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
 }

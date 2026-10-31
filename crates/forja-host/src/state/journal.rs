@@ -1,5 +1,5 @@
 use super::{outcome::StateOutcome, paired::PagedInput};
-use forja_core::{PagePoolError, StateSequence, StateTransaction};
+use forja_core::{PagePoolError, ReleasedStateCheckpoint, StateSequence, StateTransaction};
 use std::sync::Arc;
 use std::{
     collections::VecDeque,
@@ -50,7 +50,16 @@ pub struct LanePosition {
     pub reserved_tokens: u64,
 }
 
+struct RetainedBoundary {
+    version: Option<ReleasedStateCheckpoint>,
+    position: LanePosition,
+    feedback: Option<super::feedback::FeedbackBoundary>,
+    phase: SelectionPhase,
+    paged: Option<PagedInput>,
+}
+
 struct Pending {
+    retired: Option<RetainedBoundary>,
     paged: Option<PagedInput>,
     serial: u64,
     position: LanePosition,
@@ -157,10 +166,10 @@ impl StateJournal {
                     Some((checkpoint.position, checkpoint.feedback, checkpoint.phase)),
                 )
             });
-        let transaction =
+        let (transaction, released) =
             match self
                 .sequence
-                .begin_releasing_checkpoint(serial, &mut retained)
+                .begin_preserving_checkpoint(serial, &mut retained)
             {
                 Ok(transaction) => transaction,
                 Err(error) => {
@@ -175,10 +184,20 @@ impl StateJournal {
                     return Err(error);
                 }
             };
-        drop(boundary_before);
+        let retired =
+            released
+                .zip(boundary_before)
+                .map(|(version, (position, feedback, phase))| RetainedBoundary {
+                    version: Some(version),
+                    position,
+                    feedback,
+                    phase,
+                    paged: self.retained_paged.take(),
+                });
         let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
         self.retained_paged = None;
         self.pending.push_back(Pending {
+            retired,
             paged: None,
             serial,
             position,
@@ -200,9 +219,47 @@ impl StateJournal {
             .iter()
             .position(|entry| entry.serial == transaction.serial())
             .ok_or(PagePoolError::InvalidCheckpoint)?;
-        self.sequence.cancel_unsubmitted(transaction)?;
+        let restored = if let Some(retired) = self.pending[index].retired.as_mut() {
+            self.sequence
+                .cancel_preserving_checkpoint(transaction, &mut retired.version)?
+        } else {
+            self.sequence.cancel_unsubmitted(transaction)?;
+            None
+        };
+        if let Some((retired, version)) = self.pending[index].retired.take().zip(restored) {
+            self.retained = Some(super::StateLaneCheckpoint {
+                version,
+                position: retired.position,
+                feedback: retired.feedback,
+                phase: retired.phase,
+            });
+            self.retained_paged = retired.paged;
+        }
         self.fail_pending(index);
         self.restore_paged_if_drained()
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_submitted(
+        &mut self,
+        transaction: &StateTransaction,
+    ) -> Result<(), PagePoolError> {
+        self.mark_submitted_at(transaction, transaction.serial())
+    }
+
+    pub(super) fn mark_submitted_at(
+        &mut self,
+        transaction: &StateTransaction,
+        serial: u64,
+    ) -> Result<(), PagePoolError> {
+        let index = self
+            .pending
+            .iter()
+            .position(|entry| entry.serial == transaction.serial())
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        self.sequence.mark_submitted_at(transaction, serial)?;
+        self.pending[index].retired = None;
+        Ok(())
     }
 
     pub(super) fn abandon(&mut self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
