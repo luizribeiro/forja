@@ -1,11 +1,13 @@
+mod paged;
 use crate::{Config, DecoderLayer, quant::Affine};
 use forja_sdk::{
     EngineLoadConfig, EngineSelections, Error, Result, StepOutput, Tensor, Weights, bf16,
     target::metal::Variant,
 };
-/// Eager single-sequence hybrid model. A new position-zero invocation clears recurrent carry.
+/// Hybrid text model with eager or host-owned serving state.
 pub struct Model {
     config: Config,
+    paged: Option<paged::PagedModel>,
     context: u32,
     position: u32,
     usable: bool,
@@ -24,17 +26,29 @@ impl Model {
     /// # Errors
     /// Refuses invalid dimensions, profile selections, context, weights or allocations.
     pub fn load(weights: &Weights<'_>, load: &EngineLoadConfig, config: Config) -> Result<Self> {
+        Self::load_inner(weights, load, config, None)
+    }
+
+    fn load_inner(
+        weights: &Weights<'_>,
+        load: &EngineLoadConfig,
+        config: Config,
+        pool: Option<forja_sdk::PagedPool<'_>>,
+    ) -> Result<Self> {
         let (config, context) = load_config(load, config)?;
+        let mut sites = vec!["quant", "attention", "sample", "delta-prefill"];
+        if pool.is_some() {
+            sites.extend(["paged-attention.prefill", "paged-attention.decode"]);
+        }
+
         let picks = if config.cpu {
             None
         } else {
-            Some(EngineSelections::new(
-                load,
-                &[],
-                &["quant", "attention", "sample", "delta-prefill"],
-                context,
-            )?)
+            Some(EngineSelections::new(load, &[], &sites, context)?)
         };
+        let paged = pool
+            .map(|pool| paged::PagedModel::new(pool, config, context, picks.as_ref()))
+            .transpose()?;
         let weights = weights.scoped("language_model");
         let model = weights.scoped("model");
         Ok(Self {
@@ -47,12 +61,18 @@ impl Model {
             norm: model.tensor("norm.weight", &[config.hidden])?,
             layers: (0..config.layers)
                 .map(|index| {
-                    DecoderLayer::load(
-                        &model.scoped(format!("layers.{index}")),
-                        config,
-                        index,
-                        context,
-                    )
+                    let weights = model.scoped(format!("layers.{index}"));
+                    if let Some(paged) = &paged {
+                        DecoderLayer::load_paged(
+                            &weights,
+                            config,
+                            index,
+                            paged.set.clone(),
+                            &paged.positions,
+                        )
+                    } else {
+                        DecoderLayer::load(&weights, config, index, context)
+                    }
                 })
                 .collect::<Result<_>>()?,
             quant: picks
@@ -67,6 +87,7 @@ impl Model {
                 .as_ref()
                 .map(|picks| picks.at("delta-prefill", 0))
                 .transpose()?,
+            paged,
             sample: picks
                 .as_ref()
                 .map(|picks| picks.at("sample", 0))

@@ -193,3 +193,64 @@ async fn slotted_attention_component_preserves_paged_rows() -> Result<(), Box<dy
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn slotted_hybrid_component_preserves_eager_logits_and_taps() -> Result<(), Box<dyn Error>> {
+    let mut runner = forja_host::EngineRunner::new(
+        test_guests::qwen38_tiny(),
+        forja_cpu::CpuBackend::new(),
+        forja_host::Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27),
+        fixture("model.safetensors"),
+    )
+    .await?;
+    let load = forja_host::EngineLoadConfig {
+        max_context: Some(64),
+        replay: false,
+        paged_cache: true,
+        kv_cache: forja_host::KvCacheFormat::F16,
+        ..forja_host::EngineLoadConfig::default()
+    };
+    runner.load_with_selections(None, &load).await??;
+    assert!(!runner.supports_prefix_reuse());
+    let weights = forja_sdk::Weights::open(fixture("model.safetensors"))?;
+    let mut native =
+        qwen38::Model::load(&weights, &verification::tiny_load(), qwen38::Config::tiny())?;
+    for _ in 0..2 {
+        for (position, tokens, phase) in [
+            (
+                0,
+                (0..63).map(|n| n % 32 + 1).collect::<Vec<_>>(),
+                forja_host::BatchPhase::Prompt,
+            ),
+            (63, vec![3], forja_host::BatchPhase::Decode),
+        ] {
+            let ids = forja_sdk::Tensor::from_slice(&tokens, &[u32::try_from(tokens.len())?])?;
+            let expected = if phase == forja_host::BatchPhase::Prompt {
+                native.forward(&ids, position, true)?
+            } else {
+                native.decode_token(&ids, position, true)?
+            };
+            let actual = runner
+                .step(forja_host::EngineStep {
+                    phase,
+                    tokens,
+                    start_pos: position,
+                    taps: true,
+                })
+                .await??;
+            assert_eq!(actual.taps.len(), expected.taps.len());
+            for (actual, expected) in std::iter::once(&actual.logits)
+                .chain(&actual.taps)
+                .zip(std::iter::once(&expected.logits).chain(&expected.taps))
+            {
+                let bytes = expected
+                    .to_vec()?
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect::<Vec<_>>();
+                assert_eq!(runner.read(actual).await?, bytes);
+            }
+        }
+    }
+    Ok(())
+}
