@@ -160,6 +160,7 @@ async fn slotted_attention_component_preserves_paged_rows() -> Result<(), Box<dy
         for (position, tokens, phase) in [
             (0, vec![1_u32, 2, 7], forja_host::BatchPhase::Prompt),
             (3, vec![3_u32], forja_host::BatchPhase::Decode),
+            (4, vec![0_u32], forja_host::BatchPhase::Decode),
         ] {
             let rows = u32::try_from(tokens.len())?;
             let values = tokens

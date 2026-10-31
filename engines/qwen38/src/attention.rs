@@ -1,3 +1,4 @@
+mod batch;
 mod paged;
 use crate::{Config, numerics, quant::Affine};
 use forja_sdk::{

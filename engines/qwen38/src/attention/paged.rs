@@ -76,7 +76,18 @@ impl Attention {
         else {
             return Err(Error::loading("attention has no serving slot"));
         };
-        let projected = self.project(input, &positions.narrow(0, start.clone(), rows)?, quant)?;
+        let positions = positions.narrow(0, start.clone(), rows)?;
+        if !prefill {
+            return self.decode_rows(
+                input,
+                &positions,
+                std::slice::from_ref(start),
+                &[*lane],
+                quant,
+                attention,
+            );
+        }
+        let projected = self.project(input, &positions, quant)?;
         let end = start.clone().checked_add(rows)?;
         let cache = set.layer_at(*lane, *layer)?;
         let scale = crate::numerics::inverse_sqrt_width(self.config.head_dim)?;
