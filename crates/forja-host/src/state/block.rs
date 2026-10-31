@@ -51,24 +51,7 @@ impl<B: Backend + 'static> StateCommands<B> {
             .ok_or_else(|| invalid_handle("delta block query is scalar"))?;
         let layout = DeltaBlockScratch::new(tokens, heads, keys, values).map_err(guest_error)?;
         self.limits.check_tensor_shape(&[layout.elements()])?;
-        let bytes = u64::from(layout.elements())
-            .checked_mul(4)
-            .ok_or_else(|| quota("state scratch size overflow"))?;
-        let charge = StateCharge::reserve(
-            self.storage.backend.as_ref(),
-            Arc::clone(&self.storage.charge.live),
-            self.storage.limit.min(self.limits.live_bytes),
-            bytes,
-        )?;
-        let scratch = StateScratch {
-            backend: Arc::clone(&self.storage.backend),
-            tensor: self
-                .storage
-                .backend
-                .alloc(forja_core::DType::F32, &[layout.elements()])
-                .map_err(guest_error)?,
-            charge: Arc::new(charge),
-        };
+        let scratch = self.block_workspace(layout.elements())?;
         let mut dispatch = self.prepare_update(
             plane,
             StateOp::DeltaRuleBlock(self.access),
@@ -90,8 +73,41 @@ impl<B: Backend + 'static> StateCommands<B> {
         #[cfg(not(target_os = "macos"))]
         let _ = variant;
         self.record_update(plane, dispatch)?;
-        self.scratch.push(Arc::new(scratch));
+        if !self
+            .scratch
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &scratch))
+        {
+            self.scratch.push(scratch);
+        }
         Ok(())
+    }
+    fn block_workspace(&self, elements: u32) -> Result<Arc<StateScratch<B>>, compute::Error> {
+        if let Some(scratch) = self
+            .scratch
+            .iter()
+            .find(|scratch| scratch.tensor.layout().shape() == [elements])
+        {
+            return Ok(Arc::clone(scratch));
+        }
+        let bytes = u64::from(elements)
+            .checked_mul(4)
+            .ok_or_else(|| quota("state scratch size overflow"))?;
+        let charge = StateCharge::reserve(
+            self.storage.backend.as_ref(),
+            Arc::clone(&self.storage.charge.live),
+            self.storage.limit.min(self.limits.live_bytes),
+            bytes,
+        )?;
+        Ok(Arc::new(StateScratch {
+            backend: Arc::clone(&self.storage.backend),
+            tensor: self
+                .storage
+                .backend
+                .alloc(forja_core::DType::F32, &[elements])
+                .map_err(guest_error)?,
+            charge: Arc::new(charge),
+        }))
     }
 }
 
@@ -196,5 +212,72 @@ mod tests {
         assert!(live.load(Ordering::Acquire) > before);
         control.complete();
         assert_eq!(live.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn sequential_block_planes_share_workspace_under_the_byte_quota() {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(32 << 20, 8, 32 << 20, 128, 32 << 20),
+        );
+        let plane = StatePlane::new(DType::F32, vec![48, 128, 128]).unwrap();
+        let storage = host
+            .create_state_storage(StateLayout::new(vec![plane.clone(), plane]).unwrap(), 1)
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        let inputs = [0.01_f32, 0.02].map(|amplitude| {
+            let inputs = [
+                [7, 16, 128].as_slice(),
+                &[7, 16, 128],
+                &[7, 48, 128],
+                &[7, 48],
+                &[7, 48],
+            ]
+            .iter()
+            .map(|shape| host.backend.alloc(DType::F32, shape).unwrap())
+            .collect::<Vec<_>>();
+            for (index, input) in inputs.iter().enumerate() {
+                let value = if index == 3 {
+                    -10.0 * amplitude
+                } else {
+                    amplitude
+                };
+                host.backend
+                    .write(
+                        input,
+                        &value
+                            .to_le_bytes()
+                            .repeat(usize::try_from(input.layout().element_count()).unwrap()),
+                    )
+                    .unwrap();
+            }
+            inputs
+        });
+        let outputs = [
+            host.backend.alloc(DType::F32, &[7, 48, 128]).unwrap(),
+            host.backend.alloc(DType::F32, &[7, 48, 128]).unwrap(),
+        ];
+        let mut recording = storage
+            .record(&sequence, sequence.begin(1).unwrap())
+            .unwrap();
+        for (plane, output) in outputs.iter().enumerate() {
+            recording
+                .delta_rule_block(
+                    plane,
+                    inputs[plane].iter().collect::<Vec<_>>().try_into().unwrap(),
+                    output,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(recording.scratch.len(), 1);
+        assert!(forja_core::required_barriers(&recording.commands)[1]);
+        recording.submit().unwrap().finish().unwrap();
+        let actual = outputs.map(|output| host.backend.read(&output).unwrap());
+        assert!(
+            actual
+                .iter()
+                .all(|bytes| bytes.iter().any(|byte| *byte != 0))
+        );
+        assert_ne!(actual[0], actual[1]);
     }
 }
