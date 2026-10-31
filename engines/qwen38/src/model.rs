@@ -1,3 +1,5 @@
+#[cfg(target_family = "wasm")]
+mod batch;
 mod paged;
 use crate::{Config, DecoderLayer, quant::Affine};
 use forja_sdk::{

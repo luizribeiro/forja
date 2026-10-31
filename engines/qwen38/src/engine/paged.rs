@@ -38,6 +38,24 @@ pub(super) fn forward(
     Ok(logits)
 }
 
+fn forward_decode_rows(model: &mut Model, starts: &[Dim]) -> Result<()> {
+    let (set, inputs) = inputs(model)?;
+    let batch =
+        u32::try_from(starts.len()).map_err(|_| Error::loading("decode lane count exceeds u32"))?;
+    let tokens = Tensor::<u32>::zeros(&[batch])?;
+    for (lane, start) in starts.iter().enumerate() {
+        let lane = u32::try_from(lane).map_err(|_| Error::loading("decode lane exceeds u32"))?;
+        set.slot()
+            .token(lane)?
+            .narrow(0, start.clone().checked_mul(0)?, 1)?
+            .copy_into(&mut tokens.narrow(0, lane, 1)?)?;
+    }
+    model
+        .forward_decode_rows(&tokens, starts)?
+        .copy_into(&mut inputs.logits.narrow(0, 0, batch)?)?;
+    Ok(())
+}
+
 pub(super) fn select(
     model: &Model,
     lane: u32,
@@ -74,6 +92,14 @@ pub(super) fn run_batch(
     selection: bool,
 ) -> Result<forja_sdk::BatchOutput> {
     let prompt = input.shape.phase == BatchPhase::Prompt;
+    if !prompt {
+        let starts = input
+            .lanes
+            .iter()
+            .map(|lane| Dim::from(lane.as_ref().map_or(0, |lane| lane.start_pos)))
+            .collect::<Vec<_>>();
+        forward_decode_rows(model, &starts)?;
+    }
     for (index, active) in input.lanes.iter().enumerate() {
         let index = u32::try_from(index).map_err(|_| Error::loading("batch index exceeds u32"))?;
         let lane = if prompt {
@@ -94,13 +120,15 @@ pub(super) fn run_batch(
             .checked_add(rows)
             .and_then(|end| end.checked_sub(1))
             .ok_or_else(|| Error::loading("batch position overflowed"))?;
-        drop(forward(
-            model,
-            rows,
-            &start.into(),
-            lane,
-            input.shape.phase,
-        )?);
+        if prompt {
+            drop(forward(
+                model,
+                rows,
+                &start.into(),
+                lane,
+                input.shape.phase,
+            )?);
+        }
         if selection {
             drop(select(model, lane, &position.into(), active.is_some())?);
         }

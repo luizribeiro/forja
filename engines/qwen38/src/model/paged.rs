@@ -10,7 +10,7 @@ pub(super) struct PagedModel {
     pub(super) set: Rc<PagedCacheSet>,
     pub(super) positions: Tensor<u32>,
     prompt: Variant,
-    decode: Variant,
+    pub(super) decode: Variant,
 }
 impl PagedModel {
     pub(super) fn new(

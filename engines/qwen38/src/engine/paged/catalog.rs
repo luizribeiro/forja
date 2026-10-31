@@ -50,15 +50,21 @@ impl Catalog {
             .checked_sub(1)
             .ok_or_else(|| Error::loading("captured span is empty"))?;
         set.slot().capture(&refs, shape.phase, || {
-            for (lane, parameter) in params.iter().enumerate() {
+            let starts = params
+                .iter()
+                .map(|parameter| Dim::from(parameter.at(0)))
+                .collect::<Vec<_>>();
+            if shape.phase == BatchPhase::Decode && shape.selection != BatchSelection::Masked {
+                super::forward_decode_rows(model, &starts)?;
+            }
+            for (lane, start) in starts.iter().enumerate() {
                 let lane =
                     u32::try_from(lane).map_err(|_| Error::loading("captured lane exceeds u32"))?;
-                let start = Dim::from(parameter.at(0));
-                if shape.selection != BatchSelection::Masked {
+                if shape.phase == BatchPhase::Prompt && shape.selection != BatchSelection::Masked {
                     drop(super::forward(
                         model,
                         shape.tokens,
-                        &start,
+                        start,
                         lane,
                         shape.phase,
                     )?);

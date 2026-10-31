@@ -44,6 +44,7 @@ async fn load_with(
         20_000,
         128 * 1024 * 1024,
     )
+    .with_command_limits(4096, u64::MAX)
     .with_gpu_limits(Duration::from_secs(10), Duration::from_secs(3600));
     let mut engine = forja_host::EngineRunner::new(
         &component,

@@ -1,3 +1,5 @@
+#[cfg(target_family = "wasm")]
+mod batch;
 mod paged;
 use crate::{Attention, Config, DeltaNet, FeedForward};
 use forja_sdk::{Error, Result, Tensor, Weights, bf16, target::metal::Variant};
