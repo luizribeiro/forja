@@ -92,7 +92,7 @@ pub(super) struct LaneFeedback {
 
 #[derive(Clone)]
 pub(super) struct FeedbackBoundary {
-    binding: FeedbackBinding,
+    pub(super) binding: FeedbackBinding,
     pub(super) checkpoint: FeedbackCheckpoint,
 }
 

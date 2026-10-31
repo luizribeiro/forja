@@ -70,6 +70,7 @@ struct Pending {
 }
 
 pub(super) struct StateJournal {
+    selection: std::sync::Weak<()>,
     rollback_paged: Option<PagedInput>,
     retained_paged: Option<PagedInput>,
     sequence: StateSequence,
@@ -95,6 +96,7 @@ impl DerefMut for StateJournal {
 impl StateJournal {
     pub(super) fn new(sequence: StateSequence) -> Self {
         Self {
+            selection: std::sync::Weak::new(),
             rollback_paged: None,
             retained_paged: None,
             sequence,
@@ -131,6 +133,9 @@ impl StateJournal {
         position: Option<LanePosition>,
         action: Option<StateAction>,
     ) -> Result<StateTransaction, PagePoolError> {
+        if self.selection.upgrade().is_some() {
+            return Err(PagePoolError::BankInFlight);
+        }
         self.restore_paged_if_drained()?;
         if self.rollback_paged.is_some() {
             return Err(PagePoolError::BankInFlight);
@@ -412,11 +417,54 @@ impl StateJournal {
         })
     }
 
+    pub(super) fn reserve_selection(
+        &mut self,
+        start: u64,
+        identity: &Arc<()>,
+    ) -> Result<super::StateLaneCheckpoint, PagePoolError> {
+        if !self.pending.is_empty()
+            || self.selection.upgrade().is_some()
+            || self.phase == SelectionPhase::External
+            || start.checked_add(1) != Some(self.position.tokens)
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let checkpoint = self.checkpoint_latest()?;
+        self.selection = Arc::downgrade(identity);
+        Ok(checkpoint)
+    }
+
+    pub(super) fn validate_selection(
+        &self,
+        checkpoint: &super::StateLaneCheckpoint,
+        identity: &Arc<()>,
+    ) -> Result<(), PagePoolError> {
+        if !self.pending.is_empty()
+            || self.position != checkpoint.position
+            || self.phase != checkpoint.phase
+            || !self.selection.ptr_eq(&Arc::downgrade(identity))
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
+    pub(super) fn publish_selection(&mut self) {
+        self.position.sampler = self.position.tokens - 1;
+        self.position.grammar = self.position.tokens;
+        self.position.parser = self.position.tokens;
+        self.phase = SelectionPhase::Ready;
+        self.selection = std::sync::Weak::new();
+    }
+
     pub(super) fn restore_with(
         &mut self,
         checkpoint: &super::StateLaneCheckpoint,
         action: impl FnOnce() -> Result<(), PagePoolError>,
     ) -> Result<(), PagePoolError> {
+        if self.selection.upgrade().is_some() {
+            return Err(PagePoolError::BankInFlight);
+        }
         if let Some(feedback) = &self.feedback {
             feedback.validate(checkpoint.feedback.as_ref())?;
         } else if checkpoint.feedback.is_some() {
@@ -439,6 +487,9 @@ impl StateJournal {
     }
 
     pub(super) fn rewind(&mut self, tokens: u64) -> Result<(), PagePoolError> {
+        if self.selection.upgrade().is_some() {
+            return Err(PagePoolError::BankInFlight);
+        }
         let checkpoint = self
             .retained
             .as_ref()
