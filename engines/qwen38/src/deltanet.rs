@@ -11,6 +11,7 @@ pub struct DeltaNet {
     out: Affine,
     convolution: Tensor<bf16>,
     norm: Tensor<bf16>,
+    norm_unit: Tensor<f32>,
     log_a: Tensor<f32>,
     dt_bias: Tensor<f32>,
     carry: Carry,
@@ -64,6 +65,15 @@ impl DeltaNet {
             out: Affine::load(&weights.scoped("out_proj"), values, config.hidden)?,
             convolution,
             norm: weights.tensor("norm.weight", &[config.value_dim])?,
+            norm_unit: Tensor::constant(
+                &vec![
+                    1.0_f32;
+                    usize::try_from(config.value_dim).map_err(|_| forja_sdk::Error::loading(
+                        "head width exceeds address space"
+                    ))?
+                ],
+                &[config.value_dim],
+            )?,
             log_a: weights
                 .tensor::<bf16>("A_log", &[config.value_heads])?
                 .to_dtype()?,
@@ -194,7 +204,7 @@ impl DeltaNet {
             .z
             .forward(input, pick)?
             .reshape(&[value_rows, c.value_dim])?;
-        let gated = numerics::gated_norm(&y, &self.norm, &z)?
+        let gated = numerics::gated_norm(&y, &self.norm, &z, &self.norm_unit)?
             .reshape(&[tokens, c.value_heads * c.value_dim])?;
         self.out.forward(&gated, pick)
     }

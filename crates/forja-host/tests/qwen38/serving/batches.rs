@@ -67,9 +67,16 @@ async fn assert_rows(
     Ok(())
 }
 
-async fn batch(bucket: u32, stochastic: bool, expected: &[Vec<Row>]) -> Result<(), Box<dyn Error>> {
-    let mut runner = runner(CpuBackend::new(), false).await?;
+async fn batch(
+    bucket: u32,
+    stochastic: bool,
+    replay: bool,
+    expected: &[Vec<Row>],
+) -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(CpuBackend::new(), replay).await?;
+    assert_eq!(runner.metrics().live_graphs, if replay { 3 } else { 0 });
     for lane in 0..bucket {
+        runner.prepare_paged_lane(lane, None, 0)?;
         runner.prepare_paged_lane(lane, None, 64)?;
         let output = runner
             .batch_step(EngineBatch {
@@ -130,7 +137,15 @@ async fn decode_buckets_match_single_lane_tokens_and_logits() -> Result<(), Box<
             expected.push(single(&mut reference, lane, stochastic).await?);
         }
         for bucket in [1, 2, 4, 8] {
-            batch(bucket, stochastic, &expected[..usize::try_from(bucket)?]).await?;
+            for replay in [false, true] {
+                batch(
+                    bucket,
+                    stochastic,
+                    replay,
+                    &expected[..usize::try_from(bucket)?],
+                )
+                .await?;
+            }
         }
     }
     Ok(())

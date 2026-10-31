@@ -9,7 +9,10 @@ use forja_sdk::{
 };
 enum Feedback {
     Eager(Box<EagerFeedback>),
-    Paged,
+    Paged {
+        #[cfg(target_family = "wasm")]
+        catalog: Box<paged::Catalog>,
+    },
 }
 
 /// Text engine with private eager feedback or host-owned serving state.
@@ -55,10 +58,14 @@ impl Qwen38 {
         config: Config,
         pool: forja_sdk::PagedPool<'_>,
     ) -> Result<Self> {
-        Ok(Self {
-            model: Model::load_paged(weights, load, config, pool)?,
-            feedback: Feedback::Paged,
-        })
+        let model = Model::load_paged(weights, load, config, pool)?;
+        #[cfg(target_family = "wasm")]
+        let mut model = model;
+        let feedback = Feedback::Paged {
+            #[cfg(target_family = "wasm")]
+            catalog: Box::new(paged::Catalog::new(&mut model, load)?),
+        };
+        Ok(Self { model, feedback })
     }
 
     /// Loads an explicit architecture for trusted native tests.
@@ -109,7 +116,7 @@ impl Engine for Qwen38 {
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         match &mut self.feedback {
             Feedback::Eager(feedback) => feedback.invalidate(),
-            Feedback::Paged => {
+            Feedback::Paged { .. } => {
                 let output = self.model.forward_paged(
                     &input.tokens,
                     &forja_sdk::Dim::from(input.start_pos),
@@ -134,7 +141,19 @@ impl Engine for Qwen38 {
     }
     #[cfg(target_family = "wasm")]
     fn batch_step(&mut self, input: forja_sdk::BatchInput<'_>) -> Result<forja_sdk::BatchOutput> {
-        paged::run_batch(&mut self.model, &input, true)
+        let Feedback::Paged { catalog } = &self.feedback else {
+            return Err(Error::loading("batch decode requires a serving pool"));
+        };
+        let positions = input
+            .lanes
+            .iter()
+            .map(|lane| lane.as_ref().map_or(0, |lane| lane.start_pos))
+            .collect::<Vec<_>>();
+        if catalog.replay(input.shape, &positions)? {
+            paged::batch_output(&self.model, 0, input.shape.bucket)
+        } else {
+            paged::run_batch(&mut self.model, &input, true)
+        }
     }
 
     #[cfg(target_family = "wasm")]
@@ -197,7 +216,7 @@ impl Engine for Qwen38 {
     #[cfg(target_family = "wasm")]
     fn rewind_decode(&mut self, _next_pos: u32) -> Result<()> {
         match self.feedback {
-            Feedback::Paged => Ok(()),
+            Feedback::Paged { .. } => Ok(()),
             Feedback::Eager(_) => Err(Error::loading("rewind requires a serving pool")),
         }
     }
@@ -205,7 +224,10 @@ impl Engine for Qwen38 {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match &mut self.feedback {
             Feedback::Eager(feedback) => feedback.decode(&mut self.model, input),
-            Feedback::Paged => {
+            Feedback::Paged {
+                #[cfg(target_family = "wasm")]
+                catalog,
+            } => {
                 #[cfg(target_family = "wasm")]
                 {
                     let rows = paged::row_count(input.tokens.as_ref())?;
@@ -214,15 +236,25 @@ impl Engine for Qwen38 {
                         .checked_add(rows)
                         .and_then(|end| end.checked_sub(1))
                         .ok_or_else(|| Error::loading("decode position overflowed"))?;
-                    let logits = paged::forward(
-                        &mut self.model,
-                        rows,
-                        &input.start_pos.into(),
-                        0,
-                        input.phase,
-                    )?;
-                    let token = paged::select(&self.model, 0, &position.into(), true)?;
-                    forja_sdk::eval()?;
+                    let shape = forja_sdk::BatchShape {
+                        phase: input.phase,
+                        bucket: 1,
+                        tokens: rows,
+                        selection: forja_sdk::BatchSelection::Combined,
+                    };
+                    if !catalog.replay(shape, &[input.start_pos])? {
+                        drop(paged::forward(
+                            &mut self.model,
+                            rows,
+                            &input.start_pos.into(),
+                            0,
+                            input.phase,
+                        )?);
+                        drop(paged::select(&self.model, 0, &position.into(), true)?);
+                        forja_sdk::eval()?;
+                    }
+                    let output = paged::batch_output(&self.model, 0, 1)?;
+                    let (logits, token) = (output.logits, output.tokens);
                     Ok(DecodeOutput {
                         logits: logits.reshape(&[logits.shape()[1]])?,
                         token,

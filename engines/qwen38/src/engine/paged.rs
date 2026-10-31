@@ -1,3 +1,6 @@
+mod catalog;
+pub(super) use catalog::Catalog;
+
 use crate::Model;
 use forja_sdk::{BatchPhase, Dim, Error, PagedCacheSet, PagedInputTensors, Result, Tensor};
 use std::rc::Rc;

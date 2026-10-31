@@ -38,18 +38,11 @@ pub(crate) fn gated_norm(
     y: &Tensor<bf16>,
     weight: &Tensor<bf16>,
     z: &Tensor<bf16>,
+    ones: &Tensor<f32>,
 ) -> Result<Tensor<bf16>> {
-    let ones = Tensor::constant(
-        &vec![
-            1.0_f32;
-            usize::try_from(y.shape()[1])
-                .map_err(|_| forja_sdk::Error::loading("head width exceeds address space"))?
-        ],
-        &[y.shape()[1]],
-    )?;
     let normalized = y
         .to_dtype::<f32>()?
-        .rms_norm(&ones, 1.0e-6)?
+        .rms_norm(ones, 1.0e-6)?
         .to_dtype::<bf16>()?;
     let weighted = multiply(&normalized, weight)?;
     multiply(&weighted.to_dtype::<f32>()?, &silu(&z.to_dtype::<f32>()?)?)?.to_dtype()
