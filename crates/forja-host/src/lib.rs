@@ -9973,8 +9973,20 @@ mod tests {
         backend: B,
         action: Option<StateAction>,
     ) -> StateSlotFixture<B> {
+        state_slot_fixture_lanes(backend, action, 1)
+    }
+
+    fn state_slot_fixture_lanes<B: Backend + 'static>(
+        backend: B,
+        action: Option<StateAction>,
+        lanes: u32,
+    ) -> StateSlotFixture<B> {
         let mut host = Host::new(backend, GENEROUS);
+        if lanes > 1 {
+            host.limits.live_tensor_handles = 64;
+        }
         let pool = insert_test_pool(&mut host, 2, 8);
+        host.table.get_mut(&pool).unwrap().active_lanes = lanes;
         let slot = host
             .open_state_slot(
                 &pool,
@@ -10670,6 +10682,83 @@ mod tests {
         assert_eq!(seen[0], seen[2]);
         assert!(host.slot_tensors(slot.rep(), Some(2)).is_err());
         assert_eq!(host.live_handles, handles_before);
+    }
+
+    #[tokio::test]
+    async fn supplied_selection_logits_stage_readonly_strided_singletons_at_high_slots() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            ..
+        } = state_slot_fixture_lanes(CpuBackend::new(), None, 8);
+        let base = host.alloc(compute::Dtype::F32, &[7, 2]).unwrap();
+        let values = (0..7)
+            .flat_map(|i| [f32::from(u16::try_from(i).unwrap()) + 0.25, -99.0])
+            .collect::<Vec<_>>();
+        host.write(&base, &f32_bytes(&values)).unwrap();
+        let transposed = host
+            .view(&base, compute::ViewOp::Permute(vec![1, 0]))
+            .unwrap();
+        let source = host
+            .lend_view(
+                &transposed,
+                compute::ViewOp::Slice(vec![
+                    compute::SliceSpec {
+                        start: 0,
+                        len: 1,
+                        step: 1,
+                    },
+                    compute::SliceSpec {
+                        start: 0,
+                        len: 7,
+                        step: 1,
+                    },
+                ]),
+                true,
+            )
+            .unwrap();
+        let logits = host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks[0]
+            .logits;
+        host.write(&Resource::new_borrow(logits), &f32_bytes(&[-777.0; 56]))
+            .unwrap();
+        host.stage_selection_logits(&pool, &source, 8, std::iter::once(7))
+            .await
+            .unwrap();
+        let destination = Resource::new_borrow(logits);
+        let actual = host
+            .prepare_read(&destination)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        let mut expected = [-777.0; 49].to_vec();
+        expected.extend(values.iter().step_by(2).copied());
+        assert_eq!(actual, f32_bytes(&expected));
+        assert!(!host.entry(&source).unwrap().tensor.is_writable());
+        assert_eq!(
+            host.backend
+                .read(&host.entry(&base).unwrap().tensor)
+                .unwrap(),
+            f32_bytes(&values)
+        );
+        assert!(
+            host.prepare_selection_logits(pool.rep(), &source, 8, [0, 7].into_iter())
+                .is_err()
+        );
+        assert!(
+            host.prepare_selection_logits(pool.rep(), &destination, 8, std::iter::once(7))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 
     #[test]

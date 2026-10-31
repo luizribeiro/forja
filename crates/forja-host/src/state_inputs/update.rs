@@ -81,7 +81,7 @@ impl<B: Backend + 'static> Host<B> {
         )
     }
 
-    fn input_slot(
+    pub(super) fn input_slot(
         &self,
         pool: u32,
     ) -> Result<Option<(u32, &crate::BatchSlotEntry, u32)>, compute::Error> {

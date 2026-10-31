@@ -1,3 +1,4 @@
+mod logits;
 mod recovery;
 mod update;
 
