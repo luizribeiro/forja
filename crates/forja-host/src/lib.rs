@@ -11,6 +11,8 @@ mod fuzz_tests;
 mod hybrid;
 mod lending;
 mod native;
+mod selection_attempt;
+pub use selection_attempt::SelectionAttempt;
 mod slot_capture;
 mod state;
 mod state_inputs;
@@ -11320,6 +11322,71 @@ mod tests {
         let state = host.state_slots.get_mut(&slot.rep()).unwrap();
         state.release(0).unwrap();
         state.admit(0).unwrap();
+    }
+
+    #[tokio::test]
+    async fn selection_attempts_cancel_refuse_and_accept_at_the_original_boundary() {
+        for mode in 0..4 {
+            let StateSlotFixture {
+                mut host,
+                pool,
+                slot,
+                operands,
+                output,
+            } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Forward));
+            let commands = host.command_list().unwrap();
+            host.record_slot_state(
+                &commands,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
+            .unwrap();
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            host.advance_paged_batch_bank(slot.rep()).unwrap();
+            let before = host.state_slots[&slot.rep()].position(0).unwrap();
+            let attempt = host
+                .begin_slot_selection(&pool, std::iter::once((0, 0)))
+                .unwrap()
+                .unwrap();
+            if mode < 2 {
+                if mode == 0 {
+                    drop(attempt);
+                } else {
+                    assert!(attempt.accept(&mut host).is_err());
+                }
+                assert_eq!(host.state_slots[&slot.rep()].selection_count(1).unwrap(), 0);
+                assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap(), before);
+                assert_eq!(host.table.get(&slot).unwrap().next_bank, 1);
+                continue;
+            }
+            let token = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+            host.write(&token, &3_u32.to_ne_bytes()).unwrap();
+            let commands = host.command_list().unwrap();
+            host.record_slot_feedback(&commands, &slot, 0, &token)
+                .unwrap();
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            if mode == 2 {
+                attempt.rollback(&mut host).unwrap();
+                assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap(), before);
+                assert_eq!(host.table.get(&slot).unwrap().active_bank, 0);
+                assert_eq!(host.table.get(&slot).unwrap().next_bank, 1);
+                host.state_slots[&slot.rep()].rewind(0, 0).unwrap();
+                assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+            } else {
+                attempt.accept(&mut host).unwrap();
+                assert_eq!(
+                    host.state_slots[&slot.rep()].position(0).unwrap().grammar,
+                    1
+                );
+                assert_eq!(host.table.get(&slot).unwrap().active_bank, 1);
+                assert_eq!(host.table.get(&slot).unwrap().next_bank, 0);
+            }
+        }
     }
 
     #[tokio::test]
