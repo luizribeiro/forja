@@ -200,6 +200,12 @@ fn recording_quota_refusal_keeps_the_retained_predecessor() {
     drop(budget);
     assert_eq!(host.live_bytes.load(Ordering::Acquire), live);
     sequence.rewind(0).unwrap();
-    assert_eq!(sequence.position(), LanePosition::default());
+    assert_eq!(
+        sequence.position(),
+        LanePosition {
+            reserved_tokens: 7,
+            ..LanePosition::default()
+        }
+    );
     slots.begin(1, 0, position).unwrap();
 }

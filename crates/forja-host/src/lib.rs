@@ -4900,7 +4900,8 @@ impl<B: Backend + 'static> Host<B> {
                 };
             }
         }
-        self.bind_slot_state(slot_rep, lane, release, &binding, previous)?;
+        let capacity = locked.reserved_tokens();
+        self.bind_slot_state(slot_rep, lane, release, &binding, previous, capacity)?;
         drop(locked);
         self.publish_paged_lane_binding(&binding, lane_binding, lane, sequence, metadata, release)
     }
@@ -10228,6 +10229,37 @@ mod tests {
                 .position()
                 .tokens,
             0
+        );
+    }
+
+    #[test]
+    fn stateful_admission_couples_the_initial_reservation() {
+        let (mut host, pool, _slot) = convolution_slot_host();
+        let initial = host
+            .state_lane_checkpoint(pool.rep(), 0)
+            .unwrap()
+            .unwrap()
+            .position();
+        assert_eq!(initial.tokens, 0);
+        assert_eq!(initial.reserved_tokens, 8);
+        assert!(
+            matches!(host.bind_paged_lane(pool.rep(), 0, None, 4), Err(compute::Error::Quota(message)) if message == super::PAGED_LANE_RELEASE_REQUIRED)
+        );
+        assert_eq!(
+            host.state_lane_checkpoint(pool.rep(), 0)
+                .unwrap()
+                .unwrap()
+                .position(),
+            initial
+        );
+        assert_eq!(
+            host.paged_lane_prefix(pool.rep(), 0)
+                .unwrap()
+                .sequence
+                .lock()
+                .unwrap()
+                .reserved_tokens(),
+            8
         );
     }
 

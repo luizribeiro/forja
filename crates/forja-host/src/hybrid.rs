@@ -434,12 +434,26 @@ impl<B: Backend + 'static> Host<B> {
         release: bool,
         binding: &crate::PagedBinding,
         previous: [forja_core::PagedSlot; 2],
+        reserved_tokens: u64,
     ) -> Result<(), compute::Error> {
         if let Some(state) = self.state_slots.get_mut(&slot) {
             let result = if release {
                 state.release(lane)
             } else {
-                state.admit(lane)
+                (|| {
+                    let position = state
+                        .sequence_handle(lane)?
+                        .map(|sequence| sequence.latest_position())
+                        .transpose()
+                        .map_err(invalid_handle)?;
+                    if position.is_some_and(|position| {
+                        position.tokens != 0 || position.reserved_tokens != reserved_tokens
+                    }) {
+                        Err(crate::quota(crate::PAGED_LANE_RELEASE_REQUIRED))
+                    } else {
+                        state.admit_reserved(lane, reserved_tokens)
+                    }
+                })()
             };
             if let Err(error) = result {
                 for dirty in &binding.lane(lane)?.table_dirty {

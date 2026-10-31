@@ -80,6 +80,14 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses invalid lanes, quota or failed initialization without replacing an active lease.
     pub fn admit(&mut self, lane: usize) -> Result<(), compute::Error> {
+        self.admit_reserved(lane, 0)
+    }
+
+    pub(crate) fn admit_reserved(
+        &mut self,
+        lane: usize,
+        reserved_tokens: u64,
+    ) -> Result<(), compute::Error> {
         let lane = self
             .lanes
             .get_mut(lane)
@@ -92,6 +100,7 @@ impl<B: Backend> StateSlots<B> {
                     .attach_feedback(feedback.clone())
                     .map_err(pool_error)?;
             }
+            sequence.lock().position.reserved_tokens = reserved_tokens;
             lane.sequence = Some(sequence);
             lane.serial = 0;
         }
@@ -155,7 +164,11 @@ impl<B: Backend> StateSlots<B> {
         }
         let prepared = self.storage.prepare_record_metadata(self.inactive_access)?;
         let fresh = self.lanes[lane].sequence.is_none();
-        self.admit(lane)?;
+        if fresh {
+            self.admit_reserved(lane, position.reserved_tokens)?;
+        } else {
+            self.admit(lane)?;
+        }
         let owner = &mut self.lanes[lane];
         let sequence = owner
             .sequence
@@ -387,7 +400,7 @@ mod tests {
             submitted.push(slots.take_batch(bank).unwrap().submit().unwrap());
         }
         assert!(slots.begin(0, 0, position(3)).is_err());
-        assert_eq!(slots.position(0).unwrap(), LanePosition::default());
+        assert_eq!(slots.position(0).unwrap(), position(0));
         for submission in submitted {
             submission.finish().unwrap();
         }
