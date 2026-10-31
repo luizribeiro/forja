@@ -590,3 +590,47 @@ async fn foreground_admission_drops_the_queued_reply_ledger() -> Result<(), Test
     assert_eq!(engine.metrics.recompute_blocks, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn cancelled_reply_recompute_releases_the_lane_without_partial_publication()
+-> Result<(), TestError> {
+    let mut engine = engine_with_context(256, 64)
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    let ledger = crate::prefix::PrefixLedger::new(vec![0; 65]);
+    engine.queue_canonical_recompute(&ledger, 65, &[0; 127], &control, true);
+    assert!(engine.advance_canonical_recompute().await);
+    assert_eq!(engine.metrics.recompute_blocks, 1);
+    assert_eq!(
+        engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .usage()?
+            .entries,
+        0
+    );
+    control.cancel();
+    assert!(engine.advance_canonical_recompute().await);
+    assert!(!engine.metrics.recompute_pending);
+    assert_eq!(engine.metrics.recompute_cancelled, 1);
+    assert_eq!(engine.metrics.recompute_completed, 0);
+    assert_eq!(
+        engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .usage()?
+            .entries,
+        0
+    );
+    engine.runner.prepare_paged_lane(0, None, 0)?;
+    Ok(())
+}

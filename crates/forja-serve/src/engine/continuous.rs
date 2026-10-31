@@ -409,6 +409,13 @@ impl<B> ServingEngine<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn refresh_shared_metrics(&mut self, shared: &StdMutex<ServingMetrics>) {
+        self.refresh_runtime_metrics();
+        if let Ok(mut metrics) = shared.lock() {
+            *metrics = self.metrics.clone();
+        }
+    }
+
     pub(crate) async fn run_continuous(
         mut self,
         mut receiver: mpsc::Receiver<ServiceCommand>,
@@ -417,10 +424,21 @@ where
         let mut pending = VecDeque::new();
         loop {
             if pending.is_empty() {
-                let Some(command) = receiver.recv().await else {
-                    return;
-                };
-                pending.push_back(RequestEnvelope::from_command(command));
+                match receiver.try_recv() {
+                    Ok(command) => pending.push_back(RequestEnvelope::from_command(command)),
+                    Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        if self.advance_canonical_recompute().await {
+                            self.refresh_shared_metrics(&shared_metrics);
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        let Some(command) = receiver.recv().await else {
+                            return;
+                        };
+                        pending.push_back(RequestEnvelope::from_command(command));
+                    }
+                }
             }
             while let Ok(command) = receiver.try_recv() {
                 pending.push_back(RequestEnvelope::from_command(command));
@@ -471,15 +489,12 @@ where
                     prepared.run_single(&mut self).await;
                 }
             }
-            if let Ok(mut metrics) = shared_metrics.lock() {
-                self.refresh_runtime_metrics();
-                observe_phase(
-                    &mut self.metrics.scheduler_time,
-                    &mut self.metrics.scheduler_time_ns,
-                    scheduled.elapsed(),
-                );
-                *metrics = self.metrics.clone();
-            }
+            observe_phase(
+                &mut self.metrics.scheduler_time,
+                &mut self.metrics.scheduler_time_ns,
+                scheduled.elapsed(),
+            );
+            self.refresh_shared_metrics(&shared_metrics);
         }
     }
 }
