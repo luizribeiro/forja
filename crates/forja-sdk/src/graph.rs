@@ -301,6 +301,13 @@ pub fn capture<T: GraphResult>(
     })
 }
 
+pub(crate) fn alloc_output(dtype: u8, shape: &[u32]) -> Result<sys::Handle> {
+    CURRENT.with(|current| match current.borrow().as_ref() {
+        Some(Recording::Capture { commands, .. }) => sys::alloc_scratch(commands, dtype, shape),
+        _ => sys::alloc(dtype, shape),
+    })
+}
+
 pub(crate) fn affine(dim: &Dim) -> Result<sys::Affine> {
     let Some(id) = dim.id else {
         return Ok(sys::Affine {

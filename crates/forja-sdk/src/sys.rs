@@ -170,6 +170,13 @@ pub(crate) trait Backend {
     type Graph;
 
     fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor>;
+    fn alloc_scratch(
+        _commands: &Self::Commands,
+        dtype: DType,
+        shape: &[u32],
+    ) -> Result<Self::Tensor> {
+        Self::alloc(dtype, shape)
+    }
     fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()>;
     fn view(tensor: &Self::Tensor, operation: View) -> Result<Self::Tensor>;
     fn view_param(
@@ -330,6 +337,16 @@ pub(crate) mod guest {
 
         fn alloc(dtype: DType, shape: &[u32]) -> Result<Self::Tensor> {
             compute::Tensor::alloc(wit_dtype(dtype), shape).map_err(|error| guest_error(&error))
+        }
+
+        fn alloc_scratch(
+            commands: &Self::Commands,
+            dtype: DType,
+            shape: &[u32],
+        ) -> Result<Self::Tensor> {
+            commands
+                .alloc_scratch(wit_dtype(dtype), shape)
+                .map_err(|error| guest_error(&error))
         }
 
         fn write(tensor: &Self::Tensor, bytes: &[u8]) -> Result<()> {
@@ -1591,6 +1608,10 @@ pub(crate) fn dtype(dtype: u8) -> Result<DType> {
 
 pub(crate) fn alloc(dtype: u8, shape: &[u32]) -> Result<Handle> {
     Active::alloc(self::dtype(dtype)?, shape)
+}
+
+pub(crate) fn alloc_scratch(commands: &Commands, dtype: u8, shape: &[u32]) -> Result<Handle> {
+    Active::alloc_scratch(commands, self::dtype(dtype)?, shape)
 }
 
 pub(crate) fn write(tensor: &Handle, bytes: &[u8]) -> Result<()> {

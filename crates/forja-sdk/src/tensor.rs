@@ -114,7 +114,10 @@ impl<T: Element> Tensor<T> {
     ///
     /// Returns an error when the shape size overflows or allocation is refused.
     pub fn zeros(shape: &[u32]) -> Result<Self> {
-        Self::empty(shape.to_vec())
+        Ok(Self::from_handle(
+            sys::alloc(T::DTYPE, shape)?,
+            shape.to_vec(),
+        ))
     }
 
     /// Allocates a contiguous tensor and initializes it from a slice.
@@ -1716,7 +1719,7 @@ impl<T: Element> Tensor<T> {
     }
 
     pub(crate) fn empty<U: Element>(shape: Vec<u32>) -> Result<Tensor<U>> {
-        let handle = sys::alloc(U::DTYPE, &shape)?;
+        let handle = graph::alloc_output(U::DTYPE, &shape)?;
         Ok(Tensor::from_handle(handle, shape))
     }
 

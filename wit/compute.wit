@@ -229,6 +229,8 @@ interface compute {
 
   resource command-list {
     constructor();
+    /// Allocates output storage with unspecified contents, reusing retired list-private storage.
+    alloc-scratch: func(kind: dtype, shape: list<u32>) -> result<tensor, error>;
     set-profile-scope: func(site: string, layer-type: string, layer: option<u32>) -> result<_, error>;
     output: func(value: borrow<tensor>) -> result<_, error>;
     dispatch: func(operation: op, ins: list<borrow<tensor>>, out: borrow<tensor>) -> result<_, error>;

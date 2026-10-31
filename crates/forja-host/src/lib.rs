@@ -5,6 +5,7 @@
 mod prompt;
 pub use prompt::PromptChunking;
 
+mod capture_alloc;
 mod feedback;
 #[cfg(test)]
 mod fuzz_tests;
@@ -3827,6 +3828,7 @@ pub struct CommandListEntry {
     space: Option<ParamSpace>,
     parameterized: bool,
     retained: Vec<TensorEntry>,
+    scratch_allocations: Vec<(BufferId, Arc<state::StateCharge>)>,
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
     state_uses: Vec<hybrid::StateUse>,
@@ -6100,6 +6102,7 @@ impl<B: Backend + 'static> Host<B> {
                 space: None,
                 parameterized: false,
                 retained: Vec::new(),
+                scratch_allocations: Vec::new(),
                 retained_kernels: Vec::new(),
                 retained_epilogues: Vec::new(),
                 paged: Vec::new(),
@@ -8650,6 +8653,17 @@ where
     fn new(&mut self) -> impl Future<Output = wasmtime::Result<Resource<CommandListEntry>>> + Send {
         let _timer = self.import_timer(ImportKind::CommandList);
         std::future::ready(Host::command_list(self).map_err(wasmtime::Error::msg))
+    }
+
+    fn alloc_scratch(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        kind: compute::Dtype,
+        shape: Vec<u32>,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        let _timer = self.import_timer(ImportKind::Alloc);
+        std::future::ready(Ok(self.allocate_command_scratch(&commands, kind, &shape)))
     }
 
     fn set_profile_scope(
