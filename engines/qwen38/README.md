@@ -12,8 +12,10 @@ three prompt shapes (64/512/2,048) and one replaceable tail; bucket 8 runs eager
 Serving reuses exact canonical prompt prefixes with a 2 GiB snapshot ceiling.
 It saves every 4,096 tokens and the last full 64-token boundary before prompt end,
 then replays the entire suffix after the longest hit. The operator can lower
-`serving.state_snapshot_bytes`; zero disables retention. Generated reply state
-is not reusable as canonical prompt state.
+`serving.state_snapshot_bytes`; zero disables retention. After a reply, idle GPU
+work recomputes its canonical blocks for exact next-turn token matches. Arriving
+requests preempt between blocks; cancellation discards unfinished recompute.
+The next turn replays any remaining partial block.
 
 ## Use
 

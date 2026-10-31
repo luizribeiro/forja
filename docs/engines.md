@@ -143,6 +143,10 @@ references and accounting scratch also consume the existing live-byte quota.
 Serving profiles also declare `state-snapshot-interval`, a multiple of the engine's
 canonical prompt block. `ServingEngine::with_profile_prefixes` binds the paired
 cache and preserves identical prompt piece boundaries when reuse is disabled.
-The cache saves sparse boundaries strictly before prompt end and always replays
-the complete suffix. Profile variant identities conservatively refine the
-numerical reduction classes in the artifact namespace.
+Foreground prefill saves sparse boundaries strictly before prompt end and always
+replays the complete suffix. Idle reply recompute uses `Host::canonical_context`
+to authorize an aligned final boundary, executes one canonical block per idle
+scheduler turn, then publishes one complete image. A new request or cancellation
+discards unfinished work. The same snapshot and live-byte ceilings apply.
+Profile variant identities conservatively refine the numerical reduction classes
+in the artifact namespace.

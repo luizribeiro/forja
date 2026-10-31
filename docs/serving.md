@@ -40,6 +40,10 @@ directories; the dev shell defaults it to `~/.cache/forja/models`.
    Set `serving.prefix-reuse = false` for tenants sharing a server unless the
    trusted upstream provides the necessary isolation. Contiguous caches work,
    but do not reuse prefixes. This choice changes privacy and latency together.
+   Hybrid engines with snapshot retention recompute replies while idle; incoming
+   requests preempt at the next canonical block boundary.
+   `forja_canonical_recompute_*` metrics expose pending work, completed jobs,
+   blocks, preemptions, cancellations and failures.
 
 6. **Keep weight grants stable.** Granted weights are capabilities for
    operator-owned files. Do not modify or truncate files while a guest or tensor
