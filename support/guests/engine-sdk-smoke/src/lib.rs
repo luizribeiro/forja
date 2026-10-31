@@ -143,17 +143,12 @@ impl Engine for ConstantEngine {
 
 impl ConstantEngine {
     fn paged_step(&mut self, input: &StepInput) -> Result<StepOutput> {
-        let staged = self
+        let token = self
             .paged
             .as_ref()
             .ok_or_else(|| forja_sdk::Error::loading("paged smoke cache is missing"))?
             .slot()
-            .tensors()?
-            .inputs
-            .ok_or_else(|| forja_sdk::Error::loading("paged smoke inputs are missing"))?;
-        let token = staged
-            .tokens
-            .narrow(0, 0, 1)?
+            .token(0)?
             .to_vec()?
             .first()
             .copied()

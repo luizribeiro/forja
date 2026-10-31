@@ -46,6 +46,34 @@ impl StateInputs {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn state_input_token(
+        &mut self,
+        slot: u32,
+        lane: u32,
+    ) -> Result<wasmtime::component::Resource<crate::TensorEntry>, compute::Error> {
+        use wasmtime::component::Resource;
+        let entry = self
+            .table
+            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?;
+        if usize::try_from(lane).map_err(invalid_handle)? >= entry.binding.lanes.len() {
+            return Err(invalid_handle("input token lane is out of range"));
+        }
+        let inputs = entry
+            .inputs
+            .as_ref()
+            .ok_or_else(|| invalid_handle("slot has no state inputs"))?;
+        self.lend_view(
+            &Resource::new_borrow(inputs.banks[entry.active_bank].tokens),
+            compute::ViewOp::Slice(vec![compute::SliceSpec {
+                start: lane,
+                len: 1,
+                step: 1,
+            }]),
+            true,
+        )
+    }
+
     pub(crate) fn alias_paged_tensors(
         &mut self,
         handles: &[u32],

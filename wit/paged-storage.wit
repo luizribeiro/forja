@@ -30,6 +30,7 @@ interface paged-storage {
   }
   resource batch-slot {
     tensors: func() -> result<slot-tensors, error>;
+    token: func(lane: u32) -> result<tensor, error>;
   }
   record state-plane-descriptor {
     dtype: dtype,

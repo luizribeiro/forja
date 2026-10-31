@@ -8758,6 +8758,15 @@ impl<B> paged_storage::HostBatchSlot for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn token(
+        &mut self,
+        resource: Resource<BatchSlotEntry>,
+        lane: u32,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        std::future::ready(Ok(self.state_input_token(resource.rep(), lane)))
+    }
+
     fn tensors(
         &mut self,
         resource: Resource<BatchSlotEntry>,
@@ -10349,6 +10358,41 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn state_token_loans_are_read_only_banked_and_quota_checked() {
+        let (mut host, _pool, slot) = convolution_slot_host();
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .release(0)
+            .unwrap();
+        let mut buffers = Vec::new();
+        for bank in 0..2 {
+            host.table.get_mut(&slot).unwrap().active_bank = bank;
+            let token = host.state_input_token(slot.rep(), 0).unwrap();
+            let entry = host.entry(&token).unwrap();
+            assert_eq!(entry.tensor.layout().shape(), [1]);
+            assert!(!entry.tensor.is_writable());
+            buffers.push(entry.tensor.buffer());
+            assert!(host.write(&token, &17_u32.to_ne_bytes()).is_err());
+            host.drop_tensor(token).unwrap();
+        }
+        assert_ne!(buffers[0], buffers[1]);
+        assert!(host.state_input_token(slot.rep(), 1).is_err());
+        let bytes = host.live_bytes.load(Ordering::Acquire);
+        let handles = host.live_handles;
+        host.limits.live_bytes = bytes;
+        assert!(host.state_input_token(slot.rep(), 0).is_err());
+        assert_eq!(host.live_handles, handles);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), bytes);
+        assert!(
+            host.state_slots[&slot.rep()]
+                .sequence_handle(0)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn convolution_slot_host() -> (

@@ -82,6 +82,18 @@ impl PagedInputTensors {
 }
 
 impl PagedSlot<'_> {
+    /// Borrows one lane's input token with read-only host rights.
+    ///
+    /// # Errors
+    /// Refuses missing input storage, invalid lanes or exhausted host quota.
+    #[cfg(target_family = "wasm")]
+    pub fn token(&self, lane: u32) -> Result<Tensor<u32>> {
+        self.raw
+            .token(lane)
+            .map(|token| Tensor::from_guest(token, vec![1]))
+            .map_err(|error| Error::loading(format!("{error:?}")))
+    }
+
     #[cfg(target_family = "wasm")]
     #[doc(hidden)]
     #[must_use]
