@@ -381,3 +381,34 @@ fn publication_cancellation_races_keep_whole_entries() {
         assert_eq!(cache.usage().unwrap().entries, 1);
     }
 }
+
+#[test]
+fn racing_a_hit_against_eviction_pins_both_halves_through_attachment() {
+    let fixture = hybrid_fixture(262_144);
+    let next = fixture.advance(128);
+    let prompt = (0..65).collect::<Vec<_>>();
+    for _ in 0..16 {
+        let cache = fixture.cache(65_536, 65_536, 1);
+        let running = std::sync::atomic::AtomicBool::new(false);
+        cache.publish(fixture.entry(), &running).unwrap();
+        let start = std::sync::Barrier::new(2);
+        let finished = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                start.wait();
+                let hit = cache.lookup(fixture.image.namespace(), &prompt).unwrap();
+                let attached = hit.as_ref().map(|hit| {
+                    let sequence = fixture.parent.storage.reserve().unwrap();
+                    hit.attach(&sequence, 257).unwrap()
+                });
+                finished.wait();
+                attached.is_some()
+            });
+            start.wait();
+            let published = cache.publish(next.clone(), &running).is_ok();
+            finished.wait();
+            assert_ne!(worker.join().unwrap(), published);
+        });
+        assert_eq!(cache.usage().unwrap().entries, 1);
+    }
+}
