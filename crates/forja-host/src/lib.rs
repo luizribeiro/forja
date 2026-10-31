@@ -10653,6 +10653,23 @@ mod tests {
         assert_eq!(host.live_handles, handles_before);
     }
 
+    fn assert_input_allow_mask(
+        host: &Host<CpuBackend>,
+        slot: &Resource<super::BatchSlotEntry>,
+        bank: usize,
+        expected: &[u32],
+    ) {
+        let allow = host.table.get(slot).unwrap().inputs.as_ref().unwrap().banks[bank].allow;
+        let tensor = &host.entry(&Resource::new_borrow(allow)).unwrap().tensor;
+        assert_eq!(
+            host.backend.read(tensor).unwrap(),
+            expected
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn state_batch_inputs_stage_prompt_and_sampling_without_touching_other_bank() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
@@ -10728,6 +10745,8 @@ mod tests {
                 .flat_map(u32::to_ne_bytes)
                 .collect::<Vec<_>>()
         );
+        let masks = [[1_u32, 0].repeat(7), vec![u32::MAX, 1]].concat();
+        assert_input_allow_mask(&host, &slot, 0, &masks);
         let before = read(&host, prompt);
         input.lanes[0].as_mut().unwrap().tokens = Some(vec![2; 8]);
         assert!(host.write_state_batch_inputs(pool.rep(), &input).is_err());

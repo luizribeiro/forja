@@ -17,6 +17,20 @@ fn sampling_words(params: SamplingParams) -> [u32; 5] {
     ]
 }
 
+fn allow_vocabulary(allow: &mut [u32], lane: usize, vocab: u32) -> Result<(), compute::Error> {
+    let row = allow
+        .chunks_exact_mut(usize::try_from(vocab.div_ceil(32)).map_err(invalid_handle)?)
+        .nth(lane)
+        .ok_or_else(|| invalid_handle("mask lane exceeds slot"))?;
+    row.fill(u32::MAX);
+    if !vocab.is_multiple_of(32) {
+        *row.last_mut()
+            .ok_or_else(|| invalid_handle("vocabulary mask is empty"))? =
+            (1_u32 << (vocab % 32)) - 1;
+    }
+    Ok(())
+}
+
 struct InputLane<'a> {
     slot: u32,
     tokens: Option<&'a [u32]>,
@@ -115,6 +129,7 @@ impl<B: Backend + 'static> Host<B> {
                 .get_mut(index)
                 .ok_or_else(|| invalid_handle("sampling lane exceeds slot"))? =
                 sampling_words(lane.sampling);
+            allow_vocabulary(&mut allow, index, layout.vocab)?;
             if let Some(values) = lane.tokens {
                 *explicit
                     .get_mut(index)
