@@ -42,6 +42,8 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         let prompt = self.runner.canonical_context(cache.namespace, tokens);
         match prompt {
             Ok(prompt) if prompt.charged_bytes() <= cache.allowance.bytes() => {
+                self.metrics.recompute_queued = self.metrics.recompute_queued.saturating_add(1);
+                self.metrics.recompute_pending = true;
                 cache.recompute = Some(Recompute {
                     prompt,
                     control: control.clone(),

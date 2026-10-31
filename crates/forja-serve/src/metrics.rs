@@ -8,6 +8,13 @@ pub struct ServingMetrics {
     pub(crate) misses: u64,
     pub(crate) reused_tokens: u64,
     pub(crate) snapshot_refusals: u64,
+    pub(crate) recompute_queued: u64,
+    pub(crate) recompute_completed: u64,
+    pub(crate) recompute_preempted: u64,
+    pub(crate) recompute_cancelled: u64,
+    pub(crate) recompute_failed: u64,
+    pub(crate) recompute_blocks: u64,
+    pub(crate) recompute_pending: bool,
     pub(crate) match_time: [u64; 32],
     pub(crate) suffix_prefill_time: [u64; 32],
     pub(crate) ttft: [u64; 32],
@@ -50,6 +57,25 @@ impl ServingMetrics {
             &mut output,
             "forja_prefix_snapshot_refusals_total",
             self.snapshot_refusals,
+        );
+        for (name, value) in [
+            ("queued", self.recompute_queued),
+            ("completed", self.recompute_completed),
+            ("preempted", self.recompute_preempted),
+            ("cancelled", self.recompute_cancelled),
+            ("failed", self.recompute_failed),
+            ("blocks", self.recompute_blocks),
+        ] {
+            counter(
+                &mut output,
+                &format!("forja_canonical_recompute_{name}_total"),
+                value,
+            );
+        }
+        gauge(
+            &mut output,
+            "forja_canonical_recompute_pending",
+            self.recompute_pending,
         );
         histogram(&mut output, "forja_prefix_match_seconds", &self.match_time);
         histogram(
