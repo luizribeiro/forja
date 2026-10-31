@@ -5,10 +5,10 @@ use super::{
 use forja_core::HybridPrefixNamespace;
 
 impl<B: Backend> StateSequenceHandle<B> {
-    /// Attaches immutable carry to a pristine sequence without copying its planes.
+    /// Attaches immutable carry to an unused sequence without checkpoint readers.
     ///
     /// # Errors
-    /// Refuses foreign hosts, layouts, namespaces, busy sequences or insufficient capacity.
+    /// Refuses foreign identities, used/pinned/busy sequences, feedback bindings or insufficient capacity.
     pub fn attach_snapshot(
         &self,
         image: Arc<StateSnapshot<B>>,

@@ -134,6 +134,7 @@ impl StateJournal {
         if !self.has_pristine_state()? || self.feedback.is_some() {
             return Err(PagePoolError::InvalidCheckpoint);
         }
+        self.sequence.ensure_fresh()?;
         self.canonical = CanonicalPosition::Prefill(prompt, position.tokens);
         self.position = position;
         Ok(())

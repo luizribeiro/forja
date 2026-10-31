@@ -154,3 +154,39 @@ fn attachments_share_immutable_planes_until_the_first_update() {
             .is_err()
     );
 }
+
+#[test]
+fn attachment_refuses_preexisting_checkpoints_and_previously_used_sequences() {
+    let (host, parent, _) = prepared(262_144);
+    let image = parent
+        .capture_snapshot(SnapshotAllowance::new(65_536, None).unwrap())
+        .unwrap();
+    let storage = Arc::clone(&parent.storage);
+    drop(parent);
+    let fresh = storage.reserve().unwrap();
+    let used = storage.reserve().unwrap();
+    let checkpoint = fresh.checkpoint_latest().unwrap();
+    let before = host.live_bytes.load(Ordering::Acquire);
+    assert!(
+        fresh
+            .attach_snapshot(image.clone(), image.namespace(), 257)
+            .is_err()
+    );
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+    assert_eq!(fresh.position().tokens, 0);
+    assert!(fresh.snapshot.lock().unwrap().is_none());
+    drop(checkpoint);
+    fresh
+        .attach_snapshot(image.clone(), image.namespace(), 257)
+        .unwrap();
+    assert_eq!(fresh.checkpoint_latest().unwrap().position().tokens, 64);
+    let transaction = used.begin(1).unwrap();
+    used.cancel(&transaction).unwrap();
+    assert!(used.has_pristine_state().unwrap());
+    assert!(
+        used.attach_snapshot(image.clone(), image.namespace(), 257)
+            .is_err()
+    );
+    assert_eq!(used.position().tokens, 0);
+    assert!(used.snapshot.lock().unwrap().is_none());
+}

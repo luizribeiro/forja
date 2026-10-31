@@ -184,6 +184,23 @@ impl StateSequence {
         Ok(())
     }
 
+    /// Checks an untouched, unpinned boundary before replacing initial carry.
+    ///
+    /// # Errors
+    /// Refuses pending work, any previous reservation, or outstanding checkpoint readers.
+    pub fn ensure_fresh(&self) -> Result<(), PagePoolError> {
+        self.ensure_idle()?;
+        if self.latest_serial != 0
+            || self
+                .pins
+                .iter()
+                .any(|pins| pins.load(Ordering::Acquire) != 0)
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
     /// Restores a retained predecessor after every speculative reader/writer has drained.
     ///
     /// # Errors

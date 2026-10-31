@@ -128,8 +128,9 @@ ledger and artifact/numerical namespace, admit blocks through `begin_prefill`,
 and capture only after their submissions finish. Ordinary recurrent updates do
 not produce reusable canonical boundaries. Lookup pins the longest exact match
 and leaves the final prompt token for replay; a later state image cannot supply
-an earlier boundary. Keep the returned `HybridAttachment` for the request's
-lifetime. Its state planes share immutable backing until the first recording
+an earlier boundary. Attach to an unused sequence before installing request
+feedback bindings or taking checkpoints. Keep the returned `HybridAttachment`
+for the request's lifetime. Its state planes share immutable backing until the first recording
 copies whole planes into private storage.
 
 The profile's optional `[serving].state-snapshot-bytes` declares the snapshot
