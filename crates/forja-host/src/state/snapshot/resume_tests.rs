@@ -79,8 +79,46 @@ impl BlockInputs {
     }
 }
 
+fn cache_image<B: Backend + 'static>(
+    host: &mut Host<B>,
+    pages: PagedLayout,
+    image: &Arc<StateSnapshot<B>>,
+) -> crate::HybridPrefixStore<B> {
+    let pool = forja_core::PagePool::new_fixed(pages, 16, 131_072).unwrap();
+    let backing_bytes = pool.memory_usage().unwrap().0.total().unwrap();
+    host.live_bytes
+        .fetch_add(backing_bytes, std::sync::atomic::Ordering::AcqRel);
+    let mut source = pool.reserve(257).unwrap();
+    source.commit_write(64).unwrap();
+    let source = crate::PagedPrefix::new(source);
+    let resource = host
+        .table
+        .push(crate::PagePoolEntry {
+            pool,
+            active_lanes: 3,
+            max_context: 257,
+            plane_count: 1,
+            slot_banks: None,
+            slot: None,
+            charged_bytes: std::sync::atomic::AtomicU64::new(backing_bytes),
+            live_bytes: Arc::clone(&host.live_bytes),
+        })
+        .unwrap();
+    let allowance = SnapshotAllowance::new(131_072, None).unwrap();
+    let cache = host
+        .create_hybrid_prefix_store(&resource, image.namespace(), allowance, 131_072, 8)
+        .unwrap();
+    let entry = host
+        .hybrid_prefix(&resource, &source, image.clone(), image.tokens())
+        .unwrap();
+    cache
+        .publish(entry, &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    cache
+}
+
 fn cold_resume<B: Backend + 'static>(backend: B) {
-    let host = Host::new(
+    let mut host = Host::new(
         backend,
         Limits::new(4_194_304, 8, 1_048_576, 128, 1_000_000_000),
     );
@@ -122,12 +160,12 @@ fn cold_resume<B: Backend + 'static>(backend: B) {
         .iter()
         .map(|plane| host.backend.read(plane).unwrap())
         .collect::<Vec<_>>();
-    resumed
-        .attach_snapshot(image.clone(), namespace, 257)
-        .unwrap();
-    branch
-        .attach_snapshot(image.clone(), namespace, 257)
-        .unwrap();
+    let cache = cache_image(&mut host, pages, &image);
+    let hit = cache.lookup(namespace, prompt.tokens()).unwrap().unwrap();
+    let resumed_attachment = hit.attach(&resumed, 257).unwrap();
+    let branch_attachment = hit.attach(&branch, 257).unwrap();
+    assert_eq!(resumed_attachment.attention().logical_len().unwrap(), 64);
+    assert_eq!(branch_attachment.attention().logical_len().unwrap(), 64);
     let suffix = BlockInputs::new(host.backend.as_ref(), 33);
     let expected = suffix.run(&storage, &cold, &prompt, 2, 128);
     let actual = suffix.run(&storage, &resumed, &prompt, 1, 128);
