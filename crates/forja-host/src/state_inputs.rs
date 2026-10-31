@@ -2,6 +2,9 @@ mod update;
 
 use crate::{Backend, Host, compute, invalid_handle, paged_storage};
 
+// Table ownership and cloned layouts remain live until the scalar allocation retires.
+const FEEDBACK_REFERENCE_BYTES: u64 = 1024;
+
 pub(crate) struct StateInputBank {
     pub(crate) sampling: u32,
     pub(crate) tokens: u32,
@@ -109,6 +112,16 @@ impl<B: Backend + 'static> Host<B> {
         let scalars = lanes
             .checked_mul(5)
             .ok_or_else(|| invalid_handle("state feedback count overflowed"))?;
+        let available = self
+            .limits
+            .live_tensor_handles
+            .checked_sub(self.live_handles)
+            .ok_or_else(|| crate::quota("tensor handle quota is exhausted"))?;
+        if usize::try_from(scalars).map_err(invalid_handle)? > available {
+            return Err(crate::quota(
+                "feedback scalar count exceeds the tensor handle quota",
+            ));
+        }
         let feedback_versions = crate::state::feedback::FeedbackBinding::new(self, lanes)?;
         let mut handles = Vec::new();
         let result = (|| {
@@ -130,7 +143,15 @@ impl<B: Backend + 'static> Host<B> {
             };
             let banks = [bank()?, bank()?];
             let feedback = (0..scalars)
-                .map(|_| alloc(compute::Dtype::U32, &[1]))
+                .map(|_| {
+                    let tensor = self.alloc_paged_tensor_charged(
+                        compute::Dtype::U32,
+                        &[1],
+                        FEEDBACK_REFERENCE_BYTES,
+                    )?;
+                    handles.push(tensor);
+                    Ok::<_, compute::Error>(tensor)
+                })
                 .collect::<Result<_, _>>()?;
             Ok(StateInputs {
                 banks,
@@ -154,7 +175,7 @@ mod tests {
 
     #[test]
     fn state_input_banks_refund_every_partial_allocation() {
-        let mut host = Host::new(CpuBackend::new(), Limits::new(4096, 8, 4096, 64, 4096));
+        let mut host = Host::new(CpuBackend::new(), Limits::new(65536, 8, 4096, 64, 4096));
         let layout = paged_storage::StateInputLayout {
             vocab: 33,
             prompt_tokens: 7,
@@ -176,7 +197,7 @@ mod tests {
         use crate::{BackendError, SubmissionAccess};
         use std::time::Duration;
         use wasmtime::component::Resource;
-        let mut host = Host::new(CpuBackend::new(), Limits::new(4096, 8, 4096, 64, 4096));
+        let mut host = Host::new(CpuBackend::new(), Limits::new(65536, 8, 4096, 64, 4096));
         let inputs = host
             .allocate_state_inputs(
                 2,
@@ -205,6 +226,21 @@ mod tests {
         );
         host.drop_paged_handles(inputs.handles().collect());
         drop(inputs);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn excessive_feedback_reference_counts_refuse_before_allocating() {
+        let mut host = Host::new(CpuBackend::new(), Limits::new(65536, 8, 4096, 64, 4096));
+        assert!(matches!(
+            host.allocate_state_inputs(
+                33,
+                paged_storage::StateInputLayout {
+                    vocab: 1,
+                    prompt_tokens: 7
+                }
+            ),
+            Err(compute::Error::Quota(_))
+        ));
         assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
     }
 }

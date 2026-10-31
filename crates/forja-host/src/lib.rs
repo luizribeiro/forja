@@ -3978,8 +3978,21 @@ impl<B: Backend + 'static> Host<B> {
         dtype: compute::Dtype,
         shape: &[u32],
     ) -> Result<u32, compute::Error> {
+        self.alloc_paged_tensor_charged(dtype, shape, 0)
+    }
+
+    fn alloc_paged_tensor_charged(
+        &mut self,
+        dtype: compute::Dtype,
+        shape: &[u32],
+        metadata_bytes: u64,
+    ) -> Result<u32, compute::Error> {
         let dtype = core_dtype(dtype);
-        let byte_len = self.check_allocation(dtype, shape)?;
+        let byte_len = self
+            .check_allocation(dtype, shape)?
+            .checked_add(metadata_bytes)
+            .ok_or_else(|| quota("paged tensor ownership bytes overflowed"))?;
+        self.check_byte_allocation(byte_len)?;
         let tensor = self.backend.alloc(dtype, shape).map_err(guest_error)?;
         let buffer = Arc::new(BufferHandle {
             owner: tensor.clone(),
@@ -9974,6 +9987,7 @@ mod tests {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 2, 8);
         host.table.get_mut(&pool).unwrap().active_lanes = 8;
+        host.limits.live_tensor_handles = 64;
         let slot = host
             .open_state_slot(
                 &pool,
