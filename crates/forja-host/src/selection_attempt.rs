@@ -19,15 +19,12 @@ pub struct SelectionAttempt<B: Backend> {
 impl<B: Backend> SelectionAttempt<B> {
     fn restore(&mut self) -> Result<(), compute::Error> {
         self.leases.clear();
-        let mut failed = None;
+        let mut result = Ok(());
         for (boundary, _) in self.boundaries.drain(..) {
-            if let Err(error) = boundary.restore()
-                && failed.is_none()
-            {
-                failed = Some(error);
-            }
+            result = crate::recovery::finish(result, boundary.restore())
+                .map_err(crate::recovery::RecoveryError::into_compute);
         }
-        failed.map_or(Ok(()), Err)
+        result
     }
 }
 
@@ -62,7 +59,8 @@ impl<B: Backend + 'static> SelectionAttempt<B> {
             host.advance_paged_batch_bank(self.slot)
         })();
         if let Err(error) = result {
-            return Err(self.rollback(host).err().unwrap_or(error));
+            return crate::recovery::finish(Err(error), self.rollback(host))
+                .map_err(crate::recovery::RecoveryError::into_compute);
         }
         self.accepted = true;
         Ok(())
@@ -83,7 +81,8 @@ impl<B: Backend + 'static> SelectionAttempt<B> {
             Ok(())
         });
         self.accepted = true;
-        restored.and(banks)
+        crate::recovery::finish(restored, banks)
+            .map_err(crate::recovery::RecoveryError::into_compute)
     }
 }
 
@@ -145,7 +144,8 @@ impl<B: Backend + 'static> Host<B> {
             _charge: charge,
         };
         if let Err(error) = self.select_paged_batch_bank(slot_rep) {
-            return Err(attempt.rollback(self).err().unwrap_or(error));
+            return crate::recovery::finish(Err(error), attempt.rollback(self))
+                .map_err(crate::recovery::RecoveryError::into_compute);
         }
         let admitted = (|| {
             for (lane, start) in active {
@@ -171,7 +171,8 @@ impl<B: Backend + 'static> Host<B> {
             Ok(())
         })();
         if let Err(error) = admitted {
-            return Err(attempt.rollback(self).err().unwrap_or(error));
+            return crate::recovery::finish(Err(error), attempt.rollback(self))
+                .map_err(crate::recovery::RecoveryError::into_compute);
         }
         Ok(Some(attempt))
     }

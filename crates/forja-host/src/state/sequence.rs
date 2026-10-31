@@ -185,7 +185,7 @@ impl<B: Backend> StateSequenceHandle<B> {
         &self,
         checkpoint: &StateLaneCheckpoint,
         action: impl FnOnce() -> Result<(), PagePoolError>,
-    ) -> Result<(), PagePoolError> {
+    ) -> Result<(), crate::recovery::RecoveryError<PagePoolError>> {
         self.lock().restore_with(checkpoint, action)
     }
 

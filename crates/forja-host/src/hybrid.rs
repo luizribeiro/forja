@@ -500,11 +500,14 @@ impl<B: Backend + 'static> Host<B> {
                 for dirty in &binding.lane(lane)?.table_dirty {
                     dirty.store(true, std::sync::atomic::Ordering::Release);
                 }
-                binding
-                    .banks
-                    .restore_all(lane, previous)
-                    .map_err(crate::paged_refusal)?;
-                return Err(error);
+                return crate::recovery::finish(
+                    Err(error),
+                    binding
+                        .banks
+                        .restore_all(lane, previous)
+                        .map_err(crate::paged_refusal),
+                )
+                .map_err(crate::recovery::RecoveryError::into_compute);
             }
         }
         Ok(())

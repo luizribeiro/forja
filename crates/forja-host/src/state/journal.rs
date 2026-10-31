@@ -488,20 +488,31 @@ impl StateJournal {
         &mut self,
         checkpoint: &super::StateLaneCheckpoint,
         action: impl FnOnce() -> Result<(), PagePoolError>,
-    ) -> Result<(), PagePoolError> {
+    ) -> Result<(), crate::recovery::RecoveryError<PagePoolError>> {
+        self.restore_using(checkpoint, action, forja_core::StateSequence::rewind)
+    }
+
+    fn restore_using(
+        &mut self,
+        checkpoint: &super::StateLaneCheckpoint,
+        action: impl FnOnce() -> Result<(), PagePoolError>,
+        recover: impl FnOnce(
+            &mut forja_core::StateSequence,
+            &forja_core::StateCheckpoint,
+        ) -> Result<(), PagePoolError>,
+    ) -> Result<(), crate::recovery::RecoveryError<PagePoolError>> {
         if self.selection.upgrade().is_some() {
-            return Err(PagePoolError::BankInFlight);
+            return Err(PagePoolError::BankInFlight.into());
         }
         if let Some(feedback) = &self.feedback {
             feedback.validate(checkpoint.feedback.as_ref())?;
         } else if checkpoint.feedback.is_some() {
-            return Err(PagePoolError::ForeignResource);
+            return Err(PagePoolError::ForeignResource.into());
         }
         let previous = self.sequence.checkpoint()?;
         self.sequence.rewind(&checkpoint.version)?;
         if let Err(error) = action() {
-            self.sequence.rewind(&previous)?;
-            return Err(error);
+            return crate::recovery::finish(Err(error), recover(&mut self.sequence, &previous));
         }
         if let (Some(feedback), Some(boundary)) = (&self.feedback, &checkpoint.feedback) {
             feedback.restore(boundary)?;
@@ -540,6 +551,33 @@ impl StateJournal {
 mod tests {
     use super::*;
     use forja_core::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn failed_recovery_rewind_retains_the_action_failure() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut journal = StateJournal::new(pool.reserve().unwrap());
+        let checkpoint = journal.checkpoint_latest().unwrap();
+        let failure = journal
+            .restore_using(
+                &checkpoint,
+                || Err(PagePoolError::QuotaExceeded),
+                |_, _| Err(PagePoolError::CorruptState),
+            )
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            crate::recovery::RecoveryError::Both {
+                primary: PagePoolError::QuotaExceeded,
+                cleanup: PagePoolError::CorruptState,
+            }
+        );
+        assert!(failure.to_string().contains("cleanup failed: CorruptState"));
+    }
 
     #[test]
     fn accepted_predecessors_release_the_next_depth_two_version() {
@@ -608,7 +646,9 @@ mod tests {
         assert_eq!(journal.position, position(65));
         assert_eq!(
             journal.restore_with(&predicted, || Err(PagePoolError::InvalidCheckpoint)),
-            Err(PagePoolError::InvalidCheckpoint)
+            Err(crate::recovery::RecoveryError::Primary(
+                PagePoolError::InvalidCheckpoint
+            ))
         );
         assert_eq!(journal.position, position(65));
         journal.rewind(64).unwrap();
