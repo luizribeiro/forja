@@ -106,3 +106,39 @@ async fn canonical_prefix_replays_tail_with_identical_logits_and_state()
     let runner = runner_with_context(forja_cpu::CpuBackend::new(), false, 8192).await?;
     assert_boundaries(runner, &[63, 64, 65, 4096, 4097, 4161]).await
 }
+
+pub(crate) async fn assert_shared_parent<B: Backend + Send + Sync + 'static>(
+    mut runner: EngineRunner<B>,
+) -> Result<(), Box<dyn Error>> {
+    let namespace = runner.canonical_prefix_namespace([8; 32], &["test-fixed"])?;
+    let cache =
+        runner.create_canonical_prefix_store(namespace, SnapshotAllowance::new(2 << 30, None)?)?;
+    let parent = (0..65).map(|i| i % 33).collect::<Vec<_>>();
+    let original = evaluate(&mut runner, &cache, &parent, false, 0, true).await?;
+    let mut children = Vec::new();
+    for lane in [1, 2] {
+        let tokens = (0..129)
+            .map(|i| (i + if i >= 64 { lane } else { 0 }) % 33)
+            .collect::<Vec<_>>();
+        let cold = evaluate(&mut runner, &cache, &tokens, false, 0, false).await?;
+        let hit = evaluate(&mut runner, &cache, &tokens, true, lane, false).await?;
+        assert_eq!(hit.2, 64);
+        assert_eq!(cold.0, hit.0);
+        assert_eq!(cold.1, hit.1);
+        children.push((lane, hit.1));
+    }
+    for (lane, digest) in children {
+        assert_eq!(runner.state_lane_fingerprint(lane)?.1, digest);
+    }
+    let again = evaluate(&mut runner, &cache, &parent, true, 0, false).await?;
+    assert_eq!(again.2, 64);
+    assert_eq!(original.0, again.0);
+    assert_eq!(original.1, again.1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_canonical_parent_survives_two_live_branch_writers() -> Result<(), Box<dyn Error>> {
+    let runner = runner_with_context(forja_cpu::CpuBackend::new(), true, 8192).await?;
+    assert_shared_parent(runner).await
+}

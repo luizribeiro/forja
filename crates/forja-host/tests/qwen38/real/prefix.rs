@@ -16,3 +16,11 @@ async fn metal_real_canonical_sparse_boundaries_preserve_logits_and_state_bits()
     let (runner, _) = load_configured(true, None, Some(8192)).await?;
     assert_boundaries(runner, &[4096, 4097, 4161]).await
 }
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_real_shared_canonical_parent_survives_two_live_branch_writers()
+-> Result<(), Box<dyn Error>> {
+    let (runner, _) = load_configured(true, None, Some(512)).await?;
+    crate::qwen38::serving::prefix::assert_shared_parent(runner).await
+}
