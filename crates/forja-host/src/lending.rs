@@ -6,11 +6,22 @@ const REFERENCE_BYTES: u64 = 1024;
 
 impl<B: Backend + 'static> Host<B> {
     pub(crate) fn reserve_reference(&self) -> Result<Arc<StateCharge>, compute::Error> {
+        self.reserve_references(1)
+    }
+
+    pub(crate) fn reserve_references(
+        &self,
+        count: usize,
+    ) -> Result<Arc<StateCharge>, compute::Error> {
+        let bytes = u64::try_from(count.max(1))
+            .ok()
+            .and_then(|count| count.checked_mul(REFERENCE_BYTES))
+            .ok_or_else(|| crate::quota("reference metadata size overflow"))?;
         StateCharge::reserve(
             self.backend.as_ref(),
             Arc::clone(&self.live_bytes),
             self.limits.live_bytes,
-            REFERENCE_BYTES,
+            bytes,
         )
         .map(Arc::new)
     }

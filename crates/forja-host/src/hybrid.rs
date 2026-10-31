@@ -556,6 +556,7 @@ impl<B: Backend + 'static> Host<B> {
         if entry.captured_state.is_empty() {
             return self.prepare_replay_with_flight(resource, values, flight);
         }
+        let snapshot = self.reserve_references(entry.retained.len())?;
         let mut retained = entry.retained.clone();
         let (graph, access, captures, mut paged, mut checks) = (
             std::sync::Arc::clone(&entry.graph),
@@ -600,6 +601,7 @@ impl<B: Backend + 'static> Host<B> {
             Some(flight),
         );
         request.state_batch = batch;
+        request.snapshot = Some(snapshot);
         request.state_owners = owners;
         request.captured_state = captures
             .into_iter()

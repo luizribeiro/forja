@@ -6567,6 +6567,7 @@ impl<B: Backend + 'static> Host<B> {
     ) -> SubmitRequest<B> {
         SubmitRequest {
             backend: Arc::clone(&self.backend),
+            snapshot: None,
             captured_state: Vec::new(),
             state_batch: None,
             state_owners: Vec::new(),
@@ -7370,6 +7371,7 @@ struct ReadRequest<B: Backend> {
 
 struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
+    snapshot: Option<Arc<state::StateCharge>>,
     work: SubmissionWork,
     captured_state: Vec<StateCapture>,
     state_batch: Option<StateBatch<B>>,
@@ -8111,6 +8113,7 @@ where
         tokio::task::spawn_blocking(move || {
             let Self {
                 backend,
+                snapshot: _snapshot,
                 work,
                 captured_state: _captured_state,
                 state_batch,
@@ -10077,6 +10080,46 @@ mod tests {
         assert_eq!(other.slot.rep(), slot.rep());
         assert!(capture.validate(&other.host, false).is_err());
         assert!(host.prepare_submit(commands).is_err());
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+    }
+
+    #[test]
+    fn replay_snapshot_quota_refusal_preserves_the_reserved_state_frame() {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        let before = host.live_bytes.load(Ordering::Acquire);
+        host.limits.live_bytes = before;
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+        assert!(
+            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .is_err()
+        );
+        host.limits = GENEROUS;
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+        let request = host
+            .prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+            .unwrap();
+        assert!(host.live_bytes.load(Ordering::Acquire) > before);
+        drop(request);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 
