@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use forja_core::Backend;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineBatchOutput,
@@ -301,7 +304,18 @@ where
             .map_err(|error| {
                 GenerationError::unavailable(format!("prompt batch failed: {error:?}"))
             })?;
-        let output = self.select_prefill_output(prefill, output).await?;
+        let finished = count == remaining.len();
+        let selected_row = if finished && prefill.constraint.is_some() {
+            usize::try_from(prefill.slot)
+                .map_err(|_| GenerationError::new("prompt lane exceeds usize"))?
+        } else {
+            0
+        };
+        let output = if finished {
+            self.select_prefill_output(prefill, output).await?
+        } else {
+            output
+        };
         let bytes = self
             .runner
             .read_queued_batch_tokens(output)
@@ -309,7 +323,17 @@ where
             .map_err(|error| {
                 GenerationError::unavailable(format!("prompt batch read failed: {error}"))
             })?;
-        prefill.selected = read_batch_tokens(&bytes)?.first().copied();
+        prefill.selected = if finished {
+            Some(
+                *read_batch_tokens(&bytes)?
+                    .get(selected_row)
+                    .ok_or_else(|| {
+                        GenerationError::new("prompt selection omitted its physical lane")
+                    })?,
+            )
+        } else {
+            None
+        };
         let count =
             u32::try_from(count).map_err(|_| GenerationError::new("prompt chunk overflowed"))?;
         prefill.position = prefill
