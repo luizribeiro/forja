@@ -243,6 +243,52 @@ fn decoder_residuals_match_independent_transformers_layers() -> Result<(), Box<d
 mod verification;
 
 #[test]
+fn serving_catalog_preserves_eager_bucket_and_tail_budgets() {
+    use forja_sdk::{BatchPhase, BatchSelection};
+    let shapes = qwen38::Qwen38::serving_shapes();
+    assert_eq!(shapes.len(), 15);
+    for bucket in [1, 2, 4, 8] {
+        let decode = shapes
+            .iter()
+            .filter(|shape| shape.phase == BatchPhase::Decode && shape.bucket == bucket)
+            .collect::<Vec<_>>();
+        assert_eq!(decode.len(), 3);
+        for selection in [
+            BatchSelection::Combined,
+            BatchSelection::Forward,
+            BatchSelection::Masked,
+        ] {
+            assert_eq!(
+                decode
+                    .iter()
+                    .filter(|shape| shape.selection == selection && shape.tokens == 1)
+                    .count(),
+                1
+            );
+        }
+    }
+    let prompts = shapes
+        .iter()
+        .filter(|shape| shape.phase == BatchPhase::Prompt)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts.iter().map(|shape| shape.tokens).collect::<Vec<_>>(),
+        [64, 512, 2048]
+    );
+    assert!(
+        prompts
+            .iter()
+            .all(|shape| shape.bucket == 1 && shape.selection == BatchSelection::Combined)
+    );
+    let retained = shapes
+        .iter()
+        .filter(|shape| shape.phase == BatchPhase::Prompt || shape.bucket <= 4)
+        .collect::<Vec<_>>();
+    assert_eq!(retained.len() + 1, 13);
+    assert!(retained.iter().all(|shape| shape.bucket <= 4));
+}
+
+#[test]
 fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>> {
     use forja_sdk::{DecodeInput, Engine, SamplingParams};
     let weights = Weights::open(fixture("model.safetensors"))?;

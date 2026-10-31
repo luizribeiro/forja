@@ -11,6 +11,33 @@ pub struct Qwen38 {
     feedback: EagerFeedback,
 }
 impl Qwen38 {
+    /// Returns the finite serving shapes; the eight-lane shapes execute eagerly.
+    #[must_use]
+    pub fn serving_shapes() -> Vec<forja_sdk::BatchShape> {
+        use forja_sdk::{BatchPhase, BatchSelection, BatchShape};
+        [1, 2, 4, 8]
+            .into_iter()
+            .flat_map(|bucket| {
+                [
+                    BatchSelection::Combined,
+                    BatchSelection::Forward,
+                    BatchSelection::Masked,
+                ]
+                .map(move |selection| BatchShape {
+                    phase: BatchPhase::Decode,
+                    bucket,
+                    tokens: 1,
+                    selection,
+                })
+            })
+            .chain([64, 512, 2048].map(|tokens| BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens,
+                selection: BatchSelection::Combined,
+            }))
+            .collect()
+    }
     /// Loads an explicit architecture for trusted native tests.
     ///
     /// # Errors
