@@ -205,6 +205,16 @@ pub struct PagedCacheSet {
 }
 
 impl PagedCacheSet {
+    /// Borrows this cache set's host-filled serving slot.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn slot(&self) -> PagedSlot<'_> {
+        PagedSlot {
+            raw: &self._slot,
+            lifetime: PhantomData,
+        }
+    }
+
     /// Borrows one lane's protected state plane without exposing tensor storage.
     ///
     /// # Errors

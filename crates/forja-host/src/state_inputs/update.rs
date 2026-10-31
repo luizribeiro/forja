@@ -17,11 +17,52 @@ fn sampling_words(params: SamplingParams) -> [u32; 5] {
     ]
 }
 
+struct InputLane<'a> {
+    slot: u32,
+    tokens: Option<&'a [u32]>,
+    sampling: SamplingParams,
+}
+
 impl<B: Backend + 'static> Host<B> {
     pub(crate) fn write_state_batch_inputs(
         &self,
         pool: u32,
         input: &EngineBatch,
+    ) -> Result<(), compute::Error> {
+        self.write_state_inputs(
+            pool,
+            input.shape.phase,
+            input.lanes.iter().flatten().map(|lane| InputLane {
+                slot: lane.slot,
+                tokens: lane.tokens.as_deref(),
+                sampling: lane.sampling,
+            }),
+        )
+    }
+
+    pub(crate) fn write_state_single_inputs(
+        &self,
+        pool: u32,
+        phase: BatchPhase,
+        tokens: Option<&[u32]>,
+        sampling: SamplingParams,
+    ) -> Result<(), compute::Error> {
+        self.write_state_inputs(
+            pool,
+            phase,
+            std::iter::once(InputLane {
+                slot: 0,
+                tokens,
+                sampling,
+            }),
+        )
+    }
+
+    fn write_state_inputs<'a>(
+        &self,
+        pool: u32,
+        phase: BatchPhase,
+        source_lanes: impl Iterator<Item = InputLane<'a>>,
     ) -> Result<(), compute::Error> {
         let pool = self
             .table
@@ -58,23 +99,23 @@ impl<B: Backend + 'static> Host<B> {
             self.limits.live_bytes,
             words,
         )?;
-        let lanes = usize::try_from(lanes).map_err(invalid_handle)?;
-        let mut sampling = vec![sampling_words(SamplingParams::default()); lanes];
-        let mut tokens = vec![0; lanes];
-        let mut explicit = vec![0; lanes];
+        let lane_count = usize::try_from(lanes).map_err(invalid_handle)?;
+        let mut sampling = vec![sampling_words(SamplingParams::default()); lane_count];
+        let mut tokens = vec![0; lane_count];
+        let mut explicit = vec![0; lane_count];
         let mut prompt = vec![0; usize::try_from(layout.prompt_tokens).map_err(invalid_handle)?];
         let mut allow = vec![0; usize::try_from(mask_count).map_err(invalid_handle)?];
         for row in allow.chunks_exact_mut(usize::try_from(mask_words).map_err(invalid_handle)?) {
             row[0] = 1;
         }
         let mut prompt_lanes = 0;
-        for lane in input.lanes.iter().flatten() {
+        for lane in source_lanes {
             let index = usize::try_from(lane.slot).map_err(invalid_handle)?;
             *sampling
                 .get_mut(index)
                 .ok_or_else(|| invalid_handle("sampling lane exceeds slot"))? =
                 sampling_words(lane.sampling);
-            if let Some(values) = &lane.tokens {
+            if let Some(values) = lane.tokens {
                 *explicit
                     .get_mut(index)
                     .ok_or_else(|| invalid_handle("token lane exceeds slot"))? = 1;
@@ -83,18 +124,18 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| invalid_handle("token lane exceeds slot"))? = *values
                     .first()
                     .ok_or_else(|| invalid_handle("explicit tokens are empty"))?;
-                if input.shape.phase == BatchPhase::Prompt {
+                if phase == BatchPhase::Prompt {
                     prompt_lanes += 1;
                     prompt
                         .get_mut(..values.len())
                         .ok_or_else(|| invalid_handle("prompt exceeds slot input budget"))?
                         .copy_from_slice(values);
                 }
-            } else if input.shape.phase == BatchPhase::Prompt {
+            } else if phase == BatchPhase::Prompt {
                 return Err(invalid_handle("prompt input tokens are missing"));
             }
         }
-        if input.shape.phase == BatchPhase::Prompt && prompt_lanes != 1 {
+        if phase == BatchPhase::Prompt && prompt_lanes != 1 {
             return Err(invalid_handle("prompt requires exactly one input lane"));
         }
         self.recover_state_input_bank(bank)?;

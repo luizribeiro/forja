@@ -451,6 +451,46 @@ pub struct EngineTensor {
     runner_id: u64,
 }
 
+struct SingleInput<'a> {
+    phase: BatchPhase,
+    tokens: Option<&'a [u32]>,
+    start: u32,
+    sampling: SamplingParams,
+}
+
+impl<'a> From<&'a EngineStep> for SingleInput<'a> {
+    fn from(input: &'a EngineStep) -> Self {
+        Self {
+            phase: input.phase,
+            tokens: Some(input.tokens.as_slice()),
+            start: input.start_pos,
+            sampling: SamplingParams::default(),
+        }
+    }
+}
+
+impl<'a> From<&'a EngineBeginDecode> for SingleInput<'a> {
+    fn from(input: &'a EngineBeginDecode) -> Self {
+        Self {
+            phase: input.phase,
+            tokens: input.tokens.as_deref(),
+            start: input.start_pos,
+            sampling: SamplingParams::default(),
+        }
+    }
+}
+
+impl<'a> From<&'a EngineDecode> for SingleInput<'a> {
+    fn from(input: &'a EngineDecode) -> Self {
+        Self {
+            phase: input.phase,
+            tokens: input.tokens.as_deref(),
+            start: input.start_pos,
+            sampling: input.sampling,
+        }
+    }
+}
+
 /// Device-resident outputs from one engine invocation.
 #[derive(Debug)]
 pub struct EngineOutput {
@@ -1526,6 +1566,43 @@ where
         Ok(())
     }
 
+    async fn prepare_single_append(
+        &mut self,
+        input: SingleInput<'_>,
+        action: StateAction,
+    ) -> Result<(u32, Option<SequenceCheckpoint>), compute::Error> {
+        let count = input
+            .tokens
+            .map_or(Ok(1), |tokens| u32::try_from(tokens.len()))
+            .map_err(|_| quota("token count exceeds u32"))?;
+        let mut checkpoint = self
+            .prepare_paged_append(input.start, count, action)
+            .await?;
+        self.stage_paged_single_inputs(input.phase, input.tokens, input.sampling, &mut checkpoint)?;
+        Ok((count, checkpoint))
+    }
+
+    fn stage_paged_single_inputs(
+        &mut self,
+        phase: BatchPhase,
+        tokens: Option<&[u32]>,
+        sampling: SamplingParams,
+        checkpoint: &mut Option<SequenceCheckpoint>,
+    ) -> Result<(), compute::Error> {
+        let Some(pool) = self.page_pool else {
+            return Ok(());
+        };
+        if let Err(error) = self
+            .store
+            .data()
+            .write_state_single_inputs(pool, phase, tokens, sampling)
+        {
+            self.rollback_paged_append(checkpoint.take())?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn rollback_paged_append(
         &mut self,
         checkpoint: Option<SequenceCheckpoint>,
@@ -1587,14 +1664,11 @@ where
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
-        let Ok(sequence) = u32::try_from(input.tokens.len()) else {
-            return Ok(Err(quota("token count exceeds u32")));
-        };
-        let checkpoint = match self
-            .prepare_paged_append(input.start_pos, sequence, StateAction::Step)
+        let (sequence, checkpoint) = match self
+            .prepare_single_append(SingleInput::from(&input), StateAction::Step)
             .await
         {
-            Ok(checkpoint) => checkpoint,
+            Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
         let taps_requested = input.taps;
@@ -2162,15 +2236,11 @@ where
         &mut self,
         input: EngineBeginDecode,
     ) -> wasmtime::Result<Result<EngineTensor, compute::Error>> {
-        let appended = input
-            .tokens
-            .as_ref()
-            .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self
-            .prepare_paged_append(input.start_pos, appended, StateAction::Forward)
+        let (_, checkpoint) = match self
+            .prepare_single_append(SingleInput::from(&input), StateAction::Forward)
             .await
         {
-            Ok(checkpoint) => checkpoint,
+            Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
         let start_pos = input.start_pos;
@@ -2535,15 +2605,11 @@ where
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
-        let appended = input
-            .tokens
-            .as_ref()
-            .map_or(1, |tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX));
-        let checkpoint = match self
-            .prepare_paged_append(input.start_pos, appended, StateAction::Combined)
+        let (_, checkpoint) = match self
+            .prepare_single_append(SingleInput::from(&input), StateAction::Combined)
             .await
         {
-            Ok(checkpoint) => checkpoint,
+            Ok(prepared) => prepared,
             Err(error) => return Ok(Err(error)),
         };
         self.set_guest_deadline();
