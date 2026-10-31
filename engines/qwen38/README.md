@@ -9,7 +9,11 @@ decode advances recurrent state one token at a time. Single-lane SDK calls decla
 on a 64-token boundary. Serving supports decode buckets 1/2/4/8 with private
 recurrent state and token feedback per lane. Replay retains nine decode graphs,
 three prompt shapes (64/512/2,048) and one replaceable tail; bucket 8 runs eagerly.
-Each new request clears its recurrent carry. Cross-request prefix reuse is disabled.
+Serving reuses exact canonical prompt prefixes with a 2 GiB snapshot ceiling.
+It saves every 4,096 tokens and the last full 64-token boundary before prompt end,
+then replays the entire suffix after the longest hit. The operator can lower
+`serving.state_snapshot_bytes`; zero disables retention. Generated reply state
+is not reusable as canonical prompt state.
 
 ## Use
 

@@ -28,6 +28,8 @@ max-context = 32768
 prefill-chunk = 2048
 
 [serving]
+state-snapshot-bytes = 2147483648
+state-snapshot-interval = 4096
 prompt-token-budget = 2048
 paged-cache = true
 

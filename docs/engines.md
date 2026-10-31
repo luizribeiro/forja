@@ -139,3 +139,10 @@ ceiling. Native hosts resolve `serving.state_snapshot_bytes` with
 uses the declaration, zero disables retention, and a value above the declaration
 is refused. An omitted declaration disables retention. Image copies, request
 references and accounting scratch also consume the existing live-byte quota.
+
+Serving profiles also declare `state-snapshot-interval`, a multiple of the engine's
+canonical prompt block. `ServingEngine::with_profile_prefixes` binds the paired
+cache and preserves identical prompt piece boundaries when reuse is disabled.
+The cache saves sparse boundaries strictly before prompt end and always replays
+the complete suffix. Profile variant identities conservatively refine the
+numerical reduction classes in the artifact namespace.

@@ -426,3 +426,14 @@ fn snapshot_interval_is_optional_nonzero_and_part_of_profile_identity() {
     );
     assert!(toml::from_str::<Profile>(&source.replace("4096", "0")).is_err());
 }
+
+#[test]
+fn qwen38_profile_declares_bounded_sparse_canonical_snapshots() {
+    let profile: Profile = toml::from_str(include_str!(
+        "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml"
+    ))
+    .unwrap();
+    let serving = profile.serving().unwrap();
+    assert_eq!(serving.state_snapshot_bytes.unwrap().get(), 2 << 30);
+    assert_eq!(serving.state_snapshot_interval.unwrap().get(), 4096);
+}
