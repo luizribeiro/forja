@@ -86,10 +86,8 @@ async fn serving_feedback_matches_explicit_eager_tokens() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[tokio::test]
-async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
--> Result<(), Box<dyn Error>> {
-    let mut runner = runner(forja_cpu::CpuBackend::new(), false).await?;
+async fn constrained_selection_case(replay: bool) -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(forja_cpu::CpuBackend::new(), replay).await?;
     let weights = Weights::open(fixture("model.safetensors"))?;
     let mut native =
         qwen38::Model::load(&weights, &verification::tiny_load(), qwen38::Config::tiny())?;
@@ -177,3 +175,12 @@ async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
 
 #[path = "serving/batches.rs"]
 mod batches;
+
+#[tokio::test]
+async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
+-> Result<(), Box<dyn Error>> {
+    for replay in [false, true] {
+        constrained_selection_case(replay).await?;
+    }
+    Ok(())
+}

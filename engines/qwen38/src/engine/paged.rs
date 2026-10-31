@@ -45,7 +45,8 @@ pub(super) fn select(
 ) -> Result<Tensor<u32>> {
     let (set, inputs) = inputs(model)?;
     let words = inputs.allow.shape()[1];
-    let selected = inputs.logits.narrow(0, lane, 1)?.sample_masked(
+    let row = position.clone().checked_mul(0)?.checked_add(lane)?;
+    let selected = inputs.logits.narrow(0, row, 1)?.sample_masked(
         &inputs.sampling.narrow(0, lane, 1)?.reshape(&[5])?,
         &inputs.allow.narrow(0, lane, 1)?.reshape(&[words])?,
         position.clone(),

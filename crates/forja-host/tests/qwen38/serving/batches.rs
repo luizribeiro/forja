@@ -74,7 +74,7 @@ async fn batch(
     expected: &[Vec<Row>],
 ) -> Result<(), Box<dyn Error>> {
     let mut runner = runner(CpuBackend::new(), replay).await?;
-    assert_eq!(runner.metrics().live_graphs, if replay { 3 } else { 0 });
+    assert_eq!(runner.metrics().live_graphs, if replay { 9 } else { 0 });
     for lane in 0..bucket {
         runner.prepare_paged_lane(lane, None, 0)?;
         runner.prepare_paged_lane(lane, None, 64)?;
@@ -151,10 +151,10 @@ async fn decode_buckets_match_single_lane_tokens_and_logits() -> Result<(), Box<
     Ok(())
 }
 
-fn sparse_lanes(position: u32, explicit: bool) -> Vec<Option<EngineBatchLane>> {
-    (0..8)
+fn sparse_lanes(bucket: u32, position: u32, explicit: bool) -> Vec<Option<EngineBatchLane>> {
+    (0..bucket)
         .map(|lane| {
-            matches!(lane, 0 | 7).then(|| EngineBatchLane {
+            (lane == 0 || lane == bucket - 1).then(|| EngineBatchLane {
                 slot: lane,
                 tokens: explicit.then(|| vec![if lane == 0 { 3 } else { 7 }]),
                 start_pos: position,
@@ -190,29 +190,29 @@ async fn selected_reference(initial: u32, selected: u32) -> Result<Row, Box<dyn 
     })
 }
 
-#[tokio::test]
-async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
--> Result<(), Box<dyn Error>> {
-    let mut runner = runner(CpuBackend::new(), false).await?;
-    for lane in [0, 7] {
+async fn partial_selection_case(bucket: u32, replay: bool) -> Result<(), Box<dyn Error>> {
+    let mut runner = runner(CpuBackend::new(), replay).await?;
+    let last = usize::try_from(bucket - 1)?;
+    for lane in [0, bucket - 1] {
+        runner.prepare_paged_lane(lane, None, 0)?;
         runner.prepare_paged_lane(lane, None, 64)?;
     }
     let shape = BatchShape {
         phase: BatchPhase::Decode,
-        bucket: 8,
+        bucket,
         tokens: 1,
         selection: BatchSelection::Forward,
     };
     let mut logits = runner
         .batch_forward(EngineBatch {
             shape,
-            lanes: sparse_lanes(0, true),
+            lanes: sparse_lanes(bucket, 0, true),
         })
         .await??;
     assert!(runner.checkpoint_state_lane(0).is_err());
-    assert!(runner.checkpoint_state_lane(7).is_err());
-    for (lane, selected) in [(7, 32_u32), (0, 1)] {
-        let mut lanes = vec![None; 8];
+    assert!(runner.checkpoint_state_lane(bucket - 1).is_err());
+    for (lane, selected) in [(last, 32_u32), (0, 1)] {
+        let mut lanes = vec![None; usize::try_from(bucket)?];
         lanes[lane] = Some(forja_host::EngineBatchSelectLane {
             start_pos: 0,
             sampling: SamplingParams::default(),
@@ -252,7 +252,7 @@ async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
             (position.tokens, position.grammar, position.parser),
             (1, 1, 1)
         );
-        if lane == 7 {
+        if lane == last {
             assert!(runner.checkpoint_state_lane(0).is_err());
         }
     }
@@ -262,15 +262,26 @@ async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
                 selection: BatchSelection::Combined,
                 ..shape
             },
-            lanes: sparse_lanes(1, false),
+            lanes: sparse_lanes(bucket, 1, false),
         })
         .await??;
     let logits = runner.read(&output.logits).await?;
     let tokens = runner.read(&output.tokens).await?;
-    for (lane, initial, selected) in [(0, 3, 1), (7, 7, 32)] {
+    for (lane, initial, selected) in [(0, 3, 1), (last, 7, 32)] {
         let expected = selected_reference(initial, selected).await?;
         assert_eq!(&logits[lane * 132..(lane + 1) * 132], expected.logits);
         assert_eq!(&tokens[lane * 4..(lane + 1) * 4], expected.token);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
+-> Result<(), Box<dyn Error>> {
+    for bucket in [2, 4, 8] {
+        for replay in [false, true] {
+            partial_selection_case(bucket, replay).await?;
+        }
     }
     Ok(())
 }

@@ -15,6 +15,16 @@ enum Feedback {
     },
 }
 
+#[cfg(target_family = "wasm")]
+impl Feedback {
+    fn catalog(&self) -> Result<&paged::Catalog> {
+        match self {
+            Self::Paged { catalog } => Ok(catalog),
+            Self::Eager(_) => Err(Error::loading("batch decode requires a serving pool")),
+        }
+    }
+}
+
 /// Text engine with private eager feedback or host-owned serving state.
 pub struct Qwen38 {
     model: Model,
@@ -141,19 +151,9 @@ impl Engine for Qwen38 {
     }
     #[cfg(target_family = "wasm")]
     fn batch_step(&mut self, input: forja_sdk::BatchInput<'_>) -> Result<forja_sdk::BatchOutput> {
-        let Feedback::Paged { catalog } = &self.feedback else {
-            return Err(Error::loading("batch decode requires a serving pool"));
-        };
-        let positions = input
-            .lanes
-            .iter()
-            .map(|lane| lane.as_ref().map_or(0, |lane| lane.start_pos))
-            .collect::<Vec<_>>();
-        if catalog.replay(input.shape, &positions)? {
-            paged::batch_output(&self.model, 0, input.shape.bucket)
-        } else {
-            paged::run_batch(&mut self.model, &input, true)
-        }
+        self.feedback
+            .catalog()?
+            .batch(&mut self.model, &input, true)
     }
 
     #[cfg(target_family = "wasm")]
@@ -161,7 +161,10 @@ impl Engine for Qwen38 {
         &mut self,
         input: forja_sdk::BatchInput<'_>,
     ) -> Result<forja_sdk::Tensor<f32>> {
-        paged::run_batch(&mut self.model, &input, false).map(|output| output.logits)
+        self.feedback
+            .catalog()?
+            .batch(&mut self.model, &input, false)
+            .map(|output| output.logits)
     }
 
     #[cfg(target_family = "wasm")]
@@ -169,7 +172,7 @@ impl Engine for Qwen38 {
         &mut self,
         input: forja_sdk::BatchSelectInput<'_>,
     ) -> Result<forja_sdk::BatchOutput> {
-        paged::select_batch(&self.model, &input)
+        self.feedback.catalog()?.select_batch(&self.model, &input)
     }
 
     #[cfg(target_family = "wasm")]
@@ -178,14 +181,23 @@ impl Engine for Qwen38 {
         input: forja_sdk::BeginDecodeInput,
     ) -> Result<forja_sdk::Tensor<f32>> {
         let rows = paged::row_count(input.tokens.as_ref())?;
-        let logits = paged::forward(
-            &mut self.model,
-            rows,
-            &input.start_pos.into(),
-            0,
-            input.phase,
-        )?;
-        forja_sdk::eval()?;
+        let shape = forja_sdk::BatchShape {
+            phase: input.phase,
+            bucket: 1,
+            tokens: rows,
+            selection: forja_sdk::BatchSelection::Forward,
+        };
+        if !self.feedback.catalog()?.replay(shape, &[input.start_pos])? {
+            drop(paged::forward(
+                &mut self.model,
+                rows,
+                &input.start_pos.into(),
+                0,
+                input.phase,
+            )?);
+            forja_sdk::eval()?;
+        }
+        let logits = paged::batch_output(&self.model, 0, 1)?.logits;
         logits.reshape(&[logits.shape()[1]])
     }
 
@@ -197,20 +209,21 @@ impl Engine for Qwen38 {
         _sampling: forja_sdk::SamplingParams,
         _allow: &[u32],
     ) -> Result<DecodeOutput> {
-        let token = paged::select(&self.model, 0, &start_pos.into(), true)?;
-        let inputs = self
-            .model
-            .serving_set()?
-            .slot()
-            .tensors()?
-            .inputs
-            .ok_or_else(|| Error::loading("serving inputs are missing"))?;
-        let logits = inputs
-            .logits
-            .narrow(0, 0, 1)?
-            .reshape(&[inputs.logits.shape()[1]])?;
-        forja_sdk::eval()?;
-        Ok(DecodeOutput { logits, token })
+        let shape = forja_sdk::BatchShape {
+            phase: forja_sdk::BatchPhase::Decode,
+            bucket: 1,
+            tokens: 1,
+            selection: forja_sdk::BatchSelection::Masked,
+        };
+        if !self.feedback.catalog()?.replay(shape, &[start_pos])? {
+            drop(paged::select(&self.model, 0, &start_pos.into(), true)?);
+            forja_sdk::eval()?;
+        }
+        let output = paged::batch_output(&self.model, 0, 1)?;
+        Ok(DecodeOutput {
+            logits: output.logits.reshape(&[output.logits.shape()[1]])?,
+            token: output.tokens,
+        })
     }
 
     #[cfg(target_family = "wasm")]
