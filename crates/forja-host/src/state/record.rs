@@ -371,9 +371,9 @@ impl<B: Backend> StateCommands<B> {
         let next = self
             .storage
             .version_view(plane, self.access.destination())?;
-        let mut operands = inputs.to_vec();
-        operands.push(&previous);
-        operands.extend(self.metadata.iter());
+        let operands = operation
+            .bind_inputs(inputs, &previous, &self.metadata)
+            .map_err(guest_error)?;
         let outputs = [output, &next]
             .into_iter()
             .chain(scratch)

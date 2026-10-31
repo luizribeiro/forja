@@ -109,13 +109,12 @@ impl ReplayBindings {
     pub fn apply(&self, commands: CommandList) -> Result<CommandList, OpError> {
         let mut bound = CommandList::new();
         for dispatch in commands.into_dispatches() {
-            let state = matches!(dispatch.op(), Op::State(_))
-                .then(|| {
-                    self.states
-                        .iter()
-                        .find(|state| state.table == dispatch.inputs()[dispatch.inputs().len() - 3])
-                })
-                .flatten();
+            let state = if let Op::State(operation) = dispatch.op() {
+                let [_, table, _, _] = operation.input_suffix(dispatch.inputs())?;
+                self.states.iter().find(|state| state.table == *table)
+            } else {
+                None
+            };
 
             let mut dispatch = dispatch.rebase_tensors(|tensor| {
                 if let Some((_, replacement)) = state

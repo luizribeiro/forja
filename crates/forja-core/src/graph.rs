@@ -1877,7 +1877,10 @@ fn template_workspace(dispatch: &TemplateDispatch) -> Option<crate::BufferId> {
         TemplateDispatch::Static(dispatch)
             if matches!(dispatch.op(), Op::State(crate::StateOp::DeltaRuleBlock(_))) =>
         {
-            dispatch.outputs().get(2).map(Tensor::buffer)
+            dispatch
+                .outputs()
+                .get(crate::StateOp::BLOCK_WORKSPACE_OUTPUT)
+                .map(Tensor::buffer)
         }
         TemplateDispatch::Dynamic {
             dispatch:
@@ -1896,7 +1899,9 @@ fn template_workspace(dispatch: &TemplateDispatch) -> Option<crate::BufferId> {
                     ..
                 },
             ..
-        } => outputs.get(2).map(TemplateTensor::buffer),
+        } => outputs
+            .get(crate::StateOp::BLOCK_WORKSPACE_OUTPUT)
+            .map(TemplateTensor::buffer),
         _ => None,
     }
 }

@@ -1,6 +1,7 @@
 use crate::{DType, KernelCost, OpError, StateAccess, Tensor};
 
 // Activity, two expected identities, disjointness, two bounds and two generations.
+const METADATA_INPUTS: usize = 3;
 const AUTHENTICATION_SCALAR_OPS: u64 = 1 + 2 + 1 + 2 + 2;
 
 /// Generic operations over an authenticated out-of-place state version.
@@ -26,7 +27,37 @@ impl StateOp {
         }
     }
 
-    pub(crate) fn validate(self, inputs: &[&Tensor], outputs: &[&Tensor]) -> Result<(), OpError> {
+    /// Output index of the private workspace produced by a block update.
+    pub const BLOCK_WORKSPACE_OUTPUT: usize = 2;
+
+    /// Appends the source state and authentication metadata in their shared operand order.
+    ///
+    /// # Errors
+    /// Refuses an operation's incorrect data-operand count.
+    pub fn bind_inputs<'a>(
+        self,
+        data: &[&'a Tensor],
+        source: &'a Tensor,
+        metadata: &'a [Tensor],
+    ) -> Result<Vec<&'a Tensor>, OpError> {
+        if metadata.len() != METADATA_INPUTS {
+            return Err(OpError::Arity {
+                expected: METADATA_INPUTS,
+                actual: metadata.len(),
+            });
+        }
+        let mut inputs = data.to_vec();
+        inputs.push(source);
+        inputs.extend(metadata.iter());
+        self.input_suffix(&inputs)?;
+        Ok(inputs)
+    }
+
+    /// Returns source state, authentication table, generations and activity, in that order.
+    ///
+    /// # Errors
+    /// Refuses mismatched operand layouts before locating authentication identities.
+    pub fn input_suffix<T>(self, inputs: &[T]) -> Result<&[T; 4], OpError> {
         let expected = match self {
             Self::DeltaRule(_) | Self::DeltaRuleBlock(_) => 9,
             Self::CausalDepthwiseConv(_) => 6,
@@ -37,10 +68,12 @@ impl StateOp {
                 actual: inputs.len(),
             });
         }
+        inputs.last_chunk().ok_or(OpError::InvalidKernelParameter)
+    }
+
+    pub(crate) fn validate(self, inputs: &[&Tensor], outputs: &[&Tensor]) -> Result<(), OpError> {
         let bad = OpError::InvalidKernelParameter;
-        let [table, generations, activity] = &inputs[inputs.len() - 3..] else {
-            return Err(bad);
-        };
+        let [state, table, generations, activity] = self.input_suffix(inputs)?;
         if [*table, *generations, *activity]
             .iter()
             .any(|t| t.layout().dtype() != DType::U32 || !t.layout().is_contiguous())
@@ -52,12 +85,11 @@ impl StateOp {
         {
             return Err(bad);
         }
-        let state = inputs[inputs.len() - 4];
         if !state.layout().is_contiguous()
             || !outputs[1].layout().is_contiguous()
             || state.layout().dtype() != outputs[1].layout().dtype()
             || state.layout().shape() != outputs[1].layout().shape()
-            || inputs[..inputs.len() - 3]
+            || inputs[..inputs.len() - METADATA_INPUTS]
                 .iter()
                 .chain(outputs.iter())
                 .any(|t| !matches!(t.layout().dtype(), DType::F32 | DType::F16 | DType::BF16))
@@ -167,4 +199,36 @@ fn convolution_cost(inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCos
         .checked_add(crate::cost::bytes(&inputs[3..])?)?;
     cost.flops = convolution.checked_mul(channels)?.checked_mul(2)?;
     Some(cost)
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn authenticated_suffix_refuses_mismatched_operation_arity() {
+        let pool = crate::StatePool::new(
+            crate::StateLayout::new(vec![
+                crate::StatePlane::new(DType::F32, vec![7, 33]).unwrap(),
+            ])
+            .unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let transaction = sequence.begin(1).unwrap();
+        let access = StateAccess::from_slot(&sequence.bind(&transaction).unwrap()).unwrap();
+        let delta = StateOp::DeltaRule(access);
+        assert!(delta.input_suffix(&[0; 6]).is_err());
+        assert_eq!(
+            delta.input_suffix(&[0, 1, 2, 3, 4, 5, 6, 7, 8]).unwrap(),
+            &[5, 6, 7, 8]
+        );
+        let conv = StateOp::CausalDepthwiseConv(access);
+        assert!(conv.input_suffix(&[0; 9]).is_err());
+        assert_eq!(
+            conv.input_suffix(&[0, 1, 2, 3, 4, 5]).unwrap(),
+            &[2, 3, 4, 5]
+        );
+    }
 }
