@@ -1,3 +1,5 @@
+mod lease;
+pub use lease::StateSelectionLease;
 mod submission;
 pub use submission::StateSelectionSubmission;
 
@@ -64,6 +66,11 @@ impl<B: Backend> StateSelection<B> {
             charge,
             _drain: drain,
         })
+    }
+
+    /// Shares cancellable ownership with a recording scope before submission takes the guard.
+    pub fn share(self) -> StateSelectionLease<B> {
+        StateSelectionLease::new(self)
     }
 
     /// Retains the input boundary until the engine output has passed host validation.
@@ -300,7 +307,7 @@ mod tests {
     use crate::{Host, LanePosition, Limits, StateAction, state::feedback::FeedbackBinding};
     use forja_core::{DType, StateLayout, StatePlane};
 
-    fn fixture(lanes: u32) -> Vec<StateSequenceHandle<forja_cpu::CpuBackend>> {
+    pub(super) fn fixture(lanes: u32) -> Vec<StateSequenceHandle<forja_cpu::CpuBackend>> {
         let host = Host::new(
             forja_cpu::CpuBackend::new(),
             Limits::new(65536, 8, 4096, 128, 4096),

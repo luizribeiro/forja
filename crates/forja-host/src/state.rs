@@ -24,7 +24,8 @@ mod quota_tests;
 pub use journal::{LanePosition, StateAction};
 mod selection;
 pub use selection::{
-    StateSelection, StateSelectionBatch, StateSelectionBoundary, StateSelectionSubmission,
+    StateSelection, StateSelectionBatch, StateSelectionBoundary, StateSelectionLease,
+    StateSelectionSubmission,
 };
 mod sequence;
 pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
