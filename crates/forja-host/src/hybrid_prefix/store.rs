@@ -59,11 +59,8 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         {
             return Err(quota("invalid hybrid cache limits or layout"));
         }
-        let metadata = u64::try_from(maximum)
-            .ok()
-            .and_then(|n| n.checked_mul(32))
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(|| quota("cache metadata overflow"))?;
+        let count = u64::try_from(maximum).map_err(|_| quota("cache entry count overflow"))?;
+        let metadata = super::checked_metadata_bytes(count, 32, 1024)?;
         let metadata_bytes = add_bytes(metadata, backing.bytes)?;
         if bytes < metadata_bytes {
             return Err(quota("cache ceiling cannot hold its index"));
@@ -112,10 +109,7 @@ impl<B: Backend> HybridPrefixStore<B> {
                     .and_then(|resources| n.checked_add(resources))
             })
             .ok_or_else(|| quota("cache accounting extent overflow"))?;
-        let temporary = count
-            .checked_mul(64)
-            .and_then(|n| n.checked_add(256))
-            .ok_or_else(|| quota("cache accounting bytes overflow"))?;
+        let temporary = super::checked_metadata_bytes(count, 64, 256)?;
         let _temporary = StateCharge::reserve(
             self.backend.as_ref(),
             Arc::clone(&self.live),

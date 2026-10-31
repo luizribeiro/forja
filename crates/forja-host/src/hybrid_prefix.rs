@@ -6,6 +6,13 @@ pub use entry::{HybridAttachment, HybridPrefix};
 
 use crate::{compute, quota};
 
+fn checked_metadata_bytes(count: u64, stride: u64, fixed: u64) -> Result<u64, compute::Error> {
+    count
+        .checked_mul(stride)
+        .and_then(|bytes| bytes.checked_add(fixed))
+        .ok_or_else(|| quota("hybrid metadata byte count overflow"))
+}
+
 /// Guest-declared snapshot ceiling reduced by an optional operator limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SnapshotAllowance {
@@ -46,6 +53,14 @@ impl SnapshotAllowance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_extents_check_both_multiplication_and_addition() {
+        assert_eq!(checked_metadata_bytes(7, 64, 256).unwrap(), 704);
+        assert_eq!(checked_metadata_bytes(0, u64::MAX, 33).unwrap(), 33);
+        assert_eq!(checked_metadata_bytes(1, u64::MAX, 0).unwrap(), u64::MAX);
+        assert!(checked_metadata_bytes(u64::MAX, 2, 0).is_err());
+        assert!(checked_metadata_bytes(1, u64::MAX, 1).is_err());
+    }
     #[test]
     fn operator_can_only_lower_the_declared_snapshot_allowance() {
         let allowance = SnapshotAllowance::new(4097, None).unwrap();

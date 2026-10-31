@@ -73,11 +73,8 @@ impl<B: Backend> HybridPrefix<B> {
         sequence: &StateSequenceHandle<B>,
         reserved_tokens: u64,
     ) -> Result<HybridAttachment<B>, compute::Error> {
-        let references = reserved_tokens
-            .div_ceil(u64::from(self.pool.layout().page_tokens()))
-            .checked_mul(64)
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(|| crate::quota("hybrid attachment metadata overflow"))?;
+        let pages = reserved_tokens.div_ceil(u64::from(self.pool.layout().page_tokens()));
+        let references = super::checked_metadata_bytes(pages, 64, 1024)?;
         let charge = self.image.reference_charge(references)?;
         let attention = self
             .attention
@@ -147,10 +144,7 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
             .tokens
             .div_ceil(u64::from(pool.layout().page_tokens()));
         let backing = self.hybrid_backing(resource)?;
-        let reference_bytes = count
-            .checked_mul(64)
-            .and_then(|n| n.checked_add(1024))
-            .ok_or_else(|| crate::quota("hybrid reference bytes overflow"))?;
+        let reference_bytes = super::checked_metadata_bytes(count, 64, 1024)?;
         let metadata_bytes = reference_bytes
             .checked_add(backing.bytes)
             .ok_or_else(|| crate::quota("hybrid backing metadata overflow"))?;

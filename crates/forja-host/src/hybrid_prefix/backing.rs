@@ -41,11 +41,9 @@ impl<B: Backend> Host<B> {
                 "hybrid entries require every plane from the owning attention pool",
             ));
         }
-        let bytes = u64::try_from(slot.planes.len())
-            .ok()
-            .and_then(|n| n.checked_mul(16))
-            .and_then(|n| n.checked_add(256))
-            .ok_or_else(|| quota("hybrid backing references overflow"))?;
+        let count =
+            u64::try_from(slot.planes.len()).map_err(|_| quota("hybrid plane count overflow"))?;
+        let bytes = super::checked_metadata_bytes(count, 16, 256)?;
         let charge = StateCharge::reserve(
             self.backend.as_ref(),
             Arc::clone(&self.live_bytes),
