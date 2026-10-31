@@ -164,6 +164,24 @@ impl Engine for Tiny {
             _ => Err(forja_sdk::Error::loading("fixture uses step")),
         }
     }
+    fn batch_forward(
+        &mut self,
+        input: forja_sdk::BatchInput<'_>,
+    ) -> Result<forja_sdk::Tensor<f32>> {
+        match self {
+            Self::Full(engine) => engine.batch_forward(input),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
+        }
+    }
+    fn batch_select(
+        &mut self,
+        input: forja_sdk::BatchSelectInput<'_>,
+    ) -> Result<forja_sdk::BatchOutput> {
+        match self {
+            Self::Full(engine) => engine.batch_select(input),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
+        }
+    }
     fn begin_decode(
         &mut self,
         input: forja_sdk::BeginDecodeInput,

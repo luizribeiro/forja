@@ -63,9 +63,10 @@ pub(super) fn row_count(tokens: Option<&Tensor<u32>>) -> Result<u32> {
     }
 }
 
-pub(super) fn batch_step(
+pub(super) fn run_batch(
     model: &mut Model,
     input: &forja_sdk::BatchInput<'_>,
+    selection: bool,
 ) -> Result<forja_sdk::BatchOutput> {
     let prompt = input.shape.phase == BatchPhase::Prompt;
     for (index, active) in input.lanes.iter().enumerate() {
@@ -95,7 +96,9 @@ pub(super) fn batch_step(
             lane,
             input.shape.phase,
         )?);
-        drop(select(model, lane, &position.into(), active.is_some())?);
+        if selection {
+            drop(select(model, lane, &position.into(), active.is_some())?);
+        }
     }
     let base = if prompt {
         input
@@ -121,4 +124,17 @@ pub(super) fn batch_output(
         logits: inputs.logits.narrow(0, base, bucket)?,
         tokens: inputs.selected.narrow(0, base, bucket)?,
     })
+}
+
+pub(super) fn select_batch(
+    model: &Model,
+    input: &forja_sdk::BatchSelectInput<'_>,
+) -> Result<forja_sdk::BatchOutput> {
+    for (lane, active) in input.lanes.iter().enumerate() {
+        let lane = u32::try_from(lane).map_err(|_| Error::loading("selection lane exceeds u32"))?;
+        let position = active.as_ref().map_or(0, |active| active.start_pos);
+        drop(select(model, lane, &position.into(), active.is_some())?);
+    }
+    forja_sdk::eval()?;
+    batch_output(model, 0, input.shape.bucket)
 }

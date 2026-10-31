@@ -135,3 +135,127 @@ async fn decode_buckets_match_single_lane_tokens_and_logits() -> Result<(), Box<
     }
     Ok(())
 }
+
+fn sparse_lanes(position: u32, explicit: bool) -> Vec<Option<EngineBatchLane>> {
+    (0..8)
+        .map(|lane| {
+            matches!(lane, 0 | 7).then(|| EngineBatchLane {
+                slot: lane,
+                tokens: explicit.then(|| vec![if lane == 0 { 3 } else { 7 }]),
+                start_pos: position,
+                sampling: SamplingParams::default(),
+            })
+        })
+        .collect()
+}
+
+async fn selected_reference(initial: u32, selected: u32) -> Result<Row, Box<dyn Error>> {
+    let mut runner = runner(CpuBackend::new(), false).await?;
+    let logits = runner
+        .begin_decode(forja_host::EngineBeginDecode {
+            phase: BatchPhase::Decode,
+            tokens: Some(vec![initial]),
+            start_pos: 0,
+        })
+        .await??;
+    runner
+        .finish_decode(&logits, 0, SamplingParams::default(), &[selected])
+        .await??;
+    let output = runner
+        .decode(EngineDecode {
+            phase: BatchPhase::Decode,
+            tokens: None,
+            start_pos: 1,
+            sampling: SamplingParams::default(),
+        })
+        .await??;
+    Ok(Row {
+        logits: runner.read(&output.logits).await?,
+        token: runner.read(&output.token).await?,
+    })
+}
+
+#[tokio::test]
+async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
+-> Result<(), Box<dyn Error>> {
+    let mut runner = runner(CpuBackend::new(), false).await?;
+    for lane in [0, 7] {
+        runner.prepare_paged_lane(lane, None, 64)?;
+    }
+    let shape = BatchShape {
+        phase: BatchPhase::Decode,
+        bucket: 8,
+        tokens: 1,
+        selection: BatchSelection::Forward,
+    };
+    let mut logits = runner
+        .batch_forward(EngineBatch {
+            shape,
+            lanes: sparse_lanes(0, true),
+        })
+        .await??;
+    assert!(runner.checkpoint_state_lane(0).is_err());
+    assert!(runner.checkpoint_state_lane(7).is_err());
+    for (lane, selected) in [(7, 32_u32), (0, 1)] {
+        let mut lanes = vec![None; 8];
+        lanes[lane] = Some(forja_host::EngineBatchSelectLane {
+            start_pos: 0,
+            sampling: SamplingParams::default(),
+            allow: vec![selected],
+        });
+        let output = runner
+            .batch_select(
+                &logits,
+                forja_host::EngineBatchSelect {
+                    shape: BatchShape {
+                        selection: BatchSelection::Masked,
+                        ..shape
+                    },
+                    lanes,
+                },
+            )
+            .await??;
+        for (peer, token) in runner
+            .read(&output.tokens)
+            .await?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                *token,
+                if peer == lane { selected } else { 0 }.to_le_bytes()
+            );
+        }
+        logits = output.logits;
+        let position = runner
+            .checkpoint_state_lane(u32::try_from(lane)?)?
+            .ok_or("missing selected state")?
+            .position();
+        assert_eq!(
+            (position.tokens, position.grammar, position.parser),
+            (1, 1, 1)
+        );
+        if lane == 7 {
+            assert!(runner.checkpoint_state_lane(0).is_err());
+        }
+    }
+    let output = runner
+        .batch_step(EngineBatch {
+            shape: BatchShape {
+                selection: BatchSelection::Combined,
+                ..shape
+            },
+            lanes: sparse_lanes(1, false),
+        })
+        .await??;
+    let logits = runner.read(&output.logits).await?;
+    let tokens = runner.read(&output.tokens).await?;
+    for (lane, initial, selected) in [(0, 3, 1), (7, 7, 32)] {
+        let expected = selected_reference(initial, selected).await?;
+        assert_eq!(&logits[lane * 132..(lane + 1) * 132], expected.logits);
+        assert_eq!(&tokens[lane * 4..(lane + 1) * 4], expected.token);
+    }
+    Ok(())
+}

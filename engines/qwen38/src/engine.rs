@@ -134,7 +134,23 @@ impl Engine for Qwen38 {
     }
     #[cfg(target_family = "wasm")]
     fn batch_step(&mut self, input: forja_sdk::BatchInput<'_>) -> Result<forja_sdk::BatchOutput> {
-        paged::batch_step(&mut self.model, &input)
+        paged::run_batch(&mut self.model, &input, true)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn batch_forward(
+        &mut self,
+        input: forja_sdk::BatchInput<'_>,
+    ) -> Result<forja_sdk::Tensor<f32>> {
+        paged::run_batch(&mut self.model, &input, false).map(|output| output.logits)
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn batch_select(
+        &mut self,
+        input: forja_sdk::BatchSelectInput<'_>,
+    ) -> Result<forja_sdk::BatchOutput> {
+        paged::select_batch(&self.model, &input)
     }
 
     #[cfg(target_family = "wasm")]
