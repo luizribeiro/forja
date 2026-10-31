@@ -341,7 +341,7 @@ pub trait Engine: Sized + 'static {
         ))
     }
 
-    /// Selects a constrained token from retained decode logits.
+    /// Selects a constrained token using packed allow words, one bit per vocabulary id.
     ///
     /// # Errors
     ///

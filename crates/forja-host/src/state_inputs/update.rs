@@ -37,11 +37,45 @@ struct InputLane<'a> {
     sampling: SamplingParams,
 }
 
+enum AllowedTokens<'a> {
+    Ids(&'a [u32]),
+    Mask(&'a [u32]),
+}
+impl AllowedTokens<'_> {
+    fn write(self, row: &mut [u32], vocab: u32) -> Result<(), compute::Error> {
+        match self {
+            Self::Ids(allow) => {
+                if allow.is_empty()
+                    || allow.windows(2).any(|pair| pair[0] >= pair[1])
+                    || allow.iter().any(|token| *token >= vocab)
+                {
+                    return Err(invalid_handle("selection allow list is invalid"));
+                }
+                row.fill(0);
+                for &token in allow {
+                    row[usize::try_from(token / 32).map_err(invalid_handle)?] |= 1 << (token % 32);
+                }
+            }
+            Self::Mask(mask) => {
+                if mask.len() != row.len()
+                    || mask.iter().all(|word| *word == 0)
+                    || (!vocab.is_multiple_of(32)
+                        && mask.last().is_some_and(|word| *word >> (vocab % 32) != 0))
+                {
+                    return Err(invalid_handle("selection mask has invalid words"));
+                }
+                row.copy_from_slice(mask);
+            }
+        }
+        Ok(())
+    }
+}
+
 struct SelectionLane<'a> {
     slot: usize,
     start: u32,
     sampling: SamplingParams,
-    allow: &'a [u32],
+    allow: AllowedTokens<'a>,
 }
 
 impl<B: Backend + 'static> Host<B> {
@@ -57,7 +91,7 @@ impl<B: Backend + 'static> Host<B> {
                     slot,
                     start: lane.start_pos,
                     sampling: lane.sampling,
-                    allow: &lane.allow,
+                    allow: AllowedTokens::Ids(&lane.allow),
                 })
             }),
         )
@@ -76,7 +110,7 @@ impl<B: Backend + 'static> Host<B> {
                 slot: 0,
                 start,
                 sampling,
-                allow,
+                allow: AllowedTokens::Mask(allow),
             }),
         )
     }
@@ -136,11 +170,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut sampling = vec![sampling_words(SamplingParams::default()); lanes];
         let mut positions = vec![0; lanes];
         for lane in selected {
-            if lane.start >= max_context
-                || lane.allow.is_empty()
-                || lane.allow.windows(2).any(|pair| pair[0] >= pair[1])
-                || lane.allow.iter().any(|&token| token >= layout.vocab)
-            {
+            if lane.start >= max_context {
                 return Err(invalid_handle(
                     "selection position or allow list is invalid",
                 ));
@@ -154,10 +184,7 @@ impl<B: Backend + 'static> Host<B> {
                 .chunks_exact_mut(width)
                 .nth(lane.slot)
                 .ok_or_else(|| invalid_handle("selection lane exceeds mask"))?;
-            row.fill(0);
-            for &token in lane.allow {
-                row[usize::try_from(token / 32).map_err(invalid_handle)?] |= 1 << (token % 32);
-            }
+            lane.allow.write(row, layout.vocab)?;
         }
         let bank = &inputs.banks[slot.active_bank];
         let positions_handle = slot.metadata[slot.active_bank][2];

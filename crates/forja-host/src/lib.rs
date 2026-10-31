@@ -2359,7 +2359,7 @@ where
         self.release_handles(vec![tensor.handle])
     }
 
-    /// Selects a constrained token from logits returned by [`Self::begin_decode`].
+    /// Selects from retained logits using packed allow words, one bit per vocabulary id.
     ///
     /// # Errors
     ///
@@ -11034,7 +11034,7 @@ mod tests {
             top_p: 0.9,
             seed: 0x1234_5678_9abc_def0,
         };
-        host.write_state_single_selection_inputs(pool.rep(), 7, sampling, &[1, 6])
+        host.write_state_single_selection_inputs(pool.rep(), 7, sampling, &[66])
             .unwrap();
         let expected = read(&host);
         assert_eq!(
@@ -11053,7 +11053,7 @@ mod tests {
                 7_u32.to_ne_bytes().to_vec(),
             ]
         );
-        for allow in [&[][..], &[6, 1][..], &[7][..]] {
+        for allow in [&[][..], &[6, 1][..], &[0][..], &[128][..]] {
             assert!(
                 host.write_state_single_selection_inputs(pool.rep(), 7, sampling, allow)
                     .is_err()
@@ -14476,7 +14476,7 @@ mod tests {
             handle: resource.rep(),
             runner_id: runner.id,
         };
-        for allow in [&[][..], &[4][..]] {
+        for allow in [&[][..], &[16][..]] {
             assert!(
                 runner
                     .finish_decode(&supplied, 0, SamplingParams::default(), allow)
@@ -14490,7 +14490,7 @@ mod tests {
             );
         }
         let selected = runner
-            .finish_decode(&supplied, 0, SamplingParams::default(), &[1, 2])
+            .finish_decode(&supplied, 0, SamplingParams::default(), &[6])
             .await
             .unwrap()
             .unwrap();

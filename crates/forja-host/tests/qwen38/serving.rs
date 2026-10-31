@@ -128,15 +128,15 @@ async fn constrained_selection_case(replay: bool) -> Result<(), Box<dyn Error>> 
     assert!(runner.checkpoint_state_lane(0).is_err());
     assert!(
         runner
-            .finish_decode(&logits, 3, SamplingParams::default(), &[33])
+            .finish_decode(&logits, 3, SamplingParams::default(), &[0, 2])
             .await?
             .is_err()
     );
     assert!(runner.checkpoint_state_lane(0).is_err());
     let selected = runner
-        .finish_decode(&logits, 3, SamplingParams::default(), &[0])
+        .finish_decode(&logits, 3, SamplingParams::default(), &[0, 1])
         .await??;
-    assert_eq!(runner.read(&selected.token).await?, 0_u32.to_le_bytes());
+    assert_eq!(runner.read(&selected.token).await?, 32_u32.to_le_bytes());
     let position = runner
         .checkpoint_state_lane(0)?
         .ok_or("missing state checkpoint")?
@@ -151,7 +151,7 @@ async fn constrained_selection_case(replay: bool) -> Result<(), Box<dyn Error>> 
         (4, 3, 4, 4)
     );
     let expected = native
-        .decode_token(&Tensor::from_slice(&[0], &[1])?, 4, false)?
+        .decode_token(&Tensor::from_slice(&[32], &[1])?, 4, false)?
         .logits
         .to_vec()?
         .into_iter()

@@ -173,8 +173,10 @@ async fn selected_reference(initial: u32, selected: u32) -> Result<Row, Box<dyn 
             start_pos: 0,
         })
         .await??;
+    let mut mask = [0; 2];
+    mask[usize::try_from(selected / 32)?] = 1 << (selected % 32);
     runner
-        .finish_decode(&logits, 0, SamplingParams::default(), &[selected])
+        .finish_decode(&logits, 0, SamplingParams::default(), &mask)
         .await??;
     let output = runner
         .decode(EngineDecode {
