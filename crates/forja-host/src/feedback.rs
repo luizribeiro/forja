@@ -177,6 +177,7 @@ impl<B: Backend + 'static> Host<B> {
         &mut self,
         sites: &[CapturedFeedback],
         usages: &[StateUse],
+        remap: Option<crate::slot_capture::PromptReplayLane>,
         bindings: &mut forja_core::ReplayBindings,
         retained: &mut Vec<TensorEntry>,
     ) -> Result<Vec<FeedbackWrite>, compute::Error> {
@@ -184,7 +185,15 @@ impl<B: Backend + 'static> Host<B> {
         for site in sites {
             let usage = *usages
                 .iter()
-                .find(|usage| usage.slot == site.usage.slot && usage.lane == site.usage.lane)
+                .find(|usage| {
+                    usage.slot == site.usage.slot
+                        && usage.lane
+                            == crate::slot_capture::PromptReplayLane::map(
+                                remap,
+                                site.usage.slot,
+                                site.usage.lane,
+                            )
+                })
                 .ok_or_else(|| invalid_handle("feedback capture has no state lane"))?;
             if !usage.active {
                 continue;

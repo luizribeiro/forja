@@ -11793,6 +11793,126 @@ mod tests {
         }
     }
 
+    fn write_prompt_lane_fixture<B: Backend + 'static>(
+        host: &mut Host<B>,
+        pool: u32,
+        lane: u32,
+        step: u32,
+    ) {
+        let mut metadata = vec![None; 8];
+        metadata[usize::try_from(lane).unwrap()] = Some((step, 1));
+        host.write_paged_lane_metadata(pool, &metadata).unwrap();
+        host.write_state_batch_inputs(
+            pool,
+            &EngineBatch {
+                shape: BatchShape {
+                    phase: BatchPhase::Prompt,
+                    bucket: 1,
+                    tokens: 1,
+                    selection: BatchSelection::Combined,
+                },
+                lanes: vec![Some(EngineBatchLane {
+                    slot: lane,
+                    tokens: Some(vec![3]),
+                    start_pos: step,
+                    sampling: SamplingParams::default(),
+                })],
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_state_replay_targets_one_physical_lane_across_banks() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture_lanes(CpuBackend::new(), Some(StateAction::Combined), 8);
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .cancel_unsubmitted_bank(0)
+            .unwrap();
+        host.bind_paged_lane(pool.rep(), 7, None, 8).unwrap();
+        let selected = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+        host.write(&selected, &5_u32.to_ne_bytes()).unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, true).unwrap();
+        assert!(
+            host.record_slot_state(
+                &commands,
+                &slot,
+                1,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                ""
+            )
+            .is_err()
+        );
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.record_slot_feedback(&commands, &slot, 0, &selected)
+            .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        for step in 0..2 {
+            host.select_paged_batch_bank(slot.rep()).unwrap();
+            let checkpoint = host
+                .begin_paged_lane_update(pool.rep(), 7, step, 1, Some(StateAction::Combined))
+                .unwrap()
+                .0
+                .unwrap();
+            write_prompt_lane_fixture(&mut host, pool.rep(), 7, step);
+            let bank = host.table.get(&slot).unwrap().active_bank;
+            let destination = host.state_slots[&slot.rep()]
+                .feedback_output(bank, 7)
+                .unwrap()
+                .unwrap()
+                .1;
+            let binding = Arc::clone(&host.table.get(&slot).unwrap().binding);
+            binding.activity[bank][0].store(true, Ordering::Release);
+            let flight = ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+            assert!(
+                host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                    .is_err()
+            );
+            binding.activity[bank][0].store(false, Ordering::Release);
+            let flight = ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+            assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+            let position = host.state_slots[&slot.rep()].position(7).unwrap();
+            assert_eq!(
+                (position.tokens, position.grammar),
+                (u64::from(step + 1), u64::from(step + 1))
+            );
+            assert_feedback_scalar(&host, &slot, destination, 5).await;
+            host.finish_paged_lane_append(pool.rep(), 7, checkpoint)
+                .unwrap();
+            host.advance_paged_batch_bank(slot.rep()).unwrap();
+        }
+        assert_eq!(
+            host.prepare_read(&output).unwrap().run().await.unwrap(),
+            4_f32.to_ne_bytes().repeat(7)
+        );
+    }
+
     #[tokio::test]
     async fn captured_feedback_follows_versions_and_discards_forward_selection() {
         let StateSlotFixture {

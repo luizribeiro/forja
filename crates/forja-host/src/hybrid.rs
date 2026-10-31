@@ -1,3 +1,4 @@
+use crate::slot_capture::PromptReplayLane;
 use crate::{Host, PagePoolEntry, StateSlots, compute, invalid_handle, paged_storage};
 use forja_core::{Backend, StateLayout, StatePlane};
 use wasmtime::component::Resource;
@@ -568,6 +569,23 @@ struct BoundState {
     banks: Vec<(std::sync::Arc<crate::PagedBinding>, usize)>,
 }
 
+impl BoundState {
+    fn rebind_paged(&self, paged: &mut [crate::PagedUse], checks: &mut [crate::PagedCheck]) {
+        for usage in paged
+            .iter_mut()
+            .chain(checks.iter_mut().map(|check| &mut check.usage))
+        {
+            if let Some((_, bank)) = self
+                .banks
+                .iter()
+                .find(|(binding, _)| std::sync::Arc::ptr_eq(binding, &usage.binding))
+            {
+                usage.bank = *bank;
+            }
+        }
+    }
+}
+
 impl<B: Backend + 'static> Host<B> {
     pub(crate) fn prepare_state_replay_with_flight(
         &mut self,
@@ -576,15 +594,15 @@ impl<B: Backend + 'static> Host<B> {
         flight: crate::ReplayFlight,
     ) -> Result<crate::SubmitRequest<B>, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        if let Some(capture) = &entry.slot_capture {
-            capture.validate(self, !entry.captured_state.is_empty())?;
-        }
         if entry.captured_state.is_empty() && entry.slot_capture.is_none() {
             return self.prepare_replay_with_flight(resource, values, flight);
         }
         let snapshot = self.reserve_references(entry.retained.len())?;
         let mut retained = entry.retained.clone();
         let scope = entry.slot_capture.clone();
+        let remap = scope.as_ref().map_or(Ok(None), |scope| {
+            scope.prompt_lane(self, !entry.captured_state.is_empty())
+        })?;
         let feedback = entry.captured_feedback.clone();
         let selections = entry.captured_selections.clone();
         let (graph, captures, mut paged, mut checks) = (
@@ -596,9 +614,9 @@ impl<B: Backend + 'static> Host<B> {
         let checked = graph
             .values(values.clone())
             .map_err(|error| crate::graph_error(&error))?;
-        let mut bound = self.bind_graph_state(&captures)?;
+        let mut bound = self.bind_graph_state(&captures, remap)?;
         if captures.is_empty()
-            && let Some(scope) = scope
+            && let Some(scope) = &scope
         {
             let slot = self
                 .table
@@ -616,23 +634,17 @@ impl<B: Backend + 'static> Host<B> {
                 &mut bound.retained,
             )?;
         }
+        bound.rebind_paged(&mut paged, &mut checks);
         retained.extend(bound.retained);
         let sources = self.bind_graph_token_sources(&retained, &checked, &mut bound.bindings)?;
         retained.extend(sources);
-        let feedback =
-            self.bind_graph_feedback(&feedback, &bound.usages, &mut bound.bindings, &mut retained)?;
-        for usage in paged
-            .iter_mut()
-            .chain(checks.iter_mut().map(|check| &mut check.usage))
-        {
-            if let Some((_, bank)) = bound
-                .banks
-                .iter()
-                .find(|(binding, _)| std::sync::Arc::ptr_eq(binding, &usage.binding))
-            {
-                usage.bank = *bank;
-            }
-        }
+        let feedback = self.bind_graph_feedback(
+            &feedback,
+            &bound.usages,
+            remap,
+            &mut bound.bindings,
+            &mut retained,
+        )?;
         crate::PagedCheck::validate_all(&checks, Some(&checked))?;
         let selections =
             self.bind_graph_selections(&selections, &mut bound.bindings, &mut retained)?;
@@ -673,6 +685,7 @@ impl<B: Backend + 'static> Host<B> {
     fn bind_graph_state(
         &mut self,
         captures: &[CapturedState],
+        remap: Option<PromptReplayLane>,
     ) -> Result<BoundState, compute::Error> {
         let mut bound = BoundState {
             retained: Vec::new(),
@@ -683,6 +696,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut slots = std::collections::HashSet::new();
         for captured in captures {
             let original = captured.usage;
+            let lane = PromptReplayLane::map(remap, original.slot, original.lane);
             let slot = self
                 .table
                 .get(&Resource::<crate::BatchSlotEntry>::new_borrow(
@@ -708,7 +722,12 @@ impl<B: Backend + 'static> Host<B> {
                     .any(|(lane, active)| {
                         active.load(std::sync::atomic::Ordering::Acquire)
                             && !captures.iter().any(|capture| {
-                                capture.usage.slot == original.slot && capture.usage.lane == lane
+                                capture.usage.slot == original.slot
+                                    && PromptReplayLane::map(
+                                        remap,
+                                        original.slot,
+                                        capture.usage.lane,
+                                    ) == lane
                             })
                     })
                 {
@@ -727,13 +746,13 @@ impl<B: Backend + 'static> Host<B> {
                     &mut bound.retained,
                 )?;
             }
-            let active = slot.binding.activity[bank][original.lane]
-                .load(std::sync::atomic::Ordering::Acquire);
+            let active =
+                slot.binding.activity[bank][lane].load(std::sync::atomic::Ordering::Acquire);
             if active {
                 let window = slot
                     .binding
                     .banks
-                    .append_window(bank, original.lane)
+                    .append_window(bank, lane)
                     .map_err(invalid_handle)?;
                 if window.end.checked_sub(window.start) != Some(original.tokens) {
                     return Err(invalid_handle(
@@ -745,12 +764,11 @@ impl<B: Backend + 'static> Host<B> {
                 .state_slots
                 .get_mut(&original.slot)
                 .ok_or_else(|| invalid_handle("state slot is missing"))?;
-            let bindings = captured
-                .capture
-                .bind(state.commands(bank, original.lane, active)?)?;
+            let bindings = captured.capture.bind(state.commands(bank, lane, active)?)?;
             bound.bindings.extend(bindings).map_err(invalid_handle)?;
             bound.usages.push(StateUse {
                 bank,
+                lane,
                 active,
                 ..original
             });

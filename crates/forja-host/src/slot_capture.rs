@@ -14,7 +14,49 @@ pub(crate) struct SlotCapture {
     _charge: Arc<StateCharge>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct PromptReplayLane {
+    slot: u32,
+    lane: usize,
+}
+impl PromptReplayLane {
+    pub(crate) fn map(remap: Option<Self>, slot: u32, lane: usize) -> usize {
+        remap
+            .filter(|remap| remap.slot == slot && lane == 0)
+            .map_or(lane, |remap| remap.lane)
+    }
+}
+
 impl SlotCapture {
+    pub(crate) fn prompt_lane<B: Backend + 'static>(
+        &self,
+        host: &Host<B>,
+        numerical: bool,
+    ) -> Result<Option<PromptReplayLane>, compute::Error> {
+        self.validate(host, numerical)?;
+        if !self.prefill {
+            return Ok(None);
+        }
+        let slot = host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(self.slot))
+            .map_err(invalid_handle)?;
+        let mut active = slot.binding.activity[slot.active_bank]
+            .iter()
+            .enumerate()
+            .filter(|(_, active)| active.load(Ordering::Acquire));
+        let lane = active.next().map(|(lane, _)| lane);
+        if active.next().is_some() {
+            return Err(invalid_handle(
+                "prompt replay requires at most one active lane",
+            ));
+        }
+        Ok(lane.map(|lane| PromptReplayLane {
+            slot: self.slot,
+            lane,
+        }))
+    }
+
     pub(crate) fn validate<B: Backend + 'static>(
         &self,
         host: &Host<B>,
@@ -122,6 +164,7 @@ impl<B: Backend + 'static> Host<B> {
             if capture.slot != usage.slot
                 || usage.active
                 || usage.bank != 0
+                || (capture.prefill && usage.lane != 0)
                 || (!capture.prefill && usage.tokens != 1)
             {
                 return Err(invalid_handle(
