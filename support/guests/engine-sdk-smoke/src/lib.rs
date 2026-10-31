@@ -118,6 +118,41 @@ impl Engine for ConstantEngine {
         Ok(logits)
     }
 
+    fn finish_decode(
+        &mut self,
+        _logits: &Tensor<f32>,
+        start_pos: u32,
+        _sampling: forja_sdk::SamplingParams,
+        _allow: &[u32],
+    ) -> Result<DecodeOutput> {
+        let slot = self
+            .paged
+            .as_ref()
+            .ok_or_else(|| forja_sdk::Error::loading("selection slot is missing"))?
+            .slot();
+        let inputs = slot
+            .tensors()?
+            .inputs
+            .ok_or_else(|| forja_sdk::Error::loading("selection inputs are missing"))?;
+        let logits = inputs.logits.narrow(0, 0, 1)?;
+        let token = logits.sample_masked(
+            &inputs.sampling.narrow(0, 0, 1)?.reshape(&[5])?,
+            &inputs.allow.narrow(0, 0, 1)?.reshape(&[1])?,
+            start_pos,
+        )?;
+        token.copy_into(&mut inputs.selected.narrow(0, 0, 1)?)?;
+        slot.store_feedback(0, &token)?;
+        forja_sdk::eval()?;
+        Ok(DecodeOutput {
+            logits: logits.reshape(&[4])?,
+            token,
+        })
+    }
+
+    fn rewind_decode(&mut self, _next_pos: u32) -> Result<()> {
+        Ok(())
+    }
+
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         if self.paged.is_some() {
             return self.paged_step(&input);

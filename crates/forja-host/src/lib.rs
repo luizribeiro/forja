@@ -2371,6 +2371,58 @@ where
         sampling: SamplingParams,
         allow: Vec<u32>,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        let attempt = match self.begin_selection_attempt(std::iter::once((0, start_pos))) {
+            Ok(attempt) => attempt,
+            Err(error) => return Ok(Err(error)),
+        };
+        let result = self
+            .finish_decode_work(logits, start_pos, sampling, allow)
+            .await;
+        self.finish_selection_attempt(attempt, result)
+    }
+
+    fn begin_selection_attempt(
+        &mut self,
+        active: impl Iterator<Item = (usize, u32)>,
+    ) -> Result<Option<SelectionAttempt<B>>, compute::Error> {
+        let Some(pool) = self.page_pool else {
+            return Ok(None);
+        };
+        self.store
+            .data_mut()
+            .begin_slot_selection(&Resource::new_borrow(pool), active)
+    }
+
+    fn finish_selection_attempt<T>(
+        &mut self,
+        attempt: Option<SelectionAttempt<B>>,
+        result: wasmtime::Result<Result<T, compute::Error>>,
+    ) -> wasmtime::Result<Result<T, compute::Error>> {
+        let Some(attempt) = attempt else {
+            return result;
+        };
+        match result {
+            Ok(Ok(output)) => Ok(attempt.accept(self.store.data_mut()).map(|()| output)),
+            Ok(Err(error)) => Ok(Err(attempt
+                .rollback(self.store.data_mut())
+                .err()
+                .unwrap_or(error))),
+            Err(error) => {
+                attempt.rollback(self.store.data_mut()).map_err(|error| {
+                    wasmtime::Error::msg(format!("selection rollback failed: {error:?}"))
+                })?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn finish_decode_work(
+        &mut self,
+        logits: EngineTensor,
+        start_pos: u32,
+        sampling: SamplingParams,
+        allow: Vec<u32>,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         if logits.runner_id != self.id {
             return Ok(Err(invalid_handle(
                 "engine tensor belongs to another runner",
@@ -14110,6 +14162,77 @@ mod tests {
         fs::remove_file(weights).unwrap();
     }
 
+    async fn assert_supplied_selection_feedback<B: Backend + Send + Sync + 'static>(
+        runner: &mut EngineRunner<B>,
+        slot: u32,
+        before: super::LanePosition,
+    ) {
+        let resource = runner
+            .store
+            .data_mut()
+            .alloc(compute::Dtype::F32, &[4])
+            .unwrap();
+        runner
+            .store
+            .data_mut()
+            .write(
+                &resource,
+                &[100.0_f32, 4.0, 3.0, 2.0].map(f32::to_ne_bytes).concat(),
+            )
+            .unwrap();
+        let supplied = super::EngineTensor {
+            handle: resource.rep(),
+            runner_id: runner.id,
+        };
+        for allow in [&[][..], &[4][..]] {
+            assert!(
+                runner
+                    .finish_decode(&supplied, 0, SamplingParams::default(), allow)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(
+                runner.store.data().state_slots[&slot].position(0).unwrap(),
+                before
+            );
+        }
+        let selected = runner
+            .finish_decode(&supplied, 0, SamplingParams::default(), &[1, 2])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runner.read(&selected.token).await.unwrap(),
+            1_u32.to_ne_bytes()
+        );
+        assert_eq!(
+            first_f32(&runner.read(&selected.logits).await.unwrap()),
+            100.0
+        );
+        runner.discard_tensor(&supplied).unwrap();
+        for repeat in 0..2 {
+            if repeat == 1 {
+                runner.rewind_decode(1).await.unwrap().unwrap();
+            }
+            let decoded = runner
+                .decode(super::EngineDecode {
+                    phase: BatchPhase::Decode,
+                    tokens: None,
+                    start_pos: 1,
+                    sampling: SamplingParams::default(),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                runner.read(&decoded.token).await.unwrap(),
+                1_u32.to_ne_bytes()
+            );
+            assert_eq!(first_f32(&runner.read(&decoded.logits).await.unwrap()), 4.0);
+        }
+    }
+
     async fn assert_forward_selection_boundary_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
         let weights = test_weight_file();
         let mut runner =
@@ -14153,6 +14276,7 @@ mod tests {
             runner.store.data().state_slots[&slot].position(0).unwrap(),
             before
         );
+        assert_supplied_selection_feedback(&mut runner, slot, before).await;
         fs::remove_file(weights).unwrap();
     }
 
