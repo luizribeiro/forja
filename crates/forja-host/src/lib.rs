@@ -3707,6 +3707,7 @@ pub struct CommandListEntry {
     state_uses: Vec<hybrid::StateUse>,
     state_planes: Vec<(hybrid::StateUse, usize)>,
     feedback_writes: Vec<feedback::FeedbackWrite>,
+    selection_writes: Vec<feedback::SelectionWrite>,
     captured_feedback: Vec<feedback::CapturedFeedback>,
     slot_capture: Option<slot_capture::SlotCapture>,
     paged: Vec<PagedUse>,
@@ -5971,6 +5972,7 @@ impl<B: Backend + 'static> Host<B> {
                 state_uses: Vec::new(),
                 state_planes: Vec::new(),
                 feedback_writes: Vec::new(),
+                selection_writes: Vec::new(),
                 captured_feedback: Vec::new(),
                 slot_capture: None,
             })
@@ -6422,7 +6424,7 @@ impl<B: Backend + 'static> Host<B> {
     {
         let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
-        if !entry.feedback_writes.is_empty() {
+        if !entry.feedback_writes.is_empty() || !entry.selection_writes.is_empty() {
             self.release_retained(entry.retained)?;
             return Err(invalid_handle(
                 "feedback capture requires replay role bindings",
@@ -6551,14 +6553,17 @@ impl<B: Backend + 'static> Host<B> {
             self.release_retained(entry.retained)?;
             return Err(error);
         }
-        let (state_batch, state_owners) =
-            match self.prepare_state_work(&entry.state_uses, &entry.feedback_writes) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    self.release_retained(entry.retained)?;
-                    return Err(error);
-                }
-            };
+        let (state_batch, state_owners) = match self.prepare_protected_work(
+            &entry.state_uses,
+            &entry.feedback_writes,
+            &entry.selection_writes,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(error);
+            }
+        };
         let mut request = self.submission_request(
             SubmissionWork::Commands(entry.commands),
             entry.access,
@@ -6566,7 +6571,7 @@ impl<B: Backend + 'static> Host<B> {
             entry.paged,
             None,
         );
-        request.protected_batch = state_batch.map(hybrid::ProtectedBatch::from);
+        request.protected_batch = state_batch;
         request.state_owners = state_owners;
         Ok(request)
     }
@@ -10861,6 +10866,77 @@ mod tests {
                 .unwrap(),
             token.to_ne_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn opaque_selection_writes_refuse_cancelled_and_replaced_guards() {
+        for scenario in 0..3 {
+            let StateSlotFixture {
+                mut host,
+                slot,
+                operands,
+                output,
+                ..
+            } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Forward));
+            let commands = host.command_list().unwrap();
+            host.record_slot_state(
+                &commands,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
+            .unwrap();
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            host.table.get_mut(&slot).unwrap().active_bank = 1;
+            let selected = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+            host.write(&selected, &5_u32.to_ne_bytes()).unwrap();
+            host.state_slots
+                .get_mut(&slot.rep())
+                .unwrap()
+                .begin_selection(1, 0, 0)
+                .unwrap();
+            let index = host.state_slots[&slot.rep()]
+                .selection_destination(1, 0)
+                .unwrap()
+                .unwrap();
+            let commands = host.command_list().unwrap();
+            host.record_slot_feedback(&commands, &slot, 0, &selected)
+                .unwrap();
+            assert!(
+                host.record_slot_feedback(&commands, &slot, 0, &selected)
+                    .is_err()
+            );
+            if scenario != 0 {
+                host.state_slots
+                    .get_mut(&slot.rep())
+                    .unwrap()
+                    .cancel_lane(1, 0)
+                    .unwrap();
+                if scenario == 2 {
+                    host.state_slots
+                        .get_mut(&slot.rep())
+                        .unwrap()
+                        .begin_selection(1, 0, 0)
+                        .unwrap();
+                }
+                assert!(host.prepare_submit(commands).is_err());
+                assert_eq!(
+                    host.state_slots[&slot.rep()].position(0).unwrap().grammar,
+                    0
+                );
+            } else {
+                host.prepare_submit(commands).unwrap().run().await.unwrap();
+                assert_feedback_scalar(&host, &slot, index, 5).await;
+                assert_eq!(
+                    host.state_slots[&slot.rep()].position(0).unwrap().grammar,
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]

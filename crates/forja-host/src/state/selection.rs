@@ -66,6 +66,10 @@ impl<B: Backend> StateSelection<B> {
         })
     }
 
+    pub(crate) fn reservation(&self) -> (std::sync::Weak<()>, u32) {
+        (Arc::downgrade(&self.identity), self.destination())
+    }
+
     /// Returns the private output scalar to trusted recording code.
     #[must_use]
     pub fn destination(&self) -> u32 {

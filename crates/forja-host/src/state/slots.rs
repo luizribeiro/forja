@@ -394,6 +394,25 @@ impl<B: Backend> StateSlots<B> {
             .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))
     }
 
+    pub(crate) fn selection_reservation(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<Option<(std::sync::Weak<()>, u32)>, compute::Error> {
+        self.selections
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .map(|selection| selection.as_ref().map(super::StateSelection::reservation))
+            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))
+    }
+
+    pub(crate) fn selection_count(&self, bank: usize) -> Result<usize, compute::Error> {
+        self.selections
+            .get(bank)
+            .map(|bank| bank.iter().flatten().count())
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))
+    }
+
     /// Transfers all selected lanes to one completion owner without publishing them.
     ///
     /// # Errors

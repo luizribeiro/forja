@@ -1,3 +1,6 @@
+mod selection;
+pub(crate) use selection::SelectionWrite;
+
 use crate::{
     Backend, BatchSlotEntry, CommandListEntry, Host, TensorEntry, compute, hybrid::StateUse,
     invalid_handle,
@@ -57,13 +60,16 @@ impl<B: Backend + 'static> Host<B> {
         let bank = slot_entry.active_bank;
         let lane = usize::try_from(lane).map_err(invalid_handle)?;
         let list = self.table.get(commands).map_err(invalid_handle)?;
-        let usage = *list
+        let usage = list
             .state_uses
             .iter()
             .find(|usage| {
                 usage.slot == slot.rep() && usage.bank == bank && usage.lane == lane && usage.active
             })
-            .ok_or_else(|| invalid_handle("feedback requires state updates in the same list"))?;
+            .copied();
+        let Some(usage) = usage else {
+            return self.record_selection_feedback(commands, slot.rep(), bank, lane, selected);
+        };
         let (transaction, index) = self
             .state_slots
             .get(&slot.rep())
