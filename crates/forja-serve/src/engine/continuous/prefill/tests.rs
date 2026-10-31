@@ -10,6 +10,13 @@ use tokenizers::{Tokenizer, decoders::byte_level::ByteLevel, models::bpe::BPE};
 type TestError = Box<dyn std::error::Error + Send + Sync>;
 
 async fn engine() -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
+    engine_with_context(128, 64).await
+}
+
+async fn engine_with_context(
+    context: u32,
+    chunk: u32,
+) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
     let weights = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../forja-host/tests/fixtures/qwen38/model.safetensors");
     let mut runner = EngineRunner::new(
@@ -24,7 +31,7 @@ async fn engine() -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
         .load_with_selections(
             None,
             &EngineLoadConfig {
-                max_context: Some(128),
+                max_context: Some(context),
                 replay: true,
                 paged_cache: true,
                 kv_cache: KvCacheFormat::F16,
@@ -51,9 +58,9 @@ async fn engine() -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
         )?,
         forja_config::HostConfig::default(),
         info,
-        128,
-        64,
-        64,
+        context,
+        chunk,
+        chunk,
         crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
     )?)
 }
@@ -386,5 +393,49 @@ async fn invalid_canonical_lane_admission_preserves_unpinned_cached_prefixes()
     invalid.tokens.fill(1);
     assert!(engine.begin_batch_prefill(invalid, 99).await.is_err());
     assert_eq!(complete_prompt(&mut engine, 0).await?.2, 64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sparse_boundaries_consume_the_allocated_prompt_budget() -> Result<(), TestError> {
+    let mut value = serde_json::to_value(canonical_profile()?)?;
+    value["workload"]["max-context"] = serde_json::json!(512);
+    value["workload"]["prefill-chunk"] = serde_json::json!(128);
+    value["serving"]["prompt-token-budget"] = serde_json::json!(128);
+    value["serving"]["state-snapshot-interval"] = serde_json::json!(128);
+    let profile: forja_config::Profile = serde_json::from_value(value)?;
+    let mut engine = engine_with_context(512, 128)
+        .await?
+        .with_profile_prefixes(&profile)?;
+    complete_prompt(&mut engine, 0).await?;
+    let mut input = request();
+    input.prefix_reuse = true;
+    input.tokens = vec![0; 257];
+    input.prompt_tokens = 257;
+    let mut pending = engine
+        .begin_batch_prefill(input, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert_eq!(pending.cached, 64);
+    let id = crate::scheduler::RequestId(1);
+    let mut policy = crate::scheduler::SchedulerPolicy::new(vec![1], 1, 1, 128, 128)?
+        .with_prompt_chunk_multiple(std::num::NonZeroU32::new(64));
+    policy.ready_prompt(id, pending.remaining());
+    let mut rounds = Vec::new();
+    loop {
+        let batch = policy.prompt_batch(false);
+        assert_eq!(batch.len(), 1);
+        let (scheduled, budget) = batch[0];
+        assert_eq!(scheduled, id);
+        let before = pending.position;
+        let finished = engine.advance_batch_prefill(&mut pending, budget).await?;
+        assert_eq!(pending.position - before, budget);
+        rounds.push(budget);
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(rounds, [128, 64, 1]);
+    assert_eq!(pending.position, 257);
     Ok(())
 }

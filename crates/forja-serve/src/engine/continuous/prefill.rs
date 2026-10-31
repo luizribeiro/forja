@@ -267,20 +267,31 @@ where
         prefill: &mut PendingPrefill,
         budget: u32,
     ) -> Result<bool, GenerationError> {
-        if self.scheduler.prefill_chunk_multiple.is_some() {
+        if self.scheduler.prefill_chunk_multiple.is_some() && self.canonical_cache.is_none() {
             return self.advance_batch_prefill_piece(prefill, budget).await;
         }
-        let piece = self
-            .scheduler
-            .prompt_token_budget
-            .min(self.scheduler.idle_prompt_token_budget);
+        let piece = if self.scheduler.prefill_chunk_multiple.is_some() {
+            budget
+        } else {
+            self.scheduler
+                .prompt_token_budget
+                .min(self.scheduler.idle_prompt_token_budget)
+        };
         let mut remaining = budget;
         while remaining > 0 {
             let count = remaining.min(piece);
+            let before = prefill.position;
             if self.advance_batch_prefill_piece(prefill, count).await? {
                 return Ok(true);
             }
-            remaining -= count;
+            let consumed = prefill
+                .position
+                .checked_sub(before)
+                .filter(|&count| count > 0)
+                .ok_or_else(|| GenerationError::new("prompt piece made no progress"))?;
+            remaining = remaining
+                .checked_sub(consumed)
+                .ok_or_else(|| GenerationError::new("prompt piece exceeded its budget"))?;
         }
         Ok(false)
     }
