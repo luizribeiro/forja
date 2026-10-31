@@ -116,3 +116,55 @@ async fn reply_recompute_respects_disabled_and_insufficient_snapshot_allowances(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn arriving_request_preempts_reply_recompute_after_at_most_one_block() -> Result<(), TestError>
+{
+    use crate::{
+        ServingMetrics,
+        http::{AdmissionPolicy, ServiceCommand},
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, oneshot};
+    let mut engine = configured().await?;
+    let policy = AdmissionPolicy {
+        config: Arc::new(engine.config.clone()),
+    };
+    let barrier = Arc::new(crate::engine::BatchTestBarrier::new());
+    engine.set_batch_test_barrier(barrier.clone());
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.queue_canonical_recompute(
+        &PrefixLedger::new(vec![0; 65]),
+        65,
+        &[0; 127],
+        &control,
+        true,
+    );
+    let metrics = Arc::new(Mutex::new(ServingMetrics::default()));
+    let (sender, receiver) = mpsc::channel(8);
+    let worker = tokio::spawn(engine.run_continuous(receiver, metrics.clone()));
+    tokio::time::timeout(Duration::from_secs(5), barrier.reached()).await?;
+    let (reply, completion) = oneshot::channel();
+    sender.send(ServiceCommand::Text {
+        policy,
+        request: serde_json::from_value(serde_json::json!({"model":"hybrid", "prompt":"a", "max_tokens":2, "temperature":0.0}))?,
+        control: GenerationControl::new(Duration::from_secs(2)),
+        reply,
+        queued: Instant::now(),
+    }).await?;
+    barrier.release();
+    let completion = tokio::time::timeout(Duration::from_secs(5), completion).await???;
+    assert_eq!(completion.usage.cached_tokens, 0);
+    assert_eq!(completion.token_ids.len(), 2);
+    let (reply, quiesced) = oneshot::channel();
+    sender.send(ServiceCommand::Quiesce { reply }).await?;
+    quiesced.await??;
+    let observed = metrics.lock().unwrap().clone();
+    assert_eq!(observed.recompute_blocks, 1);
+    assert_eq!(observed.recompute_preempted, 1);
+    assert_eq!(observed.recompute_completed, 0);
+    assert!(!observed.recompute_pending);
+    drop(sender);
+    worker.await?;
+    Ok(())
+}
