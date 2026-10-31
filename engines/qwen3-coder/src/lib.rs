@@ -1110,7 +1110,7 @@ impl BatchDecodeGraphs {
                 continue;
             };
             sampling.extend(sampling_words(lane.sampling)?);
-            masks.extend(allow_mask(&lane.allow)?);
+            masks.extend(allow_mask(lane.allow.as_slice())?);
         }
         logits.copy_into(&mut self.logits)?;
         self.sampling.write(&sampling)?;
@@ -1590,10 +1590,10 @@ impl Engine for Qwen3Coder {
         logits: &Tensor<f32>,
         start_pos: u32,
         sampling: forja_sdk::SamplingParams,
-        allow: &[u32],
+        allow: forja_sdk::PackedMask<'_>,
     ) -> Result<forja_sdk::DecodeOutput> {
         self.decode.select(sampling)?;
-        self.decode.write_allow(allow)?;
+        self.decode.write_allow(allow.words())?;
         if self.decode.masked_graph().is_none() {
             let graph = self.capture_masked_selection(logits, start_pos)?;
             self.decode.set_masked_graph(graph);
@@ -2207,7 +2207,7 @@ impl Qwen3Coder {
                 .map_err(|_| forja_sdk::Error::loading("batch lane exceeds u32"))?;
             let selected = logits.narrow(0, lane, 1)?.sample_masked(
                 &sampling_tensor(input.sampling)?,
-                &allow_tensor(&input.allow)?,
+                &allow_tensor(input.allow.as_slice())?,
                 input.start_pos,
             )?;
             selected.copy_into(&mut output.narrow(0, lane, 1)?)?;

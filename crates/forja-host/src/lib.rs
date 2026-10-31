@@ -3,6 +3,8 @@
 #![allow(clippy::manual_async_fn)]
 
 mod prompt;
+pub use forja_sampling::{PackedMask, TokenIds};
+
 pub use prompt::PromptChunking;
 
 mod capture_alloc;
@@ -392,7 +394,7 @@ pub struct EngineBatchSelectLane {
     /// Token sampling parameters.
     pub sampling: SamplingParams,
     /// Token ids permitted by the lane's grammar.
-    pub allow: Vec<u32>,
+    pub allow: TokenIds,
 }
 
 /// One homogeneous masked-selection batch.
@@ -1025,8 +1027,12 @@ pub fn validate_batch_select_lanes(
     }
     for lane in input.lanes.iter().flatten() {
         if lane.start_pos >= serving.max_context
-            || lane.allow.is_empty()
-            || lane.allow.windows(2).any(|pair| pair[0] >= pair[1])
+            || lane.allow.as_slice().is_empty()
+            || lane
+                .allow
+                .as_slice()
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err(compute::Error::Layout(
                 "masked lane position or allow list is invalid".to_owned(),
@@ -1105,7 +1111,7 @@ impl From<EngineBatchSelect> for engine_bindings::exports::l9o::gpu::engine::Bat
                             top_p: lane.sampling.top_p,
                             seed: lane.sampling.seed,
                         },
-                        allow: lane.allow,
+                        allow: lane.allow.into_vec(),
                     })
                 })
                 .collect(),
@@ -2371,13 +2377,13 @@ where
         logits: &EngineTensor,
         start_pos: u32,
         sampling: SamplingParams,
-        allow: &[u32],
+        allow: PackedMask<'_>,
     ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
         let logits = EngineTensor {
             handle: logits.handle,
             runner_id: logits.runner_id,
         };
-        let allow = allow.to_vec();
+        let allow = allow.words().to_vec();
         self.with_profile(move |runner| {
             Box::pin(runner.finish_decode_inner(logits, start_pos, sampling, allow))
         })
@@ -12772,7 +12778,7 @@ mod tests {
             lanes: vec![Some(EngineBatchSelectLane {
                 start_pos: 7,
                 sampling: SamplingParams::default(),
-                allow,
+                allow: crate::TokenIds::new(allow),
             })],
         };
         assert!(validate_batch_select_lanes(&serving, &input(vec![1, 3])).is_ok());
@@ -12834,7 +12840,7 @@ mod tests {
                         Some(EngineBatchSelectLane {
                             start_pos: 0,
                             sampling: SamplingParams::default(),
-                            allow: vec![1],
+                            allow: crate::TokenIds::new(vec![1]),
                         }),
                         None,
                     ],
@@ -14494,7 +14500,12 @@ mod tests {
         for allow in [&[][..], &[16][..]] {
             assert!(
                 runner
-                    .finish_decode(&supplied, 0, SamplingParams::default(), allow)
+                    .finish_decode(
+                        &supplied,
+                        0,
+                        SamplingParams::default(),
+                        crate::PackedMask::new(allow)
+                    )
                     .await
                     .unwrap()
                     .is_err()
@@ -14505,7 +14516,12 @@ mod tests {
             );
         }
         let selected = runner
-            .finish_decode(&supplied, 0, SamplingParams::default(), &[6])
+            .finish_decode(
+                &supplied,
+                0,
+                SamplingParams::default(),
+                crate::PackedMask::new(&[6]),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -14614,7 +14630,7 @@ mod tests {
             lanes[lane] = Some(EngineBatchSelectLane {
                 start_pos: 0,
                 sampling: SamplingParams::default(),
-                allow: vec![1, 2],
+                allow: crate::TokenIds::new(vec![1, 2]),
             });
             let output = runner
                 .batch_select(

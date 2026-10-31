@@ -12,6 +12,7 @@ name = "host"
 path = "tests/host/main.rs"
 
 [dependencies]
+forja-sampling = { path = "../forja-sampling" }
 forja-core = { path = "../forja-core" }
 forja-program-conversions = { path = "../forja-program-conversions" }
 serde.workspace = true

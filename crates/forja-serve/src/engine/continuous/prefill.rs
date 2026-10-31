@@ -447,7 +447,7 @@ where
                     .and_then(|position| position.checked_sub(1))
                     .ok_or_else(|| GenerationError::new("prompt selection position overflowed"))?,
                 sampling: prefill.sampling,
-                allow,
+                allow: forja_host::TokenIds::new(allow),
             });
         self.runner
             .batch_select(&output.logits, EngineBatchSelect { shape, lanes })

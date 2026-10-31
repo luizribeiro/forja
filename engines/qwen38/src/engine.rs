@@ -247,7 +247,7 @@ impl Engine for Qwen38 {
         _logits: &forja_sdk::Tensor<f32>,
         start_pos: u32,
         _sampling: forja_sdk::SamplingParams,
-        _allow: &[u32],
+        _allow: forja_sdk::PackedMask<'_>,
     ) -> Result<DecodeOutput> {
         let shape = forja_sdk::BatchShape {
             phase: forja_sdk::BatchPhase::Decode,

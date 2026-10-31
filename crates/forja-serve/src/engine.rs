@@ -1953,7 +1953,12 @@ where
     B: Backend + Send + Sync + 'static,
 {
     runner
-        .finish_decode(logits, start_pos, sampling, allow)
+        .finish_decode(
+            logits,
+            start_pos,
+            sampling,
+            forja_host::PackedMask::new(allow),
+        )
         .await
         .map_err(|error| {
             GenerationError::unavailable(format!("constrained selection failed: {error}"))

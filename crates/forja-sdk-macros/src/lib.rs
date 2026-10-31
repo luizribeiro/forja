@@ -295,7 +295,7 @@ fn engine_batch_exports() -> proc_macro2::TokenStream {
                 ::forja_sdk::BatchSelectLane {
                     start_pos: lane.start_pos,
                     sampling: sampling(lane.sampling),
-                    allow: lane.allow,
+                    allow: ::forja_sdk::TokenIds::new(lane.allow),
                 }
             })).collect();
             let output = with_engine(|engine| {
@@ -441,7 +441,7 @@ fn engine_decode_phases() -> proc_macro2::TokenStream {
                         top_p: sampling.top_p,
                         seed: sampling.seed,
                     },
-                    &allow,
+                    ::forja_sdk::PackedMask::new(&allow),
                 )
             })?;
             ::forja_sdk::eval().map_err(wit_error)?;

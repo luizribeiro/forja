@@ -195,7 +195,7 @@ impl Engine for ConstantEngine {
         _logits: &Tensor<f32>,
         start_pos: u32,
         _sampling: forja_sdk::SamplingParams,
-        _allow: &[u32],
+        _allow: forja_sdk::PackedMask<'_>,
     ) -> Result<DecodeOutput> {
         let slot = self
             .paged

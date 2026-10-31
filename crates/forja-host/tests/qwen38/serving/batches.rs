@@ -179,7 +179,12 @@ async fn selected_reference(initial: u32, selected: u32) -> Result<Row, Box<dyn 
     let mut mask = [0; 2];
     mask[usize::try_from(selected / 32)?] = 1 << (selected % 32);
     runner
-        .finish_decode(&logits, 0, SamplingParams::default(), &mask)
+        .finish_decode(
+            &logits,
+            0,
+            SamplingParams::default(),
+            forja_host::PackedMask::new(&mask),
+        )
         .await??;
     let output = runner
         .decode(EngineDecode {
@@ -221,7 +226,7 @@ async fn partial_selection_case(bucket: u32, replay: bool) -> Result<(), Box<dyn
         lanes[lane] = Some(forja_host::EngineBatchSelectLane {
             start_pos: 0,
             sampling: SamplingParams::default(),
-            allow: vec![selected],
+            allow: forja_host::TokenIds::new(vec![selected]),
         });
         let output = runner
             .batch_select(

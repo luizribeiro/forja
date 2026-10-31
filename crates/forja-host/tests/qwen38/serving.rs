@@ -128,13 +128,23 @@ async fn constrained_selection_case(replay: bool) -> Result<(), Box<dyn Error>> 
     assert!(runner.checkpoint_state_lane(0).is_err());
     assert!(
         runner
-            .finish_decode(&logits, 3, SamplingParams::default(), &[0, 2])
+            .finish_decode(
+                &logits,
+                3,
+                SamplingParams::default(),
+                forja_host::PackedMask::new(&[0, 2])
+            )
             .await?
             .is_err()
     );
     assert!(runner.checkpoint_state_lane(0).is_err());
     let selected = runner
-        .finish_decode(&logits, 3, SamplingParams::default(), &[0, 1])
+        .finish_decode(
+            &logits,
+            3,
+            SamplingParams::default(),
+            forja_host::PackedMask::new(&[0, 1]),
+        )
         .await??;
     assert_eq!(runner.read(&selected.token).await?, 32_u32.to_le_bytes());
     let position = runner

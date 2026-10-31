@@ -121,6 +121,8 @@ mod tensor;
 
 use std::{error, fmt};
 
+pub use forja_sampling::{PackedMask, TokenIds};
+
 pub use element::{Element, FloatElement};
 pub use engine::{
     BatchInput, BatchLane, BatchOutput, BatchPhase, BatchSelectInput, BatchSelectLane,

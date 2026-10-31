@@ -105,10 +105,15 @@ name = "forja-program-conversions"
 version = "0.0.0"
 
 [[package]]
+name = "forja-sampling"
+version = "0.0.0"
+
+[[package]]
 name = "forja-sdk"
 version = "0.0.0"
 dependencies = [
  "forja-program-conversions",
+ "forja-sampling",
  "forja-sdk-macros",
  "half",
  "wit-bindgen",

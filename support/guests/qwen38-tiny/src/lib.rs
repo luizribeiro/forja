@@ -193,7 +193,7 @@ impl Engine for Tiny {
         logits: &forja_sdk::Tensor<f32>,
         start_pos: u32,
         sampling: forja_sdk::SamplingParams,
-        allow: &[u32],
+        allow: forja_sdk::PackedMask<'_>,
     ) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.finish_decode(logits, start_pos, sampling, allow),

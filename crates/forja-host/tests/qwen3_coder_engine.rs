@@ -394,7 +394,7 @@ async fn assert_batch_graph_modes() -> Result<(), Box<dyn Error>> {
                         Some(EngineBatchSelectLane {
                             start_pos,
                             sampling,
-                            allow: vec![token],
+                            allow: forja_host::TokenIds::new(vec![token]),
                         })
                     })
                     .into(),
@@ -449,7 +449,7 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
             lanes[0] = Some(EngineBatchSelectLane {
                 start_pos: position,
                 sampling: SamplingParams::default(),
-                allow: vec![allowed],
+                allow: forja_host::TokenIds::new(vec![allowed]),
             });
             let selected = runner
                 .batch_select(
@@ -534,7 +534,12 @@ async fn populate_single_replay_catalog(
         .await??;
     let allow = vec![u32::MAX; usize::try_from(qwen3_coder::VOCAB / 32)?];
     let output = runner
-        .finish_decode(&logits, position, SamplingParams::default(), &allow)
+        .finish_decode(
+            &logits,
+            position,
+            SamplingParams::default(),
+            forja_host::PackedMask::new(&allow),
+        )
         .await??;
     runner.read_queued_token(output).await?;
     assert_eq!(runner.metrics().live_graphs, 2 + 2);
@@ -957,7 +962,12 @@ async fn profile_masked_sample(
     let gap_started = Instant::now();
     let gap = gap_started.elapsed();
     let output = runner
-        .finish_decode(&logits, position, SamplingParams::default(), &allow)
+        .finish_decode(
+            &logits,
+            position,
+            SamplingParams::default(),
+            forja_host::PackedMask::new(&allow),
+        )
         .await??;
     let profile = runner
         .take_profile()
@@ -1055,7 +1065,12 @@ async fn constrained_continuation(
             })
             .await??;
         let output = runner
-            .finish_decode(&logits, position, sampling, &allow)
+            .finish_decode(
+                &logits,
+                position,
+                sampling,
+                forja_host::PackedMask::new(&allow),
+            )
             .await??;
         tokens.push(read_token(&runner.read_queued_token(output).await?)?);
     }

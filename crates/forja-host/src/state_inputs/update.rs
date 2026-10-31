@@ -91,7 +91,7 @@ impl<B: Backend + 'static> Host<B> {
                     slot,
                     start: lane.start_pos,
                     sampling: lane.sampling,
-                    allow: AllowedTokens::Ids(&lane.allow),
+                    allow: AllowedTokens::Ids(lane.allow.as_slice()),
                 })
             }),
         )

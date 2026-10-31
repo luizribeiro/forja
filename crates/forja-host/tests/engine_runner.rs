@@ -186,7 +186,7 @@ async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
                     Some(EngineBatchSelectLane {
                         start_pos: 0,
                         sampling: SamplingParams::default(),
-                        allow: vec![2],
+                        allow: forja_host::TokenIds::new(vec![2]),
                     }),
                     None,
                 ],

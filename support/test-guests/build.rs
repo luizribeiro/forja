@@ -186,6 +186,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "cargo::rerun-if-changed={}",
+        repository.join("crates/forja-sampling").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
         repository.join("crates/forja-sdk-macros").display()
     );
     println!(

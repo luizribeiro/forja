@@ -244,13 +244,21 @@ pub struct BatchInput<'a> {
 }
 
 /// One active lane in a masked-selection batch.
+///
+/// ```compile_fail
+/// use forja_sdk::{BatchSelectLane, PackedMask, SamplingParams};
+/// let lane = BatchSelectLane {
+///     start_pos: 0, sampling: SamplingParams::default(),
+///     allow: PackedMask::new(&[1]),
+/// };
+/// ```
 pub struct BatchSelectLane {
     /// Absolute position represented by this selection.
     pub start_pos: u32,
     /// Token sampling parameters.
     pub sampling: SamplingParams,
     /// Sorted token ids permitted by the lane's grammar.
-    pub allow: Vec<u32>,
+    pub allow: crate::TokenIds,
 }
 
 /// Inputs to the masked-selection batch export.
@@ -343,6 +351,13 @@ pub trait Engine: Sized + 'static {
 
     /// Selects a constrained token using packed allow words, one bit per vocabulary id.
     ///
+    /// ```compile_fail
+    /// use forja_sdk::{Engine, SamplingParams, Tensor, TokenIds};
+    /// fn select<E: Engine>(engine: &mut E, logits: &Tensor<f32>) {
+    ///     engine.finish_decode(logits, 0, SamplingParams::default(), TokenIds::new(vec![1]));
+    /// }
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error when the inputs are invalid or constrained selection fails.
@@ -351,7 +366,7 @@ pub trait Engine: Sized + 'static {
         _logits: &Tensor<f32>,
         _start_pos: u32,
         _sampling: SamplingParams,
-        _allow: &[u32],
+        _allow: crate::PackedMask<'_>,
     ) -> Result<DecodeOutput> {
         Err(crate::Error::loading(
             "engine does not support constrained decode",

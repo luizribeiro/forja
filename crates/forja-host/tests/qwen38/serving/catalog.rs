@@ -111,7 +111,12 @@ async fn prompt_forward_reuses_capture_without_exposing_combined_feedback()
         );
         assert!(runner.checkpoint_state_lane(0).is_err());
         let selected = runner
-            .finish_decode(&logits, 64, SamplingParams::default(), &[1, 0])
+            .finish_decode(
+                &logits,
+                64,
+                SamplingParams::default(),
+                forja_host::PackedMask::new(&[1, 0]),
+            )
             .await??;
         assert_eq!(runner.read(&selected.token).await?, 0_u32.to_le_bytes());
         assert_eq!(

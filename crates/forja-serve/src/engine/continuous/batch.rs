@@ -688,11 +688,13 @@ where
             Some(EngineBatchSelectLane {
                 start_pos: lane.position,
                 sampling: lane.sampling,
-                allow: crate::guidance::allowed_token_ids(
-                    lane.constraint_allow()
-                        .ok_or_else(|| GenerationError::new("constraint mask is missing"))?,
-                )
-                .map_err(GenerationError::new)?,
+                allow: forja_host::TokenIds::new(
+                    crate::guidance::allowed_token_ids(
+                        lane.constraint_allow()
+                            .ok_or_else(|| GenerationError::new("constraint mask is missing"))?,
+                    )
+                    .map_err(GenerationError::new)?,
+                ),
             });
         let output = self
             .runner
