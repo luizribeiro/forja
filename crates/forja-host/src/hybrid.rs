@@ -589,6 +589,8 @@ impl<B: Backend + 'static> Host<B> {
             )?;
         }
         retained.extend(bound.retained);
+        let sources = self.bind_graph_token_sources(&retained, &checked, &mut bound.bindings)?;
+        retained.extend(sources);
         for usage in paged
             .iter_mut()
             .chain(checks.iter_mut().map(|check| &mut check.usage))

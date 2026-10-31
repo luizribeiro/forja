@@ -86,6 +86,65 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 
+    pub(crate) fn bind_graph_token_sources(
+        &mut self,
+        entries: &[crate::TensorEntry],
+        values: &forja_core::ParamValues,
+        bindings: &mut forja_core::ReplayBindings,
+    ) -> Result<Vec<crate::TensorEntry>, compute::Error> {
+        let mut seen = std::collections::HashSet::new();
+        let mut retained = Vec::new();
+        for entry in entries {
+            let Some(source) = entry.slot_token else {
+                continue;
+            };
+            let layout = entry.symbolic.as_ref().map_or_else(
+                || Ok(entry.tensor.layout().clone()),
+                |layout| {
+                    layout
+                        .instantiate(values)
+                        .map_err(|error| crate::graph_error(&error))
+                },
+            )?;
+            if !seen.insert((
+                entry.tensor.buffer(),
+                layout.offset(),
+                layout.shape().to_vec(),
+                layout.strides().to_vec(),
+            )) {
+                continue;
+            }
+            let old = self
+                .backend
+                .tensor(entry.tensor.buffer(), layout.clone())
+                .map_err(crate::guest_error)?
+                .read_only();
+            let loan = self.state_input_token(source.slot, source.lane)?;
+            let fresh = self.entry(&loan).cloned();
+            self.drop_tensor(loan)?;
+            let mut fresh = fresh?;
+            let layout = forja_core::Layout::new(
+                layout.dtype(),
+                fresh.tensor.layout().offset(),
+                layout.shape().to_vec(),
+                layout.strides().to_vec(),
+                fresh.tensor.buffer().byte_len(),
+            )
+            .map_err(crate::guest_error)?;
+            fresh.tensor = self
+                .backend
+                .tensor(fresh.tensor.buffer(), layout)
+                .map_err(crate::guest_error)?
+                .read_only();
+            fresh.symbolic = None;
+            bindings
+                .view(old, fresh.tensor.clone())
+                .map_err(crate::guest_error)?;
+            retained.push(fresh);
+        }
+        Ok(retained)
+    }
+
     pub(crate) fn state_input_token(
         &mut self,
         slot: u32,

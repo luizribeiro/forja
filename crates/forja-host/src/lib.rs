@@ -10834,6 +10834,110 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn symbolic_token_replay_uses_retained_feedback_after_bank_rotation() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Combined));
+        let selected = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+        host.write(&selected, &5_u32.to_ne_bytes()).unwrap();
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.record_slot_feedback(&commands, &slot, 0, &selected)
+            .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        host.advance_paged_batch_bank(slot.rep()).unwrap();
+        host.select_paged_batch_bank(slot.rep()).unwrap();
+        host.begin_paged_lane_update(pool.rep(), 0, 1, 1, Some(StateAction::Forward))
+            .unwrap();
+        host.write_state_single_inputs(
+            pool.rep(),
+            BatchPhase::Decode,
+            None,
+            SamplingParams::default(),
+        )
+        .unwrap();
+        let token = host
+            .state_input_token_in_bank(slot.rep(), 0, Some(0))
+            .unwrap();
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let symbolic = host
+            .view_param(
+                &token,
+                &params,
+                vec![compute::ParamSlice {
+                    start: wit_affine(Some(0), 0, 0),
+                    len: wit_affine(None, 0, 1),
+                    step: 1,
+                }],
+            )
+            .unwrap();
+        let row = host
+            .view(&symbolic, compute::ViewOp::Broadcast(vec![1, 1]))
+            .unwrap();
+        let result = host.alloc(compute::Dtype::U32, &[1, 1]).unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(row.rep())],
+            &result,
+        )
+        .unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+        host.prepare_state_replay_with_flight(&graph, vec![7], flight)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.prepare_read(&result).unwrap().run().await.unwrap(),
+            5_u32.to_ne_bytes()
+        );
+        assert_eq!(
+            host.prepare_read(&output).unwrap().run().await.unwrap(),
+            4_f32.to_ne_bytes().repeat(7)
+        );
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 2);
+        assert!(
+            host.state_slots[&slot.rep()]
+                .sequence_handle(0)
+                .unwrap()
+                .unwrap()
+                .checkpoint_latest()
+                .is_err()
+        );
+    }
+
     #[test]
     fn token_source_views_remain_read_only_and_require_capture_context() {
         let (mut host, _pool, slot) = convolution_slot_host();
