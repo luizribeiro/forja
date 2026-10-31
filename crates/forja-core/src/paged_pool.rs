@@ -275,6 +275,12 @@ impl PagePool {
             .map_err(|_| PagePoolError::CorruptState)
     }
 
+    /// Whether this sequence refers to this pool's physical page namespace.
+    #[must_use]
+    pub fn owns_sequence(&self, sequence: &PagedSequence) -> bool {
+        self.same_pool(&sequence.pool)
+    }
+
     fn same_pool(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -1676,6 +1682,14 @@ mod tests {
             sequence.validate_append(&window, 5, 2),
             Err(PagePoolError::SharedTail)
         );
+    }
+
+    #[test]
+    fn ownership_distinguishes_identically_shaped_page_pools() {
+        let primary = pool(4_096);
+        let sequence = primary.reserve(7).unwrap();
+        assert!(primary.clone().owns_sequence(&sequence));
+        assert!(!pool(4_096).owns_sequence(&sequence));
     }
 
     #[test]
