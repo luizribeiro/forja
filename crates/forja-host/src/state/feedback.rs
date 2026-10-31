@@ -47,6 +47,7 @@ impl FeedbackBinding {
 }
 
 pub(super) struct FeedbackUse {
+    pub(super) combined: bool,
     pub(super) explicit: AtomicBool,
     pub(super) source: Option<FeedbackPin>,
     pub(super) destination: FeedbackPin,

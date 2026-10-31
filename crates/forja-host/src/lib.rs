@@ -5,6 +5,7 @@
 mod prompt;
 pub use prompt::PromptChunking;
 
+mod feedback;
 #[cfg(test)]
 mod fuzz_tests;
 mod hybrid;
@@ -3702,6 +3703,7 @@ pub struct CommandListEntry {
     retained_epilogues: Vec<EpilogueEntry>,
     state_uses: Vec<hybrid::StateUse>,
     state_planes: Vec<(hybrid::StateUse, usize)>,
+    feedback_writes: Vec<feedback::FeedbackWrite>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
 }
@@ -5951,6 +5953,7 @@ impl<B: Backend + 'static> Host<B> {
                 paged_bounds: Vec::new(),
                 state_uses: Vec::new(),
                 state_planes: Vec::new(),
+                feedback_writes: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -6400,6 +6403,12 @@ impl<B: Backend + 'static> Host<B> {
     {
         let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
+        if !entry.feedback_writes.is_empty() {
+            self.release_retained(entry.retained)?;
+            return Err(invalid_handle(
+                "feedback capture requires replay role bindings",
+            ));
+        }
         let mut captured_state = match self
             .validate_state_planes(&entry.state_uses, &entry.state_planes)
             .and_then(|()| self.capture_graph_state(&entry.state_uses))
@@ -6520,13 +6529,14 @@ impl<B: Backend + 'static> Host<B> {
             self.release_retained(entry.retained)?;
             return Err(error);
         }
-        let (state_batch, state_owners) = match self.prepare_state_work(&entry.state_uses) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.release_retained(entry.retained)?;
-                return Err(error);
-            }
-        };
+        let (state_batch, state_owners) =
+            match self.prepare_state_work(&entry.state_uses, &entry.feedback_writes) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.release_retained(entry.retained)?;
+                    return Err(error);
+                }
+            };
         let mut request = self.submission_request(
             SubmissionWork::Commands(entry.commands),
             entry.access,
@@ -9847,6 +9857,13 @@ mod tests {
     }
 
     fn state_slot_fixture<B: Backend + 'static>(backend: B) -> StateSlotFixture<B> {
+        state_slot_fixture_action(backend, None)
+    }
+
+    fn state_slot_fixture_action<B: Backend + 'static>(
+        backend: B,
+        action: Option<StateAction>,
+    ) -> StateSlotFixture<B> {
         let mut host = Host::new(backend, GENEROUS);
         let pool = insert_test_pool(&mut host, 2, 8);
         let slot = host
@@ -9864,7 +9881,8 @@ mod tests {
             )
             .unwrap();
         host.bind_paged_request(pool.rep(), None, 8).unwrap();
-        host.begin_paged_lane_append(pool.rep(), 0, 0, 1).unwrap();
+        host.begin_paged_lane_update(pool.rep(), 0, 0, 1, action)
+            .unwrap();
         let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
         let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
@@ -9877,6 +9895,66 @@ mod tests {
             slot,
             operands: [input, weights],
             output,
+        }
+    }
+
+    #[tokio::test]
+    async fn feedback_writes_refuse_stale_reservations_before_executing() {
+        for scenario in 0..3 {
+            let StateSlotFixture {
+                mut host,
+                slot,
+                operands,
+                output,
+                ..
+            } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Combined));
+            let commands = host.command_list().unwrap();
+            let token = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+            host.write(&token, &17_u32.to_ne_bytes()).unwrap();
+            host.record_slot_state(
+                &commands,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
+            .unwrap();
+            if scenario == 2 {
+                assert!(host.prepare_submit(commands).is_err());
+                continue;
+            }
+            host.record_slot_feedback(&commands, &slot, 0, &token)
+                .unwrap();
+            assert!(
+                host.record_slot_feedback(&commands, &slot, 0, &token)
+                    .is_err()
+            );
+            let feedback = host
+                .table
+                .get(&commands)
+                .unwrap()
+                .commands
+                .dispatches()
+                .last()
+                .unwrap()
+                .outputs()[0]
+                .clone();
+            if scenario == 1 {
+                host.state_slots
+                    .get_mut(&slot.rep())
+                    .unwrap()
+                    .cancel_unsubmitted_bank(0)
+                    .unwrap();
+                assert!(host.prepare_submit(commands).is_err());
+                assert_eq!(host.backend.read(&feedback).unwrap(), 0_u32.to_ne_bytes());
+            } else {
+                host.prepare_submit(commands).unwrap().run().await.unwrap();
+                assert_eq!(host.backend.read(&feedback).unwrap(), 17_u32.to_ne_bytes());
+                assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
+            }
         }
     }
 

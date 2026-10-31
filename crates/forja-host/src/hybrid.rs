@@ -224,6 +224,7 @@ impl<B: Backend + 'static> Host<B> {
     pub(crate) fn prepare_state_work(
         &mut self,
         usages: &[StateUse],
+        feedback: &[crate::feedback::FeedbackWrite],
     ) -> Result<
         (
             Option<crate::StateBatch<B>>,
@@ -231,6 +232,7 @@ impl<B: Backend + 'static> Host<B> {
         ),
         compute::Error,
     > {
+        self.validate_feedback_writes(usages, feedback)?;
         let Some(first) = usages.first() else {
             return Ok((None, Vec::new()));
         };
@@ -586,7 +588,7 @@ impl<B: Backend + 'static> Host<B> {
             }
         }
         crate::PagedCheck::validate_all(&checks, Some(&checked))?;
-        let (batch, mut owners) = self.prepare_state_work(&bound.usages)?;
+        let (batch, mut owners) = self.prepare_state_work(&bound.usages, &[])?;
         owners.extend(
             captures
                 .iter()

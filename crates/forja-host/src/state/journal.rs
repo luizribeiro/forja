@@ -363,12 +363,12 @@ impl StateJournal {
         let Some(feedback) = &self.feedback else {
             return Ok(None);
         };
-        let input = &self
+        let pending = self
             .pending
             .iter()
             .find(|entry| entry.serial == transaction.serial())
-            .ok_or(PagePoolError::InvalidCheckpoint)?
-            .predecessor;
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        let input = &pending.predecessor;
         let source = if input.phase == SelectionPhase::Ready {
             Some(
                 input
@@ -383,6 +383,7 @@ impl StateJournal {
             None
         };
         Ok(Some(super::feedback::FeedbackUse {
+            combined: pending.phase == SelectionPhase::Ready,
             explicit: std::sync::atomic::AtomicBool::new(true),
             source,
             destination: feedback.destination(destination)?,

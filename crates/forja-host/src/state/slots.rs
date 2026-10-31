@@ -253,6 +253,30 @@ impl<B: Backend> StateSlots<B> {
             .map(Option::flatten)
     }
 
+    pub(crate) fn feedback_output(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<Option<(forja_core::StateTransaction, u32)>, compute::Error> {
+        let record = self
+            .banks
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid_handle("feedback lane is not admitted"))?;
+        let feedback = record
+            .feedback
+            .as_ref()
+            .ok_or_else(|| invalid_handle("state feedback is missing"))?;
+        if !feedback.combined {
+            return Ok(None);
+        }
+        Ok(Some((
+            record.transaction.clone(),
+            feedback.destination.index(),
+        )))
+    }
+
     /// Borrows an admitted transaction for authenticated plane recording or replay binding.
     ///
     /// # Errors
