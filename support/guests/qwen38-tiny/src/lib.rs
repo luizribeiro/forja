@@ -21,19 +21,16 @@ impl Engine for Tiny {
     fn describe() -> EngineInfo {
         EngineInfo {
             vocab: 33,
-            max_context: 64,
+            max_context: 2048,
             tap_layers: (1..=4).collect(),
             router_layers: Vec::new(),
             prompt_block_tokens: std::num::NonZeroU32::new(64),
             serving: Some(forja_sdk::ServingInfo {
                 page_tokens: 64,
                 active_lanes: 8,
-                max_context: 64,
+                max_context: 2048,
                 prefill_chunk_multiple: None,
-                batch_shapes: qwen38::Qwen38::serving_shapes()
-                    .into_iter()
-                    .filter(|shape| shape.tokens <= 64)
-                    .collect(),
+                batch_shapes: qwen38::Qwen38::serving_shapes(),
                 planes: ["key", "value"]
                     .into_iter()
                     .map(|label| forja_sdk::CachePlane {

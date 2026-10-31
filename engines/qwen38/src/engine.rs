@@ -17,7 +17,7 @@ enum Feedback {
 
 #[cfg(target_family = "wasm")]
 impl Feedback {
-    fn catalog(&self) -> Result<&paged::Catalog> {
+    fn catalog(&mut self) -> Result<&mut paged::Catalog> {
         match self {
             Self::Paged { catalog } => Ok(catalog),
             Self::Eager(_) => Err(Error::loading("batch decode requires a serving pool")),
@@ -126,7 +126,28 @@ impl Engine for Qwen38 {
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         match &mut self.feedback {
             Feedback::Eager(feedback) => feedback.invalidate(),
-            Feedback::Paged { .. } => {
+            Feedback::Paged {
+                #[cfg(target_family = "wasm")]
+                catalog,
+            } => {
+                #[cfg(target_family = "wasm")]
+                if !input.taps {
+                    let rows = paged::row_count(Some(&input.tokens))?;
+                    let shape = forja_sdk::BatchShape {
+                        phase: input.phase,
+                        bucket: 1,
+                        tokens: rows,
+                        selection: forja_sdk::BatchSelection::Forward,
+                    };
+                    if catalog.run(&mut self.model, shape, &[input.start_pos])? {
+                        let logits = paged::batch_output(&self.model, 0, 1)?.logits;
+                        return Ok(StepOutput {
+                            logits: logits.reshape(&[logits.shape()[1]])?,
+                            taps: Vec::new(),
+                            router_logits: Vec::new(),
+                        });
+                    }
+                }
                 let output = self.model.forward_paged(
                     &input.tokens,
                     &forja_sdk::Dim::from(input.start_pos),
@@ -187,7 +208,11 @@ impl Engine for Qwen38 {
             tokens: rows,
             selection: forja_sdk::BatchSelection::Forward,
         };
-        if !self.feedback.catalog()?.replay(shape, &[input.start_pos])? {
+        if !self
+            .feedback
+            .catalog()?
+            .run(&mut self.model, shape, &[input.start_pos])?
+        {
             drop(paged::forward(
                 &mut self.model,
                 rows,
@@ -255,7 +280,7 @@ impl Engine for Qwen38 {
                         tokens: rows,
                         selection: forja_sdk::BatchSelection::Combined,
                     };
-                    if !catalog.replay(shape, &[input.start_pos])? {
+                    if !catalog.run(&mut self.model, shape, &[input.start_pos])? {
                         drop(paged::forward(
                             &mut self.model,
                             rows,

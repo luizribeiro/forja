@@ -6,6 +6,14 @@ pub(super) async fn runner<B: forja_core::Backend + Send + Sync + 'static>(
     backend: B,
     replay: bool,
 ) -> Result<EngineRunner<B>, Box<dyn Error>> {
+    runner_with_context(backend, replay, 64).await
+}
+
+pub(super) async fn runner_with_context<B: forja_core::Backend + Send + Sync + 'static>(
+    backend: B,
+    replay: bool,
+    context: u32,
+) -> Result<EngineRunner<B>, Box<dyn Error>> {
     let mut runner = EngineRunner::new(
         test_guests::qwen38_tiny(),
         backend,
@@ -17,7 +25,7 @@ pub(super) async fn runner<B: forja_core::Backend + Send + Sync + 'static>(
         .load_with_selections(
             None,
             &forja_host::EngineLoadConfig {
-                max_context: Some(64),
+                max_context: Some(context),
                 replay,
                 paged_cache: true,
                 kv_cache: forja_host::KvCacheFormat::F16,
@@ -184,3 +192,6 @@ async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
     }
     Ok(())
 }
+
+#[path = "serving/catalog.rs"]
+mod catalog;

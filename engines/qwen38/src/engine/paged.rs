@@ -23,10 +23,11 @@ pub(super) fn forward(
     phase: BatchPhase,
 ) -> Result<Tensor<f32>> {
     let (set, inputs) = inputs(model)?;
+    let anchor = start.clone().checked_mul(0)?;
     let tokens = if phase == BatchPhase::Prompt {
-        inputs.prompt.narrow(0, 0, rows)?
+        inputs.prompt.narrow(0, anchor, rows)?
     } else {
-        set.slot().token(lane)?
+        set.slot().token(lane)?.narrow(0, anchor, 1)?
     };
     let output = model.forward_paged(&tokens, start, lane, phase, false)?;
     let mut logits = inputs.logits.narrow(0, lane, 1)?;
