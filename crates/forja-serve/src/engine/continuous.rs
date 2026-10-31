@@ -446,6 +446,7 @@ where
             if let Err(error) = self.stop_canonical_recompute() {
                 tracing::warn!(%error, "cannot release background canonical state");
             }
+            self.refresh_shared_metrics(&shared_metrics);
             if matches!(pending.front(), Some(RequestEnvelope::UpdatePolicy { .. })) {
                 let Some(RequestEnvelope::UpdatePolicy {
                     generation,
