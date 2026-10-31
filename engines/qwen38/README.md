@@ -6,8 +6,10 @@ The Metal profile targets Apple M3 Ultra and limits context to 32,768 tokens.
 Prompt processing uses canonical 64-token WY blocks and a final partial block;
 decode advances recurrent state one token at a time. Single-lane SDK calls declare
 `BatchPhase::Prompt` or `BatchPhase::Decode` explicitly. Prompt submissions start
-on a 64-token boundary. Each new request clears its recurrent carry; graph replay
-and cross-request cache reuse are disabled.
+on a 64-token boundary. Serving supports decode buckets 1/2/4/8 with private
+recurrent state and token feedback per lane. Replay retains nine decode graphs,
+three prompt shapes (64/512/2,048) and one replaceable tail; bucket 8 runs eagerly.
+Each new request clears its recurrent carry. Cross-request prefix reuse is disabled.
 
 ## Use
 
@@ -39,13 +41,13 @@ The full WebAssembly component passes the reduced-precision end-to-end criteria:
 | Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
 | --- | ---: | ---: | ---: | ---: |
 | Hello | 1 | 31/32 | 0.0006813 | 0.01493 |
-| What is 2 + 2? | 8 | 32/32 | 0.0001912 | 0.01415 |
-| The capital of France is | 5 | 32/32 | 0.0001259 | 0.01498 |
+| What is 2 + 2? | 8 | 32/32 | 0.0002475 | 0.01565 |
+| The capital of France is | 5 | 32/32 | 0.0001251 | 0.01484 |
 
 Operator differentials use normwise relative error at most `1e-5` for F32 and
 `1e-2` for BF16/quantized tensors; full-model
-checks require mean KL at most `1e-2`, top-1 agreement at least 95%, and per-layer
-error at most `5e-2`. These are correctness results. No performance is claimed.
+checks require mean KL at most `1e-2`, top-1 agreement at least 95% for each prompt,
+and per-layer error at most `5e-2`. These are correctness results. No performance is claimed.
 
 Regenerate the fixtures with the pinned CPU reference environment:
 
