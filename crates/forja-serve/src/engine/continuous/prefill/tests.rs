@@ -256,3 +256,30 @@ async fn cancelled_publication_leaves_the_paired_cache_empty() -> Result<(), Tes
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn serial_prefill_uses_the_same_canonical_tail_as_continuous_serving() -> Result<(), TestError>
+{
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let input = request();
+    let cold = engine
+        .prefill(
+            input.tokens.clone(),
+            65,
+            input.params.clone(),
+            None,
+            &input.control,
+        )
+        .await?;
+    let expected = engine.runner.read_queued_token(cold.first).await?;
+    let expected_state = engine.runner.state_lane_fingerprint(0)?.1;
+    let hit = engine
+        .prefill(input.tokens, 65, input.params, None, &input.control)
+        .await?;
+    assert_eq!(hit.cached_tokens, 64);
+    assert_eq!(engine.runner.read_queued_token(hit.first).await?, expected);
+    assert_eq!(engine.runner.state_lane_fingerprint(0)?.1, expected_state);
+    Ok(())
+}

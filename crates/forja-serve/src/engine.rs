@@ -1186,6 +1186,33 @@ where
         let reserved_tokens = u64::from(prompt_tokens)
             .checked_add(u64::from(max_tokens))
             .ok_or_else(|| GenerationError::new("paged reservation overflowed"))?;
+        if let Some((prompt, hit)) =
+            self.canonical_admission(tokens, self.config.serving.prefix_reuse)?
+        {
+            self.runner
+                .prepare_paged_lane(0, None, 0)
+                .map_err(|error| GenerationError::unavailable(error.to_string()))?;
+            loop {
+                match self.runner.prepare_canonical_lane(
+                    0,
+                    prompt.clone(),
+                    hit.as_ref(),
+                    reserved_tokens,
+                ) {
+                    Ok(count) => {
+                        return Ok((
+                            usize::try_from(count).map_err(|_| {
+                                GenerationError::new("cached prefix length overflowed")
+                            })?,
+                            true,
+                        ));
+                    }
+                    Err(forja_host::bindings::l9o::gpu::compute::Error::Quota(_))
+                        if self.evict_canonical_prefix()? => {}
+                    Err(error) => return Err(GenerationError::unavailable(error.to_string())),
+                }
+            }
+        }
         let hit = if self.config.serving.prefix_reuse {
             self.prefix_index
                 .as_mut()
@@ -1246,26 +1273,8 @@ where
             .map_err(|_| GenerationError::new("cached prefix length overflowed"))?;
         let prefill_started = Instant::now();
         let first = self
-            .runner
-            .enqueue_decode(EngineDecode {
-                phase: forja_host::BatchPhase::Prompt,
-                tokens: Some(tokens[cached_len..].to_vec()),
-                start_pos,
-                sampling,
-            })
-            .await
-            .map_err(|error| {
-                GenerationError::unavailable(format!("engine prefill failed: {error}"))
-            })
-            .and_then(|result| {
-                result.map_err(|error| {
-                    GenerationError::unavailable(format!("engine prefill failed: {error:?}"))
-                })
-            });
-        let first = match first {
-            Ok(first) => first,
-            Err(error) => return Err(error),
-        };
+            .prefill_pieces(&tokens, start_pos, sampling, control)
+            .await?;
         observe(
             &mut self.metrics.suffix_prefill_time,
             prefill_started.elapsed(),

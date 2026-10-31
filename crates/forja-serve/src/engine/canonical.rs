@@ -180,6 +180,61 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 .map_err(cache_error)
         })
     }
+    pub(super) async fn prefill_pieces(
+        &mut self,
+        tokens: &[u32],
+        mut position: u32,
+        sampling: forja_host::SamplingParams,
+        control: &GenerationControl,
+    ) -> Result<forja_host::EngineDecodeOutput, GenerationError> {
+        let length = u32::try_from(tokens.len())
+            .map_err(|_| GenerationError::new("prompt length overflow"))?;
+        loop {
+            if control.is_cancelled() {
+                return Err(GenerationError::cancelled());
+            }
+            let proposed = length
+                .checked_sub(position)
+                .ok_or_else(|| GenerationError::new("prompt position exceeds ledger"))?;
+            let proposed = if self.canonical_cache.is_some() {
+                proposed.min(self.scheduler.profile_prefill_chunk)
+            } else {
+                proposed
+            };
+            let count = self.canonical_piece(position, length, proposed)?;
+            let end = position
+                .checked_add(count)
+                .ok_or_else(|| GenerationError::new("prompt extent overflow"))?;
+            let start = usize::try_from(position)
+                .map_err(|_| GenerationError::new("prompt position exceeds usize"))?;
+            let output =
+                self.runner
+                    .enqueue_decode(forja_host::EngineDecode {
+                        phase: forja_host::BatchPhase::Prompt,
+                        tokens: Some(
+                            tokens[start..usize::try_from(end).map_err(|_| {
+                                GenerationError::new("prompt extent exceeds usize")
+                            })?]
+                                .to_vec(),
+                        ),
+                        start_pos: position,
+                        sampling,
+                    })
+                    .await
+                    .map_err(cache_error)?
+                    .map_err(cache_error)?;
+            if end == length {
+                return Ok(output);
+            }
+            self.runner
+                .read_queued_token(output)
+                .await
+                .map_err(cache_error)?;
+            self.publish_canonical_boundary(0, end, length, true, control)?;
+            position = end;
+        }
+    }
+
     pub(super) fn publish_canonical_boundary(
         &mut self,
         lane: u32,
