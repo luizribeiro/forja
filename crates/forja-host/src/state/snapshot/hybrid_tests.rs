@@ -320,3 +320,40 @@ fn an_oversized_snapshot_or_accounting_quota_never_evicts_existing_entries() {
     drop(blocker);
     assert_eq!(cache.usage().unwrap(), before);
 }
+
+#[test]
+fn lookup_never_shortens_a_later_image_or_accepts_a_changed_ledger() {
+    let fixture = hybrid_fixture(262_144);
+    let cache = fixture.cache(65_536, 65_536, 8);
+    cache
+        .publish(
+            fixture.advance(128),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    for length in [1, 7, 63, 64, 65, 128] {
+        assert!(
+            cache
+                .lookup(fixture.image.namespace(), &(0..length).collect::<Vec<_>>())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut changed = (0..129).collect::<Vec<_>>();
+    changed[33] ^= 1;
+    assert!(
+        cache
+            .lookup(fixture.image.namespace(), &changed)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .lookup(fixture.image.namespace(), &(0..129).collect::<Vec<_>>())
+            .unwrap()
+            .unwrap()
+            .tokens()
+            .len(),
+        128
+    );
+}
