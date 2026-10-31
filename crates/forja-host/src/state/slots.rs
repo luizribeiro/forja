@@ -143,9 +143,7 @@ impl<B: Backend> StateSlots<B> {
             .get_mut(lane)
             .ok_or_else(|| invalid_handle("state lane is out of range"))?;
         if let Some(sequence) = &lane.sequence {
-            let mut journal = sequence.lock();
-            let checkpoint = journal.checkpoint().map_err(pool_error)?;
-            forja_core::StateSequence::rewind(&mut journal, &checkpoint).map_err(pool_error)?;
+            sequence.lock().ensure_idle().map_err(pool_error)?;
         }
         lane.sequence = None;
         Ok(())

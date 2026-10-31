@@ -170,6 +170,20 @@ impl StateSequence {
         })
     }
 
+    /// Checks that reservations and quarantined execution have all drained.
+    ///
+    /// # Errors
+    /// Refuses pending transactions or physical work that has not completed.
+    pub fn ensure_idle(&self) -> Result<(), PagePoolError> {
+        if !self.pending.is_empty()
+            || self.pool.completed.load(Ordering::Acquire)
+                < self.drain_until.max(self.quarantine_until)
+        {
+            return Err(PagePoolError::BankInFlight);
+        }
+        Ok(())
+    }
+
     /// Restores a retained predecessor after every speculative reader/writer has drained.
     ///
     /// # Errors
@@ -178,12 +192,7 @@ impl StateSequence {
         if !Arc::ptr_eq(&self.identity, &checkpoint.identity) {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if !self.pending.is_empty()
-            || self.pool.completed.load(Ordering::Acquire)
-                < self.drain_until.max(self.quarantine_until)
-        {
-            return Err(PagePoolError::BankInFlight);
-        }
+        self.ensure_idle()?;
         if checkpoint
             .published
             .as_ref()
@@ -202,7 +211,7 @@ mod tests {
     use crate::{DType, StateLayout, StatePlane, StatePool};
 
     #[test]
-    fn cloned_checkpoint_keeps_its_version_pinned_during_reservation() {
+    fn idle_check_requires_reservations_and_quarantined_work_to_drain() {
         let pool = StatePool::new(
             StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
             1,
@@ -210,19 +219,17 @@ mod tests {
         )
         .unwrap();
         let mut sequence = pool.reserve().unwrap();
-        let mut retained = Some(sequence.checkpoint().unwrap());
-        let caller = retained.as_ref().unwrap().clone();
+        sequence.ensure_idle().unwrap();
         let first = sequence.begin(1).unwrap();
-        sequence.mark_submitted(&first).unwrap();
-        pool.observe_completion(1).unwrap();
-        sequence.finish(&first, true).unwrap();
-        let second = sequence
-            .begin_releasing_checkpoint(2, &mut retained)
-            .unwrap();
-        assert_ne!(second.output, caller.version());
-        assert!(retained.is_none());
-        sequence.cancel_unsubmitted(&second).unwrap();
-        sequence.rewind(&caller).unwrap();
+        assert_eq!(sequence.ensure_idle(), Err(PagePoolError::BankInFlight));
+        sequence.cancel_unsubmitted(&first).unwrap();
+        sequence.ensure_idle().unwrap();
+        let second = sequence.begin(2).unwrap();
+        sequence.mark_submitted(&second).unwrap();
+        sequence.abandon(&second).unwrap();
+        assert_eq!(sequence.ensure_idle(), Err(PagePoolError::BankInFlight));
+        pool.observe_completion(2).unwrap();
+        sequence.ensure_idle().unwrap();
     }
 
     #[test]
@@ -259,6 +266,30 @@ mod tests {
         assert!(released.is_none());
         sequence.rewind(retained.as_ref().unwrap()).unwrap();
         assert_eq!(sequence.checkpoint().unwrap().version(), version);
+    }
+
+    #[test]
+    fn cloned_checkpoint_keeps_its_version_pinned_during_reservation() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let mut retained = Some(sequence.checkpoint().unwrap());
+        let caller = retained.as_ref().unwrap().clone();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted(&first).unwrap();
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&first, true).unwrap();
+        let second = sequence
+            .begin_releasing_checkpoint(2, &mut retained)
+            .unwrap();
+        assert_ne!(second.output, caller.version());
+        assert!(retained.is_none());
+        sequence.cancel_unsubmitted(&second).unwrap();
+        sequence.rewind(&caller).unwrap();
     }
 
     #[test]
