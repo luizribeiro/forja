@@ -8,6 +8,51 @@ impl<B: Backend> StateSlots<B> {
     pub fn prefix_layout(&self) -> &forja_core::StateLayout {
         self.storage.pool.layout()
     }
+    pub(crate) fn validate_prompt_input(
+        &self,
+        lane: usize,
+        phase: crate::BatchPhase,
+        start: u32,
+        tokens: Option<&[u32]>,
+    ) -> Result<(), compute::Error> {
+        let owner = self
+            .lanes
+            .get(lane)
+            .ok_or_else(|| invalid_handle("state lane is out of range"))?;
+        let Some(prompt) = &owner.prompt else {
+            return Ok(());
+        };
+        let length = u64::try_from(prompt.tokens().len()).map_err(invalid_handle)?;
+        let start = u64::from(start);
+        if phase == crate::BatchPhase::Decode {
+            return if start >= length {
+                Ok(())
+            } else {
+                Err(invalid_handle(
+                    "decode cannot replace canonical prompt input",
+                ))
+            };
+        }
+        let tokens =
+            tokens.ok_or_else(|| invalid_handle("canonical prompt requires explicit input"))?;
+        let end = start
+            .checked_add(u64::try_from(tokens.len()).map_err(invalid_handle)?)
+            .ok_or_else(|| invalid_handle("canonical input extent overflow"))?;
+        let block = u64::from(prompt.namespace().block().get());
+        let range = usize::try_from(start).map_err(invalid_handle)?
+            ..usize::try_from(end).map_err(invalid_handle)?;
+        if tokens.is_empty()
+            || !start.is_multiple_of(block)
+            || (end < length && !end.is_multiple_of(block))
+            || prompt.tokens().get(range) != Some(tokens)
+        {
+            return Err(invalid_handle(
+                "input differs from the canonical prompt ledger",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_prompt(&self, prompt: &CanonicalPrompt) -> Result<(), compute::Error> {
         if !Arc::ptr_eq(&prompt.charge.live, &self.storage.charge.live)
             || !prompt.namespace().matches_state(self.prefix_layout())
@@ -90,6 +135,34 @@ mod tests {
         assert!(staged.attention().is_none());
         slots.install_prefix(0, staged).unwrap();
         assert!(slots.set_prompt(0, prompt).is_err());
+        assert!(
+            slots
+                .validate_prompt_input(0, crate::BatchPhase::Decode, 0, Some(&[0]))
+                .is_err()
+        );
+        assert!(
+            slots
+                .validate_prompt_input(0, crate::BatchPhase::Prompt, 0, None)
+                .is_err()
+        );
+        assert!(
+            slots
+                .validate_prompt_input(0, crate::BatchPhase::Prompt, 0, Some(&[0; 64]))
+                .is_err()
+        );
+        let tokens = (0..129).collect::<Vec<_>>();
+        assert!(
+            slots
+                .validate_prompt_input(0, crate::BatchPhase::Prompt, 0, Some(&tokens[..63]))
+                .is_err()
+        );
+        slots
+            .validate_prompt_input(0, crate::BatchPhase::Prompt, 0, Some(&tokens[..64]))
+            .unwrap();
+        assert_eq!(slots.position(0).unwrap().tokens, 0);
+        slots
+            .validate_prompt_input(0, crate::BatchPhase::Decode, 129, None)
+            .unwrap();
         let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
         let mut end = 0;
         for rows in [64, 64, 1] {

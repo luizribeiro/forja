@@ -2,6 +2,28 @@ use crate::{Backend, CanonicalPrompt, Host, HybridPrefix, compute, invalid_handl
 use std::sync::Arc;
 
 impl<B: Backend + Send + Sync + 'static> Host<B> {
+    pub(crate) fn validate_canonical_input(
+        &self,
+        pool: u32,
+        lane: u32,
+        phase: crate::BatchPhase,
+        start: u32,
+        tokens: Option<&[u32]>,
+    ) -> Result<(), compute::Error> {
+        if let Some(slot) = self.paged_state_slot(pool)? {
+            self.state_slots
+                .get(&slot)
+                .ok_or_else(|| invalid_handle("protected state is unavailable"))?
+                .validate_prompt_input(
+                    usize::try_from(lane).map_err(invalid_handle)?,
+                    phase,
+                    start,
+                    tokens,
+                )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_canonical_lane(
         &mut self,
         pool: u32,

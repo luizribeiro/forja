@@ -1603,6 +1603,15 @@ where
             .tokens
             .map_or(Ok(1), |tokens| u32::try_from(tokens.len()))
             .map_err(|_| quota("token count exceeds u32"))?;
+        if let Some(pool) = self.page_pool {
+            self.store.data().validate_canonical_input(
+                pool,
+                0,
+                input.phase,
+                input.start,
+                input.tokens,
+            )?;
+        }
         let mut checkpoint = self
             .prepare_paged_append(input.start, count, action)
             .await?;
@@ -2201,6 +2210,15 @@ where
         input: &EngineBatch,
         appended: &[u32],
     ) -> Result<Vec<Option<(u32, SequenceCheckpoint)>>, compute::Error> {
+        for lane in input.lanes.iter().flatten() {
+            self.store.data().validate_canonical_input(
+                pool,
+                lane.slot,
+                input.shape.phase,
+                lane.start_pos,
+                lane.tokens.as_deref(),
+            )?;
+        }
         let mut checkpoints = Vec::with_capacity(input.lanes.len());
         for (input_lane, &tokens) in input.lanes.iter().zip(appended) {
             let Some(input_lane) = input_lane else {
