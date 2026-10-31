@@ -3353,6 +3353,7 @@ pub struct TensorEntry {
     tensor: Tensor,
     symbolic: Option<SymbolicLayout>,
     reference_charge: Option<Arc<state::StateCharge>>,
+    slot_token: Option<state_inputs::SlotTokenSource>,
     buffer: Arc<BufferHandle>,
 }
 
@@ -4081,6 +4082,7 @@ impl<B: Backend + 'static> Host<B> {
             tensor: tensor.clone(),
             symbolic: None,
             reference_charge: None,
+            slot_token: None,
             buffer: Arc::clone(&buffer),
         };
         self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
@@ -5155,6 +5157,7 @@ impl<B: Backend + 'static> Host<B> {
             tensor: tensor.clone(),
             symbolic: None,
             reference_charge: None,
+            slot_token: None,
             buffer: Arc::new(BufferHandle {
                 owner: tensor.clone(),
                 taints: Arc::clone(&self.taints),
@@ -5209,6 +5212,7 @@ impl<B: Backend + 'static> Host<B> {
                     tensor: entry.tensor,
                     symbolic: Some(symbolic),
                     reference_charge,
+                    slot_token: entry.slot_token,
                     buffer: entry.buffer,
                 })
                 .map_err(invalid_handle)?;
@@ -5232,6 +5236,7 @@ impl<B: Backend + 'static> Host<B> {
                 tensor,
                 symbolic: None,
                 reference_charge,
+                slot_token: entry.slot_token,
                 buffer: Arc::clone(&entry.buffer),
             })
             .map_err(invalid_handle)?;
@@ -5290,6 +5295,7 @@ impl<B: Backend + 'static> Host<B> {
                 tensor: entry.tensor,
                 symbolic: Some(layout),
                 reference_charge,
+                slot_token: entry.slot_token,
                 buffer: entry.buffer,
             })
             .map_err(invalid_handle)?;
@@ -5485,6 +5491,7 @@ impl<B: Backend + 'static> Host<B> {
             tensor,
             symbolic: None,
             reference_charge: None,
+            slot_token: None,
             buffer,
         }) {
             Ok(resource) => resource,
@@ -5919,6 +5926,7 @@ impl<B: Backend + 'static> Host<B> {
                         .map_err(guest_error)?,
                     symbolic: None,
                     reference_charge: None,
+                    slot_token: None,
                     buffer: Arc::clone(&activity.buffer),
                 })
             })
@@ -6418,6 +6426,7 @@ impl<B: Backend + 'static> Host<B> {
         }
         let mut captured_state = match self
             .validate_state_planes(&entry.state_uses, &entry.state_planes)
+            .and_then(|()| self.validate_slot_token_captures(&entry))
             .and_then(|()| self.capture_graph_state(&entry.state_uses, entry.slot_capture.as_ref()))
         {
             Ok(captured) => captured,
@@ -10822,6 +10831,63 @@ mod tests {
                     .logical_len(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn token_source_views_remain_read_only_and_require_capture_context() {
+        let (mut host, _pool, slot) = convolution_slot_host();
+        let token = host.state_input_token(slot.rep(), 0).unwrap();
+        let row = host
+            .view(&token, compute::ViewOp::Broadcast(vec![1, 1]))
+            .unwrap();
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let symbolic = host
+            .view_param(
+                &token,
+                &params,
+                vec![compute::ParamSlice {
+                    start: wit_affine(Some(0), 0, 0),
+                    len: wit_affine(None, 0, 1),
+                    step: 1,
+                }],
+            )
+            .unwrap();
+        for resource in [&token, &row, &symbolic] {
+            let entry = host.entry(resource).unwrap();
+            assert_eq!(
+                entry.slot_token,
+                Some(crate::state_inputs::SlotTokenSource {
+                    slot: slot.rep(),
+                    lane: 0
+                })
+            );
+            assert!(!entry.tensor.is_writable());
+        }
+        let output = host.alloc(compute::Dtype::U32, &[1, 1]).unwrap();
+        for scoped in [false, true] {
+            let commands = host.command_list().unwrap();
+            if scoped {
+                host.declare_slot_capture(&commands, &slot, false).unwrap();
+            }
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(row.rep())],
+                &output,
+            )
+            .unwrap();
+            let graph = host.create_graph(commands);
+            if scoped {
+                host.drop_graph(graph.unwrap()).unwrap();
+            } else {
+                assert!(graph.is_err());
+            }
+        }
+        for resource in [token, row, symbolic, output] {
+            host.drop_tensor(resource).unwrap();
         }
     }
 

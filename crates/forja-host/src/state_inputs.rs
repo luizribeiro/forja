@@ -7,6 +7,12 @@ use std::sync::atomic::AtomicBool;
 // Table ownership and cloned layouts remain live until the scalar allocation retires.
 const FEEDBACK_REFERENCE_BYTES: u64 = 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotTokenSource {
+    pub(crate) slot: u32,
+    pub(crate) lane: u32,
+}
+
 pub(crate) struct StateInputBank {
     pub(crate) prompt_phase: AtomicBool,
     pub(crate) sampling: u32,
@@ -48,6 +54,38 @@ impl StateInputs {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn validate_slot_token_captures(
+        &self,
+        commands: &crate::CommandListEntry,
+    ) -> Result<(), compute::Error> {
+        for entry in &commands.retained {
+            let Some(source) = entry.slot_token else {
+                continue;
+            };
+            let scope = commands.slot_capture.as_ref().ok_or_else(|| {
+                invalid_handle("token sources require a slot capture declaration")
+            })?;
+            let slot = self
+                .table
+                .get(
+                    &wasmtime::component::Resource::<crate::BatchSlotEntry>::new_borrow(
+                        source.slot,
+                    ),
+                )
+                .map_err(invalid_handle)?;
+            if source.slot != scope.slot
+                || usize::try_from(source.lane).map_err(invalid_handle)? >= slot.binding.lanes.len()
+                || entry.tensor.layout().element_count() != 1
+                || entry.tensor.is_writable()
+            {
+                return Err(invalid_handle(
+                    "captured token source differs from its slot",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn state_input_token(
         &mut self,
         slot: u32,
@@ -103,7 +141,7 @@ impl<B: Backend + 'static> Host<B> {
                 lane,
             )
         };
-        self.lend_view(
+        let token = self.lend_view(
             &Resource::new_borrow(handle),
             compute::ViewOp::Slice(vec![compute::SliceSpec {
                 start,
@@ -111,7 +149,12 @@ impl<B: Backend + 'static> Host<B> {
                 step: 1,
             }]),
             true,
-        )
+        )?;
+        self.table
+            .get_mut(&token)
+            .map_err(invalid_handle)?
+            .slot_token = Some(SlotTokenSource { slot, lane });
+        Ok(token)
     }
 
     pub(crate) fn alias_paged_tensors(
