@@ -1791,18 +1791,20 @@ fn plan_graph_memory(
                     consumed: false,
                 });
         }
+        let workspace = template_workspace(dispatch);
         for buffer in outputs {
             lifetimes
                 .entry(buffer)
                 .and_modify(|lifetime| {
                     lifetime.end = index;
+                    lifetime.consumed |= workspace == Some(buffer);
                 })
                 .or_insert(Lifetime {
                     start: index,
                     end: index,
                     bytes: buffer.byte_len(),
                     begins_with_write: true,
-                    consumed: false,
+                    consumed: workspace == Some(buffer),
                 });
         }
     }
@@ -1868,6 +1870,35 @@ fn plan_graph_memory(
         transient_bytes,
         peak_live_bytes,
     })
+}
+
+fn template_workspace(dispatch: &TemplateDispatch) -> Option<crate::BufferId> {
+    match dispatch {
+        TemplateDispatch::Static(dispatch)
+            if matches!(dispatch.op(), Op::State(crate::StateOp::DeltaRuleBlock(_))) =>
+        {
+            dispatch.outputs().get(2).map(Tensor::buffer)
+        }
+        TemplateDispatch::Dynamic {
+            dispatch:
+                DynamicDispatch::Operation {
+                    op: TemplateOp::Static(Op::State(crate::StateOp::DeltaRuleBlock(_))),
+                    outputs,
+                    ..
+                },
+            ..
+        }
+        | TemplateDispatch::Rule {
+            dispatch:
+                DynamicDispatch::Operation {
+                    op: TemplateOp::Static(Op::State(crate::StateOp::DeltaRuleBlock(_))),
+                    outputs,
+                    ..
+                },
+            ..
+        } => outputs.get(2).map(TemplateTensor::buffer),
+        _ => None,
+    }
 }
 
 fn template_dispatch_buffers(

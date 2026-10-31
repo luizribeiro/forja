@@ -171,3 +171,57 @@ fn convolution_counts_history_tap_reads_and_boundary_carry() {
         assert_eq!(cost.flops, 2 * u64::from(tokens) * 7 * 4);
     }
 }
+
+#[test]
+fn graph_memory_places_single_dispatch_private_block_workspace() {
+    let (access, inputs, [y, state]) = delta_fixture(true);
+    let layout = crate::DeltaBlockScratch::new(7, 3, 7, 33).unwrap();
+    let scratch = tensor(12, DType::F32, &[layout.elements()]);
+    let op = Op::State(StateOp::DeltaRuleBlock(access));
+    let refs = inputs.iter().collect::<Vec<_>>();
+    let reachable = inputs
+        .iter()
+        .chain([&y, &state])
+        .map(Tensor::buffer)
+        .collect();
+    for concrete in [false, true] {
+        let mut graph = crate::GraphTemplate::new(
+            crate::ParamSpace::new(Vec::new()).unwrap(),
+            crate::GraphLimits::default(),
+        );
+        if concrete {
+            graph
+                .record_validated(
+                    crate::Dispatch::new_many(op, &refs, &[&y, &state, &scratch]).unwrap(),
+                )
+                .unwrap();
+        } else {
+            let inputs = inputs
+                .iter()
+                .cloned()
+                .map(crate::TemplateTensor::from)
+                .collect::<Vec<_>>();
+            let outputs =
+                [y.clone(), state.clone(), scratch.clone()].map(crate::TemplateTensor::from);
+            graph
+                .dispatch_many(
+                    op,
+                    &inputs.iter().collect::<Vec<_>>(),
+                    &outputs.iter().collect::<Vec<_>>(),
+                )
+                .unwrap();
+        }
+        let plan = graph.plan_memory(&reachable).unwrap();
+        assert!(plan.contains(scratch.buffer()));
+        assert_eq!(plan.arena_bytes(), scratch.buffer().byte_len());
+        let arena = tensor(13, DType::F32, &[layout.elements()]);
+        let rebound = graph.bind_memory(&plan, &arena).unwrap();
+        let commands = rebound
+            .instantiate(&rebound.values(Vec::new()).unwrap())
+            .unwrap();
+        assert_eq!(
+            commands.dispatches()[0].outputs()[2].buffer(),
+            arena.buffer()
+        );
+    }
+}
