@@ -3,8 +3,10 @@
 mod batch;
 pub use batch::{StateBatch, StateBatchSubmission};
 mod block;
+mod canonical;
 mod capture;
 mod cell;
+pub use canonical::CanonicalPrompt;
 pub use capture::StateCapture;
 mod guest;
 pub use guest::StateEntry;

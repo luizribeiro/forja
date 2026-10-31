@@ -21,10 +21,11 @@ mod slot_capture;
 mod state;
 mod state_inputs;
 pub use state::{
-    LanePosition, SharedStateTrace, StateAction, StateBatch, StateBatchSubmission, StateCapture,
-    StateCell, StateCommands, StateEntry, StateLaneCheckpoint, StateRecording, StateSelection,
-    StateSelectionBatch, StateSelectionBoundary, StateSelectionLease, StateSelectionSubmission,
-    StateSequenceHandle, StateSlots, StateStorage, StateSubmission, StateTrace,
+    CanonicalPrompt, LanePosition, SharedStateTrace, StateAction, StateBatch, StateBatchSubmission,
+    StateCapture, StateCell, StateCommands, StateEntry, StateLaneCheckpoint, StateRecording,
+    StateSelection, StateSelectionBatch, StateSelectionBoundary, StateSelectionLease,
+    StateSelectionSubmission, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
+    StateTrace,
 };
 mod weights;
 
