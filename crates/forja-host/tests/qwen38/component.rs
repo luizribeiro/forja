@@ -95,3 +95,69 @@ async fn slotted_recurrent_component_matches_eager_state_bits() -> Result<(), Bo
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn slotted_attention_component_preserves_paged_rows() -> Result<(), Box<dyn Error>> {
+    let mut runner = forja_host::EngineRunner::new(
+        test_guests::qwen38_tiny(),
+        forja_cpu::CpuBackend::new(),
+        forja_host::Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27),
+        fixture("model.safetensors"),
+    )
+    .await?;
+    runner
+        .load_with_selections(
+            None,
+            &forja_host::EngineLoadConfig {
+                max_context: Some(64),
+                replay: false,
+                paged_cache: true,
+                kv_cache: forja_host::KvCacheFormat::F16,
+                tunings: vec!["attention-fixture".into()],
+                ..forja_host::EngineLoadConfig::default()
+            },
+        )
+        .await??;
+    let weights = forja_sdk::Weights::open(fixture("model.safetensors"))?;
+    let mut native = qwen38::Attention::load(
+        &weights.scoped("language_model.model.layers.3.self_attn"),
+        qwen38::Config::tiny(),
+        64,
+    )?;
+    for _ in 0..2 {
+        for (position, tokens, phase) in [
+            (0, vec![1_u32, 2, 7], forja_host::BatchPhase::Prompt),
+            (3, vec![3_u32], forja_host::BatchPhase::Decode),
+        ] {
+            let rows = u32::try_from(tokens.len())?;
+            let values = tokens
+                .iter()
+                .flat_map(|&token| [forja_sdk::bf16::from_f64(f64::from(token)); 64])
+                .collect::<Vec<_>>();
+            let input = forja_sdk::Tensor::from_slice(&values, &[rows, 64])?;
+            let expected = if phase == forja_host::BatchPhase::Prompt {
+                native.prefill(&input, position, None, None)?
+            } else {
+                native.attention_layer(&input, position, None, None)?
+            }
+            .narrow(0, rows - 1, 1)?
+            .narrow(1, 0, 33)?
+            .to_dtype::<f32>()?
+            .to_vec()?;
+            let output = runner
+                .step(forja_host::EngineStep {
+                    phase,
+                    tokens,
+                    start_pos: position,
+                    taps: false,
+                })
+                .await??;
+            let bytes = expected
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(runner.read(&output.logits).await?, bytes);
+        }
+    }
+    Ok(())
+}

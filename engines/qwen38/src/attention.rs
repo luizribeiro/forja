@@ -1,3 +1,4 @@
+mod paged;
 use crate::{Config, numerics, quant::Affine};
 use forja_sdk::{
     Dim, Error, Result, Tensor, Weights, bf16, f16,
@@ -14,7 +15,7 @@ pub struct Attention {
     out: Affine,
     q_norm: Tensor<bf16>,
     k_norm: Tensor<bf16>,
-    cache: KvCache<f16>,
+    cache: Cache,
 }
 impl Attention {
     /// Processes a canonical prompt block using the pinned per-row attention reduction.
@@ -51,6 +52,16 @@ impl Attention {
     /// Refuses invalid geometry, missing weights or failed allocations.
     pub fn load(weights: &Weights<'_>, config: Config, context: u32) -> Result<Self> {
         config.validate()?;
+        let cache = Cache::Eager(KvCache::new(
+            config.kv_heads,
+            context,
+            config.head_dim,
+            f16::from_f32(0.0),
+        )?);
+        Self::load_with_cache(weights, config, cache)
+    }
+
+    fn load_with_cache(weights: &Weights<'_>, config: Config, cache: Cache) -> Result<Self> {
         Ok(Self {
             config,
             q: Affine::load(
@@ -75,12 +86,7 @@ impl Attention {
             )?,
             q_norm: weights.tensor("q_norm.weight", &[config.head_dim])?,
             k_norm: weights.tensor("k_norm.weight", &[config.head_dim])?,
-            cache: KvCache::new(
-                config.kv_heads,
-                context,
-                config.head_dim,
-                f16::from_f32(0.0),
-            )?,
+            cache,
         })
     }
     /// Processes one normalized token at its absolute position.
@@ -103,12 +109,15 @@ impl Attention {
         let positions = Tensor::constant(&[position], &[1])?;
         let projected = self.project(input, &positions, quant)?;
         let scale = crate::numerics::inverse_sqrt_width(self.config.head_dim)?;
+        let Cache::Eager(cache) = &mut self.cache else {
+            return Err(Error::loading("paged attention requires a serving lane"));
+        };
         let attended = match attention {
             Some(pick) => cached_attention_with(
                 &projected.query,
                 &projected.key,
                 &projected.value,
-                &mut self.cache,
+                cache,
                 scale,
                 &Dim::from(position),
                 &Dim::from(end),
@@ -118,7 +127,7 @@ impl Attention {
                 &projected.query,
                 &projected.key,
                 &projected.value,
-                &mut self.cache,
+                cache,
                 scale,
                 &Dim::from(position),
                 &Dim::from(end),
@@ -190,4 +199,14 @@ fn partial_rope(input: &Tensor<bf16>, positions: &Tensor<u32>, width: u32) -> Re
     let output = input.contiguous()?;
     rotated.copy_into(&mut output.narrow(2, 0, width)?)?;
     Ok(output)
+}
+
+enum Cache {
+    Eager(KvCache<f16>),
+    Paged {
+        set: std::rc::Rc<forja_sdk::PagedCacheSet>,
+        layer: u32,
+        lane: u32,
+        positions: Tensor<u32>,
+    },
 }

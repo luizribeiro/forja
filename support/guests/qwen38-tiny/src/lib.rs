@@ -12,6 +12,7 @@ use forja_sdk::{
 enum Tiny {
     Full(qwen38::Qwen38),
     Recurrent(qwen38::DeltaNet),
+    Attention(qwen38::Attention),
 }
 
 #[export_engine]
@@ -51,6 +52,17 @@ impl Engine for Tiny {
         let Some(pool) = pool else {
             return Self::load(weights, load);
         };
+        if load.tunings.iter().any(|name| name == "attention-fixture") {
+            let context = load.max_context.unwrap_or(64);
+            return qwen38::Attention::load_paged(
+                &weights.scoped("language_model.model.layers.3.self_attn"),
+                qwen38::Config::tiny(),
+                std::rc::Rc::new(pool.cache_set(1)?),
+                0,
+                forja_sdk::Tensor::constant(&(0..context).collect::<Vec<_>>(), &[context])?,
+            )
+            .map(Self::Attention);
+        }
         let prompt_tokens = load.max_context.unwrap_or(64).min(64);
         let config = qwen38::Config::tiny();
         let cache = std::rc::Rc::new(pool.cache_set_with_state(
@@ -72,6 +84,33 @@ impl Engine for Tiny {
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         match self {
             Self::Full(engine) => engine.step(input),
+            Self::Attention(layer) => {
+                let values = input.tokens.to_vec()?;
+                let rows = u32::try_from(values.len())
+                    .map_err(|_| forja_sdk::Error::loading("fixture rows overflow"))?;
+                let x = values
+                    .into_iter()
+                    .flat_map(|token| [forja_sdk::bf16::from_f64(f64::from(token)); 64])
+                    .collect::<Vec<_>>();
+                let output = layer.paged_layer(
+                    &forja_sdk::Tensor::constant(&x, &[rows, 64])?,
+                    &forja_sdk::Dim::from(input.start_pos),
+                    input.phase == forja_sdk::BatchPhase::Prompt,
+                    None,
+                    &forja_sdk::target::metal::Variant::new("paged-sdpa.vector")?,
+                )?;
+                let logits = output
+                    .narrow(0, rows - 1, 1)?
+                    .narrow(1, 0, 33)?
+                    .to_dtype()?
+                    .reshape(&[33])?;
+                forja_sdk::eval()?;
+                Ok(StepOutput {
+                    logits,
+                    taps: Vec::new(),
+                    router_logits: Vec::new(),
+                })
+            }
             Self::Recurrent(layer) => {
                 let [token]: [u32; 1] = input.tokens.to_vec()?.try_into().map_err(|_| {
                     forja_sdk::Error::loading("recurrent fixture requires one token")
@@ -97,7 +136,9 @@ impl Engine for Tiny {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.decode(input),
-            Self::Recurrent(_) => Err(forja_sdk::Error::loading("recurrent fixture uses step")),
+            Self::Recurrent(_) | Self::Attention(_) => {
+                Err(forja_sdk::Error::loading("recurrent fixture uses step"))
+            }
         }
     }
 }
