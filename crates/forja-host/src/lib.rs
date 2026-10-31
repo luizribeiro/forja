@@ -11,6 +11,7 @@ mod fuzz_tests;
 mod hybrid;
 mod lending;
 mod native;
+mod slot_capture;
 mod state;
 mod state_inputs;
 pub use state::{
@@ -3704,6 +3705,7 @@ pub struct CommandListEntry {
     state_uses: Vec<hybrid::StateUse>,
     state_planes: Vec<(hybrid::StateUse, usize)>,
     feedback_writes: Vec<feedback::FeedbackWrite>,
+    slot_capture: Option<slot_capture::SlotCapture>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
 }
@@ -3734,6 +3736,7 @@ impl CommandListEntry {
 #[derive(Debug)]
 pub struct GraphEntry {
     captured_state: Vec<hybrid::CapturedState>,
+    slot_capture: Option<slot_capture::SlotCapture>,
     graph: Arc<PreparedGraph>,
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
@@ -5721,9 +5724,10 @@ impl<B: Backend + 'static> Host<B> {
         config: &paged_storage::SdpaCfg,
         appended: Option<[&Resource<TensorEntry>; 2]>,
     ) -> Result<(), compute::Error> {
+        let bank = self.slot_capture_bank(commands, slot)?;
         let (key, table, generations, activity, usage) =
-            self.paged_slot_entries(slot, lane, config.key_plane, None)?;
-        let (value, _, _, _, _) = self.paged_slot_entries(slot, lane, config.value_plane, None)?;
+            self.paged_slot_entries(slot, lane, config.key_plane, bank)?;
+        let (value, _, _, _, _) = self.paged_slot_entries(slot, lane, config.value_plane, bank)?;
         let (query, output) = (self.entry(query)?.clone(), self.entry(output)?.clone());
         let [_query_heads, query_tokens, width]: [u32; 3] =
             query.tensor.layout().shape().try_into().map_err(|_| {
@@ -5752,7 +5756,6 @@ impl<B: Backend + 'static> Host<B> {
                 "paged append attention requires one causal query".to_owned(),
             ));
         }
-        let page_tokens = page_shape[1];
         let protected = vec![
             key.tensor.buffer(),
             value.tensor.buffer(),
@@ -5765,11 +5768,11 @@ impl<B: Backend + 'static> Host<B> {
         let (operation, primary, outputs, bound) = if let Some([new_key, new_value]) = appended {
             (
                 (
-                    TemplateOp::paged_sdpa_append(config.scale, affine_q_start, page_tokens),
+                    TemplateOp::paged_sdpa_append(config.scale, affine_q_start, page_shape[1]),
                     affine_q_start.is_constant().then_some(Op::PagedSdpaAppend {
                         scale: config.scale,
                         q_start: config.q_start.offset,
-                        page_tokens,
+                        page_tokens: page_shape[1],
                     }),
                 ),
                 [
@@ -5791,14 +5794,14 @@ impl<B: Backend + 'static> Host<B> {
                         config.causal,
                         affine_q_start,
                         affine_key_length,
-                        page_tokens,
+                        page_shape[1],
                     ),
                     affine_q_start.is_constant().then_some(Op::PagedSdpa {
                         scale: config.scale,
                         causal: config.causal,
                         q_start: config.q_start.offset,
                         key_length: config.key_length.offset,
-                        page_tokens,
+                        page_tokens: page_shape[1],
                     }),
                 ),
                 [query, key, value],
@@ -5957,6 +5960,7 @@ impl<B: Backend + 'static> Host<B> {
                 state_uses: Vec::new(),
                 state_planes: Vec::new(),
                 feedback_writes: Vec::new(),
+                slot_capture: None,
             })
             .map_err(invalid_handle)
     }
@@ -6388,7 +6392,7 @@ impl<B: Backend + 'static> Host<B> {
         let (transient, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.retained)
             .into_iter()
             .partition(|entry| plan.contains(entry.tensor.buffer()));
-        self.release_graph_state_scratch(captured_state)?;
+        self.release_graph_state_scratch(captured_state, entry.slot_capture.as_ref())?;
         self.release_retained(transient)?;
         self.live_bytes
             .fetch_add(new_charge - old_charge, Ordering::AcqRel);
@@ -6414,7 +6418,7 @@ impl<B: Backend + 'static> Host<B> {
         }
         let mut captured_state = match self
             .validate_state_planes(&entry.state_uses, &entry.state_planes)
-            .and_then(|()| self.capture_graph_state(&entry.state_uses))
+            .and_then(|()| self.capture_graph_state(&entry.state_uses, entry.slot_capture.as_ref()))
         {
             Ok(captured) => captured,
             Err(error) => {
@@ -6473,6 +6477,7 @@ impl<B: Backend + 'static> Host<B> {
             };
         let graph_entry = GraphEntry {
             captured_state,
+            slot_capture: entry.slot_capture.clone(),
             graph: Arc::new(graph),
             access: entry.access,
             retained: Vec::new(),
@@ -6518,10 +6523,10 @@ impl<B: Backend + 'static> Host<B> {
         resource: Resource<CommandListEntry>,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
-        if entry.parameterized {
+        if entry.parameterized || entry.slot_capture.is_some() {
             self.release_retained(entry.retained)?;
             return Err(compute::Error::OpSignature(
-                "submit does not accept parameterized command lists".to_owned(),
+                "submit requires a concrete execution command list".to_owned(),
             ));
         }
         if let Err(error) = PagedCheck::validate_all(&entry.paged_bounds, None) {
@@ -6609,7 +6614,7 @@ impl<B: Backend + 'static> Host<B> {
         flight: ReplayFlight,
     ) -> Result<SubmitRequest<B>, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
-        if !entry.captured_state.is_empty() {
+        if !entry.captured_state.is_empty() || entry.slot_capture.is_some() {
             return Err(invalid_handle("state graphs require fresh slot bindings"));
         }
         let checked = entry
@@ -8897,8 +8902,9 @@ where
         direction: paged_storage::CopyDirection,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
         let result = (|| {
+            let bank = self.slot_capture_bank(&commands, &slot)?;
             let (pages, table, generations, activity, usage) =
-                self.paged_slot_entries(&slot, lane, span.plane, None)?;
+                self.paged_slot_entries(&slot, lane, span.plane, bank)?;
             let ordinary = self.entry(&ordinary)?.clone();
             let start = core_affine(span.start);
             let tokens = ordinary
@@ -9971,6 +9977,46 @@ mod tests {
                 assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_slot_traces_replay_their_own_inactive_metadata() {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let lists = [host.command_list().unwrap(), host.command_list().unwrap()];
+        for list in &lists {
+            host.declare_slot_capture(list, &slot, false).unwrap();
+            host.record_slot_state(
+                list,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
+            .unwrap();
+        }
+        let graphs = lists.map(|list| host.create_graph(list).unwrap());
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graphs[0]).unwrap()).unwrap();
+        host.prepare_state_replay_with_flight(&graphs[0], Vec::new(), flight)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.prepare_read(&output).unwrap().run().await.unwrap(),
+            2_f32.to_ne_bytes().repeat(7)
+        );
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        state.release(0).unwrap();
+        state.admit(0).unwrap();
     }
 
     fn captured_slot_releases_request_leases<B: Backend + Send + Sync + 'static>(backend: B) {

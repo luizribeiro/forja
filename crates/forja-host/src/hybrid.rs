@@ -105,13 +105,24 @@ impl<B: Backend + 'static> Host<B> {
         output: &Resource<crate::TensorEntry>,
         algorithm: &str,
     ) -> Result<(), compute::Error> {
+        let capture = self
+            .table
+            .get(commands)
+            .map_err(invalid_handle)?
+            .slot_capture
+            .clone();
         let slot_entry = self.table.get(slot).map_err(invalid_handle)?;
-        let bank = slot_entry.active_bank;
+        let bank = if capture.is_some() {
+            0
+        } else {
+            slot_entry.active_bank
+        };
         let lane = usize::try_from(lane).map_err(invalid_handle)?;
-        let active = slot_entry.binding.activity[bank]
-            .get(lane)
-            .ok_or_else(|| invalid_handle("state lane is out of range"))?
-            .load(std::sync::atomic::Ordering::Acquire);
+        let active = capture.is_none()
+            && slot_entry.binding.activity[bank]
+                .get(lane)
+                .ok_or_else(|| invalid_handle("state lane is out of range"))?
+                .load(std::sync::atomic::Ordering::Acquire);
         let inputs = inputs
             .iter()
             .map(|input| self.entry(input).cloned())
@@ -142,16 +153,30 @@ impl<B: Backend + 'static> Host<B> {
                 "command list dispatch count exceeds the guest limit",
             ));
         }
-        let state = self
-            .state_slots
-            .get_mut(&slot.rep())
-            .ok_or_else(|| invalid_handle("slot has no protected state"))?;
-        let body = state.commands(bank, lane, active)?;
+        let usage = StateUse {
+            slot: slot.rep(),
+            bank,
+            lane,
+            active,
+            tokens,
+        };
         let tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
         let plane = usize::try_from(plane).map_err(invalid_handle)?;
-        record_state_operation(body, plane, operation, &tensors, &output.tensor, algorithm)?;
-        let protected = body.protected_buffers().collect::<Vec<_>>();
-        let dispatches = std::mem::take(&mut body.commands).into_dispatches();
+        let (protected, dispatches) =
+            self.with_state_commands(usage, capture.as_ref(), |body| {
+                record_state_operation(
+                    body,
+                    plane,
+                    operation,
+                    &tensors,
+                    &output.tensor,
+                    algorithm,
+                )?;
+                Ok((
+                    body.protected_buffers().collect::<Vec<_>>(),
+                    std::mem::take(&mut body.commands).into_dispatches(),
+                ))
+            })?;
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         entry.protected.extend(protected);
         entry.access.record(&inputs, std::slice::from_ref(&output));
@@ -163,13 +188,6 @@ impl<B: Backend + 'static> Host<B> {
                 .recorded
                 .push(crate::RecordedDispatch::Static(Box::new(dispatch)));
         }
-        let usage = StateUse {
-            slot: slot.rep(),
-            bank,
-            lane,
-            active,
-            tokens,
-        };
         entry.state_planes.push((usage, plane));
         if !entry.state_uses.contains(&usage) {
             entry.state_uses.push(usage);
@@ -483,6 +501,7 @@ impl<B: Backend + 'static> Host<B> {
     pub(crate) fn capture_graph_state(
         &mut self,
         usages: &[StateUse],
+        scope: Option<&crate::slot_capture::SlotCapture>,
     ) -> Result<Vec<CapturedState>, compute::Error>
     where
         B: Send + Sync,
@@ -490,13 +509,7 @@ impl<B: Backend + 'static> Host<B> {
         usages
             .iter()
             .map(|usage| {
-                let state = self
-                    .state_slots
-                    .get_mut(&usage.slot)
-                    .ok_or_else(|| invalid_handle("state slot is missing"))?;
-                let capture = state
-                    .commands(usage.bank, usage.lane, usage.active)?
-                    .capture()?;
+                let capture = self.with_state_commands(*usage, scope, |body| body.capture())?;
                 Ok(CapturedState {
                     usage: *usage,
                     capture,
@@ -508,14 +521,14 @@ impl<B: Backend + 'static> Host<B> {
     pub(crate) fn release_graph_state_scratch(
         &mut self,
         captures: &mut [CapturedState],
+        scope: Option<&crate::slot_capture::SlotCapture>,
     ) -> Result<(), compute::Error> {
         for captured in captures {
             let usage = captured.usage;
-            self.state_slots
-                .get_mut(&usage.slot)
-                .ok_or_else(|| invalid_handle("state slot is missing"))?
-                .commands(usage.bank, usage.lane, usage.active)?
-                .release_graph_scratch();
+            self.with_state_commands(usage, scope, |body| {
+                body.release_graph_scratch();
+                Ok(())
+            })?;
             captured.capture.release_graph_scratch();
         }
         Ok(())
