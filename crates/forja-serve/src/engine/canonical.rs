@@ -58,21 +58,12 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .runner
             .canonical_prefix_namespace(self.prefix_namespace.0, &classes)
             .map_err(cache_error)?;
-        let store = if allowance.bytes() == 0 {
-            None
-        } else {
-            Some(
-                self.runner
-                    .create_canonical_prefix_store(namespace, allowance)
-                    .map_err(cache_error)?,
-            )
-        };
         self.canonical_cache = Some(CanonicalCache {
             schedule,
             namespace,
             allowance,
             declared: declared.get(),
-            store,
+            store: None,
         });
         self.configure_canonical_cache(&self.config.clone())?;
         Ok(self)
@@ -107,31 +98,28 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .as_ref()
             .ok_or_else(|| GenerationError::new("canonical cache requires serving geometry"))?;
         let limits = prefix_limits(serving, config, self.max_context)?;
-        if let Some(store) = &mut cache.store {
+        let mut created = if cache.store.is_none() && effective.bytes() > 0 {
+            Some(
+                self.runner
+                    .create_canonical_prefix_store(cache.namespace, effective)
+                    .map_err(cache_error)?,
+            )
+        } else {
+            None
+        };
+        if let Some(store) = cache.store.as_mut().or(created.as_mut()) {
             store
                 .reconfigure_policy(
                     limits.entries,
-                    limits.tokens as u64,
-                    limits.referenced_pages as u64,
+                    u64::try_from(limits.tokens).map_err(cache_error)?,
+                    u64::try_from(limits.referenced_pages).map_err(cache_error)?,
                     effective,
                     config.serving.prefix_reuse,
                 )
                 .map_err(cache_error)?;
-        } else if effective.bytes() > 0 {
-            let mut store = self
-                .runner
-                .create_canonical_prefix_store(cache.namespace, effective)
-                .map_err(cache_error)?;
-            store
-                .reconfigure_policy(
-                    limits.entries,
-                    limits.tokens as u64,
-                    limits.referenced_pages as u64,
-                    effective,
-                    config.serving.prefix_reuse,
-                )
-                .map_err(cache_error)?;
-            cache.store = Some(store);
+        }
+        if created.is_some() {
+            cache.store = created;
         }
         cache.allowance = effective;
         Ok(())
