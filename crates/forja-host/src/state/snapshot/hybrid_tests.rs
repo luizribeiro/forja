@@ -572,3 +572,69 @@ fn hybrid_backing_refuses_a_slot_from_an_identically_shaped_foreign_pool() {
     );
     assert_eq!(fixture.host.live_bytes.load(Ordering::Acquire), before);
 }
+
+#[test]
+fn paired_lane_admission_refuses_quota_without_installing_state() {
+    let mut fixture = hybrid_fixture(262_144);
+    let slot = fixture
+        .host
+        .table
+        .get(&fixture.resource)
+        .unwrap()
+        .slot
+        .unwrap();
+    let feedback = crate::state::feedback::FeedbackBinding::new(&fixture.host, 2).unwrap();
+    let state = crate::StateSlots::new(fixture.parent.storage.clone(), 1)
+        .unwrap()
+        .with_feedback(feedback);
+    fixture.host.state_slots.insert(slot, state);
+    let entry = fixture.entry();
+    let blocked = fixture.pool.reserve(11 * 64).unwrap();
+    let before = fixture.host.live_bytes.load(Ordering::Acquire);
+    assert!(
+        fixture
+            .host
+            .prepare_canonical_lane(
+                fixture.resource.rep(),
+                0,
+                fixture.image.prompt.clone(),
+                Some(&entry),
+                257
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.host.live_bytes.load(Ordering::Acquire), before);
+    assert!(
+        fixture.host.state_slots[&slot]
+            .sequence_handle(0)
+            .unwrap()
+            .is_none()
+    );
+    drop(blocked);
+    assert_eq!(
+        fixture
+            .host
+            .prepare_canonical_lane(
+                fixture.resource.rep(),
+                0,
+                fixture.image.prompt.clone(),
+                Some(&entry),
+                257
+            )
+            .unwrap(),
+        64
+    );
+    assert_eq!(
+        fixture.host.state_slots[&slot].position(0).unwrap().tokens,
+        64
+    );
+    assert_eq!(
+        fixture
+            .host
+            .paged_lane_prefix(fixture.resource.rep(), 0)
+            .unwrap()
+            .logical_len()
+            .unwrap(),
+        64
+    );
+}

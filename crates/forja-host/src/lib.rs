@@ -2,6 +2,7 @@
 
 #![allow(clippy::manual_async_fn)]
 
+mod prefix_runtime;
 mod prompt;
 pub use forja_sampling::{PackedMask, TokenIds};
 
@@ -5052,6 +5053,17 @@ impl<B: Backend + 'static> Host<B> {
         prefix: Option<PagedPrefix>,
         reserved_tokens: u64,
     ) -> Result<(), compute::Error> {
+        self.bind_paged_lane_staged(pool_rep, lane, prefix, reserved_tokens, None)
+    }
+
+    fn bind_paged_lane_staged(
+        &mut self,
+        pool_rep: u32,
+        lane: u32,
+        prefix: Option<PagedPrefix>,
+        reserved_tokens: u64,
+        staged: Option<StagedPrefix<B>>,
+    ) -> Result<(), compute::Error> {
         let (pool, max_context, slot_rep) = {
             let entry = self
                 .table
@@ -5065,7 +5077,7 @@ impl<B: Backend + 'static> Host<B> {
                     .ok_or_else(|| invalid_handle("paged slot is not open"))?,
             )
         };
-        if prefix.is_some() && self.state_slots.contains_key(&slot_rep) {
+        if prefix.is_some() && self.state_slots.contains_key(&slot_rep) && staged.is_none() {
             return Err(invalid_handle(
                 "prefix reuse is unavailable for a slot with state",
             ));
@@ -5142,7 +5154,9 @@ impl<B: Backend + 'static> Host<B> {
             }
         }
         let capacity = locked.reserved_tokens();
-        self.bind_slot_state(slot_rep, lane, release, &binding, previous, capacity)?;
+        self.bind_slot_state(
+            slot_rep, lane, release, &binding, previous, capacity, staged,
+        )?;
         drop(locked);
         self.publish_paged_lane_binding(&binding, lane_binding, lane, sequence, metadata, release)
     }

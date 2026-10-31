@@ -468,6 +468,10 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "state installation shares the paged admission rollback boundary"
+    )]
     pub(crate) fn bind_slot_state(
         &mut self,
         slot: u32,
@@ -476,10 +480,13 @@ impl<B: Backend + 'static> Host<B> {
         binding: &crate::PagedBinding,
         previous: [forja_core::PagedSlot; 2],
         reserved_tokens: u64,
+        staged: Option<crate::StagedPrefix<B>>,
     ) -> Result<(), compute::Error> {
         if let Some(state) = self.state_slots.get_mut(&slot) {
             let result = if release {
                 state.release(lane)
+            } else if let Some(staged) = staged {
+                state.install_prefix(lane, staged)
             } else {
                 (|| {
                     let position = state
