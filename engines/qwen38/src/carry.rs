@@ -40,6 +40,14 @@ impl Carry {
         })
     }
 
+    pub(super) fn select_lane(&mut self, selected: u32) -> Result<()> {
+        let Self::Slotted { lane, .. } = self else {
+            return Err(Error::loading("recurrent carry has no serving slot"));
+        };
+        *lane = selected;
+        Ok(())
+    }
+
     pub(super) const fn is_slotted(&self) -> bool {
         matches!(self, Self::Slotted { .. })
     }

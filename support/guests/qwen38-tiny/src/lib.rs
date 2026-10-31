@@ -12,6 +12,7 @@ use forja_sdk::{
 enum Tiny {
     Full(qwen38::Qwen38),
     Recurrent(qwen38::DeltaNet),
+    Decoder(qwen38::DecoderLayer),
     Attention(qwen38::Attention),
 }
 
@@ -73,6 +74,16 @@ impl Engine for Tiny {
                 prompt_tokens,
             },
         )?);
+        if load.tunings.iter().any(|name| name == "decoder-fixture") {
+            return qwen38::DecoderLayer::load_paged(
+                &weights.scoped("language_model.model.layers.0"),
+                config,
+                0,
+                cache,
+                &forja_sdk::Tensor::constant(&(0..64).collect::<Vec<_>>(), &[64])?,
+            )
+            .map(Self::Decoder);
+        }
         qwen38::DeltaNet::load_paged(
             &weights.scoped("language_model.model.layers.0.linear_attn"),
             config,
@@ -111,7 +122,7 @@ impl Engine for Tiny {
                     router_logits: Vec::new(),
                 })
             }
-            Self::Recurrent(layer) => {
+            Self::Recurrent(_) | Self::Decoder(_) => {
                 let [token]: [u32; 1] = input.tokens.to_vec()?.try_into().map_err(|_| {
                     forja_sdk::Error::loading("recurrent fixture requires one token")
                 })?;
@@ -119,11 +130,18 @@ impl Engine for Tiny {
                     &[forja_sdk::bf16::from_f64(f64::from(token)); 64],
                     &[1, 64],
                 )?;
-                let logits = layer
-                    .deltanet_layer(&x, None)?
-                    .narrow(1, 0, 33)?
-                    .to_dtype()?
-                    .reshape(&[33])?;
+                let output = match self {
+                    Self::Recurrent(layer) => layer.deltanet_layer(&x, None)?,
+                    Self::Decoder(layer) => layer.paged_layer(
+                        &x,
+                        0,
+                        &forja_sdk::Dim::from(input.start_pos),
+                        input.phase,
+                        [None; 3],
+                    )?,
+                    _ => return Err(forja_sdk::Error::loading("invalid fixture mixer")),
+                };
+                let logits = output.narrow(1, 0, 33)?.to_dtype()?.reshape(&[33])?;
                 forja_sdk::eval()?;
                 Ok(StepOutput {
                     logits,
@@ -136,7 +154,7 @@ impl Engine for Tiny {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.decode(input),
-            Self::Recurrent(_) | Self::Attention(_) => {
+            Self::Recurrent(_) | Self::Decoder(_) | Self::Attention(_) => {
                 Err(forja_sdk::Error::loading("recurrent fixture uses step"))
             }
         }

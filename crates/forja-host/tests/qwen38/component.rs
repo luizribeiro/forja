@@ -30,6 +30,45 @@ async fn tiny_component_matches_teacher_forced_transformers() -> Result<(), Box<
 
 #[tokio::test]
 async fn slotted_recurrent_component_matches_eager_state_bits() -> Result<(), Box<dyn Error>> {
+    let weights = forja_sdk::Weights::open(fixture("model.safetensors"))?;
+    let mut native = qwen38::DeltaNet::load(
+        &weights.scoped("language_model.model.layers.0.linear_attn"),
+        qwen38::Config::tiny(),
+    )?;
+    assert_slotted_fixture("recurrent-fixture", |input, position| {
+        if position == 0 {
+            native.reset()?;
+        }
+        native.deltanet_layer(input, None)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn slotted_decoder_component_matches_eager_residual_bits() -> Result<(), Box<dyn Error>> {
+    let weights = forja_sdk::Weights::open(fixture("model.safetensors"))?;
+    let mut native = qwen38::DecoderLayer::load(
+        &weights.scoped("language_model.model.layers.0"),
+        qwen38::Config::tiny(),
+        0,
+        64,
+    )?;
+    assert_slotted_fixture("decoder-fixture", |input, position| {
+        if position == 0 {
+            native.reset()?;
+        }
+        native.forward(input, position, None, None)
+    })
+    .await
+}
+
+async fn assert_slotted_fixture(
+    tuning: &str,
+    mut forward: impl FnMut(
+        &forja_sdk::Tensor<forja_sdk::bf16>,
+        u32,
+    ) -> forja_sdk::Result<forja_sdk::Tensor<forja_sdk::bf16>>,
+) -> Result<(), Box<dyn Error>> {
     let mut runner = forja_host::EngineRunner::new(
         test_guests::qwen38_tiny(),
         forja_cpu::CpuBackend::new(),
@@ -45,19 +84,13 @@ async fn slotted_recurrent_component_matches_eager_state_bits() -> Result<(), Bo
                 replay: false,
                 paged_cache: true,
                 kv_cache: forja_host::KvCacheFormat::F16,
-                tunings: vec!["recurrent-fixture".into()],
+                tunings: vec![tuning.into()],
                 ..forja_host::EngineLoadConfig::default()
             },
         )
         .await??;
     assert!(!runner.supports_prefix_reuse());
-    let weights = forja_sdk::Weights::open(fixture("model.safetensors"))?;
-    let mut native = qwen38::DeltaNet::load(
-        &weights.scoped("language_model.model.layers.0.linear_attn"),
-        qwen38::Config::tiny(),
-    )?;
     for request in 0..2 {
-        native.reset()?;
         if request == 0 {
             runner.prepare_paged_request(None, 0)?;
             runner.prepare_paged_request(None, 64)?;
@@ -67,8 +100,7 @@ async fn slotted_recurrent_component_matches_eager_state_bits() -> Result<(), Bo
                 &[forja_sdk::bf16::from_f32(f32::from(token)); 64],
                 &[1, 64],
             )?;
-            let expected = native
-                .deltanet_layer(&input, None)?
+            let expected = forward(&input, u32::try_from(position)?)?
                 .narrow(1, 0, 33)?
                 .to_dtype::<f32>()?
                 .to_vec()?;

@@ -73,6 +73,10 @@ impl DeltaNet {
             carry,
         })
     }
+    pub(crate) fn select_lane(&mut self, lane: u32) -> Result<()> {
+        self.carry.select_lane(lane)
+    }
+
     /// Starts a new sequence with zero convolution history and recurrent state.
     ///
     /// # Errors
