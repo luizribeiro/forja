@@ -168,3 +168,6 @@ mod attach;
 
 #[cfg(test)]
 mod hybrid_tests;
+
+#[cfg(test)]
+mod resume_tests;
