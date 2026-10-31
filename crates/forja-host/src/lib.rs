@@ -17,7 +17,8 @@ mod state_inputs;
 pub use state::{
     LanePosition, SharedStateTrace, StateAction, StateBatch, StateBatchSubmission, StateCapture,
     StateCell, StateCommands, StateEntry, StateLaneCheckpoint, StateRecording, StateSelection,
-    StateSequenceHandle, StateSlots, StateStorage, StateSubmission, StateTrace,
+    StateSelectionBatch, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
+    StateTrace,
 };
 mod weights;
 

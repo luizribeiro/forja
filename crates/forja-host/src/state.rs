@@ -23,7 +23,7 @@ mod paired;
 mod quota_tests;
 pub use journal::{LanePosition, StateAction};
 mod selection;
-pub use selection::StateSelection;
+pub use selection::{StateSelection, StateSelectionBatch};
 mod sequence;
 pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;
