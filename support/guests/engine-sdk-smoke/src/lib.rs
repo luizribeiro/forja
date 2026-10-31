@@ -1,10 +1,10 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    BatchPhase, BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo,
-    EngineLoadConfig, Graph, KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo,
-    StepInput, StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill,
-    target::metal::Variant,
+    BatchInput, BatchPhase, BatchSelection, BatchShape, BeginDecodeInput, CachePlane, DecodeInput,
+    DecodeOutput, Dim, Engine, EngineInfo, EngineLoadConfig, Graph, KvCacheFormat, PagedCacheSet,
+    PagedPool, Param, Result, ServingInfo, StepInput, StepOutput, Tensor, Weights, export_engine,
+    nn::blocks::ChunkedPrefill, target::metal::Variant,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -41,7 +41,14 @@ impl Engine for ConstantEngine {
                 active_lanes: 2,
                 max_context: 32,
                 prefill_chunk_multiple: std::num::NonZeroU32::new(2),
-                batch_shapes: vec![],
+                batch_shapes: [BatchSelection::Forward, BatchSelection::Masked]
+                    .map(|selection| BatchShape {
+                        phase: BatchPhase::Decode,
+                        bucket: 2,
+                        tokens: 1,
+                        selection,
+                    })
+                    .into(),
             }),
         }
     }
@@ -116,6 +123,44 @@ impl Engine for ConstantEngine {
         let (logits, _) = self.feedback_logits()?;
         forja_sdk::eval()?;
         Ok(logits)
+    }
+
+    fn batch_forward(&mut self, input: BatchInput<'_>) -> Result<Tensor<f32>> {
+        let inputs = input
+            .slot
+            .tensors()?
+            .inputs
+            .ok_or_else(|| forja_sdk::Error::loading("batch inputs are missing"))?;
+        let values = input
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(lane, active)| {
+                active
+                    .as_ref()
+                    .map(|_| {
+                        input
+                            .slot
+                            .token(
+                                u32::try_from(lane)
+                                    .map_err(|_| forja_sdk::Error::loading("lane exceeds u32"))?,
+                            )
+                            .and_then(|token| Self::token_value(&token))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (lane, value) in values.into_iter().enumerate() {
+            if let Some(value) = value {
+                let lane = u32::try_from(lane)
+                    .map_err(|_| forja_sdk::Error::loading("lane exceeds u32"))?;
+                self.feedback_logits_value(lane, value)?
+                    .reshape(&[1, 4])?
+                    .copy_into(&mut inputs.logits.narrow(0, lane, 1)?)?;
+            }
+        }
+        forja_sdk::eval()?;
+        inputs.logits.narrow(0, 0, input.shape.bucket)
     }
 
     fn finish_decode(
@@ -201,24 +246,31 @@ impl ConstantEngine {
             .as_ref()
             .ok_or_else(|| forja_sdk::Error::loading("feedback smoke needs a serving slot"))?;
         let token = set.slot().token(0)?;
+        let value = Self::token_value(&token)?;
+        Ok((self.feedback_logits_value(0, value)?, token))
+    }
+
+    fn token_value(token: &Tensor<u32>) -> Result<f32> {
         let value = token
             .to_vec()?
             .first()
             .copied()
-            .ok_or_else(|| forja_sdk::Error::loading("feedback smoke token is missing"))?;
-        let value = f32::from(
-            u16::try_from(value)
-                .map_err(|_| forja_sdk::Error::loading("feedback smoke token exceeds u16"))?,
-        );
-        self.paged_value.write(&[value; 64])?;
-        let values = self.paged_value.reshape(&[1, 64])?;
+            .ok_or_else(|| forja_sdk::Error::loading("feedback token is missing"))?;
+        Ok(f32::from(u16::try_from(value).map_err(|_| {
+            forja_sdk::Error::loading("feedback token exceeds u16")
+        })?))
+    }
+
+    fn feedback_logits_value(&self, lane: u32, value: f32) -> Result<Tensor<f32>> {
+        let values = Tensor::from_slice(&[value; 64], &[1, 64])?;
         let weights = Tensor::from_slice(&[1.0; 128], &[2, 64])?;
-        let logits = set
-            .state_at(0, 0)?
+        self.paged
+            .as_ref()
+            .ok_or_else(|| forja_sdk::Error::loading("feedback slot is missing"))?
+            .state_at(lane, 0)?
             .causal_convolution(&values, &weights)?
             .reshape(&[64])?
-            .narrow(0, 0, 4)?;
-        Ok((logits, token))
+            .narrow(0, 0, 4)
     }
 
     fn paged_step(&mut self, input: &StepInput) -> Result<StepOutput> {

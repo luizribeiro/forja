@@ -14280,6 +14280,78 @@ mod tests {
         fs::remove_file(weights).unwrap();
     }
 
+    async fn assert_batched_selection_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
+        let weights = test_weight_file();
+        let mut runner =
+            EngineRunner::new(test_guests::engine_sdk_smoke(), backend, GENEROUS, &weights)
+                .await
+                .unwrap();
+        runner
+            .load_with_selections(
+                None,
+                &super::EngineLoadConfig {
+                    paged_cache: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for lane in 0..2 {
+            runner.prepare_paged_lane(lane, None, 8).unwrap();
+        }
+        let shape = BatchShape {
+            phase: BatchPhase::Decode,
+            bucket: 2,
+            tokens: 1,
+            selection: BatchSelection::Forward,
+        };
+        let logits = runner
+            .batch_forward(EngineBatch {
+                shape,
+                lanes: (0..2)
+                    .map(|lane| {
+                        Some(EngineBatchLane {
+                            slot: lane,
+                            tokens: Some(vec![lane + 1]),
+                            start_pos: 0,
+                            sampling: SamplingParams::default(),
+                        })
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runner.read(&logits).await.unwrap(),
+            [1.0_f32; 4]
+                .into_iter()
+                .chain([2.0; 4])
+                .flat_map(f32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        );
+        let slot = runner.paged_batch_slot(runner.page_pool.unwrap()).unwrap();
+        for lane in 0..2 {
+            let position = runner.store.data().state_slots[&slot]
+                .position(lane)
+                .unwrap();
+            assert_eq!((position.tokens, position.grammar), (1, 0));
+        }
+        fs::remove_file(weights).unwrap();
+    }
+
+    #[tokio::test]
+    async fn batched_selection_sdk() {
+        assert_batched_selection_sdk(CpuBackend::new()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_batched_selection_sdk() {
+        assert_batched_selection_sdk(forja_metal::MetalBackend::new().unwrap()).await;
+    }
+
     #[tokio::test]
     async fn forward_selection_boundary_sdk() {
         assert_forward_selection_boundary_sdk(CpuBackend::new()).await;
