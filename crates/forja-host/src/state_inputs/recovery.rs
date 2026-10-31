@@ -8,12 +8,19 @@ impl<B: Backend + 'static> Host<B> {
         &self,
         bank: &StateInputBank,
     ) -> Result<(), compute::Error> {
+        self.recover_state_input_handles(bank.handles())
+    }
+
+    pub(super) fn recover_state_input_handles(
+        &self,
+        handles: impl IntoIterator<Item = u32>,
+    ) -> Result<(), compute::Error> {
         let _order = self
             .taints
             .queue
             .lock()
             .map_err(|_| invalid_handle("submission order is poisoned"))?;
-        for handle in bank.handles() {
+        for handle in handles {
             let entry = self.entry(&Resource::new_borrow(handle))?;
             let tensor = &entry.tensor;
             let buffer = tensor.buffer();

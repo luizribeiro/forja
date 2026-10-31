@@ -37,7 +37,136 @@ struct InputLane<'a> {
     sampling: SamplingParams,
 }
 
+struct SelectionLane<'a> {
+    slot: usize,
+    start: u32,
+    sampling: SamplingParams,
+    allow: &'a [u32],
+}
+
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn write_state_selection_inputs(
+        &self,
+        pool: u32,
+        input: &crate::EngineBatchSelect,
+    ) -> Result<(), compute::Error> {
+        self.write_selection_inputs(
+            pool,
+            input.lanes.iter().enumerate().filter_map(|(slot, lane)| {
+                lane.as_ref().map(|lane| SelectionLane {
+                    slot,
+                    start: lane.start_pos,
+                    sampling: lane.sampling,
+                    allow: &lane.allow,
+                })
+            }),
+        )
+    }
+
+    pub(crate) fn write_state_single_selection_inputs(
+        &self,
+        pool: u32,
+        start: u32,
+        sampling: SamplingParams,
+        allow: &[u32],
+    ) -> Result<(), compute::Error> {
+        self.write_selection_inputs(
+            pool,
+            std::iter::once(SelectionLane {
+                slot: 0,
+                start,
+                sampling,
+                allow,
+            }),
+        )
+    }
+
+    fn input_slot(
+        &self,
+        pool: u32,
+    ) -> Result<Option<(u32, &crate::BatchSlotEntry, u32)>, compute::Error> {
+        let pool = self
+            .table
+            .get(&Resource::<crate::PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?;
+        let Some(rep) = pool.slot else {
+            return Ok(None);
+        };
+        let slot = self
+            .table
+            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(rep))
+            .map_err(invalid_handle)?;
+        Ok(Some((rep, slot, pool.max_context)))
+    }
+
+    fn write_selection_inputs<'a>(
+        &self,
+        pool: u32,
+        selected: impl Iterator<Item = SelectionLane<'a>>,
+    ) -> Result<(), compute::Error> {
+        let Some((_, slot, max_context)) = self.input_slot(pool)? else {
+            return Ok(());
+        };
+        let Some(inputs) = &slot.inputs else {
+            return Ok(());
+        };
+        let layout = slot
+            .input_layout
+            .ok_or_else(|| invalid_handle("state input layout is missing"))?;
+        let width = usize::try_from(layout.vocab.div_ceil(32)).map_err(invalid_handle)?;
+        let lanes = slot.binding.lanes.len();
+        let words = u64::from(layout.vocab.div_ceil(32))
+            .checked_add(6)
+            .and_then(|words| words.checked_mul(u64::try_from(lanes).ok()?))
+            .and_then(|words| words.checked_mul(8))
+            .ok_or_else(|| invalid_handle("selection staging bytes overflowed"))?;
+        let _charge = StateCharge::reserve(
+            self.backend.as_ref(),
+            Arc::clone(&self.live_bytes),
+            self.limits.live_bytes,
+            words,
+        )?;
+        let count = lanes
+            .checked_mul(width)
+            .ok_or_else(|| invalid_handle("selection mask count overflowed"))?;
+        let mut masks = vec![0_u32; count];
+        for row in masks.chunks_exact_mut(width) {
+            row[0] = 1;
+        }
+        let mut sampling = vec![sampling_words(SamplingParams::default()); lanes];
+        let mut positions = vec![0; lanes];
+        for lane in selected {
+            if lane.start >= max_context
+                || lane.allow.is_empty()
+                || lane.allow.windows(2).any(|pair| pair[0] >= pair[1])
+                || lane.allow.iter().any(|&token| token >= layout.vocab)
+            {
+                return Err(invalid_handle(
+                    "selection position or allow list is invalid",
+                ));
+            }
+            *sampling
+                .get_mut(lane.slot)
+                .ok_or_else(|| invalid_handle("selection lane exceeds slot"))? =
+                sampling_words(lane.sampling);
+            positions[lane.slot] = lane.start;
+            let row = masks
+                .chunks_exact_mut(width)
+                .nth(lane.slot)
+                .ok_or_else(|| invalid_handle("selection lane exceeds mask"))?;
+            row.fill(0);
+            for &token in lane.allow {
+                row[usize::try_from(token / 32).map_err(invalid_handle)?] |= 1 << (token % 32);
+            }
+        }
+        let bank = &inputs.banks[slot.active_bank];
+        let positions_handle = slot.metadata[slot.active_bank][2];
+        self.recover_state_input_handles([bank.sampling, bank.allow, positions_handle])?;
+        self.write_input_words(bank.sampling, sampling.into_iter().flatten())?;
+        self.write_input_words(bank.allow, masks.into_iter())?;
+        self.write_input_words(positions_handle, positions.into_iter())
+    }
+
     pub(crate) fn write_state_batch_inputs(
         &self,
         pool: u32,
@@ -78,17 +207,9 @@ impl<B: Backend + 'static> Host<B> {
         phase: BatchPhase,
         source_lanes: impl Iterator<Item = InputLane<'a>>,
     ) -> Result<(), compute::Error> {
-        let pool = self
-            .table
-            .get(&Resource::<crate::PagePoolEntry>::new_borrow(pool))
-            .map_err(invalid_handle)?;
-        let Some(slot_rep) = pool.slot else {
+        let Some((slot_rep, slot, _)) = self.input_slot(pool)? else {
             return Ok(());
         };
-        let slot = self
-            .table
-            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot_rep))
-            .map_err(invalid_handle)?;
         let Some(inputs) = &slot.inputs else {
             return Ok(());
         };

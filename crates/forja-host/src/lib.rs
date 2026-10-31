@@ -1960,6 +1960,9 @@ where
             Ok(slot) => slot,
             Err(error) => return Ok(Err(error)),
         };
+        if let Err(error) = self.store.data().write_state_selection_inputs(pool, &input) {
+            return Ok(Err(error));
+        }
         let wit_input = input.into();
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
@@ -2340,6 +2343,14 @@ where
             return Ok(Err(invalid_handle(
                 "engine tensor belongs to another runner",
             )));
+        }
+        if let Some(pool) = self.page_pool
+            && let Err(error) = self
+                .store
+                .data()
+                .write_state_single_selection_inputs(pool, start_pos, sampling, &allow)
+        {
+            return Ok(Err(error));
         }
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
@@ -10659,6 +10670,70 @@ mod tests {
         assert_eq!(seen[0], seen[2]);
         assert!(host.slot_tensors(slot.rep(), Some(2)).is_err());
         assert_eq!(host.live_handles, handles_before);
+    }
+
+    #[test]
+    fn selection_controls_preserve_seed_bits_and_refuse_before_bank_writes() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        host.table.get_mut(&slot).unwrap().active_bank = 1;
+        let entry = host.table.get(&slot).unwrap();
+        let bank = &entry.inputs.as_ref().unwrap().banks[1];
+        let handles = [bank.sampling, bank.allow, entry.metadata[1][2]];
+        let read = |host: &Host<CpuBackend>| {
+            handles.map(|handle| {
+                host.backend
+                    .read(&host.entry(&Resource::new_borrow(handle)).unwrap().tensor)
+                    .unwrap()
+            })
+        };
+        let sampling = SamplingParams {
+            temperature: 0.7,
+            top_k: 3,
+            top_p: 0.9,
+            seed: 0x1234_5678_9abc_def0,
+        };
+        host.write_state_single_selection_inputs(pool.rep(), 7, sampling, &[1, 6])
+            .unwrap();
+        let expected = read(&host);
+        assert_eq!(
+            expected,
+            [
+                [
+                    0.7_f32.to_bits(),
+                    3,
+                    0.9_f32.to_bits(),
+                    0x9abc_def0,
+                    0x1234_5678
+                ]
+                .map(u32::to_ne_bytes)
+                .concat(),
+                66_u32.to_ne_bytes().to_vec(),
+                7_u32.to_ne_bytes().to_vec(),
+            ]
+        );
+        for allow in [&[][..], &[6, 1][..], &[7][..]] {
+            assert!(
+                host.write_state_single_selection_inputs(pool.rep(), 7, sampling, allow)
+                    .is_err()
+            );
+            assert_eq!(read(&host), expected);
+        }
+        assert!(
+            host.write_state_single_selection_inputs(pool.rep(), 8, sampling, &[1])
+                .is_err()
+        );
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(
+            host.write_state_single_selection_inputs(pool.rep(), 7, sampling, &[1])
+                .is_err()
+        );
+        assert_eq!(read(&host), expected);
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 
     fn assert_input_allow_mask(
