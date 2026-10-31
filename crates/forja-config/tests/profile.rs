@@ -398,3 +398,31 @@ fn snapshot_allowances_are_declared_by_profiles_and_only_lowered_by_operators() 
         Choice::Fixed(ByteSize::new(1_048_576))
     );
 }
+
+#[test]
+fn snapshot_interval_is_optional_nonzero_and_part_of_profile_identity() {
+    let legacy: Profile = toml::from_str(PROFILE).unwrap();
+    assert!(
+        !legacy
+            .canonical_toml()
+            .unwrap()
+            .contains("state-snapshot-interval")
+    );
+    let source = PROFILE.replace("[serving]", "[serving]\nstate-snapshot-interval = 4096");
+    let profile: Profile = toml::from_str(&source).unwrap();
+    assert_eq!(
+        profile
+            .serving()
+            .unwrap()
+            .state_snapshot_interval
+            .unwrap()
+            .get(),
+        4096
+    );
+    assert_ne!(legacy.sha256().unwrap(), profile.sha256().unwrap());
+    assert_eq!(
+        toml::from_str::<Profile>(&profile.canonical_toml().unwrap()).unwrap(),
+        profile
+    );
+    assert!(toml::from_str::<Profile>(&source.replace("4096", "0")).is_err());
+}
