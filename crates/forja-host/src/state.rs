@@ -27,7 +27,7 @@ pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;
 pub use slots::StateSlots;
 mod trace;
-pub use trace::StateTrace;
+pub use trace::{SharedStateTrace, StateTrace};
 mod submit;
 pub use submit::StateSubmission;
 

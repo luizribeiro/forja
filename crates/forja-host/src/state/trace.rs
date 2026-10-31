@@ -1,12 +1,58 @@
 use super::{StateCharge, StateCommands, StateStorage};
 use crate::{compute, invalid_handle};
 use forja_core::{Backend, StateAccess};
-use std::sync::Arc;
+use std::{
+    any::Any,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 /// Independent inactive lane recordings for one graph trace, without request leases.
 pub struct StateTrace<B: Backend> {
     lanes: Vec<StateCommands<B>>,
-    _charge: StateCharge,
+    charge: Arc<StateCharge>,
+}
+
+/// Shared trace ownership suitable for a backend-independent component resource.
+#[derive(Clone)]
+pub struct SharedStateTrace {
+    trace: Arc<dyn Any + Send + Sync>,
+    _charge: Arc<StateCharge>,
+}
+
+impl std::fmt::Debug for SharedStateTrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedStateTrace")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<B: Backend + Send + Sync + 'static> StateTrace<B> {
+    /// Shares this trace while retaining its metadata charge through the final reference.
+    #[must_use]
+    pub fn share(self) -> SharedStateTrace {
+        let charge = Arc::clone(&self.charge);
+        SharedStateTrace {
+            trace: Arc::new(Mutex::new(Some(self))),
+            _charge: charge,
+        }
+    }
+}
+
+impl SharedStateTrace {
+    /// Borrows the original backend's trace, or its empty state after capture retirement.
+    ///
+    /// # Errors
+    /// Refuses a different backend type or a poisoned lock.
+    pub fn lock<B: Backend + 'static>(
+        &self,
+    ) -> Result<MutexGuard<'_, Option<StateTrace<B>>>, compute::Error> {
+        self.trace
+            .downcast_ref::<Mutex<Option<StateTrace<B>>>>()
+            .ok_or_else(|| invalid_handle("state trace belongs to another backend"))?
+            .lock()
+            .map_err(|_| invalid_handle("state trace lock is poisoned"))
+    }
 }
 
 impl<B: Backend> StateTrace<B> {
@@ -34,7 +80,7 @@ impl<B: Backend> StateTrace<B> {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             lanes,
-            _charge: charge,
+            charge: Arc::new(charge),
         })
     }
 
@@ -54,6 +100,33 @@ mod tests {
     use super::*;
     use crate::{Host, LanePosition, Limits, StateBatch, StateSlots};
     use forja_core::{DType, StateLayout, StatePlane};
+
+    #[test]
+    fn shared_traces_keep_metadata_charged_after_typed_capture_retirement() {
+        use std::sync::atomic::Ordering;
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(131_072, 8, 4096, 128, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7]).unwrap()]).unwrap(),
+                1,
+            )
+            .unwrap();
+        let slots = StateSlots::new(storage, 1).unwrap();
+        let before = host.live_bytes.load(Ordering::Acquire);
+        let shared = slots.trace().unwrap().share();
+        let last = shared.clone();
+        drop(shared);
+        #[cfg(target_os = "macos")]
+        assert!(last.lock::<forja_metal::MetalBackend>().is_err());
+        drop(last.lock::<forja_cpu::CpuBackend>().unwrap().take());
+        assert!(last.lock::<forja_cpu::CpuBackend>().unwrap().is_none());
+        assert!(host.live_bytes.load(Ordering::Acquire) > before);
+        drop(last);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+    }
 
     #[test]
     fn interleaved_traces_rebind_their_own_metadata_without_request_leases() {
