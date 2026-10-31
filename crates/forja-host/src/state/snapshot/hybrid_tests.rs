@@ -262,3 +262,61 @@ fn hybrid_lru_counts_shared_allocations_and_promotes_exact_hits() {
     assert_eq!(hit.tokens().len(), 192);
     assert_eq!(cache.usage().unwrap().entries, 2);
 }
+#[test]
+fn byte_pressure_evicts_only_unpinned_entries_and_refusals_are_atomic() {
+    let fixture = hybrid_fixture(262_144);
+    let first = fixture.entry();
+    let next = fixture.advance(128);
+    let cache = fixture.cache(65_536, next.retained_bytes() + 1280, 8);
+    let running = std::sync::atomic::AtomicBool::new(false);
+    cache.publish(first.clone(), &running).unwrap();
+    let before = cache.usage().unwrap();
+    let pages = fixture.pool.memory_usage().unwrap().0;
+    let live = fixture.host.live_bytes.load(Ordering::Acquire);
+    assert!(cache.publish(next.clone(), &running).is_err());
+    assert_eq!(cache.usage().unwrap(), before);
+    assert_eq!(fixture.pool.memory_usage().unwrap().0, pages);
+    assert_eq!(fixture.host.live_bytes.load(Ordering::Acquire), live);
+    drop(first);
+    cache.publish(next, &running).unwrap();
+    assert!(
+        cache
+            .lookup(fixture.image.namespace(), &(0..65).collect::<Vec<_>>())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cache.usage().unwrap().entries, 1);
+}
+
+#[test]
+fn an_oversized_snapshot_or_accounting_quota_never_evicts_existing_entries() {
+    let fixture = hybrid_fixture(262_144);
+    let first = fixture.entry();
+    let next = fixture.advance(128);
+    let allowance = first.reference_bytes()
+        + fixture.image.charged_bytes()
+        + fixture.image.prompt.charged_bytes();
+    let cache = fixture.cache(allowance, 65_536, 8);
+    let running = std::sync::atomic::AtomicBool::new(false);
+    let old = Arc::downgrade(&first);
+    cache.publish(first, &running).unwrap();
+    let before = cache.usage().unwrap();
+    assert!(cache.publish(next.clone(), &running).is_err());
+    assert_eq!(cache.usage().unwrap(), before);
+    assert!(old.upgrade().is_some());
+    let host = &fixture.host;
+    let remaining = host.limits.live_bytes - host.live_bytes.load(Ordering::Acquire);
+    let blocker = StateCharge::reserve(
+        host.backend.as_ref(),
+        Arc::clone(&host.live_bytes),
+        host.limits.live_bytes,
+        remaining - 1,
+    )
+    .unwrap();
+    let exhausted = host.live_bytes.load(Ordering::Acquire);
+    assert!(cache.publish(next.clone(), &running).is_err());
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), exhausted);
+    assert!(old.upgrade().is_some());
+    drop(blocker);
+    assert_eq!(cache.usage().unwrap(), before);
+}
