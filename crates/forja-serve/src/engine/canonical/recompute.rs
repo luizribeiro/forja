@@ -1,4 +1,4 @@
-use super::{GenerationControl, ServingEngine};
+use super::{GenerationControl, GenerationError, ServingEngine, cache_error};
 use crate::prefix::PrefixLedger;
 use forja_core::Backend;
 use forja_host::CanonicalPrompt;
@@ -7,9 +7,36 @@ use std::sync::Arc;
 pub(super) struct Recompute {
     prompt: Arc<CanonicalPrompt>,
     control: GenerationControl,
+    position: Option<u32>,
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
+    pub(in crate::engine) fn stop_canonical_recompute(&mut self) -> Result<(), GenerationError> {
+        let job = self
+            .canonical_cache
+            .as_mut()
+            .and_then(|cache| cache.recompute.take());
+        let Some(job) = job else {
+            return Ok(());
+        };
+        if job.control.is_cancelled() {
+            self.metrics.recompute_cancelled = self.metrics.recompute_cancelled.saturating_add(1);
+        } else {
+            self.metrics.recompute_preempted = self.metrics.recompute_preempted.saturating_add(1);
+        }
+        self.release_recompute(&job)
+    }
+
+    fn release_recompute(&mut self, job: &Recompute) -> Result<(), GenerationError> {
+        self.metrics.recompute_pending = false;
+        if job.position.is_some() {
+            self.runner
+                .prepare_paged_lane(0, None, 0)
+                .map_err(cache_error)?;
+        }
+        Ok(())
+    }
+
     pub(in crate::engine) fn queue_canonical_recompute(
         &mut self,
         ledger: &PrefixLedger,
@@ -47,6 +74,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 cache.recompute = Some(Recompute {
                     prompt,
                     control: control.clone(),
+                    position: None,
                 });
             }
             Ok(_) | Err(_) => {

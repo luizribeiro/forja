@@ -1251,6 +1251,7 @@ where
         constraint: Option<ConstraintPlan>,
         control: &GenerationControl,
     ) -> Result<PrefilledPrompt, GenerationError> {
+        self.stop_canonical_recompute()?;
         let started = Instant::now();
         let sampling = SamplingParams {
             temperature: params.temperature,

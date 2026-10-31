@@ -77,6 +77,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         &mut self,
         config: &forja_config::HostConfig,
     ) -> Result<(), GenerationError> {
+        self.stop_canonical_recompute()?;
         let Some(cache) = &mut self.canonical_cache else {
             if matches!(config.serving.state_snapshot_bytes, forja_config::Choice::Fixed(bytes) if bytes.get() > 0)
             {

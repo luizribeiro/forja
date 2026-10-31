@@ -425,6 +425,9 @@ where
             while let Ok(command) = receiver.try_recv() {
                 pending.push_back(RequestEnvelope::from_command(command));
             }
+            if let Err(error) = self.stop_canonical_recompute() {
+                tracing::warn!(%error, "cannot release background canonical state");
+            }
             if matches!(pending.front(), Some(RequestEnvelope::UpdatePolicy { .. })) {
                 let Some(RequestEnvelope::UpdatePolicy {
                     generation,

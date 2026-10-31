@@ -570,3 +570,23 @@ async fn short_prompts_bypass_canonical_admission_without_ledger_charges() -> Re
     assert_eq!(engine.metrics.snapshot_refusals, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn foreground_admission_drops_the_queued_reply_ledger() -> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    let ledger = crate::prefix::PrefixLedger::new(vec![0; 65]);
+    engine.queue_canonical_recompute(&ledger, 65, &[0; 63], &control, true);
+    assert!(engine.metrics.recompute_pending);
+    let input = request();
+    let _prefill = engine
+        .begin_batch_prefill(input, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert!(!engine.metrics.recompute_pending);
+    assert_eq!(engine.metrics.recompute_preempted, 1);
+    assert_eq!(engine.metrics.recompute_blocks, 0);
+    Ok(())
+}
