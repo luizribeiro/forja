@@ -82,6 +82,23 @@ impl PagedInputTensors {
 }
 
 impl PagedSlot<'_> {
+    /// Records a selected token into the current lane transaction's private feedback.
+    ///
+    /// # Errors
+    /// Refuses invalid tokens, missing state work or a host-denied transaction.
+    #[cfg(target_family = "wasm")]
+    pub fn store_feedback(&self, lane: u32, token: &Tensor<u32>) -> Result<()> {
+        crate::graph::record_import(|commands| {
+            crate::sys::guest::paged_storage::record_feedback(
+                commands,
+                self.raw,
+                lane,
+                token.handle(),
+            )
+            .map_err(|error| Error::loading(format!("{error:?}")))
+        })
+    }
+
     /// Borrows one lane's input token with read-only host rights.
     ///
     /// # Errors

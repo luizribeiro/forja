@@ -51,6 +51,13 @@ interface paged-storage {
     delta-rule-block,
   }
 
+  record-feedback: func(
+    cmds: borrow<command-list>,
+    slot: borrow<batch-slot>,
+    lane: u32,
+    selected: borrow<tensor>,
+  ) -> result<_, error>;
+
   record-state: func(
     cmds: borrow<command-list>,
     slot: borrow<batch-slot>,

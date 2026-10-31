@@ -8856,6 +8856,18 @@ impl<B> paged_storage::Host for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn record_feedback(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+        selected: Resource<TensorEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(
+            self.record_slot_feedback(&commands, &slot, lane, &selected)
+        ))
+    }
+
     fn record_state(
         &mut self,
         commands: Resource<CommandListEntry>,
@@ -12486,6 +12498,66 @@ mod tests {
             3
         );
         fs::remove_file(weights).unwrap();
+    }
+
+    async fn assert_feedback_sdk_roundtrip<B: Backend + Send + Sync + 'static>(backend: B) {
+        let weights = test_weight_file();
+        let mut runner =
+            EngineRunner::new(test_guests::engine_sdk_smoke(), backend, GENEROUS, &weights)
+                .await
+                .unwrap();
+        runner
+            .load_with_selections(
+                None,
+                &super::EngineLoadConfig {
+                    paged_cache: true,
+                    ..super::EngineLoadConfig::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for (position, tokens, expected, carry) in [
+            (0, Some(vec![3]), 3_u32, 3_f32),
+            (1, None, 3, 6.0),
+            (2, Some(vec![1]), 1, 4.0),
+            (0, Some(vec![2]), 2, 2.0),
+        ] {
+            let output = runner
+                .decode(super::EngineDecode {
+                    phase: if position == 0 {
+                        BatchPhase::Prompt
+                    } else {
+                        BatchPhase::Decode
+                    },
+                    tokens,
+                    start_pos: position,
+                    sampling: SamplingParams::default(),
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                runner.read(&output.token).await.unwrap(),
+                expected.to_ne_bytes()
+            );
+            assert_eq!(
+                first_f32(&runner.read(&output.logits).await.unwrap()),
+                carry
+            );
+        }
+        fs::remove_file(weights).unwrap();
+    }
+
+    #[tokio::test]
+    async fn feedback_sdk_roundtrip() {
+        assert_feedback_sdk_roundtrip(CpuBackend::new()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_feedback_sdk_roundtrip() {
+        assert_feedback_sdk_roundtrip(forja_metal::MetalBackend::new().unwrap()).await;
     }
 
     #[tokio::test]
