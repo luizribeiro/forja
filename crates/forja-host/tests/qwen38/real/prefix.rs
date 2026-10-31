@@ -24,3 +24,11 @@ async fn metal_real_shared_canonical_parent_survives_two_live_branch_writers()
     let (runner, _) = load_configured(true, None, Some(512)).await?;
     crate::qwen38::serving::prefix::assert_shared_parent(runner, 65).await
 }
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_real_recomputed_reply_preserves_cold_logits_and_every_state_plane()
+-> Result<(), Box<dyn Error>> {
+    let (runner, _) = load_configured(true, None, Some(512)).await?;
+    crate::qwen38::serving::prefix::assert_recomputed_reply(runner).await
+}
