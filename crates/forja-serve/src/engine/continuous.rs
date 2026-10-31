@@ -473,7 +473,7 @@ where
                 continue;
             }
             let scheduled = Instant::now();
-            if self.info.serving.is_some()
+            if self.supports_continuous_batching()
                 && pending
                     .front()
                     .is_some_and(|request| !request.requires_serial_path())

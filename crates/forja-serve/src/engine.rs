@@ -1082,6 +1082,10 @@ where
         Ok(())
     }
 
+    pub(crate) const fn uses_canonical_prefixes(&self) -> bool {
+        self.canonical_cache.is_some()
+    }
+
     pub(crate) const fn supports_continuous_batching(&self) -> bool {
         !self.scheduler.decode_buckets.is_empty()
     }

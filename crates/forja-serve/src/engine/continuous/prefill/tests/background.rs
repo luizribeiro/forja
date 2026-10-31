@@ -168,3 +168,55 @@ async fn arriving_request_preempts_reply_recompute_after_at_most_one_block() -> 
     worker.await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn serial_generation_keeps_the_canonical_idle_worker() -> Result<(), TestError> {
+    use crate::{
+        ServingMetrics,
+        http::{AdmissionPolicy, ChatService, ServiceCommand},
+    };
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, oneshot};
+    let mut engine = configured().await?;
+    engine.scheduler.decode_buckets.clear();
+    let policy = AdmissionPolicy {
+        config: Arc::new(engine.config.clone()),
+    };
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.queue_canonical_recompute(
+        &PrefixLedger::new(vec![0; 65]),
+        65,
+        &[1; 63],
+        &control,
+        true,
+    );
+    let metrics = Arc::new(Mutex::new(ServingMetrics::default()));
+    let (sender, receiver) = mpsc::channel(8);
+    let worker = tokio::spawn(engine.run(receiver, metrics.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.lock().unwrap().recompute_completed == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    let (reply, completion) = oneshot::channel();
+    sender.send(ServiceCommand::Text {
+        policy,
+        request: serde_json::from_value(serde_json::json!({"model":"hybrid", "prompt":"a", "max_tokens":2, "temperature":0.0}))?,
+        control: GenerationControl::new(Duration::from_secs(2)), reply, queued: Instant::now(),
+    }).await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await???
+            .token_ids
+            .len(),
+        2
+    );
+    drop(sender);
+    worker.await?;
+    let observed = metrics.lock().unwrap().clone();
+    assert_eq!(observed.recompute_blocks, 2);
+    assert_eq!(observed.recompute_completed, 1);
+    assert!(!observed.recompute_pending);
+    Ok(())
+}

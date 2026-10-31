@@ -140,7 +140,7 @@ where
         receiver: mpsc::Receiver<ServiceCommand>,
         metrics: Arc<StdMutex<ServingMetrics>>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        if self.supports_continuous_batching() {
+        if self.supports_continuous_batching() || self.uses_canonical_prefixes() {
             Box::pin(self.run_continuous(receiver, metrics))
         } else {
             Box::pin(run_serial(self, receiver, metrics))
