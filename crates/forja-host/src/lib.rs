@@ -5722,8 +5722,8 @@ impl<B: Backend + 'static> Host<B> {
         appended: Option<[&Resource<TensorEntry>; 2]>,
     ) -> Result<(), compute::Error> {
         let (key, table, generations, activity, usage) =
-            self.paged_slot_entries(slot, lane, config.key_plane)?;
-        let (value, _, _, _, _) = self.paged_slot_entries(slot, lane, config.value_plane)?;
+            self.paged_slot_entries(slot, lane, config.key_plane, None)?;
+        let (value, _, _, _, _) = self.paged_slot_entries(slot, lane, config.value_plane, None)?;
         let (query, output) = (self.entry(query)?.clone(), self.entry(output)?.clone());
         let [_query_heads, query_tokens, width]: [u32; 3] =
             query.tensor.layout().shape().try_into().map_err(|_| {
@@ -5845,6 +5845,7 @@ impl<B: Backend + 'static> Host<B> {
         slot: &Resource<BatchSlotEntry>,
         lane: u32,
         plane: u32,
+        bank: Option<usize>,
     ) -> Result<
         (
             TensorEntry,
@@ -5856,7 +5857,8 @@ impl<B: Backend + 'static> Host<B> {
         compute::Error,
     > {
         let slot = self.table.get(slot).map_err(invalid_handle)?;
-        let bank = slot.active_bank;
+        let fixed_bank = bank.is_some();
+        let bank = bank.unwrap_or(slot.active_bank);
         let lane = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let plane = usize::try_from(plane)
@@ -5882,7 +5884,8 @@ impl<B: Backend + 'static> Host<B> {
             .get(bank)
             .and_then(|bank| bank.get(lane))
             .ok_or_else(|| invalid_handle("paged lane activity is missing"))?;
-        let ungated = lane == 0
+        let ungated = !fixed_bank
+            && lane == 0
             && !slot.binding.activity_gated[bank].load(Ordering::Acquire)
             && lane_activity.load(Ordering::Acquire)
             && slot
@@ -8895,7 +8898,7 @@ where
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
         let result = (|| {
             let (pages, table, generations, activity, usage) =
-                self.paged_slot_entries(&slot, lane, span.plane)?;
+                self.paged_slot_entries(&slot, lane, span.plane, None)?;
             let ordinary = self.entry(&ordinary)?.clone();
             let start = core_affine(span.start);
             let tokens = ordinary
@@ -11259,6 +11262,23 @@ mod tests {
         })
     }
 
+    #[test]
+    fn fixed_paged_banks_preserve_activity_guards() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let (_pool, slot) = fresh_paged_lane(&mut host);
+        let (_, original, _, _, usage) = host.paged_slot_entries(&slot, 0, 0, None).unwrap();
+        assert!(usage.ungated);
+        for bank in 0..2 {
+            let (_, table, _, activity, usage) =
+                host.paged_slot_entries(&slot, 0, 0, Some(bank)).unwrap();
+            assert!(!usage.ungated);
+            assert!(activity.is_some());
+            assert_eq!(usage.bank, bank);
+            assert_eq!(original.tensor.buffer() == table.tensor.buffer(), bank == 0);
+        }
+        assert!(host.paged_slot_entries(&slot, 0, 0, Some(2)).is_err());
+    }
+
     #[tokio::test]
     async fn paged_append_records_and_retains_every_output() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
@@ -11266,8 +11286,8 @@ mod tests {
         let commands = host.command_list().unwrap();
         let rows = append_attention_rows(&mut host, 2);
         let (key, table, generations, activity, usage) =
-            host.paged_slot_entries(&slot, 0, 0).unwrap();
-        let (value, _, _, _, _) = host.paged_slot_entries(&slot, 0, 1).unwrap();
+            host.paged_slot_entries(&slot, 0, 0, None).unwrap();
+        let (value, _, _, _, _) = host.paged_slot_entries(&slot, 0, 1, None).unwrap();
         let outputs = [host.entry(&rows[3]).unwrap().clone(), key, value].map(|mut entry| {
             if entry.tensor.layout().shape().len() == 3 && entry.tensor.layout().shape()[1] == 4 {
                 let shape = entry.tensor.layout().shape();
