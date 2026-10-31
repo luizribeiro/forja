@@ -149,27 +149,7 @@ impl<B: Backend + 'static> Host<B> {
         let body = state.commands(bank, lane, active)?;
         let tensors = inputs.iter().map(|entry| &entry.tensor).collect::<Vec<_>>();
         let plane = usize::try_from(plane).map_err(invalid_handle)?;
-        match (operation, tensors.as_slice()) {
-            (paged_storage::StateOperation::CausalConvolution, [input, weights])
-                if algorithm.is_empty() =>
-            {
-                body.causal_convolution(plane, input, weights, &output.tensor)?;
-            }
-            (paged_storage::StateOperation::DeltaRule, [q, k, v, decay, beta])
-                if algorithm.is_empty() =>
-            {
-                body.delta_rule(plane, [q, k, v, decay, beta], &output.tensor)?;
-            }
-            (paged_storage::StateOperation::DeltaRuleBlock, [q, k, v, decay, beta]) => {
-                body.delta_rule_block(
-                    plane,
-                    [q, k, v, decay, beta],
-                    &output.tensor,
-                    Some(algorithm),
-                )?;
-            }
-            _ => return Err(invalid_handle("invalid state operands or algorithm")),
-        }
+        record_state_operation(body, plane, operation, &tensors, &output.tensor, algorithm)?;
         let protected = body.protected_buffers().collect::<Vec<_>>();
         let dispatches = std::mem::take(&mut body.commands).into_dispatches();
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
@@ -726,4 +706,31 @@ impl<B: Backend + 'static> Host<B> {
         }
         Ok(())
     }
+}
+
+fn record_state_operation<B: Backend + 'static>(
+    body: &mut crate::StateCommands<B>,
+    plane: usize,
+    operation: paged_storage::StateOperation,
+    tensors: &[&forja_core::Tensor],
+    output: &forja_core::Tensor,
+    algorithm: &str,
+) -> Result<(), compute::Error> {
+    match (operation, tensors) {
+        (paged_storage::StateOperation::CausalConvolution, [input, weights])
+            if algorithm.is_empty() =>
+        {
+            body.causal_convolution(plane, input, weights, output)?;
+        }
+        (paged_storage::StateOperation::DeltaRule, [q, k, v, decay, beta])
+            if algorithm.is_empty() =>
+        {
+            body.delta_rule(plane, [q, k, v, decay, beta], output)?;
+        }
+        (paged_storage::StateOperation::DeltaRuleBlock, [q, k, v, decay, beta]) => {
+            body.delta_rule_block(plane, [q, k, v, decay, beta], output, Some(algorithm))?;
+        }
+        _ => return Err(invalid_handle("invalid state operands or algorithm")),
+    }
+    Ok(())
 }
