@@ -13,7 +13,9 @@ mod feedback;
 mod fuzz_tests;
 mod hybrid;
 mod hybrid_prefix;
-pub use hybrid_prefix::{HybridAttachment, HybridPrefix, SnapshotAllowance};
+pub use hybrid_prefix::{
+    HybridAttachment, HybridCacheUsage, HybridPrefix, HybridPrefixStore, SnapshotAllowance,
+};
 mod lending;
 mod native;
 mod recovery;

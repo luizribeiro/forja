@@ -1,3 +1,5 @@
+mod store;
+pub use store::{HybridCacheUsage, HybridPrefixStore};
 mod entry;
 pub use entry::{HybridAttachment, HybridPrefix};
 

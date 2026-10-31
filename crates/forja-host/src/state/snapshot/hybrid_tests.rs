@@ -128,3 +128,38 @@ fn hybrid_entries_pair_exact_ledgers_and_reject_foreign_pages_atomically() {
     assert_eq!(entry.attention_tokens().unwrap(), 64);
     assert_eq!(entry.attention_layout(), pool.layout());
 }
+
+#[test]
+fn hybrid_cache_admission_is_cancelable_and_counts_shared_backing() {
+    let fixture = hybrid_fixture(262_144);
+    let HybridFixture {
+        host,
+        image,
+        resource,
+        source,
+        ..
+    } = fixture;
+    let entry = host
+        .hybrid_prefix(&resource, &source, image.clone(), image.tokens())
+        .unwrap();
+    let cache = host
+        .create_hybrid_prefix_store(
+            &resource,
+            image.namespace(),
+            SnapshotAllowance::new(65_536, None).unwrap(),
+            65_536,
+            2,
+        )
+        .unwrap();
+    let empty = cache.usage().unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    assert!(!cache.publish(entry.clone(), &cancelled).unwrap());
+    assert_eq!(cache.usage().unwrap(), empty);
+    cancelled.store(false, Ordering::Release);
+    assert!(cache.publish(entry.clone(), &cancelled).unwrap());
+    let accepted = cache.usage().unwrap();
+    assert_eq!(accepted.entries, 1);
+    assert_eq!(accepted.bytes, empty.bytes + entry.retained_bytes());
+    assert!(!cache.publish(entry.clone(), &cancelled).unwrap());
+    assert_eq!(cache.usage().unwrap(), accepted);
+}
