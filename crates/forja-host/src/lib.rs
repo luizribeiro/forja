@@ -12,6 +12,7 @@ mod fuzz_tests;
 mod hybrid;
 mod lending;
 mod native;
+mod recovery;
 mod selection_attempt;
 pub use selection_attempt::SelectionAttempt;
 mod slot_capture;

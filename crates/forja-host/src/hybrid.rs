@@ -341,17 +341,10 @@ impl<B: Backend> SubmittedWork<B> {
             Self::Plain(_) => Ok(()),
             Self::State(batch) => batch.finish_after(execution),
             Self::Selection(batch) => batch.finish_after(execution),
-        }
-        .map_err(|_| {
-            execution
-                .err()
-                .unwrap_or(forja_core::BackendError::ExecutionFailed)
-        });
-        taint.finish(
-            result.and_then(|value| state.map(|()| value)),
-            true,
-            timeout,
-        )
+        };
+        let result = crate::recovery::finish(result, state)
+            .map_err(crate::recovery::RecoveryError::into_backend);
+        taint.finish(result, true, timeout)
     }
 }
 

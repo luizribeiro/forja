@@ -82,8 +82,8 @@ impl<B: Backend + 'static> Host<B> {
             };
             let loan = self.feedback_destination(site.slot, index)?;
             let entry = self.entry(&loan).cloned();
-            self.drop_tensor(loan)?;
-            let entry = entry?;
+            let entry = crate::recovery::finish(entry, self.drop_tensor(loan))
+                .map_err(crate::recovery::RecoveryError::into_compute)?;
             bindings
                 .view(site.destination.clone(), entry.tensor.clone())
                 .map_err(crate::guest_error)?;
@@ -133,8 +133,8 @@ impl<B: Backend + 'static> Host<B> {
             &[Resource::new_borrow(selected.rep())],
             &output,
         );
-        self.drop_tensor(output)?;
-        result?;
+        crate::recovery::finish(result, self.drop_tensor(output))
+            .map_err(crate::recovery::RecoveryError::into_compute)?;
         self.table
             .get_mut(commands)
             .map_err(invalid_handle)?
