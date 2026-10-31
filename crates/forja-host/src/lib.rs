@@ -14110,6 +14110,63 @@ mod tests {
         fs::remove_file(weights).unwrap();
     }
 
+    async fn assert_forward_selection_boundary_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
+        let weights = test_weight_file();
+        let mut runner =
+            EngineRunner::new(test_guests::engine_sdk_smoke(), backend, GENEROUS, &weights)
+                .await
+                .unwrap();
+        runner
+            .load_with_selections(
+                None,
+                &super::EngineLoadConfig {
+                    paged_cache: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let logits = runner
+            .begin_decode(super::EngineBeginDecode {
+                phase: BatchPhase::Prompt,
+                tokens: Some(vec![3]),
+                start_pos: 0,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_f32(&runner.read(&logits).await.unwrap()), 3.0);
+        let pool = runner.page_pool.unwrap();
+        let slot = runner.paged_batch_slot(pool).unwrap();
+        let before = runner.store.data().state_slots[&slot].position(0).unwrap();
+        assert_eq!((before.tokens, before.grammar), (1, 0));
+        assert!(runner.checkpoint_state_lane(0).is_err());
+        let attempt = runner
+            .store
+            .data_mut()
+            .begin_slot_selection(&Resource::new_borrow(pool), std::iter::once((0, 0)))
+            .unwrap()
+            .unwrap();
+        assert!(attempt.accept(runner.store.data_mut()).is_err());
+        assert_eq!(
+            runner.store.data().state_slots[&slot].position(0).unwrap(),
+            before
+        );
+        fs::remove_file(weights).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_selection_boundary_sdk() {
+        assert_forward_selection_boundary_sdk(CpuBackend::new()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metal_forward_selection_boundary_sdk() {
+        assert_forward_selection_boundary_sdk(forja_metal::MetalBackend::new().unwrap()).await;
+    }
+
     #[tokio::test]
     async fn feedback_sdk_roundtrip() {
         assert_feedback_sdk_roundtrip(CpuBackend::new()).await;

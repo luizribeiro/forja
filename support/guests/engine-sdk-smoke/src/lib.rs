@@ -1,9 +1,10 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    BatchPhase, CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo, EngineLoadConfig,
-    Graph, KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo, StepInput,
-    StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill, target::metal::Variant,
+    BatchPhase, BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo,
+    EngineLoadConfig, Graph, KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo,
+    StepInput, StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill,
+    target::metal::Variant,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -101,31 +102,20 @@ impl Engine for ConstantEngine {
     }
 
     fn decode(&mut self, _input: DecodeInput) -> Result<DecodeOutput> {
-        let set = self
-            .paged
+        let (logits, token) = self.feedback_logits()?;
+        self.paged
             .as_ref()
-            .ok_or_else(|| forja_sdk::Error::loading("feedback smoke needs a serving slot"))?;
-        let token = set.slot().token(0)?;
-        let value = token
-            .to_vec()?
-            .first()
-            .copied()
-            .ok_or_else(|| forja_sdk::Error::loading("feedback smoke token is missing"))?;
-        let value = f32::from(
-            u16::try_from(value)
-                .map_err(|_| forja_sdk::Error::loading("feedback smoke token exceeds u16"))?,
-        );
-        self.paged_value.write(&[value; 64])?;
-        let values = self.paged_value.reshape(&[1, 64])?;
-        let weights = Tensor::from_slice(&[1.0; 128], &[2, 64])?;
-        let logits = set
-            .state_at(0, 0)?
-            .causal_convolution(&values, &weights)?
-            .reshape(&[64])?
-            .narrow(0, 0, 4)?;
-        set.slot().store_feedback(0, &token)?;
+            .ok_or_else(|| forja_sdk::Error::loading("feedback slot is missing"))?
+            .slot()
+            .store_feedback(0, &token)?;
         forja_sdk::eval()?;
         Ok(DecodeOutput { logits, token })
+    }
+
+    fn begin_decode(&mut self, _input: BeginDecodeInput) -> Result<Tensor<f32>> {
+        let (logits, _) = self.feedback_logits()?;
+        forja_sdk::eval()?;
+        Ok(logits)
     }
 
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
@@ -170,6 +160,32 @@ impl Engine for ConstantEngine {
 }
 
 impl ConstantEngine {
+    fn feedback_logits(&self) -> Result<(Tensor<f32>, Tensor<u32>)> {
+        let set = self
+            .paged
+            .as_ref()
+            .ok_or_else(|| forja_sdk::Error::loading("feedback smoke needs a serving slot"))?;
+        let token = set.slot().token(0)?;
+        let value = token
+            .to_vec()?
+            .first()
+            .copied()
+            .ok_or_else(|| forja_sdk::Error::loading("feedback smoke token is missing"))?;
+        let value = f32::from(
+            u16::try_from(value)
+                .map_err(|_| forja_sdk::Error::loading("feedback smoke token exceeds u16"))?,
+        );
+        self.paged_value.write(&[value; 64])?;
+        let values = self.paged_value.reshape(&[1, 64])?;
+        let weights = Tensor::from_slice(&[1.0; 128], &[2, 64])?;
+        let logits = set
+            .state_at(0, 0)?
+            .causal_convolution(&values, &weights)?
+            .reshape(&[64])?
+            .narrow(0, 0, 4)?;
+        Ok((logits, token))
+    }
+
     fn paged_step(&mut self, input: &StepInput) -> Result<StepOutput> {
         let token = self
             .paged
