@@ -69,6 +69,46 @@ impl Carry {
         }
     }
 
+    pub(super) fn convolve_into<T: FloatElement>(
+        &self,
+        input: &Tensor<T>,
+        weights: &Tensor<T>,
+        output: &mut Tensor<T>,
+    ) -> Result<()> {
+        let Self::Slotted {
+            cache,
+            planes,
+            lane,
+        } = self
+        else {
+            return Err(Error::loading("recurrent carry has no serving slot"));
+        };
+        cache
+            .state_at(*lane, planes[0])?
+            .causal_convolution_into(input, weights, output)
+    }
+
+    pub(super) fn delta_into<T: FloatElement>(
+        &self,
+        qk: [&Tensor<f32>; 2],
+        value: &Tensor<T>,
+        decay: &Tensor<f32>,
+        beta: &Tensor<T>,
+        output: &mut Tensor<T>,
+    ) -> Result<()> {
+        let Self::Slotted {
+            cache,
+            planes,
+            lane,
+        } = self
+        else {
+            return Err(Error::loading("recurrent carry has no serving slot"));
+        };
+        cache
+            .state_at(*lane, planes[1])?
+            .delta_rule_into(qk[0], qk[1], value, decay, beta, output)
+    }
+
     pub(super) fn delta<T: FloatElement>(
         &mut self,
         qk: [&Tensor<f32>; 2],

@@ -1,3 +1,5 @@
+mod batch;
+
 use crate::{Config, carry::Carry, numerics, quant::Affine};
 use forja_sdk::{Result, Tensor, Weights, bf16, target::metal::Variant};
 

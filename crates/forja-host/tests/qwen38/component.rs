@@ -95,7 +95,7 @@ async fn assert_slotted_fixture(
             runner.prepare_paged_request(None, 0)?;
             runner.prepare_paged_request(None, 64)?;
         }
-        for (position, token) in [1_u16, 2, 7].into_iter().enumerate() {
+        for (position, token) in [1_u16, 2, 7, 0, 32].into_iter().enumerate() {
             let input = forja_sdk::Tensor::from_slice(
                 &[forja_sdk::bf16::from_f32(f32::from(token)); 64],
                 &[1, 64],

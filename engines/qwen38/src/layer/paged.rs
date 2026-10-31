@@ -64,7 +64,7 @@ impl DecoderLayer {
                 if prefill {
                     layer.prefill(&normalized, quant, delta)?
                 } else {
-                    layer.deltanet_layer(&normalized, quant)?
+                    layer.decode_rows(&normalized, &[lane], quant)?
                 }
             }
             Mixer::Attention(layer) => {
