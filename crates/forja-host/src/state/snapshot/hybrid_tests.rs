@@ -30,9 +30,11 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
     )
     .unwrap();
     let pool = forja_core::PagePool::new_fixed(layout.clone(), 16, 131_072).unwrap();
-    let mut source = pool.reserve(129).unwrap();
-    source.commit_write(128).unwrap();
+    let mut source = pool.reserve(257).unwrap();
+    source.commit_write(256).unwrap();
     let source = crate::PagedPrefix::new(source);
+    let backing_bytes = pool.memory_usage().unwrap().0.total().unwrap();
+    host.live_bytes.fetch_add(backing_bytes, Ordering::AcqRel);
     let resource = host
         .table
         .push(crate::PagePoolEntry {
@@ -42,7 +44,7 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
             plane_count: 1,
             slot_banks: None,
             slot: None,
-            charged_bytes: std::sync::atomic::AtomicU64::new(0),
+            charged_bytes: std::sync::atomic::AtomicU64::new(backing_bytes),
             live_bytes: Arc::clone(&host.live_bytes),
         })
         .unwrap();
@@ -162,4 +164,101 @@ fn hybrid_cache_admission_is_cancelable_and_counts_shared_backing() {
     assert_eq!(accepted.bytes, empty.bytes + entry.retained_bytes());
     assert!(!cache.publish(entry.clone(), &cancelled).unwrap());
     assert_eq!(cache.usage().unwrap(), accepted);
+}
+
+impl HybridFixture {
+    fn entry(&self) -> Arc<crate::HybridPrefix<CpuBackend>> {
+        self.host
+            .hybrid_prefix(
+                &self.resource,
+                &self.source,
+                self.image.clone(),
+                self.image.tokens(),
+            )
+            .unwrap()
+    }
+    fn advance(&self, end: u64) -> Arc<crate::HybridPrefix<CpuBackend>> {
+        let prompt = if end < 129 {
+            Arc::clone(&self.image.prompt)
+        } else {
+            self.host
+                .canonical_prompt(self.image.namespace(), (0..257).collect())
+                .unwrap()
+        };
+        let transaction = self
+            .parent
+            .begin_prefill(end, prompt, end, 257, crate::StateAction::Step)
+            .unwrap();
+        self.parent.lock().mark_submitted(&transaction).unwrap();
+        self.parent.storage.pool.observe_completion(end).unwrap();
+        self.parent.lock().finish(&transaction, true).unwrap();
+        let image = self
+            .parent
+            .capture_snapshot(SnapshotAllowance::new(65_536, None).unwrap())
+            .unwrap();
+        self.host
+            .hybrid_prefix(&self.resource, &self.source, image.clone(), image.tokens())
+            .unwrap()
+    }
+    fn cache(
+        &self,
+        allowance: u64,
+        bytes: u64,
+        entries: usize,
+    ) -> crate::HybridPrefixStore<CpuBackend> {
+        self.host
+            .create_hybrid_prefix_store(
+                &self.resource,
+                self.image.namespace(),
+                SnapshotAllowance::new(allowance, None).unwrap(),
+                bytes,
+                entries,
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn hybrid_lru_counts_shared_allocations_and_promotes_exact_hits() {
+    let fixture = hybrid_fixture(262_144);
+    let cache = fixture.cache(65_536, 65_536, 2);
+    let first = fixture.entry();
+    let first_bytes = first.retained_bytes();
+    let first_weak = Arc::downgrade(&first);
+    let empty = cache.usage().unwrap();
+    let running = std::sync::atomic::AtomicBool::new(false);
+    cache.publish(first, &running).unwrap();
+    let second = fixture.advance(128);
+    let second_bytes = second.retained_bytes();
+    let second_weak = Arc::downgrade(&second);
+    cache.publish(second, &running).unwrap();
+    let usage = cache.usage().unwrap();
+    assert_eq!(usage.entries, 2);
+    assert_eq!(
+        usage.bytes,
+        empty.bytes + first_bytes + second_bytes
+            - fixture.image.prompt.charged_bytes()
+            - fixture.pool.layout().total_page_bytes()
+    );
+    assert!(
+        cache
+            .lookup(fixture.image.namespace(), &(0..64).collect::<Vec<_>>())
+            .unwrap()
+            .is_none()
+    );
+    let hit = cache
+        .lookup(fixture.image.namespace(), &(0..65).collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.tokens().len(), 64);
+    drop(hit);
+    cache.publish(fixture.advance(192), &running).unwrap();
+    assert!(first_weak.upgrade().is_some());
+    assert!(second_weak.upgrade().is_none());
+    let hit = cache
+        .lookup(fixture.image.namespace(), &(0..257).collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hit.tokens().len(), 192);
+    assert_eq!(cache.usage().unwrap().entries, 2);
 }

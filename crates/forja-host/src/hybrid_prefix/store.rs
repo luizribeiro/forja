@@ -162,7 +162,69 @@ impl<B: Backend> HybridPrefixStore<B> {
         self.measure(self.entries.lock().map_err(invalid_handle)?.iter())
     }
 
-    /// Publishes a complete boundary if every ceiling permits it.
+    /// Pins the longest complete matching boundary and makes it most recently used.
+    /// A hit always leaves at least the final prompt token for replay.
+    ///
+    /// # Errors
+    /// Refuses poisoned cache metadata.
+    pub fn lookup(
+        &self,
+        namespace: HybridPrefixNamespace,
+        prompt: &[u32],
+    ) -> Result<Option<Arc<HybridPrefix<B>>>, compute::Error> {
+        if namespace != self.namespace {
+            return Ok(None);
+        }
+        let mut entries = self.entries.lock().map_err(invalid_handle)?;
+        let index = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.tokens().len() < prompt.len() && prompt.starts_with(entry.tokens())
+            })
+            .max_by_key(|(_, entry)| entry.tokens().len())
+            .map(|(index, _)| index);
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let hit = entries.remove(index);
+        entries.push(Arc::clone(&hit));
+        Ok(Some(hit))
+    }
+
+    fn eviction_plan(
+        &self,
+        entries: &[Arc<HybridPrefix<B>>],
+        entry: &Arc<HybridPrefix<B>>,
+    ) -> Result<Vec<bool>, compute::Error> {
+        let mut evicted = Vec::new();
+        evicted
+            .try_reserve_exact(entries.len())
+            .map_err(|_| quota("cache eviction plan allocation failed"))?;
+        evicted.resize(entries.len(), false);
+        loop {
+            let retained = entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !evicted[*index])
+                .map(|(_, entry)| entry);
+            let usage = self.measure(retained.chain(std::iter::once(entry)))?;
+            if usage.entries <= self.maximum
+                && usage.bytes <= self.bytes
+                && usage.snapshot_bytes <= self.allowance.bytes()
+            {
+                return Ok(evicted);
+            }
+            let victim = entries
+                .iter()
+                .enumerate()
+                .position(|(index, old)| !evicted[index] && Arc::strong_count(old) == 1)
+                .ok_or_else(|| quota("hybrid cache ceiling exceeded; no unpinned victim"))?;
+            evicted[victim] = true;
+        }
+    }
+
+    /// Publishes a complete boundary, evicting the least recently used unpinned entries.
     /// Cancellation is sampled at the publication point; later cancellation does not revoke it.
     ///
     /// # Errors
@@ -186,16 +248,16 @@ impl<B: Backend> HybridPrefixStore<B> {
         if entries.iter().any(|old| old.tokens() == entry.tokens()) {
             return Ok(false);
         }
-        let usage = self.measure(entries.iter().chain(std::iter::once(&entry)))?;
-        if usage.entries > self.maximum
-            || usage.bytes > self.bytes
-            || usage.snapshot_bytes > self.allowance.bytes()
-        {
-            return Err(quota("hybrid cache ceiling exceeded"));
-        }
+        let evicted = self.eviction_plan(&entries, &entry)?;
         if cancelled.load(Ordering::Acquire) {
             return Ok(false);
         }
+        let mut index = 0;
+        entries.retain(|_| {
+            let keep = !evicted[index];
+            index += 1;
+            keep
+        });
         entries.push(entry);
         Ok(true)
     }
