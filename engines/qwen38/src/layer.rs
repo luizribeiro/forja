@@ -34,6 +34,15 @@ impl DecoderLayer {
                 config,
             )?))
         };
+        Self::load_with_mixer(weights, config, index, mixer)
+    }
+
+    fn load_with_mixer(
+        weights: &Weights<'_>,
+        config: Config,
+        index: u32,
+        mixer: Mixer,
+    ) -> Result<Self> {
         Ok(Self {
             index,
             mixer,
@@ -78,12 +87,7 @@ impl DecoderLayer {
         delta: Option<&Variant>,
         prefill: bool,
     ) -> Result<Tensor<bf16>> {
-        let layer_type = match &self.mixer {
-            Mixer::Recurrent(_) => "recurrent",
-            Mixer::Attention(_) => "attention",
-        };
-        forja_sdk::profile_scope("mixer", layer_type, Some(self.index))?;
-        let normalized = input.rms_norm(&self.input_norm, 1.0e-6)?;
+        let normalized = self.normalize(input)?;
         let mixed = match &mut self.mixer {
             Mixer::Recurrent(layer) if prefill => layer.prefill(&normalized, quant, delta)?,
             Mixer::Recurrent(layer) => layer.deltanet_layer(&normalized, quant)?,
@@ -94,7 +98,25 @@ impl DecoderLayer {
                 layer.attention_layer(&normalized, position, quant, attention)?
             }
         };
-        let residual = (input + &mixed)?;
+        self.finish(input, &mixed, quant)
+    }
+
+    fn normalize(&self, input: &Tensor<bf16>) -> Result<Tensor<bf16>> {
+        let layer_type = match &self.mixer {
+            Mixer::Recurrent(_) => "recurrent",
+            Mixer::Attention(_) => "attention",
+        };
+        forja_sdk::profile_scope("mixer", layer_type, Some(self.index))?;
+        input.rms_norm(&self.input_norm, 1.0e-6)
+    }
+
+    fn finish(
+        &self,
+        input: &Tensor<bf16>,
+        mixed: &Tensor<bf16>,
+        quant: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        let residual = (input + mixed)?;
         forja_sdk::profile_scope("ffn", "ffn", Some(self.index))?;
         let normalized = residual.rms_norm(&self.post_norm, 1.0e-6)?;
         &residual + &self.ffn.ffn(&normalized, quant)?
