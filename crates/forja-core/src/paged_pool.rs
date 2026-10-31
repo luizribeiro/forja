@@ -910,6 +910,13 @@ impl PagedSequence {
         PageTable::new(entries, generations).map_err(|_| PagePoolError::CorruptState)
     }
 
+    /// Iterates retained page identities without allocating a whole-pool generation table.
+    pub fn page_entries(&self) -> impl ExactSizeIterator<Item = PageTableEntry> + '_ {
+        self.pages
+            .iter()
+            .map(|page| PageTableEntry::new(page.index, page.generation))
+    }
+
     /// Returns the allocator reference count for each page in sequence order.
     ///
     /// # Errors
@@ -1681,6 +1688,16 @@ mod tests {
         assert_eq!(
             sequence.validate_append(&window, 5, 2),
             Err(PagePoolError::SharedTail)
+        );
+    }
+
+    #[test]
+    fn retained_page_identities_match_the_authenticated_table() {
+        let pool = pool(4_096);
+        let sequence = pool.reserve(7).unwrap();
+        assert_eq!(
+            sequence.page_entries().collect::<Vec<_>>(),
+            sequence.table().unwrap().entries()
         );
     }
 

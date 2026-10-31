@@ -160,10 +160,7 @@ impl<B: Backend + 'static> Host<B> {
             .fork_reserved(image.position().tokens, image.position().tokens)
             .map_err(invalid_handle)?;
         let pages = child
-            .table()
-            .map_err(invalid_handle)?
-            .entries()
-            .iter()
+            .page_entries()
             .map(|entry| (entry.page(), entry.generation()))
             .collect();
         let retained = image
