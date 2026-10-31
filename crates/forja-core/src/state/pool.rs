@@ -130,6 +130,12 @@ pub struct StateTransaction {
 }
 
 impl StateTransaction {
+    /// Tests whether two capabilities name the same sequence reservation.
+    #[must_use]
+    pub fn same_reservation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity) && self.serial == other.serial
+    }
+
     /// Monotonic transaction serial within its owning sequence.
     #[must_use]
     pub const fn serial(&self) -> u64 {
@@ -433,6 +439,22 @@ mod tests {
         assert!(a.finish(&retry, true).is_err());
         assert!(a.bind(&retry).is_err());
     }
+    #[test]
+    fn transaction_identity_survives_cloning_and_rejects_reused_allocations() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let mut foreign = pool.reserve().unwrap();
+        let first = sequence.begin(1).unwrap();
+        assert!(first.same_reservation(&first.clone()));
+        assert!(!first.same_reservation(&foreign.begin(1).unwrap()));
+        sequence.cancel_unsubmitted(&first).unwrap();
+        assert!(!first.same_reservation(&sequence.begin(2).unwrap()));
+        drop(sequence);
+        let mut reused = pool.reserve().unwrap();
+        assert!(!first.same_reservation(&reused.begin(1).unwrap()));
+    }
+
     #[test]
     fn transaction_clones_cannot_bind_a_second_recording() {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
