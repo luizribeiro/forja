@@ -440,6 +440,20 @@ pub(crate) fn record_many(
 }
 
 #[cfg(target_family = "wasm")]
+pub(crate) fn capture_import<T>(
+    operation: impl FnOnce(&mut sys::Commands) -> Result<T>,
+) -> Result<Option<T>> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if let Some(Recording::Capture { commands, .. }) = current.as_mut() {
+            operation(commands).map(Some)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+#[cfg(target_family = "wasm")]
 pub(crate) fn record_import(
     operation: impl FnOnce(&mut sys::Commands) -> Result<()>,
 ) -> Result<()> {

@@ -1,9 +1,9 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo, EngineLoadConfig, Graph,
-    KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo, StepInput, StepOutput,
-    Tensor, Weights, capture, export_engine, nn::blocks::ChunkedPrefill, target::metal::Variant,
+    BatchPhase, CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo, EngineLoadConfig,
+    Graph, KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo, StepInput,
+    StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill, target::metal::Variant,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -13,7 +13,7 @@ struct ConstantEngine {
     embeddings: Tensor<f32>,
     prefill: Option<ChunkedPrefill<f32>>,
     paged: Option<PagedCacheSet>,
-    paged_graph: Option<Graph<Tensor<f32>>>,
+    paged_graph: Option<(BatchPhase, Graph<Tensor<f32>>)>,
     paged_query: Tensor<f32>,
     paged_key: Tensor<f32>,
     paged_value: Tensor<f32>,
@@ -186,7 +186,11 @@ impl ConstantEngine {
                 .map_err(|_| forja_sdk::Error::loading("paged smoke token exceeds u16"))?,
         );
         self.paged_value.write(&vec![value; 64])?;
-        if self.paged_graph.is_none() {
+        if self
+            .paged_graph
+            .as_ref()
+            .is_none_or(|(phase, _)| *phase != input.phase)
+        {
             let parameter = Param::new(0..=31)?;
             let start = Dim::from(parameter.at(input.start_pos));
             let end = start.clone().checked_add(1)?;
@@ -202,17 +206,31 @@ impl ConstantEngine {
                 .state_at(0, 0)?;
             let weights = Tensor::from_slice(&[1.0; 128], &[2, 64])?;
             let variant = Variant::new("paged-sdpa.vector")?;
-            self.paged_graph = Some(capture(&[&parameter], || {
-                let _history =
-                    history.causal_convolution(&self.paged_value.reshape(&[1, 64])?, &weights)?;
-                cache.append(&self.paged_key, &self.paged_value, &start)?;
-                cache
-                    .attention(&self.paged_query, 1.0, &start, &end, &variant)?
-                    .reshape(&[64])?
-                    .narrow(0, 0, 4)
-            })?);
+            let slot = self
+                .paged
+                .as_ref()
+                .ok_or_else(|| forja_sdk::Error::loading("capture slot is missing"))?
+                .slot();
+            self.paged_graph = Some((
+                input.phase,
+                slot.capture(&[&parameter], input.phase, || {
+                    let inputs = slot
+                        .tensors()?
+                        .inputs
+                        .ok_or_else(|| forja_sdk::Error::loading("capture inputs are missing"))?;
+                    slot.token(0)?
+                        .copy_into(&mut inputs.selected.narrow(0, 0, 1)?)?;
+                    let _history = history
+                        .causal_convolution(&self.paged_value.reshape(&[1, 64])?, &weights)?;
+                    cache.append(&self.paged_key, &self.paged_value, &start)?;
+                    cache
+                        .attention(&self.paged_query, 1.0, &start, &end, &variant)?
+                        .reshape(&[64])?
+                        .narrow(0, 0, 4)
+                })?,
+            ));
         }
-        let graph = self
+        let (_, graph) = self
             .paged_graph
             .as_ref()
             .ok_or_else(|| forja_sdk::Error::loading("paged smoke graph is missing"))?;

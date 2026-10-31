@@ -82,6 +82,30 @@ impl PagedInputTensors {
 }
 
 impl PagedSlot<'_> {
+    /// Captures slot operations with inactive state and replay-bound ordinary inputs.
+    ///
+    /// # Errors
+    /// Refuses nested capture, pending lazy work, incompatible parameters or host quota.
+    #[cfg(target_family = "wasm")]
+    pub fn capture<T: crate::GraphResult>(
+        &self,
+        params: &[&crate::Param],
+        phase: crate::BatchPhase,
+        trace: impl FnOnce() -> Result<T>,
+    ) -> Result<crate::Graph<T>> {
+        crate::capture(params, || {
+            crate::graph::record_import(|commands| {
+                crate::sys::guest::paged_storage::capture_slot(
+                    commands,
+                    self.raw,
+                    phase == crate::BatchPhase::Prompt,
+                )
+                .map_err(|error| Error::loading(format!("{error:?}")))
+            })?;
+            trace()
+        })
+    }
+
     /// Records a selected token into the current lane transaction's private feedback.
     ///
     /// # Errors
@@ -105,10 +129,18 @@ impl PagedSlot<'_> {
     /// Refuses missing input storage, invalid lanes or exhausted host quota.
     #[cfg(target_family = "wasm")]
     pub fn token(&self, lane: u32) -> Result<Tensor<u32>> {
-        self.raw
-            .token(lane)
-            .map(|token| Tensor::from_guest(token, vec![1]))
-            .map_err(|error| Error::loading(format!("{error:?}")))
+        let captured = crate::graph::capture_import(|commands| {
+            crate::sys::guest::paged_storage::capture_token(commands, self.raw, lane)
+                .map_err(|error| Error::loading(format!("{error:?}")))
+        })?;
+        let token = match captured {
+            Some(token) => token,
+            None => self
+                .raw
+                .token(lane)
+                .map_err(|error| Error::loading(format!("{error:?}")))?,
+        };
+        Ok(Tensor::from_guest(token, vec![1]))
     }
 
     #[cfg(target_family = "wasm")]
@@ -128,10 +160,17 @@ impl PagedSlot<'_> {
     /// Returns an error when the host refuses the slot or its lane count.
     #[cfg(target_family = "wasm")]
     pub fn tensors(&self) -> Result<PagedSlotTensors> {
-        let tensors = self
-            .raw
-            .tensors()
-            .map_err(|error| Error::loading(format!("{error:?}")))?;
+        let captured = crate::graph::capture_import(|commands| {
+            crate::sys::guest::paged_storage::capture_tensors(commands, self.raw)
+                .map_err(|error| Error::loading(format!("{error:?}")))
+        })?;
+        let tensors = match captured {
+            Some(tensors) => tensors,
+            None => self
+                .raw
+                .tensors()
+                .map_err(|error| Error::loading(format!("{error:?}")))?,
+        };
         let shape = vec![tensors.lanes];
         Ok(PagedSlotTensors {
             logical_lengths: Tensor::from_guest(tensors.logical_lengths, shape.clone()),

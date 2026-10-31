@@ -12711,6 +12711,12 @@ mod tests {
                 .get(&Resource::<BatchSlotEntry>::new_borrow(slot_id))
                 .unwrap();
             assert_eq!(slot.active_bank, call % 2);
+            let selected = slot.inputs.as_ref().unwrap().banks[slot.active_bank].selected;
+            let selected = &host.entry(&Resource::new_borrow(selected)).unwrap().tensor;
+            assert_eq!(
+                host.backend.read(selected).unwrap(),
+                [token.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+            );
             assert!(binding.activity[slot.active_bank][0].load(Ordering::Acquire));
             assert!(!binding.activity[slot.active_bank][1].load(Ordering::Acquire));
             let current = host.paged_lane_prefix(pool, 1).unwrap();
