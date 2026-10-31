@@ -668,3 +668,27 @@ fn hybrid_reference_ceiling_updates_preserve_pins_and_refuse_atomically() {
             .unwrap()
     );
 }
+
+#[test]
+fn snapshot_policy_lowering_refuses_pins_then_evicts_without_partial_changes() {
+    let fixture = hybrid_fixture(262_144);
+    let mut cache = fixture.cache(65_536, 65_536, 2);
+    let entry = fixture.entry();
+    cache
+        .publish(entry.clone(), &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    let before = cache.usage().unwrap();
+    let zero = SnapshotAllowance::new(65_536, Some(0)).unwrap();
+    assert!(cache.reconfigure_policy(2, 256, 4, zero, true).is_err());
+    assert_eq!(cache.usage().unwrap(), before);
+    drop(entry);
+    cache.reconfigure_policy(2, 256, 4, zero, true).unwrap();
+    assert_eq!(cache.usage().unwrap().entries, 0);
+    assert!(
+        cache
+            .publish(fixture.entry(), &std::sync::atomic::AtomicBool::new(false))
+            .is_err()
+    );
+    let larger = SnapshotAllowance::new(65_537, None).unwrap();
+    assert!(cache.reconfigure_policy(2, 256, 4, larger, true).is_err());
+}

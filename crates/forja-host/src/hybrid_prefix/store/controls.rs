@@ -36,6 +36,22 @@ impl<B: Backend> HybridPrefixStore<B> {
         pages: u64,
         enabled: bool,
     ) -> Result<(), compute::Error> {
+        self.reconfigure_policy(maximum, tokens, pages, self.allowance, enabled)
+    }
+
+    /// Atomically resolves snapshot and reference ceilings, evicting only unpinned entries.
+    ///
+    /// # Errors
+    /// Refuses ceilings above the guest declaration or below retained pinned allocations.
+    pub fn reconfigure_policy(
+        &mut self,
+        maximum: usize,
+        tokens: u64,
+        pages: u64,
+        allowance: crate::SnapshotAllowance,
+        enabled: bool,
+    ) -> Result<(), compute::Error> {
+        let allowance = self.allowance.with_operator(allowance.bytes())?;
         let mut entries = self.entries.lock().map_err(invalid_handle)?;
         if maximum > entries.capacity() {
             return Err(quota("hybrid index capacity exceeded"));
@@ -53,7 +69,10 @@ impl<B: Backend> HybridPrefixStore<B> {
                     .filter(|(index, _)| !removed[*index])
                     .map(|(_, entry)| entry),
             )?;
-            let fits = usage.entries <= maximum && usage.tokens <= tokens && usage.pages <= pages;
+            let fits = usage.entries <= maximum
+                && usage.tokens <= tokens
+                && usage.pages <= pages
+                && usage.snapshot_bytes <= allowance.bytes();
             let victim = entries
                 .iter()
                 .enumerate()
@@ -77,6 +96,7 @@ impl<B: Backend> HybridPrefixStore<B> {
         self.tokens = tokens;
         self.pages = pages;
         self.enabled = enabled;
+        self.allowance = allowance;
         Ok(())
     }
 }
