@@ -34,7 +34,7 @@ pub use snapshot::StateSnapshot;
 mod sequence;
 pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;
-pub use slots::StateSlots;
+pub use slots::{StagedPrefix, StateSlots};
 mod trace;
 pub use trace::{SharedStateTrace, StateTrace};
 mod submit;

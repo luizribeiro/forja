@@ -8,6 +8,16 @@ impl<B: Backend> StateSlots<B> {
     pub fn prefix_layout(&self) -> &forja_core::StateLayout {
         self.storage.pool.layout()
     }
+    pub(super) fn validate_prompt(&self, prompt: &CanonicalPrompt) -> Result<(), compute::Error> {
+        if !Arc::ptr_eq(&prompt.charge.live, &self.storage.charge.live)
+            || !prompt.namespace().matches_state(self.prefix_layout())
+        {
+            return Err(invalid_handle(
+                "canonical prompt belongs to another state domain",
+            ));
+        }
+        Ok(())
+    }
     /// Binds an exact prompt ledger before an admitted lane begins evaluating it.
     ///
     /// # Errors
@@ -17,13 +27,7 @@ impl<B: Backend> StateSlots<B> {
         lane: usize,
         prompt: Arc<CanonicalPrompt>,
     ) -> Result<(), compute::Error> {
-        if !Arc::ptr_eq(&prompt.charge.live, &self.storage.charge.live)
-            || !prompt.namespace().matches_state(self.prefix_layout())
-        {
-            return Err(invalid_handle(
-                "canonical prompt belongs to another state domain",
-            ));
-        }
+        self.validate_prompt(&prompt)?;
         let owner = self
             .lanes
             .get_mut(lane)
@@ -80,8 +84,11 @@ mod tests {
             .unwrap();
         let storage = host.create_state_storage(layout, 1).unwrap();
         let mut slots = StateSlots::new(storage, 1).unwrap();
-        slots.admit_reserved(0, 257).unwrap();
-        slots.set_prompt(0, prompt.clone()).unwrap();
+        assert!(slots.stage_prefix(0, prompt.clone(), None, 64).is_err());
+        assert!(slots.sequence_handle(0).unwrap().is_none());
+        let staged = slots.stage_prefix(0, prompt.clone(), None, 257).unwrap();
+        assert!(staged.attention().is_none());
+        slots.install_prefix(0, staged).unwrap();
         assert!(slots.set_prompt(0, prompt).is_err());
         let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
         let mut end = 0;

@@ -1,3 +1,5 @@
+mod staged;
+pub use staged::StagedPrefix;
 mod prefix;
 mod selection;
 use selection::SelectionFrame;
@@ -17,6 +19,7 @@ struct Lane<B: Backend> {
     sequence: Option<StateSequenceHandle<B>>,
     serial: u64,
     prompt: Option<Arc<super::CanonicalPrompt>>,
+    attachment: Option<crate::HybridAttachment<B>>,
 }
 
 /// Two rebinding banks of lane transactions over one private state pool.
@@ -67,6 +70,7 @@ impl<B: Backend> StateSlots<B> {
                 sequence: None,
                 serial: 0,
                 prompt: None,
+                attachment: None,
             })
             .collect::<Vec<_>>();
         let selections = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
@@ -150,6 +154,7 @@ impl<B: Backend> StateSlots<B> {
         }
         lane.sequence = None;
         lane.prompt = None;
+        lane.attachment = None;
         Ok(())
     }
 
