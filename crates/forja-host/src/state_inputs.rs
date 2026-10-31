@@ -56,7 +56,7 @@ impl<B: Backend + 'static> Host<B> {
             let result = (|| {
                 let resource = Resource::new_borrow(handle);
                 let shape = self.entry(&resource)?.tensor.layout().shape().to_vec();
-                self.view(&resource, compute::ViewOp::Reshape(shape))
+                self.lend_view(&resource, compute::ViewOp::Reshape(shape), false)
             })();
             match result {
                 Ok(alias) => aliases.push(alias),

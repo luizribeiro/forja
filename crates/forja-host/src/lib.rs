@@ -8,6 +8,7 @@ pub use prompt::PromptChunking;
 #[cfg(test)]
 mod fuzz_tests;
 mod hybrid;
+mod lending;
 mod native;
 mod state;
 mod state_inputs;
@@ -3349,6 +3350,7 @@ impl BufferHandle {
 pub struct TensorEntry {
     tensor: Tensor,
     symbolic: Option<SymbolicLayout>,
+    reference_charge: Option<Arc<state::StateCharge>>,
     buffer: Arc<BufferHandle>,
 }
 
@@ -4072,6 +4074,7 @@ impl<B: Backend + 'static> Host<B> {
         let entry = TensorEntry {
             tensor: tensor.clone(),
             symbolic: None,
+            reference_charge: None,
             buffer: Arc::clone(&buffer),
         };
         self.live_bytes.fetch_add(byte_len, Ordering::AcqRel);
@@ -5145,6 +5148,7 @@ impl<B: Backend + 'static> Host<B> {
         let entry = TensorEntry {
             tensor: tensor.clone(),
             symbolic: None,
+            reference_charge: None,
             buffer: Arc::new(BufferHandle {
                 owner: tensor.clone(),
                 taints: Arc::clone(&self.taints),
@@ -5184,6 +5188,11 @@ impl<B: Backend + 'static> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         self.check_handle_quota()?;
         let entry = self.entry(resource)?.clone();
+        let reference_charge = entry
+            .reference_charge
+            .as_ref()
+            .map(|_| self.reserve_reference())
+            .transpose()?;
         let operation = core_view(operation).map_err(guest_error)?;
         if let Some(layout) = &entry.symbolic {
             let symbolic =
@@ -5193,6 +5202,7 @@ impl<B: Backend + 'static> Host<B> {
                 .push(TensorEntry {
                     tensor: entry.tensor,
                     symbolic: Some(symbolic),
+                    reference_charge,
                     buffer: entry.buffer,
                 })
                 .map_err(invalid_handle)?;
@@ -5215,6 +5225,7 @@ impl<B: Backend + 'static> Host<B> {
             .push(TensorEntry {
                 tensor,
                 symbolic: None,
+                reference_charge,
                 buffer: Arc::clone(&entry.buffer),
             })
             .map_err(invalid_handle)?;
@@ -5235,6 +5246,11 @@ impl<B: Backend + 'static> Host<B> {
     ) -> Result<Resource<TensorEntry>, compute::Error> {
         self.check_handle_quota()?;
         let entry = self.entry(resource)?.clone();
+        let reference_charge = entry
+            .reference_charge
+            .as_ref()
+            .map(|_| self.reserve_reference())
+            .transpose()?;
         let space = self.table.get(space).map_err(invalid_handle)?.space.clone();
         if slices.len() != entry.tensor.layout().shape().len() {
             return Err(compute::Error::Layout(
@@ -5267,6 +5283,7 @@ impl<B: Backend + 'static> Host<B> {
             .push(TensorEntry {
                 tensor: entry.tensor,
                 symbolic: Some(layout),
+                reference_charge,
                 buffer: entry.buffer,
             })
             .map_err(invalid_handle)?;
@@ -5461,6 +5478,7 @@ impl<B: Backend + 'static> Host<B> {
         let tensor = match self.table.push(TensorEntry {
             tensor,
             symbolic: None,
+            reference_charge: None,
             buffer,
         }) {
             Ok(resource) => resource,
@@ -5891,6 +5909,7 @@ impl<B: Backend + 'static> Host<B> {
                         )
                         .map_err(guest_error)?,
                     symbolic: None,
+                    reference_charge: None,
                     buffer: Arc::clone(&activity.buffer),
                 })
             })

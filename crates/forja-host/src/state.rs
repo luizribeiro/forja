@@ -40,6 +40,7 @@ const POOL_METADATA_RESERVE: u64 = 4096;
 const RECORD_METADATA_RESERVE: u64 = 128;
 const SEQUENCE_METADATA_RESERVE: u64 = 1024;
 
+#[derive(Debug)]
 pub(crate) struct StateCharge {
     bytes: u64,
     live: Arc<AtomicU64>,
