@@ -77,18 +77,7 @@ impl<B: Backend + 'static> Host<B> {
         {
             return Err(invalid_handle("feedback is already recorded for this lane"));
         }
-        let handle = *slot_entry
-            .inputs
-            .as_ref()
-            .ok_or_else(|| invalid_handle("slot has no feedback storage"))?
-            .feedback
-            .get(usize::try_from(index).map_err(invalid_handle)?)
-            .ok_or_else(|| invalid_handle("feedback destination is missing"))?;
-        let output = self.lend_view(
-            &Resource::new_borrow(handle),
-            compute::ViewOp::Reshape(vec![1]),
-            false,
-        )?;
+        let output = self.feedback_destination(slot.rep(), index)?;
         let result = self.dispatch(
             commands,
             compute::Op::Copy,
@@ -175,21 +164,7 @@ impl<B: Backend + 'static> Host<B> {
             else {
                 continue;
             };
-            let handle = *self
-                .table
-                .get(&Resource::<BatchSlotEntry>::new_borrow(usage.slot))
-                .map_err(invalid_handle)?
-                .inputs
-                .as_ref()
-                .ok_or_else(|| invalid_handle("slot has no feedback storage"))?
-                .feedback
-                .get(usize::try_from(index).map_err(invalid_handle)?)
-                .ok_or_else(|| invalid_handle("feedback destination is missing"))?;
-            let loan = self.lend_view(
-                &Resource::new_borrow(handle),
-                compute::ViewOp::Reshape(vec![1]),
-                false,
-            )?;
+            let loan = self.feedback_destination(usage.slot, index)?;
             let entry = self.entry(&loan).cloned();
             self.drop_tensor(loan)?;
             let entry = entry?;
@@ -200,6 +175,28 @@ impl<B: Backend + 'static> Host<B> {
             writes.push(FeedbackWrite { usage, transaction });
         }
         Ok(writes)
+    }
+
+    fn feedback_destination(
+        &mut self,
+        slot: u32,
+        index: u32,
+    ) -> Result<Resource<TensorEntry>, compute::Error> {
+        let handle = *self
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?
+            .inputs
+            .as_ref()
+            .ok_or_else(|| invalid_handle("slot has no feedback storage"))?
+            .feedback
+            .get(usize::try_from(index).map_err(invalid_handle)?)
+            .ok_or_else(|| invalid_handle("feedback destination is missing"))?;
+        self.lend_view(
+            &Resource::new_borrow(handle),
+            compute::ViewOp::Reshape(vec![1]),
+            false,
+        )
     }
 
     pub(crate) fn validate_feedback_writes(
