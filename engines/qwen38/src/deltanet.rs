@@ -16,6 +16,14 @@ pub struct DeltaNet {
     dt_bias: Tensor<f32>,
     carry: Carry,
 }
+struct DeltaProjection {
+    query: Tensor<f32>,
+    key: Tensor<f32>,
+    value: Tensor<bf16>,
+    beta: Tensor<bf16>,
+    a: Tensor<f32>,
+}
+
 impl DeltaNet {
     /// Loads exact projection shapes and allocates zeroed private state.
     ///
@@ -144,40 +152,22 @@ impl DeltaNet {
         {
             return Err(forja_sdk::Error::loading("invalid delta layer token span"));
         }
-        let key_rows = rows(tokens, c.key_heads)?;
         let value_rows = rows(tokens, c.value_heads)?;
         let projected = self.qkv.forward(input, pick)?;
         let convolved = self.carry.convolve(&projected, &self.convolution)?;
         let mixed = numerics::silu_bf16(&convolved)?;
-        let keys = c.key_heads * c.key_dim;
-        let query = mixed
-            .narrow(1, 0, keys)?
-            .contiguous()?
-            .reshape(&[key_rows, c.key_dim])?
-            .to_dtype::<f32>()?;
-        let key = mixed
-            .narrow(1, keys, keys)?
-            .contiguous()?
-            .reshape(&[key_rows, c.key_dim])?
-            .to_dtype::<f32>()?;
-        let scale = numerics::inverse_sqrt_width(c.key_dim)?;
-        let query = numerics::l2(&query, scale)?;
-        let key = numerics::l2(&key, 1.0)?;
-        let value = mixed
-            .narrow(1, 2 * keys, c.value_heads * c.value_dim)?
-            .contiguous()?
-            .reshape(&[value_rows, c.value_dim])?;
         let gate_shape = if prefill {
             vec![tokens, c.value_heads]
         } else {
             vec![c.value_heads]
         };
-        let beta = numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(&gate_shape)?;
-        let a = self
-            .a
-            .forward(input, pick)?
-            .reshape(&gate_shape)?
-            .to_dtype::<f32>()?;
+        let DeltaProjection {
+            query,
+            key,
+            value,
+            beta,
+            a,
+        } = self.project_mix(&mixed, input, pick, &gate_shape)?;
         let y = if prefill {
             let bias = self.dt_bias.broadcast_as(&gate_shape)?;
             let log_a = self.log_a.broadcast_as(&gate_shape)?;
@@ -200,11 +190,65 @@ impl DeltaNet {
             self.carry
                 .delta([&query, &key], &value, &decay, &beta, false, None)?
         };
+        self.finish_rows(&y, input, pick)
+    }
+    fn project_mix(
+        &self,
+        mixed: &Tensor<bf16>,
+        input: &Tensor<bf16>,
+        pick: Option<&Variant>,
+        gate_shape: &[u32],
+    ) -> Result<DeltaProjection> {
+        let c = self.config;
+        let tokens = input.shape()[0];
+        let key_rows = rows(tokens, c.key_heads)?;
+        let value_rows = rows(tokens, c.value_heads)?;
+        let keys = c.key_heads * c.key_dim;
+        let query = mixed
+            .narrow(1, 0, keys)?
+            .contiguous()?
+            .reshape(&[key_rows, c.key_dim])?
+            .to_dtype::<f32>()?;
+        let key = mixed
+            .narrow(1, keys, keys)?
+            .contiguous()?
+            .reshape(&[key_rows, c.key_dim])?
+            .to_dtype::<f32>()?;
+        let scale = numerics::inverse_sqrt_width(c.key_dim)?;
+        let query = numerics::l2(&query, scale)?;
+        let key = numerics::l2(&key, 1.0)?;
+        let value = mixed
+            .narrow(1, 2 * keys, c.value_heads * c.value_dim)?
+            .contiguous()?
+            .reshape(&[value_rows, c.value_dim])?;
+        let beta = numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(gate_shape)?;
+        let a = self
+            .a
+            .forward(input, pick)?
+            .reshape(gate_shape)?
+            .to_dtype::<f32>()?;
+        Ok(DeltaProjection {
+            query,
+            key,
+            value,
+            beta,
+            a,
+        })
+    }
+    fn finish_rows(
+        &self,
+        y: &Tensor<bf16>,
+        input: &Tensor<bf16>,
+        pick: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        let c = self.config;
+        let tokens = input.shape()[0];
+        let value_rows = rows(tokens, c.value_heads)?;
         let z = self
             .z
             .forward(input, pick)?
             .reshape(&[value_rows, c.value_dim])?;
-        let gated = numerics::gated_norm(&y, &self.norm, &z, &self.norm_unit)?
+        let gated = numerics::gated_norm(y, &self.norm, &z, &self.norm_unit)?
             .reshape(&[tokens, c.value_heads * c.value_dim])?;
         self.out.forward(&gated, pick)
     }
