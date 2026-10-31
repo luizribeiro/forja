@@ -1983,3 +1983,26 @@ mod tests {
         assert_eq!(replacement_address, address);
     }
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/common/mod.rs"]
+mod common;
+#[cfg(test)]
+#[path = "../tests/paged.rs"]
+mod paged_tests;
+#[cfg(test)]
+#[path = "../tests/state_auth.rs"]
+mod state_auth_tests;
+
+#[cfg(test)]
+pub(crate) fn drained_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> Vec<u8> {
+    let mut buffers = backend.buffers.lock().unwrap();
+    let buffer = buffers.get_mut(tensor).unwrap();
+    buffer.drain_pending(backend.gpu_timeout).unwrap();
+    gather(buffer.bytes(), tensor.layout()).unwrap()
+}
+
+#[cfg(test)]
+#[path = "../tests/gather_quant_matmul.rs"]
+mod gather_quant_tests;

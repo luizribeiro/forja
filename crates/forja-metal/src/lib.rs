@@ -1,6 +1,9 @@
 //! Metal 4 acceleration behind a safe Forja API.
 //! This is the sole crate permitted to contain the unsafe code required by Objective-C interop.
 
+#[cfg(all(test, target_os = "macos"))]
+extern crate self as forja_metal;
+
 #[cfg(target_os = "macos")]
 mod bandwidth;
 #[cfg(target_os = "macos")]

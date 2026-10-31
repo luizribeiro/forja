@@ -6,16 +6,12 @@ mod common;
 mod dispatch_safety;
 #[path = "../gather_matmul.rs"]
 mod gather_matmul;
-#[path = "../gather_quant_matmul.rs"]
-mod gather_quant_matmul;
 #[path = "../indirect_commands.rs"]
 mod indirect_commands;
 #[path = "../map_programs.rs"]
 mod map_programs;
 #[path = "../nan_comparisons.rs"]
 mod nan_comparisons;
-#[path = "../paged.rs"]
-mod paged;
 #[path = "../quant_embed.rs"]
 mod quant_embed;
 #[path = "../quant_matmul.rs"]
@@ -30,8 +26,6 @@ mod rounding;
 mod row_programs;
 #[path = "../state.rs"]
 mod state;
-#[path = "../state_auth.rs"]
-mod state_auth;
 #[path = "../state_block.rs"]
 mod state_block;
 #[path = "../state_block_grouping.rs"]

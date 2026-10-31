@@ -59,10 +59,10 @@ fn metal_state_authentication_preserves_canaries_and_ignores_poisoned_lanes() {
         let mut outputs = vec![&y, &next];
         outputs.extend(scratch.as_ref());
         let assert_private_canaries = || {
-            assert_eq!(backend.read(&next).unwrap(), before_state);
+            assert_eq!(super::drained_canary_bytes(&backend, &next), before_state);
             if let Some(tensor) = &scratch {
                 assert_eq!(
-                    &backend.read(tensor).unwrap(),
+                    &super::drained_canary_bytes(&backend, tensor),
                     before_scratch.as_ref().unwrap()
                 );
             }
@@ -72,11 +72,11 @@ fn metal_state_authentication_preserves_canaries_and_ignores_poisoned_lanes() {
             .write(&inputs[metadata_start + 1], &[0; 12])
             .unwrap();
         assert!(run(&backend, access, kind, &inputs, &outputs).is_err());
-        assert_eq!(backend.read(&y).unwrap(), before_y);
+        assert_eq!(super::drained_canary_bytes(&backend, &y), before_y);
         assert_private_canaries();
         backend.write(&inputs[metadata_start], &[0xff; 16]).unwrap();
         assert!(run(&backend, access, kind, &inputs, &outputs).is_err());
-        assert_eq!(backend.read(&y).unwrap(), before_y);
+        assert_eq!(super::drained_canary_bytes(&backend, &y), before_y);
         assert_private_canaries();
         backend.write(&inputs[metadata_start + 2], &[0; 4]).unwrap();
         run(&backend, access, kind, &inputs, &outputs).unwrap();

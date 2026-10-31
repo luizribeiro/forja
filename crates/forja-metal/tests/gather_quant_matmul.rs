@@ -55,7 +55,7 @@ fn metal_decode_batch_routing_microbenchmark() {
             let route = || routing_benchmark_commands(&backend, &tensors, &output, paired, true);
             let grouped = || routing_benchmark_commands(&backend, &tensors, &output, paired, false);
             let (route_time, grouped_time) =
-                crate::common::comparative_gpu_times(&backend, route, grouped);
+                super::common::comparative_gpu_times(&backend, route, grouped);
             eprintln!(
                 "routing-batch site={site} rows={rows} route_us={} grouped_us={} ratio={:.4}",
                 route_time.as_secs_f64() * 1.0e6,

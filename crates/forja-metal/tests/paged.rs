@@ -273,7 +273,7 @@ fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
             ..
         }
     ));
-    assert_eq!(backend.read(&pool).unwrap(), canary);
+    assert_eq!(super::drained_canary_bytes(&backend, &pool), canary);
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn metal_paged_copy_isolates_rejected_row_from_other_rows_in_same_dispatch() {
         }
     ));
     assert_eq!(
-        decode_f32(&backend.read(&pool).unwrap()),
+        decode_f32(&super::drained_canary_bytes(&backend, &pool)),
         vec![9.0, 9.0, 1.0, 2.0, 5.0, 6.0]
     );
 }
@@ -400,7 +400,7 @@ fn metal_paged_copy_rejects_wide_row_spanning_multiple_threadgroups() {
             ..
         }
     ));
-    assert_eq!(backend.read(&pool).unwrap(), canary);
+    assert_eq!(super::drained_canary_bytes(&backend, &pool), canary);
 }
 
 #[test]
