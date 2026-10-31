@@ -132,6 +132,55 @@ impl Engine for Qwen38 {
             }
         }
     }
+    #[cfg(target_family = "wasm")]
+    fn begin_decode(
+        &mut self,
+        input: forja_sdk::BeginDecodeInput,
+    ) -> Result<forja_sdk::Tensor<f32>> {
+        let rows = paged::row_count(input.tokens.as_ref())?;
+        let logits = paged::forward(
+            &mut self.model,
+            rows,
+            &input.start_pos.into(),
+            0,
+            input.phase,
+        )?;
+        forja_sdk::eval()?;
+        logits.reshape(&[logits.shape()[1]])
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn finish_decode(
+        &mut self,
+        _logits: &forja_sdk::Tensor<f32>,
+        start_pos: u32,
+        _sampling: forja_sdk::SamplingParams,
+        _allow: &[u32],
+    ) -> Result<DecodeOutput> {
+        let token = paged::select(&self.model, 0, &start_pos.into())?;
+        let inputs = self
+            .model
+            .serving_set()?
+            .slot()
+            .tensors()?
+            .inputs
+            .ok_or_else(|| Error::loading("serving inputs are missing"))?;
+        let logits = inputs
+            .logits
+            .narrow(0, 0, 1)?
+            .reshape(&[inputs.logits.shape()[1]])?;
+        forja_sdk::eval()?;
+        Ok(DecodeOutput { logits, token })
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn rewind_decode(&mut self, _next_pos: u32) -> Result<()> {
+        match self.feedback {
+            Feedback::Paged => Ok(()),
+            Feedback::Eager(_) => Err(Error::loading("rewind requires a serving pool")),
+        }
+    }
+
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match &mut self.feedback {
             Feedback::Eager(feedback) => feedback.decode(&mut self.model, input),

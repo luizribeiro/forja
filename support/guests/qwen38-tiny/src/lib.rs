@@ -155,6 +155,33 @@ impl Engine for Tiny {
             }
         }
     }
+    fn begin_decode(
+        &mut self,
+        input: forja_sdk::BeginDecodeInput,
+    ) -> Result<forja_sdk::Tensor<f32>> {
+        match self {
+            Self::Full(engine) => engine.begin_decode(input),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
+        }
+    }
+    fn finish_decode(
+        &mut self,
+        logits: &forja_sdk::Tensor<f32>,
+        start_pos: u32,
+        sampling: forja_sdk::SamplingParams,
+        allow: &[u32],
+    ) -> Result<DecodeOutput> {
+        match self {
+            Self::Full(engine) => engine.finish_decode(logits, start_pos, sampling, allow),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
+        }
+    }
+    fn rewind_decode(&mut self, next_pos: u32) -> Result<()> {
+        match self {
+            Self::Full(engine) => engine.rewind_decode(next_pos),
+            _ => Err(forja_sdk::Error::loading("fixture uses step")),
+        }
+    }
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.decode(input),
