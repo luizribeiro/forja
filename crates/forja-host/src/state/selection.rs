@@ -66,6 +66,25 @@ impl<B: Backend> StateSelection<B> {
         })
     }
 
+    /// Retains the input boundary until the engine output has passed host validation.
+    ///
+    /// # Errors
+    /// Refuses exhausted reference accounting before cloning any checkpoint or request lease.
+    pub fn boundary(&self) -> Result<StateSelectionBoundary<B>, compute::Error> {
+        let storage = &self.sequence.storage;
+        let charge = StateCharge::reserve(
+            storage.backend.as_ref(),
+            Arc::clone(&storage.charge.live),
+            storage.limit,
+            1024,
+        )?;
+        Ok(StateSelectionBoundary {
+            sequence: self.sequence.clone(),
+            checkpoint: self.checkpoint.clone(),
+            _charge: charge,
+        })
+    }
+
     pub(crate) fn reservation(&self) -> (std::sync::Weak<()>, u32) {
         (Arc::downgrade(&self.identity), self.destination())
     }
@@ -88,6 +107,67 @@ impl<B: Backend> StateSelection<B> {
     /// Refuses a stale boundary or scalar association without changing consumer cursors.
     pub fn finish(self, succeeded: bool) -> Result<(), compute::Error> {
         StateSelectionBatch::new(vec![self])?.finish(succeeded)
+    }
+}
+
+/// A charged input boundary for rolling back a refused engine selection result.
+pub struct StateSelectionBoundary<B: Backend> {
+    sequence: StateSequenceHandle<B>,
+    checkpoint: StateLaneCheckpoint,
+    _charge: StateCharge,
+}
+
+impl<B: Backend> StateSelectionBoundary<B> {
+    /// Verifies that the exact selected scalar and its consumer cursors were published.
+    ///
+    /// # Errors
+    /// Refuses incomplete, failed, stale or advanced selection boundaries after draining owners.
+    pub fn verify_selected(&self, scalar: u32) -> Result<(), compute::Error> {
+        self.sequence
+            .wait_drained(self.sequence.storage.limits.submission_timeout)
+            .map_err(guest_error)?;
+        let checkpoint = self
+            .sequence
+            .lock()
+            .checkpoint_latest()
+            .map_err(invalid_handle)?;
+        let input = self.checkpoint.position;
+        let expected = super::LanePosition {
+            sampler: input
+                .tokens
+                .checked_sub(1)
+                .ok_or_else(|| invalid_handle("selection input is empty"))?,
+            grammar: input.tokens,
+            parser: input.tokens,
+            ..input
+        };
+        if checkpoint.phase != super::journal::SelectionPhase::Ready
+            || checkpoint.position != expected
+            || checkpoint.version.version() != self.checkpoint.version.version()
+            || checkpoint
+                .feedback
+                .as_ref()
+                .is_none_or(|feedback| feedback.checkpoint.scalar().index() != scalar)
+        {
+            return Err(invalid_handle(
+                "selection did not publish its reserved scalar and cursors",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drains selection work and restores feedback/cursors while preserving retained carry.
+    ///
+    /// # Errors
+    /// Refuses timeouts or a boundary whose carry version has advanced.
+    pub fn restore(self) -> Result<(), compute::Error> {
+        self.sequence
+            .wait_drained(self.sequence.storage.limits.submission_timeout)
+            .map_err(guest_error)?;
+        self.sequence
+            .lock()
+            .restore_selection(&self.checkpoint)
+            .map_err(invalid_handle)
     }
 }
 
@@ -239,6 +319,62 @@ mod tests {
                 sequence
             })
             .collect()
+    }
+
+    #[test]
+    fn selection_rollback_preserves_retained_carry_and_refuses_newer_versions() {
+        for advanced in [false, true] {
+            let sequence = fixture(1).pop().unwrap();
+            for (serial, action) in [(1, StateAction::Combined), (2, StateAction::Forward)] {
+                let transaction = sequence
+                    .begin_action_at(
+                        serial,
+                        LanePosition {
+                            tokens: serial,
+                            reserved_tokens: 7,
+                            ..LanePosition::default()
+                        },
+                        action,
+                    )
+                    .unwrap();
+                sequence.lock().mark_submitted(&transaction).unwrap();
+                sequence.storage.pool.observe_completion(serial).unwrap();
+                sequence.lock().finish(&transaction, true).unwrap();
+            }
+            let before = sequence.position();
+            let selection = StateSelection::new(sequence.clone(), 1, 0).unwrap();
+            let boundary = selection.boundary().unwrap();
+            let scalar = selection.destination();
+            selection.finish(true).unwrap();
+            boundary.verify_selected(scalar).unwrap();
+            assert!(boundary.verify_selected(u32::MAX).is_err());
+            assert_eq!(sequence.position().grammar, 2);
+            if advanced {
+                let transaction = sequence
+                    .begin_action_at(
+                        3,
+                        LanePosition {
+                            tokens: 3,
+                            reserved_tokens: 7,
+                            ..LanePosition::default()
+                        },
+                        StateAction::Step,
+                    )
+                    .unwrap();
+                sequence.lock().mark_submitted(&transaction).unwrap();
+                sequence.storage.pool.observe_completion(3).unwrap();
+                sequence.lock().finish(&transaction, true).unwrap();
+                assert!(boundary.restore().is_err());
+                assert_eq!(sequence.position().tokens, 3);
+            } else {
+                boundary.restore().unwrap();
+                assert_eq!(sequence.position(), before);
+                assert!(sequence.checkpoint_latest().is_err());
+                sequence.rewind(1).unwrap();
+                assert_eq!(sequence.position().tokens, 1);
+                assert_eq!(sequence.position().grammar, 1);
+            }
+        }
     }
 
     #[test]

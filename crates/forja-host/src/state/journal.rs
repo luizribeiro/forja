@@ -457,6 +457,33 @@ impl StateJournal {
         self.selection = std::sync::Weak::new();
     }
 
+    pub(super) fn restore_selection(
+        &mut self,
+        checkpoint: &super::StateLaneCheckpoint,
+    ) -> Result<(), PagePoolError> {
+        if !self.pending.is_empty()
+            || self.selection.upgrade().is_some()
+            || self.position.tokens != checkpoint.position.tokens
+            || self.sequence.checkpoint()?.version() != checkpoint.version.version()
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let feedback = self
+            .feedback
+            .as_ref()
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        feedback.validate(checkpoint.feedback.as_ref())?;
+        let boundary = checkpoint
+            .feedback
+            .as_ref()
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        self.sequence.rewind(&checkpoint.version)?;
+        feedback.restore(boundary)?;
+        self.position = checkpoint.position;
+        self.phase = checkpoint.phase;
+        Ok(())
+    }
+
     pub(super) fn restore_with(
         &mut self,
         checkpoint: &super::StateLaneCheckpoint,
