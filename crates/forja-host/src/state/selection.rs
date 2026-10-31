@@ -1,3 +1,6 @@
+mod submission;
+pub use submission::StateSelectionSubmission;
+
 use super::{StateCharge, StateLaneCheckpoint, StateSequenceHandle, sequence::RecordingGuard};
 use crate::{compute, guest_error, invalid_handle};
 use forja_core::{Backend, CompletionResource, FeedbackPin};
@@ -25,6 +28,7 @@ impl<B: Backend> StateSelection<B> {
         scratch: u32,
     ) -> Result<Self, compute::Error> {
         let storage = &sequence.storage;
+        storage.check_usable()?;
         let charge = Arc::new(StateCharge::reserve(
             storage.backend.as_ref(),
             Arc::clone(&storage.charge.live),
@@ -127,6 +131,35 @@ impl<B: Backend> StateSelectionBatch<B> {
             .map(StateSelection::retained_resource)
     }
 
+    /// Queues ordinary selection commands while retaining every private scalar owner.
+    ///
+    /// # Errors
+    /// Returns backend failure without publishing any feedback or consumer cursor.
+    pub fn submit(
+        self,
+        commands: forja_core::CommandList,
+    ) -> Result<StateSelectionSubmission<B>, compute::Error> {
+        let backend = Arc::clone(&self.selections[0].sequence.storage.backend);
+        self.submit_using(|owners| backend.submit_retained(commands, owners))
+    }
+
+    pub(crate) fn submit_using(
+        self,
+        submit: impl FnOnce(Vec<CompletionResource>) -> Result<B::Submission, forja_core::BackendError>,
+    ) -> Result<StateSelectionSubmission<B>, compute::Error> {
+        let storage = &self.selections[0].sequence.storage;
+        storage.check_usable()?;
+        let timeout = storage.limits.submission_timeout;
+        let submission = submit(self.retained_resources().collect())
+            .inspect_err(|_| {
+                storage
+                    .poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
+            })
+            .map_err(guest_error)?;
+        Ok(StateSelectionSubmission::new(self, submission, timeout))
+    }
+
     /// Publishes all feedback and consumer cursors together after successful device completion.
     ///
     /// # Errors
@@ -202,6 +235,41 @@ mod tests {
                 sequence
             })
             .collect()
+    }
+
+    #[test]
+    fn selection_submissions_drain_cancellation_before_allowing_retry() {
+        let sequence = fixture(1).pop().unwrap();
+        let transaction = sequence
+            .begin_action_at(
+                1,
+                LanePosition {
+                    tokens: 7,
+                    reserved_tokens: 33,
+                    ..LanePosition::default()
+                },
+                StateAction::Forward,
+            )
+            .unwrap();
+        sequence.lock().mark_submitted(&transaction).unwrap();
+        sequence.storage.pool.observe_completion(1).unwrap();
+        sequence.lock().finish(&transaction, true).unwrap();
+        for mode in 0..3 {
+            let selection = StateSelection::new(sequence.clone(), 6, 0).unwrap();
+            let batch = StateSelectionBatch::new(vec![selection]).unwrap();
+            let submission = batch.submit(forja_core::CommandList::new()).unwrap();
+            assert!(sequence.begin(2).is_err());
+            match mode {
+                0 => drop(submission),
+                1 => submission.cancel().unwrap(),
+                _ => submission.finish().unwrap(),
+            }
+            sequence
+                .wait_drained(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(sequence.checkpoint_latest().is_ok(), mode == 2);
+            assert_eq!(sequence.position().grammar, if mode == 2 { 7 } else { 0 });
+        }
     }
 
     #[test]

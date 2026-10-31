@@ -17,8 +17,8 @@ mod state_inputs;
 pub use state::{
     LanePosition, SharedStateTrace, StateAction, StateBatch, StateBatchSubmission, StateCapture,
     StateCell, StateCommands, StateEntry, StateLaneCheckpoint, StateRecording, StateSelection,
-    StateSelectionBatch, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
-    StateTrace,
+    StateSelectionBatch, StateSelectionSubmission, StateSequenceHandle, StateSlots, StateStorage,
+    StateSubmission, StateTrace,
 };
 mod weights;
 
@@ -10861,6 +10861,53 @@ mod tests {
                 .unwrap(),
             token.to_ne_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn failed_selection_submission_preserves_awaiting_state_for_retry() {
+        let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
+        backend.fail_submission = Some(2);
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture_action(backend, Some(StateAction::Forward));
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let sequence = host.state_slots[&slot.rep()]
+            .sequence_handle(0)
+            .unwrap()
+            .unwrap();
+        let before = sequence.position();
+        for failed in [true, false] {
+            let selection = super::StateSelection::new(sequence.clone(), 0, 0).unwrap();
+            let batch = super::StateSelectionBatch::new(vec![selection]).unwrap();
+            let result = batch
+                .submit(forja_core::CommandList::new())
+                .unwrap()
+                .finish();
+            assert_eq!(result.is_err(), failed);
+            if failed {
+                assert_eq!(sequence.position(), before);
+                assert!(sequence.checkpoint_latest().is_err());
+            } else {
+                assert_eq!(sequence.position().tokens, 1);
+                assert_eq!(sequence.checkpoint_latest().unwrap().position().grammar, 1);
+            }
+        }
     }
 
     #[tokio::test]
