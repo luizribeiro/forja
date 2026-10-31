@@ -1,5 +1,7 @@
 use forja_sdk::{Result, Tensor, Weights, bf16, target::metal::Variant};
 
+const TILED_MIN_ROWS: u32 = 16;
+
 /// Four-bit affine weights with one scale and bias per 64 columns.
 pub struct Affine {
     packed: Tensor<u32>,
@@ -33,8 +35,8 @@ impl Affine {
                 let [rows, width]: [u32; 2] = input.shape().try_into().map_err(|_| {
                     forja_sdk::Error::loading("projection requires row-major input")
                 })?;
-                if pick.name() == "quant-matmul.tiled" && (1..16).contains(&rows) {
-                    let padded = Tensor::zeros(&[16, width])?;
+                if pick.name() == "quant-matmul.tiled" && (1..TILED_MIN_ROWS).contains(&rows) {
+                    let padded = Tensor::zeros(&[TILED_MIN_ROWS, width])?;
                     input.copy_into(&mut padded.narrow(0, 0, rows)?)?;
                     padded
                         .quant_matmul_with(&self.packed, &self.scales, &self.biases, 4, 64, pick)?
