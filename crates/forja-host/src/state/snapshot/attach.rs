@@ -54,6 +54,7 @@ impl<B: Backend> StateSequenceHandle<B> {
             .map_err(invalid_handle)?
             .resolve(checkpoint.version())
             .map_err(invalid_handle)?;
+        drop(journal);
         let _temporary = StateCharge::reserve(
             self.storage.backend.as_ref(),
             Arc::clone(&self.storage.charge.live),

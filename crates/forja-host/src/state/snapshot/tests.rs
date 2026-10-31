@@ -190,3 +190,56 @@ fn attachment_refuses_preexisting_checkpoints_and_previously_used_sequences() {
     assert_eq!(used.position().tokens, 0);
     assert!(used.snapshot.lock().unwrap().is_none());
 }
+
+#[test]
+fn materialization_releases_the_journal_while_copying_pinned_carry() {
+    let (control, host) = super::super::lifecycle_tests::controlled_host();
+    let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
+    let pages = PagedLayout::new(
+        64,
+        vec![PagedPlane {
+            dtype: DType::F32,
+            elements_per_token: 1,
+            alignment: 4,
+            label: "key".into(),
+        }],
+    )
+    .unwrap();
+    let namespace = HybridPrefixNamespace::new(
+        [0; 32],
+        &layout,
+        &pages,
+        NonZeroU32::new(64).unwrap(),
+        &["fixed"],
+    )
+    .unwrap();
+    let prompt = host.canonical_prompt(namespace, (0..65).collect()).unwrap();
+    let storage = host.create_state_storage(layout, 2).unwrap();
+    let parent = storage.reserve().unwrap();
+    let transaction = parent
+        .begin_prefill(1, prompt, 64, 129, StateAction::Step)
+        .unwrap();
+    parent.lock().mark_submitted(&transaction).unwrap();
+    storage.pool.observe_completion(1).unwrap();
+    parent.lock().finish(&transaction, true).unwrap();
+    let image = parent
+        .capture_snapshot(SnapshotAllowance::new(32_768, None).unwrap())
+        .unwrap();
+    let child = storage.reserve().unwrap();
+    child.attach_snapshot(image, namespace, 129).unwrap();
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    *control.read_barriers.lock().unwrap() = Some((entered.clone(), release.clone()));
+    std::thread::scope(|scope| {
+        let copy = scope.spawn(|| child.materialize_snapshot());
+        entered.wait();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reference = &child;
+        let reader = scope.spawn(move || send.send(reference.position()).unwrap());
+        let position = receive.recv_timeout(std::time::Duration::from_secs(1));
+        release.wait();
+        copy.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert_eq!(position.unwrap().tokens, 64);
+    });
+}

@@ -18,6 +18,7 @@ type Retained = Arc<Mutex<Vec<CompletionResource>>>;
 #[derive(Default)]
 pub(super) struct Control {
     retained: Mutex<Vec<Retained>>,
+    pub(super) read_barriers: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     waits: AtomicUsize,
     pub(super) failure: AtomicU8,
     timeout_ns: AtomicU64,
@@ -95,6 +96,13 @@ impl Backend for ControlledBackend {
         self.cpu.write(tensor, bytes)
     }
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+        self.cpu.read(tensor)
+    }
+    fn read_replay_output(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
+        if let Some((entered, release)) = self.control.read_barriers.lock().unwrap().take() {
+            entered.wait();
+            release.wait();
+        }
         self.cpu.read(tensor)
     }
     fn release(&self, tensor: &Tensor) -> Result<(), BackendError> {
