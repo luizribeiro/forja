@@ -9979,6 +9979,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capture_context_refuses_phase_mismatch_and_reused_resource_ids() {
+        let StateSlotFixture { mut host, slot, .. } = state_slot_fixture(CpuBackend::new());
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        assert!(host.declare_slot_capture(&commands, &slot, false).is_err());
+        let capture = host
+            .table
+            .get(&commands)
+            .unwrap()
+            .slot_capture
+            .clone()
+            .unwrap();
+        let phase = &host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks[0]
+            .prompt_phase;
+        capture.validate(&host, true).unwrap();
+        phase.store(true, Ordering::Release);
+        assert!(capture.validate(&host, true).is_err());
+        capture.validate(&host, false).unwrap();
+        phase.store(false, Ordering::Release);
+        capture.validate(&host, true).unwrap();
+        let other = state_slot_fixture(CpuBackend::new());
+        assert_eq!(other.slot.rep(), slot.rep());
+        assert!(capture.validate(&other.host, false).is_err());
+        assert!(host.prepare_submit(commands).is_err());
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+    }
+
     #[tokio::test]
     async fn explicit_slot_traces_replay_their_own_inactive_metadata() {
         let StateSlotFixture {

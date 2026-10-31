@@ -550,6 +550,9 @@ impl<B: Backend + 'static> Host<B> {
         flight: crate::ReplayFlight,
     ) -> Result<crate::SubmitRequest<B>, compute::Error> {
         let entry = self.table.get(resource).map_err(invalid_handle)?;
+        if let Some(capture) = &entry.slot_capture {
+            capture.validate(self, !entry.captured_state.is_empty())?;
+        }
         if entry.captured_state.is_empty() {
             return self.prepare_replay_with_flight(resource, values, flight);
         }

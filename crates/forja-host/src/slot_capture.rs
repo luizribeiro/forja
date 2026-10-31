@@ -1,16 +1,46 @@
 use crate::{
-    Backend, BatchSlotEntry, CommandListEntry, Host, SharedStateTrace, compute, invalid_handle,
-    state::StateCharge,
+    Backend, BatchSlotEntry, CommandListEntry, Host, PagedBinding, SharedStateTrace, compute,
+    invalid_handle, state::StateCharge,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Weak, atomic::Ordering};
 use wasmtime::component::Resource;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SlotCapture {
     pub(crate) slot: u32,
     pub(crate) prefill: bool,
+    binding: Weak<PagedBinding>,
     pub(crate) trace: SharedStateTrace,
     _charge: Arc<StateCharge>,
+}
+
+impl SlotCapture {
+    pub(crate) fn validate<B: Backend + 'static>(
+        &self,
+        host: &Host<B>,
+        numerical: bool,
+    ) -> Result<(), compute::Error> {
+        let slot = host
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(self.slot))
+            .map_err(invalid_handle)?;
+        let inputs = slot
+            .inputs
+            .as_ref()
+            .ok_or_else(|| invalid_handle("capture slot has no state inputs"))?;
+        if !self.binding.ptr_eq(&Arc::downgrade(&slot.binding))
+            || (numerical
+                && inputs.banks[slot.active_bank]
+                    .prompt_phase
+                    .load(Ordering::Acquire)
+                    != self.prefill)
+        {
+            return Err(invalid_handle(
+                "capture slot identity or numerical phase differs",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<B: Backend + Send + Sync + 'static> Host<B> {
@@ -30,6 +60,7 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
                 "slot capture requires an empty undeclared command list",
             ));
         }
+        let binding = Arc::downgrade(&self.table.get(slot).map_err(invalid_handle)?.binding);
         let charge = self.reserve_reference()?;
         let trace = self
             .state_slots
@@ -42,6 +73,7 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
             .slot_capture = Some(SlotCapture {
             slot: slot.rep(),
             prefill,
+            binding,
             trace: trace.share(),
             _charge: charge,
         });
