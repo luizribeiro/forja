@@ -373,3 +373,18 @@ async fn retained_runtime_memory_includes_the_paired_prefix_index() -> Result<()
     assert!(engine.memory_usage().accounted_bytes().unwrap() > before);
     Ok(())
 }
+
+#[tokio::test]
+async fn invalid_canonical_lane_admission_preserves_unpinned_cached_prefixes()
+-> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    complete_prompt(&mut engine, 0).await?;
+    let mut invalid = request();
+    invalid.prefix_reuse = true;
+    invalid.tokens.fill(1);
+    assert!(engine.begin_batch_prefill(invalid, 99).await.is_err());
+    assert_eq!(complete_prompt(&mut engine, 0).await?.2, 64);
+    Ok(())
+}

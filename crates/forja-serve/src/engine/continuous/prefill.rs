@@ -209,7 +209,14 @@ where
                         return Err((request, batch_admission_error(&error)));
                     }
                 }
-                Err(error) if prefix.is_none() => {
+                Err(error)
+                    if prefix.is_none()
+                        && (canonical.is_none()
+                            || matches!(
+                                error,
+                                forja_host::bindings::l9o::gpu::compute::Error::Quota(_)
+                            )) =>
+                {
                     let canonical_eviction = match self.evict_canonical_prefix() {
                         Ok(evicted) => evicted,
                         Err(error) => return Err((request, error)),
