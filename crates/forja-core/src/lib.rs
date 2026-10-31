@@ -30,6 +30,9 @@ pub use graph::{
     GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,
     TemplateTensor,
 };
+mod written_ranges;
+pub use written_ranges::WrittenRanges;
+
 pub use layout::{Layout, LayoutError, MAX_RANK, Slice, byte_ranges_overlap, is_injective};
 pub use ops::{
     BackendDispatchData, BufferId, CommandList, Dispatch, Op, OpError, Operand, PagedCopyDirection,
