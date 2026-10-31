@@ -46,10 +46,10 @@ async fn singles(runner: &mut Runner, bucket: u32) -> Result<Vec<Vec<Row>>, Box<
     Ok(rows)
 }
 async fn compare(bucket: u32) -> Result<(), Box<dyn Error>> {
-    let (mut reference, _) = load_with(false, Some(4)).await?;
+    let (mut reference, _) = load_with(false, Some(64)).await?;
     let expected = singles(&mut reference, bucket).await?;
     drop(reference);
-    let (mut runner, _) = load_with(true, Some(4)).await?;
+    let (mut runner, _) = load_with(true, Some(64)).await?;
     assert_eq!(runner.metrics().live_graphs, 10);
     for lane in 0..bucket {
         runner
