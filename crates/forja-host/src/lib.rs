@@ -7694,6 +7694,40 @@ impl BufferTaints {
             .map_or(Ok(()), Err)
     }
 
+    fn drain_writes(&self, buffer: BufferId, timeout: Duration) -> Result<(), BackendError> {
+        let (pending, mut timed_out) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?;
+            (
+                state
+                    .pending_writes
+                    .get(&buffer)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(_, outcome)| outcome.upgrade())
+                    .collect::<Vec<_>>(),
+                state
+                    .tainted
+                    .get(&buffer)
+                    .is_some_and(|(_, error)| *error == BackendError::Timeout),
+            )
+        };
+        let started = Instant::now();
+        for outcome in pending {
+            if outcome.wait(timeout.saturating_sub(started.elapsed())) == Err(BackendError::Timeout)
+            {
+                timed_out = true;
+            }
+        }
+        if timed_out {
+            Err(BackendError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+
     fn check(&self, buffer: BufferId) -> Result<(), BackendError> {
         self.state
             .lock()

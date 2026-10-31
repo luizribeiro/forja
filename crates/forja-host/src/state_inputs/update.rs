@@ -97,6 +97,7 @@ impl<B: Backend + 'static> Host<B> {
         if input.shape.phase == BatchPhase::Prompt && prompt_lanes != 1 {
             return Err(invalid_handle("prompt requires exactly one input lane"));
         }
+        self.recover_state_input_bank(bank)?;
         self.write_state_input_words(
             bank,
             sampling.into_iter().flatten(),

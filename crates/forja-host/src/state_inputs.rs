@@ -1,3 +1,4 @@
+mod recovery;
 mod update;
 
 use crate::{Backend, Host, compute, invalid_handle, paged_storage};
