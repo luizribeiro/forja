@@ -15,13 +15,13 @@ impl<P, C> From<P> for RecoveryError<P, C> {
     }
 }
 
-impl<P: fmt::Debug, C: fmt::Debug> fmt::Display for RecoveryError<P, C> {
+impl<P: fmt::Display, C: fmt::Debug> fmt::Display for RecoveryError<P, C> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Primary(error) => write!(out, "{error:?}"),
+            Self::Primary(error) => write!(out, "{error}"),
             Self::Cleanup(error) => write!(out, "cleanup failed: {error:?}"),
             Self::Both { primary, cleanup } => {
-                write!(out, "{primary:?}; cleanup failed: {cleanup:?}")
+                write!(out, "{primary}; cleanup failed: {cleanup:?}")
             }
         }
     }
@@ -95,6 +95,22 @@ impl RecoveryError<wasmtime::Error, compute::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_display_preserves_domain_context() {
+        let primary = forja_core::PagePoolError::InvalidCheckpoint;
+        let message = primary.to_string();
+        assert!(message.starts_with("paged pool error: "));
+        let failure = finish::<(), _, _>(Err(primary), Err("restore")).unwrap_err();
+        assert_eq!(
+            failure.to_string(),
+            format!("{message}; cleanup failed: \"restore\"")
+        );
+        assert_eq!(
+            RecoveryError::<_, ()>::Primary(primary).to_string(),
+            message
+        );
+    }
 
     #[test]
     fn double_failure_preserves_primary_kind_and_cleanup_context() {
