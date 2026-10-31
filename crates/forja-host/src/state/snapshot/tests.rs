@@ -154,3 +154,72 @@ fn attachments_share_immutable_planes_until_the_first_update() {
             .is_err()
     );
 }
+
+#[test]
+fn hybrid_entries_pair_exact_ledgers_and_reject_foreign_pages_atomically() {
+    let (mut host, parent, _) = prepared(262_144);
+    let image = parent
+        .capture_snapshot(SnapshotAllowance::new(65_536, None).unwrap())
+        .unwrap();
+    let layout = PagedLayout::new(
+        64,
+        vec![PagedPlane {
+            dtype: DType::F16,
+            elements_per_token: 33,
+            alignment: 2,
+            label: "key".into(),
+        }],
+    )
+    .unwrap();
+    let pool = forja_core::PagePool::new_fixed(layout.clone(), 16, 131_072).unwrap();
+    let mut source = pool.reserve(129).unwrap();
+    source.commit_write(128).unwrap();
+    let source = crate::PagedPrefix::new(source);
+    let resource = host
+        .table
+        .push(crate::PagePoolEntry {
+            pool: pool.clone(),
+            active_lanes: 1,
+            max_context: 257,
+            plane_count: 1,
+            slot_banks: None,
+            slot: None,
+            charged_bytes: std::sync::atomic::AtomicU64::new(0),
+            live_bytes: Arc::clone(&host.live_bytes),
+        })
+        .unwrap();
+    let before = host.live_bytes.load(Ordering::Acquire);
+    let pages = pool.memory_usage().unwrap().0;
+    let mut changed = image.tokens().to_vec();
+    changed[33] ^= 1;
+    assert!(
+        host.hybrid_prefix(&resource, &source, image.clone(), &changed)
+            .is_err()
+    );
+    let foreign = crate::PagedPrefix::new(
+        forja_core::PagePool::new_fixed(layout, 16, 131_072)
+            .unwrap()
+            .reserve(129)
+            .unwrap(),
+    );
+    assert!(
+        host.hybrid_prefix(&resource, &foreign, image.clone(), image.tokens())
+            .is_err()
+    );
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+    assert_eq!(pool.memory_usage().unwrap().0, pages);
+    let entry = host
+        .hybrid_prefix(&resource, &source, image.clone(), image.tokens())
+        .unwrap();
+    assert_eq!(entry.page_count(), 1);
+    assert_eq!(entry.tokens(), image.tokens());
+    assert_eq!(
+        entry.retained_bytes(),
+        image.charged_bytes()
+            + image.prompt.charged_bytes()
+            + entry.reference_bytes()
+            + pool.layout().total_page_bytes()
+    );
+    assert_eq!(entry.attention_tokens().unwrap(), 64);
+    assert_eq!(entry.attention_layout(), pool.layout());
+}

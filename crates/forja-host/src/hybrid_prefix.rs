@@ -1,3 +1,6 @@
+mod entry;
+pub use entry::HybridPrefix;
+
 use crate::{compute, quota};
 
 /// Guest-declared snapshot ceiling reduced by an optional operator limit.

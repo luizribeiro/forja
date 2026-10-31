@@ -13,7 +13,7 @@ mod feedback;
 mod fuzz_tests;
 mod hybrid;
 mod hybrid_prefix;
-pub use hybrid_prefix::SnapshotAllowance;
+pub use hybrid_prefix::{HybridPrefix, SnapshotAllowance};
 mod lending;
 mod native;
 mod recovery;

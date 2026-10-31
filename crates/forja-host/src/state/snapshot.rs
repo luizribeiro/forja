@@ -15,6 +15,23 @@ pub struct StateSnapshot<B: Backend> {
 }
 
 impl<B: Backend> StateSnapshot<B> {
+    pub(crate) fn retained_allocations(&self) -> [(usize, u64); 2] {
+        [
+            (Arc::as_ptr(&self.charge).addr(), self.charge.bytes),
+            (
+                Arc::as_ptr(&self.prompt.charge).addr(),
+                self.prompt.charged_bytes(),
+            ),
+        ]
+    }
+    pub(crate) fn owned_by(
+        &self,
+        backend: &Arc<B>,
+        live: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> bool {
+        Arc::ptr_eq(&self.backend, backend) && Arc::ptr_eq(&self.charge.live, live)
+    }
+
     /// Exact prefix ledger; an earlier image cannot be obtained by shortening it.
     #[must_use]
     pub fn tokens(&self) -> &[u32] {
