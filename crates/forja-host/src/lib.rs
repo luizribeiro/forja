@@ -2429,16 +2429,13 @@ where
         };
         match result {
             Ok(Ok(output)) => Ok(attempt.accept(self.store.data_mut()).map(|()| output)),
-            Ok(Err(error)) => Ok(Err(attempt
-                .rollback(self.store.data_mut())
-                .err()
-                .unwrap_or(error))),
-            Err(error) => {
-                attempt.rollback(self.store.data_mut()).map_err(|error| {
-                    wasmtime::Error::msg(format!("selection rollback failed: {error:?}"))
-                })?;
-                Err(error)
-            }
+            Ok(Err(error)) => Ok(recovery::finish(
+                Err(error),
+                attempt.rollback(self.store.data_mut()),
+            )
+            .map_err(recovery::RecoveryError::into_compute)),
+            Err(error) => recovery::finish(Err(error), attempt.rollback(self.store.data_mut()))
+                .map_err(recovery::RecoveryError::into_wasmtime),
         }
     }
 
@@ -4483,15 +4480,12 @@ impl<B: Backend + 'static> Host<B> {
             let (table, copy, upload) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    sequence.rollback(checkpoint).map_err(paged_refusal)?;
-                    binding
-                        .banks
-                        .restore_all(lane, previous)
-                        .map_err(paged_refusal)?;
-                    for dirty in &lane_binding.table_dirty {
-                        dirty.store(true, Ordering::Release);
-                    }
-                    return Err(error);
+                    let restored = recovery::finish(
+                        Err(error),
+                        sequence.rollback(checkpoint).map_err(paged_refusal),
+                    )
+                    .map_err(recovery::RecoveryError::into_compute);
+                    return restore_paged_banks(restored, &binding, lane, previous);
                 }
             };
             (checkpoint, state_checkpoint, previous, table, copy, upload)
@@ -5116,13 +5110,7 @@ impl<B: Backend + 'static> Host<B> {
             if let Err(error) =
                 self.upload_paged_table(table_handle, generations, generation_pages, table)
             {
-                for dirty in &lane_binding.table_dirty {
-                    dirty.store(true, Ordering::Release);
-                }
-                return match binding.banks.restore_all(lane, previous) {
-                    Ok(()) => Err(error),
-                    Err(restore) => Err(compute::Error::Quota(restore.to_string())),
-                };
+                return restore_paged_banks(Err(error), &binding, lane, previous);
             }
         }
         let capacity = locked.reserved_tokens();
@@ -9851,6 +9839,25 @@ fn rollback_paged_if_current(
         sequence.rollback(checkpoint).map_err(paged_refusal)?;
     }
     Ok(())
+}
+
+fn restore_paged_banks<T>(
+    primary: Result<T, compute::Error>,
+    binding: &PagedBinding,
+    lane: usize,
+    previous: [forja_core::PagedSlot; 2],
+) -> Result<T, compute::Error> {
+    let restored = binding
+        .banks
+        .restore_all(lane, previous)
+        .map_err(paged_refusal);
+    let dirty = binding.lane(lane).map(|binding| {
+        for dirty in &binding.table_dirty {
+            dirty.store(true, Ordering::Release);
+        }
+    });
+    let cleanup = recovery::finish(restored, dirty).map_err(recovery::RecoveryError::into_compute);
+    recovery::finish(primary, cleanup).map_err(recovery::RecoveryError::into_compute)
 }
 
 fn paged_refusal(error: forja_core::PagePoolError) -> compute::Error {

@@ -80,6 +80,18 @@ impl RecoveryError<BackendError, compute::Error> {
     }
 }
 
+impl RecoveryError<wasmtime::Error, compute::Error> {
+    pub(crate) fn into_wasmtime(self) -> wasmtime::Error {
+        match self {
+            Self::Primary(error) => error,
+            Self::Cleanup(error) => wasmtime::Error::msg(format!("cleanup failed: {error:?}")),
+            Self::Both { primary, cleanup } => {
+                primary.context(format!("cleanup failed: {cleanup:?}"))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +114,14 @@ mod tests {
         .unwrap_err();
         assert!(failure.to_string().contains("journal"));
         assert_eq!(failure.into_backend(), BackendError::Timeout);
+        let failure = finish::<(), _, _>(
+            Err(wasmtime::Error::msg("guest trap")),
+            Err(compute::Error::InvalidHandle("rollback".into())),
+        )
+        .unwrap_err()
+        .into_wasmtime();
+        let context = format!("{failure:#}");
+        assert!(context.contains("guest trap") && context.contains("rollback"));
         assert!(matches!(
             finish::<(), (), _>(Ok(()), Err("cleanup")),
             Err(RecoveryError::Cleanup("cleanup"))
