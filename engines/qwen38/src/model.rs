@@ -23,32 +23,8 @@ impl Model {
     ///
     /// # Errors
     /// Refuses invalid dimensions, profile selections, context, weights or allocations.
-    pub fn load(
-        weights: &Weights<'_>,
-        load: &EngineLoadConfig,
-        mut config: Config,
-    ) -> Result<Self> {
-        if let Some(layers) = load.num_hidden_layers {
-            if layers == 0 || layers > config.layers {
-                return Err(Error::loading("invalid decoder layer limit"));
-            }
-            config.layers = layers;
-        }
-        config.validate()?;
-        if !load.variant_rule_picks.is_empty() {
-            return Err(Error::loading(
-                "the eager model requires fixed variant picks",
-            ));
-        }
-        let context = load
-            .max_context
-            .filter(|n| (1..=262_144).contains(n))
-            .ok_or_else(|| Error::loading("unsupported profile context"))?;
-        if load.kv_cache != forja_sdk::KvCacheFormat::F16 {
-            return Err(Error::loading(
-                "the reference engine requires f16 KV storage",
-            ));
-        }
+    pub fn load(weights: &Weights<'_>, load: &EngineLoadConfig, config: Config) -> Result<Self> {
+        let (config, context) = load_config(load, config)?;
         let picks = if config.cpu {
             None
         } else {
@@ -223,4 +199,29 @@ impl Model {
             router_logits: Vec::new(),
         })
     }
+}
+
+fn load_config(load: &EngineLoadConfig, mut config: Config) -> Result<(Config, u32)> {
+    if let Some(layers) = load.num_hidden_layers {
+        if layers == 0 || layers > config.layers {
+            return Err(Error::loading("invalid decoder layer limit"));
+        }
+        config.layers = layers;
+    }
+    config.validate()?;
+    if !load.variant_rule_picks.is_empty() {
+        return Err(Error::loading(
+            "the eager model requires fixed variant picks",
+        ));
+    }
+    let context = load
+        .max_context
+        .filter(|n| (1..=262_144).contains(n))
+        .ok_or_else(|| Error::loading("unsupported profile context"))?;
+    if load.kv_cache != forja_sdk::KvCacheFormat::F16 {
+        return Err(Error::loading(
+            "the reference engine requires f16 KV storage",
+        ));
+    }
+    Ok((config, context))
 }
