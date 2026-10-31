@@ -78,12 +78,6 @@ impl<B: Backend + 'static> Host<B> {
                 .ok_or_else(|| invalid_handle("state slot is missing"))?
                 .selection_reservation(bank, site.lane)?
             else {
-                if slot.binding.activity[bank][site.lane].load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return Err(invalid_handle(
-                        "active selection capture has no reserved boundary",
-                    ));
-                }
                 continue;
             };
             let loan = self.feedback_destination(site.slot, index)?;
@@ -100,6 +94,9 @@ impl<B: Backend + 'static> Host<B> {
                 lane: site.lane,
                 identity,
             });
+        }
+        if !sites.is_empty() && writes.is_empty() {
+            return Err(invalid_handle("selection capture has no reserved output"));
         }
         Ok(writes)
     }

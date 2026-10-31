@@ -11272,6 +11272,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selection_graph_padding_leaves_other_resident_lanes_awaiting() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture_lanes(CpuBackend::new(), Some(StateAction::Forward), 2);
+        host.bind_paged_lane(pool.rep(), 1, None, 8).unwrap();
+        host.begin_paged_lane_update(pool.rep(), 1, 0, 1, Some(StateAction::Forward))
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        for lane in 0..2 {
+            host.record_slot_state(
+                &commands,
+                &slot,
+                lane,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
+            .unwrap();
+        }
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let inputs = host
+            .state_input_tensors(slot.rep(), Some(0))
+            .unwrap()
+            .unwrap();
+        host.write(&inputs.selected, &[2_u32, 3].map(u32::to_ne_bytes).concat())
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        for lane in 0..2 {
+            let token = host
+                .view(
+                    &inputs.selected,
+                    compute::ViewOp::Slice(vec![compute::SliceSpec {
+                        start: lane,
+                        len: 1,
+                        step: 1,
+                    }]),
+                )
+                .unwrap();
+            host.record_slot_feedback(&commands, &slot, lane, &token)
+                .unwrap();
+        }
+        let graph = host.create_graph(commands).unwrap();
+        assert!(host.table.get(&slot).unwrap().binding.activity[0][1].load(Ordering::Acquire));
+        host.state_slots
+            .get_mut(&slot.rep())
+            .unwrap()
+            .begin_selection(0, 0, 0)
+            .unwrap();
+        let index = host.state_slots[&slot.rep()]
+            .selection_destination(0, 0)
+            .unwrap()
+            .unwrap();
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+        host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_feedback_scalar(&host, &slot, index, 2).await;
+        let state = &host.state_slots[&slot.rep()];
+        assert_eq!(state.position(0).unwrap().grammar, 1);
+        assert_eq!(state.position(1).unwrap().grammar, 0);
+        assert!(
+            state
+                .sequence_handle(1)
+                .unwrap()
+                .unwrap()
+                .checkpoint_latest()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn captured_selection_rebinds_banks_without_retaining_requests() {
         assert_captured_selection(CpuBackend::new()).await;
     }
