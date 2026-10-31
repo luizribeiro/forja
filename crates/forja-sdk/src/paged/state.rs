@@ -25,12 +25,9 @@ impl PagedState<'_> {
         input: &Tensor<T>,
         weights: &Tensor<T>,
     ) -> Result<Tensor<T>> {
-        self.record(
-            Update::Convolution,
-            &[input.handle(), weights.handle()],
-            input.shape(),
-            "",
-        )
+        let mut output = Tensor::<T>::zeros(input.shape())?;
+        self.causal_convolution_into(input, weights, &mut output)?;
+        Ok(output)
     }
 
     /// Records one recurrent update using Q/K, values, decay and beta.
@@ -45,7 +42,43 @@ impl PagedState<'_> {
         decay: &Tensor<f32>,
         beta: &Tensor<T>,
     ) -> Result<Tensor<T>> {
-        self.record(
+        let mut output = Tensor::<T>::zeros(v.shape())?;
+        self.delta_rule_into(q, k, v, decay, beta, &mut output)?;
+        Ok(output)
+    }
+
+    /// Records convolution into a caller-owned output view.
+    ///
+    /// # Errors
+    /// Refuses invalid shapes, aliases or a host-denied update.
+    pub fn causal_convolution_into<T: FloatElement>(
+        &self,
+        input: &Tensor<T>,
+        weights: &Tensor<T>,
+        output: &mut Tensor<T>,
+    ) -> Result<()> {
+        self.record_into(
+            Update::Convolution,
+            &[input.handle(), weights.handle()],
+            output,
+            "",
+        )
+    }
+
+    /// Records a recurrent update into a caller-owned output view.
+    ///
+    /// # Errors
+    /// Refuses invalid shapes, aliases or a host-denied update.
+    pub fn delta_rule_into<T: FloatElement>(
+        &self,
+        q: &Tensor<f32>,
+        k: &Tensor<f32>,
+        v: &Tensor<T>,
+        decay: &Tensor<f32>,
+        beta: &Tensor<T>,
+        output: &mut Tensor<T>,
+    ) -> Result<()> {
+        self.record_into(
             Update::Recurrent,
             &[
                 q.handle(),
@@ -54,7 +87,7 @@ impl PagedState<'_> {
                 decay.handle(),
                 beta.handle(),
             ],
-            v.shape(),
+            output,
             "",
         )
     }
@@ -93,10 +126,21 @@ impl PagedState<'_> {
         shape: &[u32],
         algorithm: &str,
     ) -> Result<Tensor<T>> {
+        let output = Tensor::<T>::zeros(shape)?;
+        self.record_into(operation, inputs, &output, algorithm)?;
+        Ok(output)
+    }
+
+    fn record_into<T: FloatElement>(
+        &self,
+        operation: Update,
+        inputs: &[&crate::sys::Handle],
+        output: &Tensor<T>,
+        algorithm: &str,
+    ) -> Result<()> {
         #[cfg(target_family = "wasm")]
         {
             use crate::sys::guest::paged_storage::{self, StateOperation};
-            let output = Tensor::<T>::zeros(shape)?;
             let operation = match operation {
                 Update::Convolution => StateOperation::CausalConvolution,
                 Update::Recurrent => StateOperation::DeltaRule,
@@ -114,13 +158,12 @@ impl PagedState<'_> {
                     algorithm,
                 )
                 .map_err(|error| Error::loading(format!("{error:?}")))
-            })?;
-            Ok(output)
+            })
         }
         #[cfg(not(target_family = "wasm"))]
         {
             let _ = (
-                self.set, self.lane, self.plane, operation, inputs, shape, algorithm,
+                self.set, self.lane, self.plane, operation, inputs, output, algorithm,
             );
             Err(Error::loading("slotted state requires a component host"))
         }
