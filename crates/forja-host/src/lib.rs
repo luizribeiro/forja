@@ -10018,6 +10018,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_state_outputs_recover_failed_ordinary_scratch() {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let buffer = host.entry(&output).unwrap().tensor.buffer();
+        host.taints
+            .state
+            .lock()
+            .unwrap()
+            .tainted
+            .insert(buffer, (0, BackendError::ExecutionFailed));
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        let sink = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(output.rep())],
+            &sink,
+        )
+        .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        assert_eq!(
+            host.prepare_read(&sink).unwrap().run().await.unwrap(),
+            2_f32.to_ne_bytes().repeat(7)
+        );
+    }
+
+    #[tokio::test]
     async fn slot_state_commands_keep_private_pool_hazards_out_of_guest_taints() {
         let StateSlotFixture {
             mut host,

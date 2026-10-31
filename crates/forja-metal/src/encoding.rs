@@ -10360,11 +10360,10 @@ impl CompletionAccess {
 
 fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = CompletionAccess> + '_ {
     let inactive = matches!(dispatch.op(), Op::State(op) if !op.access().is_active());
-    let definite = !inactive
-        && !matches!(
-            dispatch.op(),
-            Op::PagedCopy { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
-        );
+    let definite = !matches!(
+        dispatch.op(),
+        Op::PagedCopy { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+    );
     dispatch
         .inputs()
         .iter()
@@ -10377,7 +10376,9 @@ fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = CompletionAc
                 .iter()
                 .enumerate()
                 .filter(move |(index, _)| !inactive || *index != 1)
-                .map(move |(_, tensor)| CompletionAccess::write(tensor, definite)),
+                .map(move |(index, tensor)| {
+                    CompletionAccess::write(tensor, definite && (!inactive || index == 0))
+                }),
         )
 }
 

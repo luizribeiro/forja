@@ -58,7 +58,7 @@ fn poisoned_padding<B: Backend + Send + Sync + 'static>(backend: B) {
     write_constant(host.backend.as_ref(), &previous, 9.0);
     write_constant(host.backend.as_ref(), &next, 13.0);
     let mut completed = Vec::new();
-    for corrupt in [false, true] {
+    for corrupt in [false, true, false] {
         let mut commands = slots.inactive().unwrap();
         commands
             .causal_convolution(0, &input, &weights, &output)

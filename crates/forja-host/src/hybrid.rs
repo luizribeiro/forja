@@ -174,9 +174,7 @@ impl<B: Backend + 'static> Host<B> {
         let dispatches = std::mem::take(&mut body.commands).into_dispatches();
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         entry.protected.extend(protected);
-        entry
-            .access
-            .record_conditional(&inputs, std::slice::from_ref(&output));
+        entry.access.record(&inputs, std::slice::from_ref(&output));
         entry.retained.extend(inputs);
         entry.retained.push(output);
         for dispatch in dispatches {
