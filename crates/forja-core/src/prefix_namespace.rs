@@ -149,3 +149,38 @@ mod tests {
         assert!(HybridPrefixNamespace::new([1; 32], &state, &pages, NonZeroU32::MIN, &[]).is_err());
     }
 }
+
+/// Hashes raw protected-plane payloads with unambiguous plane boundaries.
+///
+/// # Errors
+/// Refuses lengths that cannot be represented by checked 64-bit extents.
+pub fn state_payload_digest<'a>(
+    planes: impl Iterator<Item = &'a [u8]>,
+) -> Result<[u8; 32], crate::BackendError> {
+    let mut hash = Sha256::new();
+    hash.update(b"forja-state-payload-v1");
+    for plane in planes {
+        hash.update(
+            u64::try_from(plane.len())
+                .map_err(|_| crate::BackendError::InvalidInput)?
+                .to_le_bytes(),
+        );
+        hash.update(plane);
+    }
+    Ok(hash.finalize().into())
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::state_payload_digest;
+    #[test]
+    fn payload_digests_preserve_bits_and_plane_boundaries() {
+        let digest = |planes: &[&[u8]]| state_payload_digest(planes.iter().copied()).unwrap();
+        assert_eq!(digest(&[&[0, 1], &[2]]), digest(&[&[0, 1], &[2]]));
+        assert_ne!(digest(&[&[0, 1], &[2]]), digest(&[&[0], &[1, 2]]));
+        assert_ne!(
+            digest(&[&0_f32.to_le_bytes()]),
+            digest(&[&(-0_f32).to_le_bytes()])
+        );
+    }
+}

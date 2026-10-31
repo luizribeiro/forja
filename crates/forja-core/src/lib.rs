@@ -10,7 +10,7 @@ mod paged;
 mod paged_pool;
 mod prefix_namespace;
 mod profile_scope;
-pub use prefix_namespace::HybridPrefixNamespace;
+pub use prefix_namespace::{HybridPrefixNamespace, state_payload_digest};
 mod replay_bindings;
 pub use replay_bindings::ReplayBindings;
 pub mod program;

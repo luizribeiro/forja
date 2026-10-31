@@ -128,6 +128,10 @@ fn attachments_share_immutable_planes_until_the_first_update() {
             assert_eq!(host.backend.read(plane).unwrap(), *bytes);
         }
     }
+    assert_eq!(
+        children[0].fingerprint().unwrap(),
+        children[1].fingerprint().unwrap()
+    );
     let transaction = children[0].begin(2).unwrap();
     let recording = storage.record(&children[0], transaction).unwrap();
     assert!(children[0].snapshot.lock().unwrap().is_none());
@@ -146,6 +150,10 @@ fn attachments_share_immutable_planes_until_the_first_update() {
         assert_eq!(host.backend.read(&image.planes[plane]).unwrap(), *bytes);
     }
     drop(recording);
+    assert_ne!(
+        children[0].fingerprint().unwrap(),
+        children[1].fingerprint().unwrap()
+    );
     assert_eq!(children[0].position().tokens, 64);
     assert_eq!(children[1].position().tokens, 64);
     assert!(
