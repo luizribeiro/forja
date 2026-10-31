@@ -248,6 +248,10 @@ impl BatchLane {
         self.sink.fail(error);
     }
 
+    pub(super) const fn ledger(&self) -> &PrefixLedger {
+        &self.ledger
+    }
+
     pub(super) fn take_ledger(&mut self) -> PrefixLedger {
         std::mem::take(&mut self.ledger)
     }

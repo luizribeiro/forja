@@ -1,3 +1,5 @@
+mod recompute;
+
 use super::{GenerationControl, GenerationError, ServingEngine, prefix_limits};
 use forja_config::Profile;
 use forja_core::{Backend, CanonicalPrefixSchedule, HybridPrefixNamespace};
@@ -10,6 +12,7 @@ pub(super) struct CanonicalCache<B: Backend> {
     namespace: HybridPrefixNamespace,
     allowance: SnapshotAllowance,
     declared: u64,
+    recompute: Option<recompute::Recompute>,
     pub(super) store: Option<HybridPrefixStore<B>>,
 }
 
@@ -63,6 +66,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             namespace,
             allowance,
             declared: declared.get(),
+            recompute: None,
             store: None,
         });
         self.configure_canonical_cache(&self.config.clone())?;

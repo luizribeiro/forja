@@ -1023,7 +1023,16 @@ where
             .map_err(|error| batch_admission_error(&error));
         let cleanup = publish.and(release.map(|_| ()));
         match (completion, cleanup) {
-            (Ok(completion), Ok(())) => lane.reply(completion).await,
+            (Ok(completion), Ok(())) => {
+                self.queue_canonical_recompute(
+                    lane.ledger(),
+                    completion.usage.prompt_tokens,
+                    &completion.token_ids,
+                    &lane.control,
+                    lane.prefix_reuse(),
+                );
+                lane.reply(completion).await;
+            }
             (Err(error), _) | (Ok(_), Err(error)) => lane.fail(error),
         }
     }

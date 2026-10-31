@@ -373,6 +373,15 @@ impl PrefixLedger {
     pub(crate) fn into_tokens(self) -> Vec<u32> {
         self.0
     }
+    pub(crate) fn completed_context(&self, prompt_tokens: u32, reply: &[u32]) -> Option<Vec<u32>> {
+        let prompt = self.0.get(..usize::try_from(prompt_tokens).ok()?)?;
+        let capacity = prompt.len().checked_add(reply.len())?;
+        let mut tokens = Vec::new();
+        tokens.try_reserve_exact(capacity).ok()?;
+        tokens.extend_from_slice(prompt);
+        tokens.extend_from_slice(reply);
+        Some(tokens)
+    }
 }
 impl PrefixFingerprint {
     pub(crate) fn new(namespace: PrefixNamespace, tokens: Vec<u32>) -> Self {
@@ -459,6 +468,18 @@ mod tests {
         let mut sequence = pool.reserve(256).unwrap();
         sequence.commit_write(tokens as u64).unwrap();
         PagedPrefix::new(sequence)
+    }
+    #[test]
+    fn completed_context_includes_the_unforwarded_terminal_reply_token() {
+        let mut ledger = PrefixLedger::new(vec![1, 2, 3]);
+        ledger.record(4, true);
+        ledger.record(5, false);
+        assert_eq!(
+            ledger.completed_context(3, &[4, 5]),
+            Some(vec![1, 2, 3, 4, 5])
+        );
+        assert!(ledger.completed_context(7, &[4, 5]).is_none());
+        assert_eq!(ledger.into_tokens(), [1, 2, 3, 4]);
     }
     #[test]
     fn finds_boundaries_partial_blocks_and_prompt_cap() {

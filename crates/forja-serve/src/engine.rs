@@ -1586,6 +1586,15 @@ where
             },
         )
         .await;
+        if let Ok(completion) = &result {
+            self.queue_canonical_recompute(
+                &pipeline.ledger,
+                prompt_tokens,
+                &completion.token_ids,
+                control,
+                self.config.serving.prefix_reuse,
+            );
+        }
         let ledger = result.is_ok().then(|| std::mem::take(&mut pipeline.ledger));
         let ledger = (self.config.serving.prefix_reuse && self.prefix_index.is_some())
             .then_some(ledger)
