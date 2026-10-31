@@ -165,3 +165,6 @@ impl<B: Backend> Drop for StateSnapshot<B> {
 mod tests;
 
 mod attach;
+
+#[cfg(test)]
+mod hybrid_tests;
