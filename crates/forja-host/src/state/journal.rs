@@ -126,6 +126,49 @@ impl StateJournal {
         Ok(matches!(self.canonical, CanonicalPosition::Empty))
     }
 
+    pub(super) fn begin_prefill(
+        &mut self,
+        serial: u64,
+        prompt: Arc<super::CanonicalPrompt>,
+        end: u64,
+        reserved_tokens: u64,
+        action: StateAction,
+    ) -> Result<StateTransaction, PagePoolError> {
+        let input = self.checkpoint_latest()?;
+        if u64::try_from(prompt.tokens.len()).map_err(|_| PagePoolError::ArithmeticOverflow)?
+            > reserved_tokens
+            || !input.canonical.permits(&prompt, input.position.tokens, end)
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let transaction = self.begin_action(
+            serial,
+            Some(LanePosition {
+                tokens: end,
+                reserved_tokens,
+                ..input.position
+            }),
+            Some(action),
+        )?;
+        self.pending
+            .back_mut()
+            .ok_or(PagePoolError::CorruptState)?
+            .canonical = CanonicalPosition::Prefill(prompt, end);
+        Ok(transaction)
+    }
+
+    pub(super) fn canonical_boundary(
+        &self,
+    ) -> Result<Option<(Arc<super::CanonicalPrompt>, u64)>, PagePoolError> {
+        self.ensure_snapshot_idle()?;
+        Ok(match &self.canonical {
+            CanonicalPosition::Prefill(prompt, end) if *end == self.position.tokens => {
+                Some((Arc::clone(prompt), *end))
+            }
+            _ => None,
+        })
+    }
+
     pub(super) fn attach_feedback(
         &mut self,
         binding: super::feedback::FeedbackBinding,

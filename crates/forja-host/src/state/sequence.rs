@@ -164,6 +164,37 @@ impl<B: Backend> StateSequenceHandle<B> {
         self.lock().has_pristine_state()
     }
 
+    /// Reserves canonically evaluated prompt blocks before the prompt's final token.
+    ///
+    /// # Errors
+    /// Refuses foreign ledgers, changed prefixes, generated state or unavailable versions.
+    pub fn begin_prefill(
+        &self,
+        serial: u64,
+        prompt: Arc<super::CanonicalPrompt>,
+        end: u64,
+        reserved_tokens: u64,
+        action: super::StateAction,
+    ) -> Result<StateTransaction, PagePoolError> {
+        if !Arc::ptr_eq(&prompt.charge.live, &self.storage.charge.live)
+            || !prompt.namespace.matches_state(self.storage.pool.layout())
+        {
+            return Err(PagePoolError::ForeignResource);
+        }
+        self.lock()
+            .begin_prefill(serial, prompt, end, reserved_tokens, action)
+    }
+
+    /// Returns the completed canonical boundary, refusing work still in flight.
+    ///
+    /// # Errors
+    /// Refuses pending transactions or selection guards and undrained device work.
+    pub fn canonical_token_count(&self) -> Result<Option<u64>, PagePoolError> {
+        self.lock()
+            .canonical_boundary()
+            .map(|boundary| boundary.map(|(_, end)| end))
+    }
+
     /// Returns the newest declared cursor boundary, including a pending forward operation.
     ///
     /// # Errors

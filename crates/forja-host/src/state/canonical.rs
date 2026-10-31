@@ -67,6 +67,38 @@ pub(super) enum CanonicalPosition {
     #[default]
     Empty,
     Recurrent,
+    Prefill(Arc<CanonicalPrompt>, u64),
+}
+
+impl CanonicalPosition {
+    pub(super) fn permits(&self, prompt: &CanonicalPrompt, start: u64, end: u64) -> bool {
+        let Ok(end_index) = usize::try_from(end) else {
+            return false;
+        };
+        let Ok(start_index) = usize::try_from(start) else {
+            return false;
+        };
+        let block = u64::from(prompt.namespace.block().get());
+        if end <= start
+            || end_index >= prompt.tokens.len()
+            || !start.is_multiple_of(block)
+            || !end.is_multiple_of(block)
+        {
+            return false;
+        }
+        match self {
+            Self::Empty => start == 0,
+            Self::Prefill(previous, through) => {
+                *through == start
+                    && previous.namespace == prompt.namespace
+                    && previous
+                        .tokens
+                        .get(..start_index)
+                        .is_some_and(|tokens| tokens == &prompt.tokens[..start_index])
+            }
+            Self::Recurrent => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +184,85 @@ mod tests {
         assert!(!sequence.has_pristine_state().unwrap());
         sequence.rewind(0).unwrap();
         assert!(sequence.has_pristine_state().unwrap());
+    }
+    #[test]
+    fn canonical_blocks_require_exact_prompt_lineage_and_leave_a_tail() {
+        for length in [63, 64, 65, 129] {
+            let host = Host::new(
+                forja_cpu::CpuBackend::new(),
+                Limits::new(131_072, 8, 4096, 32, 4096),
+            );
+            let storage = host
+                .create_state_storage(
+                    StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 7, 33]).unwrap()])
+                        .unwrap(),
+                    1,
+                )
+                .unwrap();
+            let sequence = storage.reserve().unwrap();
+            let prompt = host
+                .canonical_prompt(namespace(), (0..length).collect())
+                .unwrap();
+            let first = sequence.begin_prefill(
+                1,
+                Arc::clone(&prompt),
+                64,
+                257,
+                super::super::StateAction::Step,
+            );
+            if length <= 64 {
+                assert!(first.is_err());
+                assert!(sequence.has_pristine_state().unwrap());
+                continue;
+            }
+            let first = first.unwrap();
+            assert!(sequence.canonical_token_count().is_err());
+            sequence.lock().mark_submitted(&first).unwrap();
+            storage.pool.observe_completion(1).unwrap();
+            sequence.lock().finish(&first, true).unwrap();
+            assert_eq!(sequence.canonical_token_count().unwrap(), Some(64));
+            if length == 129 {
+                let mut changed = prompt.tokens().to_vec();
+                changed[33] = 999;
+                let changed = host.canonical_prompt(namespace(), changed).unwrap();
+                assert!(
+                    sequence
+                        .begin_prefill(2, changed, 128, 257, super::super::StateAction::Step)
+                        .is_err()
+                );
+                let second = sequence
+                    .begin_prefill(
+                        2,
+                        Arc::clone(&prompt),
+                        128,
+                        257,
+                        super::super::StateAction::Step,
+                    )
+                    .unwrap();
+                sequence.cancel(&second).unwrap();
+                assert_eq!(sequence.canonical_token_count().unwrap(), Some(64));
+            }
+            let generated = sequence
+                .begin_at(
+                    3,
+                    super::super::LanePosition {
+                        tokens: 128,
+                        reserved_tokens: 257,
+                        ..sequence.position()
+                    },
+                )
+                .unwrap();
+            sequence.lock().mark_submitted(&generated).unwrap();
+            storage.pool.observe_completion(3).unwrap();
+            sequence.lock().finish(&generated, true).unwrap();
+            assert_eq!(sequence.canonical_token_count().unwrap(), None);
+            assert!(
+                sequence
+                    .begin_prefill(4, prompt, 192, 257, super::super::StateAction::Step)
+                    .is_err()
+            );
+            sequence.rewind(64).unwrap();
+            assert_eq!(sequence.canonical_token_count().unwrap(), Some(64));
+        }
     }
 }
