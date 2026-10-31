@@ -40,9 +40,9 @@ The full WebAssembly component passes the reduced-precision end-to-end criteria:
 
 | Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
 | --- | ---: | ---: | ---: | ---: |
-| Hello | 1 | 31/32 | 0.0006813 | 0.01493 |
-| What is 2 + 2? | 8 | 32/32 | 0.0002475 | 0.01565 |
-| The capital of France is | 5 | 32/32 | 0.0001251 | 0.01484 |
+| Hello | 1 | 31/32 | 0.0008287 | 0.01589 |
+| What is 2 + 2? | 8 | 32/32 | 0.0001693 | 0.01518 |
+| The capital of France is | 5 | 32/32 | 0.00008628 | 0.01190 |
 
 Operator differentials use normwise relative error at most `1e-5` for F32 and
 `1e-2` for BF16/quantized tensors; full-model
@@ -56,6 +56,9 @@ uv run --no-project --python 3.12 --with-requirements support/golden/qwen38-requ
 ```
 
 ## Porting notes
+
+Quantized projections use one tiled reduction class. Inputs shorter than 16 rows
+are zero-padded and cropped so every decode bucket uses the same row reduction.
 
 Decay uses GPU float32 `exp_rounded`/`ln_1p` with a softplus threshold of 20,
 matching the reference operation order without scalar readbacks. The block

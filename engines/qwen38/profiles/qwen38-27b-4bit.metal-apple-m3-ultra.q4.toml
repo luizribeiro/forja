@@ -32,7 +32,7 @@ prompt-token-budget = 2048
 paged-cache = true
 
 [variants.fixed]
-quant = "quant-matmul.portable"
+quant = "quant-matmul.tiled"
 attention = "sdpa.vector-256-two-pass"
 sample = "sample.parallel"
 "paged-attention.prefill" = "paged-sdpa.steel-half-256"

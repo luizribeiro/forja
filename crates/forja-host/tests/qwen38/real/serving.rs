@@ -168,3 +168,53 @@ async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Bo
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+async fn metal_real_long_prompt_replays_within_production_submission_limits()
+-> Result<(), Box<dyn Error>> {
+    let (mut runner, _) = load_with(true, None).await?;
+    for start in [0, 2048] {
+        runner
+            .step(forja_host::EngineStep {
+                phase: BatchPhase::Prompt,
+                tokens: (0..2048).map(|row| 100 + row % 7).collect(),
+                start_pos: start,
+                taps: false,
+            })
+            .await??;
+    }
+    for (phase, tokens, start_pos) in [
+        (BatchPhase::Prompt, Some(vec![100]), 4096),
+        (BatchPhase::Decode, None, 4097),
+    ] {
+        let output = runner
+            .decode(EngineDecode {
+                phase,
+                tokens,
+                start_pos,
+                sampling: SamplingParams::default(),
+            })
+            .await??;
+        assert_eq!(runner.read(&output.token).await?.len(), 4);
+        assert!(
+            runner
+                .read(&output.logits)
+                .await?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|bytes| f32::from_le_bytes(*bytes).is_finite())
+        );
+    }
+    assert_eq!(
+        runner
+            .checkpoint_state_lane(0)?
+            .ok_or("missing long prompt state")?
+            .position()
+            .tokens,
+        4098
+    );
+    assert_eq!(runner.metrics().live_graphs, 13);
+    Ok(())
+}
