@@ -192,17 +192,8 @@ impl Guest for Component {
             .lanes
             .into_iter()
             .map(|lane| {
-                lane.and_then(|lane| {
-                    lane.allow.iter().enumerate().find_map(|(word, &bits)| {
-                        (bits != 0).then(|| {
-                            u32::try_from(word)
-                                .unwrap_or(u32::MAX)
-                                .saturating_mul(32)
-                                .saturating_add(bits.trailing_zeros())
-                        })
-                    })
-                })
-                .unwrap_or(0)
+                lane.and_then(|lane| lane.allow.first().copied())
+                    .unwrap_or(0)
             })
             .collect::<Vec<_>>();
         let logits = vec![0.0; usize::try_from(bucket).unwrap_or(0) * 4];

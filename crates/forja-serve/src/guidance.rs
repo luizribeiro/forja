@@ -208,6 +208,28 @@ impl Drop for GuidanceSession {
     }
 }
 
+pub(crate) fn allowed_token_ids(mask: &[u32]) -> Result<Vec<u32>, String> {
+    let mut tokens = Vec::new();
+    for (index, &word) in mask.iter().enumerate() {
+        let base = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(32))
+            .ok_or("constraint mask exceeds token ids")?;
+        let mut bits = word;
+        while bits != 0 {
+            tokens.push(
+                base.checked_add(bits.trailing_zeros())
+                    .ok_or("constraint token id overflowed")?,
+            );
+            bits &= bits - 1;
+        }
+    }
+    if tokens.is_empty() {
+        return Err("constraint mask permits no tokens".to_owned());
+    }
+    Ok(tokens)
+}
+
 fn parser_limits() -> ParserLimits {
     ParserLimits {
         max_items_in_row: 2_000,
@@ -341,6 +363,27 @@ mod tests {
         let mut tokenizer = Tokenizer::new(model);
         tokenizer.with_decoder(Some(ByteLevel::default()));
         tokenizer
+    }
+
+    #[tokio::test]
+    async fn batch_token_ids_preserve_the_guidance_mask() {
+        let worker = GuidanceWorker::new(&tokenizer(), 3, &[2]).unwrap();
+        let session = worker.compile(r#"start: "b""#.to_owned()).await.unwrap();
+        let mask = session.mask().await.unwrap().unwrap();
+        assert_eq!(mask, [2]);
+        assert_eq!(super::allowed_token_ids(&mask).unwrap(), [1]);
+        session.commit(1).await.unwrap();
+        assert!(session.mask().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn batch_token_ids_cross_empty_words_in_order() {
+        assert_eq!(
+            super::allowed_token_ids(&[1 << 31, 0, 1]).unwrap(),
+            [31, 64]
+        );
+        assert!(super::allowed_token_ids(&[]).is_err());
+        assert!(super::allowed_token_ids(&[0, 0]).is_err());
     }
 
     #[tokio::test]

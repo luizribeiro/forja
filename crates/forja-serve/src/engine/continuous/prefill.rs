@@ -377,13 +377,14 @@ where
         prefill: &PendingPrefill,
         output: EngineBatchOutput,
     ) -> Result<EngineBatchOutput, GenerationError> {
-        let Some(allow) = prefill
+        let Some(mask) = prefill
             .constraint
             .as_ref()
-            .map(|constraint| constraint.allow.clone())
+            .map(|constraint| &constraint.allow)
         else {
             return Ok(output);
         };
+        let allow = crate::guidance::allowed_token_ids(mask).map_err(GenerationError::new)?;
         let needed = prefill.slot.saturating_add(1);
         let shape = self
             .info

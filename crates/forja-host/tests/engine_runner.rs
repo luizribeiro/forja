@@ -195,7 +195,7 @@ async fn runs_a_forward_only_batch() -> wasmtime::Result<()> {
         .await??;
     assert_eq!(
         runner.read(&selected.tokens).await?,
-        [1, 0, 0, 0, 0, 0, 0, 0]
+        [2, 0, 0, 0, 0, 0, 0, 0]
     );
     Ok(())
 }
