@@ -412,3 +412,59 @@ fn racing_a_hit_against_eviction_pins_both_halves_through_attachment() {
         assert_eq!(cache.usage().unwrap().entries, 1);
     }
 }
+
+#[test]
+fn attention_pages_remain_live_until_their_last_hybrid_reference_drops() {
+    let fixture = hybrid_fixture(262_144);
+    let cache = fixture.cache(65_536, 65_536, 1);
+    cache
+        .publish(fixture.entry(), &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    let hit = cache
+        .lookup(fixture.image.namespace(), &(0..65).collect::<Vec<_>>())
+        .unwrap()
+        .unwrap();
+    let child = fixture.parent.storage.reserve().unwrap();
+    let attached = hit.attach(&child, 257).unwrap();
+    assert_eq!(
+        fixture
+            .source
+            .sequence
+            .lock()
+            .unwrap()
+            .page_reference_counts()
+            .unwrap()[0],
+        3
+    );
+    drop(hit);
+    drop(cache);
+    assert_eq!(
+        fixture
+            .source
+            .sequence
+            .lock()
+            .unwrap()
+            .page_reference_counts()
+            .unwrap()[0],
+        3
+    );
+    drop(attached);
+    assert_eq!(
+        fixture
+            .source
+            .sequence
+            .lock()
+            .unwrap()
+            .page_reference_counts()
+            .unwrap()[0],
+        1
+    );
+    drop(fixture.source);
+    let all = fixture.pool.reserve(1024).unwrap();
+    assert!(
+        all.page_reference_counts()
+            .unwrap()
+            .iter()
+            .all(|&count| count == 1)
+    );
+}
