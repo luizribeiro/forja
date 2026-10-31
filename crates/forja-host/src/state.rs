@@ -29,6 +29,8 @@ pub use selection::{
     StateSelection, StateSelectionBatch, StateSelectionBoundary, StateSelectionLease,
     StateSelectionSubmission,
 };
+mod snapshot;
+pub use snapshot::StateSnapshot;
 mod sequence;
 pub use sequence::{StateLaneCheckpoint, StateSequenceHandle};
 mod slots;

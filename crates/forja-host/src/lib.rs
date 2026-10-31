@@ -26,8 +26,8 @@ pub use state::{
     CanonicalPrompt, LanePosition, SharedStateTrace, StateAction, StateBatch, StateBatchSubmission,
     StateCapture, StateCell, StateCommands, StateEntry, StateLaneCheckpoint, StateRecording,
     StateSelection, StateSelectionBatch, StateSelectionBoundary, StateSelectionLease,
-    StateSelectionSubmission, StateSequenceHandle, StateSlots, StateStorage, StateSubmission,
-    StateTrace,
+    StateSelectionSubmission, StateSequenceHandle, StateSlots, StateSnapshot, StateStorage,
+    StateSubmission, StateTrace,
 };
 mod weights;
 
