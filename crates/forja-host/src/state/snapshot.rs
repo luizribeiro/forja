@@ -42,6 +42,36 @@ impl<B: Backend> StateSnapshot<B> {
         Arc::ptr_eq(&self.backend, backend) && Arc::ptr_eq(&self.charge.live, live)
     }
 
+    /// Compares complete plane payloads bitwise without exposing protected tensor views.
+    ///
+    /// # Errors
+    /// Refuses unavailable comparison scratch or backend read failures.
+    pub fn bitwise_eq(&self, other: &Self) -> Result<bool, compute::Error> {
+        if self.namespace() != other.namespace()
+            || self.tokens() != other.tokens()
+            || self.layout != other.layout
+        {
+            return Ok(false);
+        }
+        let bytes = self
+            .layout
+            .version_bytes()
+            .checked_mul(2)
+            .ok_or_else(|| quota("snapshot comparison bytes overflow"))?;
+        let _temporary = self.reference_charge(bytes)?;
+        for (left, right) in self.planes.iter().zip(&other.planes) {
+            if self.backend.read_replay_output(left).map_err(guest_error)?
+                != other
+                    .backend
+                    .read_replay_output(right)
+                    .map_err(guest_error)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Exact prefix ledger; an earlier image cannot be obtained by shortening it.
     #[must_use]
     pub fn tokens(&self) -> &[u32] {

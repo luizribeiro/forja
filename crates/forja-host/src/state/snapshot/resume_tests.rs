@@ -172,18 +172,10 @@ fn cold_resume<B: Backend + Send + Sync + 'static>(backend: B) {
     assert_eq!(expected, actual);
     let expected = cold.capture_snapshot(allowance).unwrap();
     let actual = resumed.capture_snapshot(allowance).unwrap();
-    for (expected, actual) in expected.planes.iter().zip(&actual.planes) {
-        assert_eq!(
-            host.backend.read(expected).unwrap(),
-            host.backend.read(actual).unwrap()
-        );
-    }
+    assert!(expected.bitwise_eq(&actual).unwrap());
     BlockInputs::new(host.backend.as_ref(), 4097).run(&storage, &branch, &prompt, 1, 128);
     let different = branch.capture_snapshot(allowance).unwrap();
-    assert_ne!(
-        host.backend.read(&expected.planes[0]).unwrap(),
-        host.backend.read(&different.planes[0]).unwrap()
-    );
+    assert!(!expected.bitwise_eq(&different).unwrap());
     for (plane, bytes) in image.planes.iter().zip(before) {
         assert_eq!(host.backend.read(plane).unwrap(), bytes);
     }
