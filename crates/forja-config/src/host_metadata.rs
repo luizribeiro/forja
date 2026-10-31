@@ -95,6 +95,7 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("serving.prefix_cache_entries", ReloadClass::Live),
     ("serving.prefix_cache_tokens", ReloadClass::Live),
     ("serving.prefix_cache_pages", ReloadClass::Live),
+    ("serving.state_snapshot_bytes", ReloadClass::Model),
     ("serving.page_pool_bytes", ReloadClass::Restart),
     ("backend.kind", ReloadClass::Restart),
     ("backend.metal.graph_replay", ReloadClass::Restart),

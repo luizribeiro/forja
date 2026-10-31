@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, num::NonZeroU32};
+use std::{
+    collections::BTreeMap,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -313,6 +316,9 @@ pub struct Workload {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Serving {
+    /// Maximum bytes retained for immutable hybrid state images and their metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_snapshot_bytes: Option<NonZeroU64>,
     /// Prompt-token budget while any sequence is decoding.
     pub prompt_token_budget: NonZeroU32,
     /// Whether this profile selects host-owned paged cache storage.
@@ -323,6 +329,7 @@ pub struct Serving {
 impl Default for Serving {
     fn default() -> Self {
         Self {
+            state_snapshot_bytes: None,
             prompt_token_budget: NonZeroU32::MIN,
             paged_cache: false,
         }

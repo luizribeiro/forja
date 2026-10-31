@@ -111,6 +111,8 @@ pub struct Serving {
     pub prefix_cache_tokens: Choice<NonZeroU64>,
     /// Maximum pages retained by reusable prefixes.
     pub prefix_cache_pages: Choice<NonZeroU32>,
+    /// Lower-only ceiling for the profile's immutable state-snapshot allowance; zero disables it.
+    pub state_snapshot_bytes: Choice<ByteSize>,
     /// Bytes reserved for the page pool.
     pub page_pool_bytes: Choice<PositiveByteSize>,
 }
@@ -128,6 +130,7 @@ impl Default for Serving {
             prefix_cache_entries: Choice::Auto,
             prefix_cache_tokens: Choice::Auto,
             prefix_cache_pages: Choice::Auto,
+            state_snapshot_bytes: Choice::Auto,
             page_pool_bytes: Choice::Auto,
         }
     }
@@ -343,6 +346,26 @@ impl Default for Metrics {
 }
 
 impl HostConfig {
+    /// Resolves the snapshot ceiling for a host constructing a hybrid prefix store.
+    /// An omitted guest declaration disables state snapshot retention.
+    ///
+    /// # Errors
+    /// Refuses an operator value above the guest declaration.
+    pub fn resolve_state_snapshot_bytes(&self, profile: &crate::Profile) -> Result<u64, String> {
+        let guest = profile
+            .serving()
+            .and_then(|serving| serving.state_snapshot_bytes)
+            .map_or(0, NonZeroU64::get);
+        let effective = match self.serving.state_snapshot_bytes {
+            Choice::Auto => guest,
+            Choice::Fixed(bytes) => bytes.get(),
+        };
+        if effective > guest {
+            return Err("serving.state_snapshot_bytes exceeds the profile declaration".to_owned());
+        }
+        Ok(effective)
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.request.default_output_tokens == 0
             || self.request.default_output_tokens > self.request.max_output_tokens

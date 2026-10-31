@@ -119,3 +119,22 @@ device choices; the host validates generic operations and memory capabilities.
    engine entry in [the index](../engines/README.md), serving settings in
    [serving](serving.md), and implementation-specific porting details beside the
    engine. Keep guides focused on reproducible commands and their expected results.
+
+## Protected hybrid prefixes
+
+Native hosts use `HybridPrefixStore` to retain attention pages and every opaque
+state plane as one entry. Create a charged `CanonicalPrompt` with the complete
+ledger and artifact/numerical namespace, admit blocks through `begin_prefill`,
+and capture only after their submissions finish. Ordinary recurrent updates do
+not produce reusable canonical boundaries. Lookup pins the longest exact match
+and leaves the final prompt token for replay; a later state image cannot supply
+an earlier boundary. Keep the returned `HybridAttachment` for the request's
+lifetime. Its state planes share immutable backing until the first recording
+copies whole planes into private storage.
+
+The profile's optional `[serving].state-snapshot-bytes` declares the snapshot
+ceiling. Native hosts resolve `serving.state_snapshot_bytes` with
+`HostConfig::resolve_state_snapshot_bytes` before constructing the store; `auto`
+uses the declaration, zero disables retention, and a value above the declaration
+is refused. An omitted declaration disables retention. Image copies, request
+references and accounting scratch also consume the existing live-byte quota.

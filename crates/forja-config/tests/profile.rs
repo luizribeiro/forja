@@ -358,3 +358,43 @@ fn enforces_profile_collection_and_name_bounds() {
     assert!(toml::from_str::<Profile>(&PROFILE.replace("residual-norm", &name)).is_ok());
     assert!(error(&PROFILE.replace("residual-norm", &(name + "n"))).contains("64-byte"));
 }
+
+#[test]
+fn snapshot_allowances_are_declared_by_profiles_and_only_lowered_by_operators() {
+    use forja_config::{ByteSize, Choice, HostConfig};
+    let legacy: Profile = toml::from_str(PROFILE).unwrap();
+    assert!(
+        !legacy
+            .canonical_toml()
+            .unwrap()
+            .contains("state-snapshot-bytes")
+    );
+    let mut config = HostConfig::default();
+    assert_eq!(config.resolve_state_snapshot_bytes(&legacy).unwrap(), 0);
+    config.serving.state_snapshot_bytes = Choice::Fixed(ByteSize::new(1));
+    assert!(config.resolve_state_snapshot_bytes(&legacy).is_err());
+    let source = PROFILE.replace("[serving]", "[serving]\nstate-snapshot-bytes = 4097");
+    let profile: Profile = toml::from_str(&source).unwrap();
+    assert_ne!(legacy.sha256().unwrap(), profile.sha256().unwrap());
+    assert_eq!(
+        toml::from_str::<Profile>(&profile.canonical_toml().unwrap()).unwrap(),
+        profile
+    );
+    config.serving.state_snapshot_bytes = Choice::Auto;
+    assert_eq!(config.resolve_state_snapshot_bytes(&profile).unwrap(), 4097);
+    for bytes in [0, 33, 4097] {
+        config.serving.state_snapshot_bytes = Choice::Fixed(ByteSize::new(bytes));
+        assert_eq!(
+            config.resolve_state_snapshot_bytes(&profile).unwrap(),
+            bytes
+        );
+    }
+    config.serving.state_snapshot_bytes = Choice::Fixed(ByteSize::new(4098));
+    assert!(config.resolve_state_snapshot_bytes(&profile).is_err());
+    assert!(toml::from_str::<Profile>(&source.replace("4097", "0")).is_err());
+    let parsed: HostConfig = toml::from_str("[serving]\nstate_snapshot_bytes = '1MiB'").unwrap();
+    assert_eq!(
+        parsed.serving.state_snapshot_bytes,
+        Choice::Fixed(ByteSize::new(1_048_576))
+    );
+}
