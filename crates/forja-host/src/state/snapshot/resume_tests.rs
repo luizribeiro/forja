@@ -100,8 +100,7 @@ fn cache_image<B: Backend + 'static>(
             plane_count: 1,
             slot_banks: None,
             slot: None,
-            charged_bytes: std::sync::atomic::AtomicU64::new(backing_bytes),
-            live_bytes: Arc::clone(&host.live_bytes),
+            charge: crate::PagePoolCharge::shared(backing_bytes, Arc::clone(&host.live_bytes)),
         })
         .unwrap();
     let allowance = SnapshotAllowance::new(131_072, None).unwrap();

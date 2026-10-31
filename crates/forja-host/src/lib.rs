@@ -1497,8 +1497,7 @@ where
                 .map_err(|_| compute::Error::Layout("paged plane count exceeds u32".to_owned()))?,
             slot_banks: None,
             slot: None,
-            charged_bytes: AtomicU64::new(0),
-            live_bytes: Arc::clone(&self.store.data().live_bytes),
+            charge: crate::PagePoolCharge::shared(0, Arc::clone(&self.store.data().live_bytes)),
         };
         let resource = self
             .store
@@ -3501,14 +3500,25 @@ pub struct PagePoolEntry {
     plane_count: u32,
     slot_banks: Option<Arc<PagedSlotBanks>>,
     slot: Option<u32>,
-    charged_bytes: AtomicU64,
-    live_bytes: Arc<AtomicU64>,
+    charge: Arc<PagePoolCharge>,
 }
 
-impl Drop for PagePoolEntry {
+struct PagePoolCharge {
+    bytes: AtomicU64,
+    live: Arc<AtomicU64>,
+}
+impl PagePoolCharge {
+    fn shared(bytes: u64, live: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: AtomicU64::new(bytes),
+            live,
+        })
+    }
+}
+impl Drop for PagePoolCharge {
     fn drop(&mut self) {
-        self.live_bytes
-            .fetch_sub(self.charged_bytes.load(Ordering::Acquire), Ordering::AcqRel);
+        self.live
+            .fetch_sub(self.bytes.load(Ordering::Acquire), Ordering::AcqRel);
     }
 }
 
@@ -4084,8 +4094,8 @@ impl<B: Backend + 'static> Host<B> {
         let entry = self.table.get_mut(resource).map_err(invalid_handle)?;
         entry.slot_banks = Some(banks);
         entry.slot = Some(slot.rep());
-        entry.charged_bytes.fetch_add(charge, Ordering::AcqRel);
-        entry.live_bytes.fetch_add(charge, Ordering::AcqRel);
+        entry.charge.bytes.fetch_add(charge, Ordering::AcqRel);
+        entry.charge.live.fetch_add(charge, Ordering::AcqRel);
         Ok(slot)
     }
 
@@ -10107,8 +10117,7 @@ mod tests {
                 plane_count,
                 slot_banks: None,
                 slot: None,
-                charged_bytes: AtomicU64::new(charged_bytes),
-                live_bytes: Arc::clone(&host.live_bytes),
+                charge: crate::PagePoolCharge::shared(charged_bytes, Arc::clone(&host.live_bytes)),
             })
             .unwrap()
     }
@@ -12564,6 +12573,18 @@ mod tests {
     }
 
     #[test]
+    fn retained_pool_accounting_outlives_the_guest_resource() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 1, 8);
+        let lease = Arc::clone(&host.table.get(&pool).unwrap().charge);
+        let before = host.live_bytes.load(Ordering::Acquire);
+        drop(host.table.delete(pool).unwrap());
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        drop(lease);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn paged_pool_fixture_tracks_its_initial_charge() {
         let mut host = Host::new(CpuBackend::new(), GENEROUS);
         let pool = insert_test_pool(&mut host, 1, 8);
@@ -12571,7 +12592,8 @@ mod tests {
             .table
             .get(&pool)
             .unwrap()
-            .charged_bytes
+            .charge
+            .bytes
             .load(Ordering::Acquire);
 
         assert_eq!(host.live_bytes.load(Ordering::Acquire), charged);
@@ -12921,8 +12943,7 @@ mod tests {
                 plane_count: 1,
                 slot_banks: None,
                 slot: None,
-                charged_bytes: AtomicU64::new(charged_bytes),
-                live_bytes: Arc::clone(&host.live_bytes),
+                charge: crate::PagePoolCharge::shared(charged_bytes, Arc::clone(&host.live_bytes)),
             })
             .unwrap();
         let sequence = host.table.push(PagedSequenceEntry).unwrap();
@@ -14989,7 +15010,7 @@ mod tests {
                 .unwrap();
             (
                 entry.pool.memory_usage().unwrap(),
-                entry.charged_bytes.load(Ordering::Acquire),
+                entry.charge.bytes.load(Ordering::Acquire),
                 host.live_bytes.load(Ordering::Acquire),
             )
         };
@@ -15013,7 +15034,7 @@ mod tests {
                 .get(&Resource::<PagePoolEntry>::new_borrow(pool_rep))
                 .unwrap();
             assert_eq!(entry.pool.memory_usage().unwrap(), before_memory);
-            assert_eq!(entry.charged_bytes.load(Ordering::Acquire), before_charged);
+            assert_eq!(entry.charge.bytes.load(Ordering::Acquire), before_charged);
             assert_eq!(host.live_bytes.load(Ordering::Acquire), before_live);
         }
         drop(after);

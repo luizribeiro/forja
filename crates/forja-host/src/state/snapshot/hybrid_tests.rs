@@ -44,8 +44,7 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
             plane_count: 1,
             slot_banks: None,
             slot: None,
-            charged_bytes: std::sync::atomic::AtomicU64::new(backing_bytes),
-            live_bytes: Arc::clone(&host.live_bytes),
+            charge: crate::PagePoolCharge::shared(backing_bytes, Arc::clone(&host.live_bytes)),
         })
         .unwrap();
     HybridFixture {
