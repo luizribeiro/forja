@@ -383,6 +383,7 @@ impl StateJournal {
             None
         };
         Ok(Some(super::feedback::FeedbackUse {
+            explicit: std::sync::atomic::AtomicBool::new(true),
             source,
             destination: feedback.destination(destination)?,
             charge,

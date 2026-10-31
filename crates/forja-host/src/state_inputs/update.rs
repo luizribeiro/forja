@@ -68,12 +68,12 @@ impl<B: Backend + 'static> Host<B> {
             .table
             .get(&Resource::<crate::PagePoolEntry>::new_borrow(pool))
             .map_err(invalid_handle)?;
-        let Some(slot) = pool.slot else {
+        let Some(slot_rep) = pool.slot else {
             return Ok(());
         };
         let slot = self
             .table
-            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot_rep))
             .map_err(invalid_handle)?;
         let Some(inputs) = &slot.inputs else {
             return Ok(());
@@ -133,6 +133,9 @@ impl<B: Backend + 'static> Host<B> {
                 }
             } else if phase == BatchPhase::Prompt {
                 return Err(invalid_handle("prompt input tokens are missing"));
+            }
+            if let Some(state) = self.state_slots.get(&slot_rep) {
+                state.select_feedback_input(slot.active_bank, index, lane.tokens.is_some())?;
             }
         }
         if phase == BatchPhase::Prompt && prompt_lanes != 1 {

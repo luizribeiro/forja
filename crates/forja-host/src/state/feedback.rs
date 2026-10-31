@@ -4,7 +4,10 @@ use forja_core::{
     Backend, CompletionResource, FeedbackCheckpoint, FeedbackPin, FeedbackVersions, PagePoolError,
     StateSequence,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Clone)]
 pub(crate) struct FeedbackBinding {
@@ -44,6 +47,7 @@ impl FeedbackBinding {
 }
 
 pub(super) struct FeedbackUse {
+    pub(super) explicit: AtomicBool,
     pub(super) source: Option<FeedbackPin>,
     pub(super) destination: FeedbackPin,
     pub(super) charge: Arc<StateCharge>,
@@ -54,6 +58,24 @@ pub(super) const FEEDBACK_USE_BYTES: u64 = (size_of::<FeedbackUse>()
     as u64;
 
 impl FeedbackUse {
+    pub(super) fn select_input(&self, explicit: bool) -> Result<(), PagePoolError> {
+        if !explicit && self.source.is_none() {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        self.explicit.store(explicit, Ordering::Release);
+        Ok(())
+    }
+
+    pub(super) fn source_index(&self) -> Result<Option<u32>, PagePoolError> {
+        if self.explicit.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        self.source
+            .as_ref()
+            .map(|pin| Some(pin.index()))
+            .ok_or(PagePoolError::CorruptState)
+    }
+
     pub(super) fn retained_resources(&self) -> impl Iterator<Item = CompletionResource> + '_ {
         self.source
             .iter()
@@ -196,6 +218,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(initial.source.is_none());
+        assert!(initial.select_input(false).is_err());
+        assert_eq!(initial.source_index().unwrap(), None);
         journal.mark_submitted(&first).unwrap();
         pool.observe_completion(1).unwrap();
         journal.finish(&first, true).unwrap();
@@ -212,6 +236,14 @@ mod tests {
             initial.destination.index()
         );
         assert_ne!(next.destination.index(), initial.destination.index());
+        assert_eq!(next.source_index().unwrap(), None);
+        next.select_input(false).unwrap();
+        assert_eq!(
+            next.source_index().unwrap(),
+            Some(initial.destination.index())
+        );
+        next.select_input(true).unwrap();
+        assert_eq!(next.source_index().unwrap(), None);
         let retained = next.retained_resources().collect::<Vec<_>>();
         drop(next);
         drop(initial);
@@ -224,6 +256,59 @@ mod tests {
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
         journal.cancel_unsubmitted(&second).unwrap();
         assert_eq!(journal.position.tokens, 1);
+    }
+
+    #[test]
+    fn omitted_tokens_refuse_external_and_unselected_predecessors() {
+        use crate::{LanePosition, StateAction};
+        use forja_core::StateAccess;
+        for action in [StateAction::Step, StateAction::Forward] {
+            let (host, _binding, pool, mut journal) = fixture();
+            let first = journal
+                .begin_action(
+                    1,
+                    Some(LanePosition {
+                        tokens: 1,
+                        reserved_tokens: 3,
+                        ..LanePosition::default()
+                    }),
+                    Some(action),
+                )
+                .unwrap();
+            journal.mark_submitted(&first).unwrap();
+            pool.observe_completion(1).unwrap();
+            journal.finish(&first, true).unwrap();
+            let second = journal
+                .begin_action(
+                    2,
+                    Some(LanePosition {
+                        tokens: 2,
+                        reserved_tokens: 3,
+                        ..LanePosition::default()
+                    }),
+                    Some(StateAction::Combined),
+                )
+                .unwrap();
+            let access = StateAccess::from_slot(&journal.bind(&second).unwrap()).unwrap();
+            let charge = Arc::new(
+                StateCharge::reserve(
+                    host.backend.as_ref(),
+                    Arc::clone(&host.live_bytes),
+                    host.limits.live_bytes,
+                    FEEDBACK_USE_BYTES,
+                )
+                .unwrap(),
+            );
+            let feedback = journal
+                .feedback_use(&second, access.destination(), charge)
+                .unwrap()
+                .unwrap();
+            assert!(feedback.select_input(false).is_err());
+            assert_eq!(feedback.source_index().unwrap(), None);
+            feedback.select_input(true).unwrap();
+            journal.cancel_unsubmitted(&second).unwrap();
+            assert_eq!(journal.position.tokens, 1);
+        }
     }
 
     #[test]

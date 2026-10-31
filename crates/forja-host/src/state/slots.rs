@@ -206,6 +206,53 @@ impl<B: Backend> StateSlots<B> {
         Ok(())
     }
 
+    fn feedback_use(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<Option<&super::feedback::FeedbackUse>, compute::Error> {
+        self.banks
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .ok_or_else(|| invalid_handle("state bank or lane is out of range"))?
+            .as_ref()
+            .map(|record| {
+                record
+                    .feedback
+                    .as_ref()
+                    .ok_or_else(|| invalid_handle("state feedback is missing"))
+            })
+            .transpose()
+    }
+
+    pub(crate) fn select_feedback_input(
+        &self,
+        bank: usize,
+        lane: usize,
+        explicit: bool,
+    ) -> Result<(), compute::Error> {
+        if let Some(feedback) = self.feedback_use(bank, lane)? {
+            feedback.select_input(explicit).map_err(invalid_handle)
+        } else if explicit {
+            Ok(())
+        } else {
+            Err(invalid_handle(
+                "retained feedback requires a lane transaction",
+            ))
+        }
+    }
+
+    pub(crate) fn feedback_source(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<Option<u32>, compute::Error> {
+        self.feedback_use(bank, lane)?
+            .map(|feedback| feedback.source_index().map_err(invalid_handle))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     /// Borrows an admitted transaction for authenticated plane recording or replay binding.
     ///
     /// # Errors

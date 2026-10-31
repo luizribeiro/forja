@@ -63,10 +63,29 @@ impl<B: Backend + 'static> Host<B> {
             .inputs
             .as_ref()
             .ok_or_else(|| invalid_handle("slot has no state inputs"))?;
+        let source = self
+            .state_slots
+            .get(&slot)
+            .ok_or_else(|| invalid_handle("slot has no protected state"))?
+            .feedback_source(
+                entry.active_bank,
+                usize::try_from(lane).map_err(invalid_handle)?,
+            )?;
+        let (handle, start) = if let Some(index) = source {
+            (
+                *inputs
+                    .feedback
+                    .get(usize::try_from(index).map_err(invalid_handle)?)
+                    .ok_or_else(|| invalid_handle("feedback source is missing"))?,
+                0,
+            )
+        } else {
+            (inputs.banks[entry.active_bank].tokens, lane)
+        };
         self.lend_view(
-            &Resource::new_borrow(inputs.banks[entry.active_bank].tokens),
+            &Resource::new_borrow(handle),
             compute::ViewOp::Slice(vec![compute::SliceSpec {
-                start: lane,
+                start,
                 len: 1,
                 step: 1,
             }]),
