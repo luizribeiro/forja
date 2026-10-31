@@ -1,3 +1,6 @@
+#[path = "batches/joins.rs"]
+mod joins;
+
 use super::{Error, runner};
 use forja_cpu::CpuBackend;
 use forja_host::{
