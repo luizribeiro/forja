@@ -94,44 +94,20 @@ impl Attention {
         quant: Option<&Variant>,
         attention: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
-        let c = self.config;
-        if input.shape() != [1, c.hidden] {
+        if input.shape() != [1, self.config.hidden] {
             return Err(Error::loading("attention requires one normalized token"));
         }
         let end = position
             .checked_add(1)
             .ok_or_else(|| Error::loading("attention position overflow"))?;
         let positions = Tensor::constant(&[position], &[1])?;
-        let projected =
-            self.q
-                .forward(input, quant)?
-                .reshape(&[1, c.query_heads, 2 * c.head_dim])?;
-        let query = projected
-            .narrow(2, 0, c.head_dim)?
-            .contiguous()?
-            .rms_norm(&self.q_norm, 1.0e-6)?;
-        let gate = projected
-            .narrow(2, c.head_dim, c.head_dim)?
-            .contiguous()?
-            .reshape(&[1, c.query_heads * c.head_dim])?;
-        let key = self
-            .k
-            .forward(input, quant)?
-            .reshape(&[1, c.kv_heads, c.head_dim])?
-            .rms_norm(&self.k_norm, 1.0e-6)?;
-        let query = partial_rope(&query, &positions, c.rotary_dim)?.to_dtype::<f32>()?;
-        let key = partial_rope(&key, &positions, c.rotary_dim)?.to_dtype::<f32>()?;
-        let value = self
-            .v
-            .forward(input, quant)?
-            .reshape(&[1, c.kv_heads, c.head_dim])?
-            .to_dtype::<f32>()?;
-        let scale = crate::numerics::inverse_sqrt_width(c.head_dim)?;
+        let projected = self.project(input, &positions, quant)?;
+        let scale = crate::numerics::inverse_sqrt_width(self.config.head_dim)?;
         let attended = match attention {
             Some(pick) => cached_attention_with(
-                &query,
-                &key,
-                &value,
+                &projected.query,
+                &projected.key,
+                &projected.value,
                 &mut self.cache,
                 scale,
                 &Dim::from(position),
@@ -139,19 +115,75 @@ impl Attention {
                 pick,
             )?,
             None => cached_attention(
-                &query,
-                &key,
-                &value,
+                &projected.query,
+                &projected.key,
+                &projected.value,
                 &mut self.cache,
                 scale,
                 &Dim::from(position),
                 &Dim::from(end),
             )?,
-        }
-        .to_dtype::<bf16>()?;
-        let gated = numerics::multiply(&attended, &numerics::sigmoid_bf16(&gate)?)?;
+        };
+        self.output(&attended, &projected.gate, quant)
+    }
+
+    fn project(
+        &self,
+        input: &Tensor<bf16>,
+        positions: &Tensor<u32>,
+        quant: Option<&Variant>,
+    ) -> Result<AttentionProjection> {
+        let c = self.config;
+        let rows = input.shape()[0];
+        let projected =
+            self.q
+                .forward(input, quant)?
+                .reshape(&[rows, c.query_heads, 2 * c.head_dim])?;
+        let query = projected
+            .narrow(2, 0, c.head_dim)?
+            .contiguous()?
+            .rms_norm(&self.q_norm, 1.0e-6)?;
+        let gate = projected
+            .narrow(2, c.head_dim, c.head_dim)?
+            .contiguous()?
+            .reshape(&[rows, c.query_heads * c.head_dim])?;
+        let key = self
+            .k
+            .forward(input, quant)?
+            .reshape(&[rows, c.kv_heads, c.head_dim])?
+            .rms_norm(&self.k_norm, 1.0e-6)?;
+        let query = partial_rope(&query, positions, c.rotary_dim)?.to_dtype::<f32>()?;
+        let key = partial_rope(&key, positions, c.rotary_dim)?.to_dtype::<f32>()?;
+        let value = self
+            .v
+            .forward(input, quant)?
+            .reshape(&[rows, c.kv_heads, c.head_dim])?
+            .to_dtype::<f32>()?;
+        Ok(AttentionProjection {
+            query,
+            key,
+            value,
+            gate,
+        })
+    }
+
+    fn output(
+        &self,
+        attended: &Tensor<f32>,
+        gate: &Tensor<bf16>,
+        quant: Option<&Variant>,
+    ) -> Result<Tensor<bf16>> {
+        let attended = attended.to_dtype::<bf16>()?;
+        let gated = numerics::multiply(&attended, &numerics::sigmoid_bf16(gate)?)?;
         self.out.forward(&gated, quant)
     }
+}
+
+struct AttentionProjection {
+    query: Tensor<f32>,
+    key: Tensor<f32>,
+    value: Tensor<f32>,
+    gate: Tensor<bf16>,
 }
 fn partial_rope(input: &Tensor<bf16>, positions: &Tensor<u32>, width: u32) -> Result<Tensor<bf16>> {
     let rotated = input.narrow(2, 0, width)?.rope(positions, 10_000_000.0)?;
