@@ -48,7 +48,7 @@ impl BlockInputs {
             conv_output: backend.alloc(DType::BF16, &[64, 7]).unwrap(),
         }
     }
-    fn run<B: Backend + 'static>(
+    fn run<B: Backend + Send + Sync + 'static>(
         &self,
         storage: &Arc<StateStorage<B>>,
         sequence: &StateSequenceHandle<B>,
@@ -79,7 +79,7 @@ impl BlockInputs {
     }
 }
 
-fn cache_image<B: Backend + 'static>(
+fn cache_image<B: Backend + Send + Sync + 'static>(
     host: &mut Host<B>,
     pages: PagedLayout,
     image: &Arc<StateSnapshot<B>>,
@@ -95,7 +95,7 @@ fn cache_image<B: Backend + 'static>(
         .table
         .push(crate::PagePoolEntry {
             pool,
-            active_lanes: 3,
+            active_lanes: 11,
             max_context: 257,
             plane_count: 1,
             slot_banks: None,
@@ -103,6 +103,7 @@ fn cache_image<B: Backend + 'static>(
             charge: crate::PagePoolCharge::shared(backing_bytes, Arc::clone(&host.live_bytes)),
         })
         .unwrap();
+    host.open_paged_slot(&resource, 1).unwrap();
     let allowance = SnapshotAllowance::new(131_072, None).unwrap();
     let cache = host
         .create_hybrid_prefix_store(&resource, image.namespace(), allowance, 131_072, 8)
@@ -116,7 +117,7 @@ fn cache_image<B: Backend + 'static>(
     cache
 }
 
-fn cold_resume<B: Backend + 'static>(backend: B) {
+fn cold_resume<B: Backend + Send + Sync + 'static>(backend: B) {
     let mut host = Host::new(
         backend,
         Limits::new(4_194_304, 8, 1_048_576, 128, 1_000_000_000),

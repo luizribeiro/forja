@@ -786,6 +786,7 @@ pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
 #[derive(Clone)]
 pub struct PagedPrefix {
     sequence: Arc<Mutex<PagedSequence>>,
+    retained: Option<forja_core::CompletionResource>,
 }
 
 impl PagedPrefix {
@@ -795,7 +796,13 @@ impl PagedPrefix {
     pub fn new(sequence: PagedSequence) -> Self {
         Self {
             sequence: Arc::new(Mutex::new(sequence)),
+            retained: None,
         }
+    }
+
+    fn retaining(mut self, retained: forja_core::CompletionResource) -> Self {
+        self.retained = Some(retained);
+        self
     }
 
     /// Forks a committed prefix and reserves its complete request capacity.
@@ -813,7 +820,9 @@ impl PagedPrefix {
             .lock()
             .map_err(|_| PagePoolError::CorruptState)?
             .fork_reserved(prefix_tokens, reserved_tokens)?;
-        Ok(Self::new(sequence))
+        let mut child = Self::new(sequence);
+        child.retained.clone_from(&self.retained);
+        Ok(child)
     }
 
     /// Returns the number of physical pages referenced by this sequence.
@@ -4969,7 +4978,10 @@ impl<B: Backend + 'static> Host<B> {
             .as_ref()
             .cloned()
             .ok_or_else(|| invalid_handle("paged sequence is not active"))?;
-        Ok(PagedPrefix { sequence })
+        Ok(PagedPrefix {
+            sequence,
+            retained: None,
+        })
     }
 
     fn checkpoint_paged_lane(

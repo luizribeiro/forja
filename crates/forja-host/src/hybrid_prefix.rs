@@ -1,3 +1,4 @@
+mod backing;
 mod store;
 pub use store::{HybridCacheUsage, HybridPrefixStore};
 mod entry;

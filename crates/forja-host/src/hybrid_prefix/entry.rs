@@ -95,10 +95,10 @@ impl<B: Backend> HybridPrefix<B> {
 
 /// A live request's paired attention/carry ownership; its parent remains pinned against eviction.
 pub struct HybridAttachment<B: Backend> {
-    _charge: StateCharge,
     entry: Arc<HybridPrefix<B>>,
     attention: PagedPrefix,
     state: StateSequenceHandle<B>,
+    _charge: StateCharge,
 }
 impl<B: Backend> HybridAttachment<B> {
     /// Private request attention sequence, initially sharing immutable cached pages.
@@ -118,19 +118,19 @@ impl<B: Backend> HybridAttachment<B> {
     }
 }
 
-impl<B: Backend + 'static> Host<B> {
+impl<B: Backend + Send + Sync + 'static> Host<B> {
     /// Prepares an exact hybrid boundary without admitting it to a cache.
     ///
     /// # Errors
     /// Refuses foreign pools/hosts, mismatched ledgers, layouts, lengths or quota exhaustion.
     pub fn hybrid_prefix(
         &self,
-        pool: &Resource<PagePoolEntry>,
+        resource: &Resource<PagePoolEntry>,
         attention: &PagedPrefix,
         image: Arc<StateSnapshot<B>>,
         attention_tokens: &[u32],
     ) -> Result<Arc<HybridPrefix<B>>, compute::Error> {
-        let pool = &self.table.get(pool).map_err(invalid_handle)?.pool;
+        let pool = &self.table.get(resource).map_err(invalid_handle)?.pool;
         let mut source = attention.sequence.lock().map_err(invalid_handle)?;
         if !image.owned_by(&self.backend, &self.live_bytes)
             || !image.namespace().matches_attention(pool.layout())
@@ -146,23 +146,20 @@ impl<B: Backend + 'static> Host<B> {
             .position()
             .tokens
             .div_ceil(u64::from(pool.layout().page_tokens()));
-        let metadata_bytes = count
+        let backing = self.hybrid_backing(resource)?;
+        let reference_bytes = count
             .checked_mul(64)
             .and_then(|n| n.checked_add(1024))
             .ok_or_else(|| crate::quota("hybrid reference bytes overflow"))?;
+        let metadata_bytes = reference_bytes
+            .checked_add(backing.bytes)
+            .ok_or_else(|| crate::quota("hybrid backing metadata overflow"))?;
         let charge = StateCharge::reserve(
             self.backend.as_ref(),
             Arc::clone(&self.live_bytes),
             self.limits.live_bytes,
-            metadata_bytes,
+            reference_bytes,
         )?;
-        let child = source
-            .fork_reserved(image.position().tokens, image.position().tokens)
-            .map_err(invalid_handle)?;
-        let pages = child
-            .page_entries()
-            .map(|entry| (entry.page(), entry.generation()))
-            .collect();
         let retained = image
             .retained_allocations()
             .iter()
@@ -174,9 +171,17 @@ impl<B: Backend + 'static> Host<B> {
                     .and_then(|pages| n.checked_add(pages))
             })
             .ok_or_else(|| crate::quota("hybrid byte count overflow"))?;
+        let child = source
+            .fork_reserved(image.position().tokens, image.position().tokens)
+            .map_err(invalid_handle)?;
+        let pages = child
+            .page_entries()
+            .map(|entry| (entry.page(), entry.generation()))
+            .collect();
         let entry = Arc::new(HybridPrefix {
             image,
-            attention: PagedPrefix::new(child),
+            attention: PagedPrefix::new(child)
+                .retaining(forja_core::CompletionResource::new(backing)),
             pool: pool.clone(),
             pages,
             _charge: charge,

@@ -16,6 +16,7 @@ struct HybridFixture {
 
 fn hybrid_fixture(limit: u64) -> HybridFixture {
     let (mut host, parent, _) = prepared(limit);
+    host.limits.tensor_elements = 65_536;
     let image = parent
         .capture_snapshot(SnapshotAllowance::new(65_536, None).unwrap())
         .unwrap();
@@ -39,7 +40,7 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
         .table
         .push(crate::PagePoolEntry {
             pool: pool.clone(),
-            active_lanes: 1,
+            active_lanes: 11,
             max_context: 257,
             plane_count: 1,
             slot_banks: None,
@@ -47,6 +48,7 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
             charge: crate::PagePoolCharge::shared(backing_bytes, Arc::clone(&host.live_bytes)),
         })
         .unwrap();
+    host.open_paged_slot(&resource, 1).unwrap();
     HybridFixture {
         host,
         parent,
@@ -266,7 +268,8 @@ fn byte_pressure_evicts_only_unpinned_entries_and_refusals_are_atomic() {
     let fixture = hybrid_fixture(262_144);
     let first = fixture.entry();
     let next = fixture.advance(128);
-    let cache = fixture.cache(65_536, next.retained_bytes() + 1280, 8);
+    let index_bytes = fixture.cache(65_536, 65_536, 8).usage().unwrap().bytes;
+    let cache = fixture.cache(65_536, next.retained_bytes() + index_bytes, 8);
     let running = std::sync::atomic::AtomicBool::new(false);
     cache.publish(first.clone(), &running).unwrap();
     let before = cache.usage().unwrap();
@@ -466,4 +469,62 @@ fn attention_pages_remain_live_until_their_last_hybrid_reference_drops() {
             .iter()
             .all(|&count| count == 1)
     );
+}
+
+#[tokio::test]
+async fn hybrid_forks_keep_attention_backing_alive_after_guest_resources_close() {
+    let mut fixture = hybrid_fixture(262_144);
+    let slot = fixture
+        .host
+        .table
+        .get(&fixture.resource)
+        .unwrap()
+        .slot
+        .unwrap();
+    let plane = fixture
+        .host
+        .table
+        .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+        .unwrap()
+        .planes[0];
+    let tensor = fixture
+        .host
+        .entry(&Resource::new_borrow(plane))
+        .unwrap()
+        .tensor
+        .clone();
+    let payload = vec![0x5a; usize::try_from(tensor.layout().element_count() * 2).unwrap()];
+    fixture.host.backend.write(&tensor, &payload).unwrap();
+    let entry = fixture.entry();
+    let child = fixture.parent.storage.reserve().unwrap();
+    let attached = entry.attach(&child, 257).unwrap();
+    let retained = attached.attention().clone();
+    drop(attached);
+    drop(entry);
+    <Host<CpuBackend> as crate::paged_storage::HostBatchSlot>::drop(
+        &mut fixture.host,
+        Resource::new_own(slot),
+    )
+    .await
+    .unwrap();
+    let before = fixture.host.live_bytes.load(Ordering::Acquire);
+    assert!(
+        fixture
+            .host
+            .create_hybrid_prefix_store(
+                &fixture.resource,
+                fixture.image.namespace(),
+                SnapshotAllowance::new(65_536, None).unwrap(),
+                65_536,
+                8
+            )
+            .is_err()
+    );
+    assert_eq!(fixture.host.live_bytes.load(Ordering::Acquire), before);
+    drop(fixture.host.table.delete(fixture.resource).unwrap());
+    assert_eq!(fixture.host.backend.read(&tensor).unwrap(), payload);
+    let before = fixture.host.live_bytes.load(Ordering::Acquire);
+    drop(retained);
+    assert!(fixture.host.backend.read(&tensor).is_err());
+    assert!(fixture.host.live_bytes.load(Ordering::Acquire) < before);
 }

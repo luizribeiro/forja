@@ -33,10 +33,11 @@ pub struct HybridPrefixStore<B: Backend> {
     maximum: usize,
     metadata_bytes: u64,
     entries: Mutex<Vec<Arc<HybridPrefix<B>>>>,
+    _backing: Arc<super::backing::HybridBacking<B>>,
     _charge: StateCharge,
 }
 
-impl<B: Backend + 'static> Host<B> {
+impl<B: Backend + Send + Sync + 'static> Host<B> {
     /// Creates a cache subordinate to the existing total byte and table quotas.
     ///
     /// # Errors
@@ -49,6 +50,7 @@ impl<B: Backend + 'static> Host<B> {
         bytes: u64,
         maximum: usize,
     ) -> Result<HybridPrefixStore<B>, compute::Error> {
+        let backing = self.hybrid_backing(pool)?;
         let pool = &self.table.get(pool).map_err(invalid_handle)?.pool;
         if !namespace.matches_attention(pool.layout())
             || bytes > self.limits.live_bytes
@@ -62,7 +64,8 @@ impl<B: Backend + 'static> Host<B> {
             .and_then(|n| n.checked_mul(32))
             .and_then(|n| n.checked_add(1024))
             .ok_or_else(|| quota("cache metadata overflow"))?;
-        if bytes < metadata {
+        let metadata_bytes = add_bytes(metadata, backing.bytes)?;
+        if bytes < metadata_bytes {
             return Err(quota("cache ceiling cannot hold its index"));
         }
         let charge = StateCharge::reserve(
@@ -84,8 +87,9 @@ impl<B: Backend + 'static> Host<B> {
             allowance,
             bytes,
             maximum,
-            metadata_bytes: metadata,
+            metadata_bytes,
             entries: Mutex::new(entries),
+            _backing: backing,
             _charge: charge,
         })
     }
