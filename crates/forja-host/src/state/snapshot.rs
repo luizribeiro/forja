@@ -12,9 +12,19 @@ pub struct StateSnapshot<B: Backend> {
     pub(super) position: LanePosition,
     pub(super) charge: Arc<StateCharge>,
     count: usize,
+    limit: u64,
 }
 
 impl<B: Backend> StateSnapshot<B> {
+    pub(crate) fn reference_charge(&self, bytes: u64) -> Result<StateCharge, compute::Error> {
+        StateCharge::reserve(
+            self.backend.as_ref(),
+            Arc::clone(&self.charge.live),
+            self.limit,
+            bytes,
+        )
+    }
+
     pub(crate) fn retained_allocations(&self) -> [(usize, u64); 2] {
         [
             (Arc::as_ptr(&self.charge).addr(), self.charge.bytes),
@@ -115,6 +125,7 @@ impl<B: Backend> StateSequenceHandle<B> {
             position,
             charge: Arc::new(charge),
             count,
+            limit: self.storage.limit,
         };
         for (plane, descriptor) in image.layout.planes().iter().enumerate() {
             image.planes.push(

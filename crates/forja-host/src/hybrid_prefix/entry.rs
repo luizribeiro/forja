@@ -73,6 +73,12 @@ impl<B: Backend> HybridPrefix<B> {
         sequence: &StateSequenceHandle<B>,
         reserved_tokens: u64,
     ) -> Result<HybridAttachment<B>, compute::Error> {
+        let references = reserved_tokens
+            .div_ceil(u64::from(self.pool.layout().page_tokens()))
+            .checked_mul(64)
+            .and_then(|n| n.checked_add(1024))
+            .ok_or_else(|| crate::quota("hybrid attachment metadata overflow"))?;
+        let charge = self.image.reference_charge(references)?;
         let attention = self
             .attention
             .fork_reserved(self.image.position().tokens, reserved_tokens)
@@ -82,12 +88,14 @@ impl<B: Backend> HybridPrefix<B> {
             entry: Arc::clone(self),
             attention,
             state: sequence.clone(),
+            _charge: charge,
         })
     }
 }
 
 /// A live request's paired attention/carry ownership; its parent remains pinned against eviction.
 pub struct HybridAttachment<B: Backend> {
+    _charge: StateCharge,
     entry: Arc<HybridPrefix<B>>,
     attention: PagedPrefix,
     state: StateSequenceHandle<B>,

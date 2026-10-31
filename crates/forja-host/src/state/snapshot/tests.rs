@@ -225,6 +225,20 @@ fn hybrid_entries_pair_exact_ledgers_and_reject_foreign_pages_atomically() {
     assert!(entry.attach(&parent, 257).is_err());
     assert_eq!(pool.memory_usage().unwrap().0, before);
     assert!(child.has_pristine_state().unwrap());
+    let available = host.limits.live_bytes - host.live_bytes.load(Ordering::Acquire);
+    let blocker = StateCharge::reserve(
+        host.backend.as_ref(),
+        Arc::clone(&host.live_bytes),
+        host.limits.live_bytes,
+        available - 1,
+    )
+    .unwrap();
+    let exhausted_bytes = host.live_bytes.load(Ordering::Acquire);
+    assert!(entry.attach(&child, 257).is_err());
+    assert_eq!(host.live_bytes.load(Ordering::Acquire), exhausted_bytes);
+    assert_eq!(pool.memory_usage().unwrap().0, before);
+    assert!(child.has_pristine_state().unwrap());
+    drop(blocker);
     let attached = entry.attach(&child, 257).unwrap();
     assert_eq!(attached.attention().logical_len().unwrap(), 64);
     assert_eq!(attached.state().position().tokens, 64);
