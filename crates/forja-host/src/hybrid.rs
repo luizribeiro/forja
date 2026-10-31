@@ -192,6 +192,7 @@ impl<B: Backend + 'static> Host<B> {
             active,
             tokens,
         };
+        entry.state_planes.push((usage, plane));
         if !entry.state_uses.contains(&usage) {
             entry.state_uses.push(usage);
         }
@@ -200,6 +201,26 @@ impl<B: Backend + 'static> Host<B> {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn validate_state_planes(
+        &self,
+        usages: &[StateUse],
+        planes: &[(StateUse, usize)],
+    ) -> Result<(), compute::Error> {
+        for usage in usages {
+            let expected = self
+                .state_slots
+                .get(&usage.slot)
+                .ok_or_else(|| invalid_handle("state slot is missing"))?
+                .plane_count();
+            if !(0..expected).all(|plane| planes.contains(&(*usage, plane))) {
+                return Err(invalid_handle(
+                    "each command list must update every state plane",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_state_work(
         &mut self,
         usages: &[StateUse],

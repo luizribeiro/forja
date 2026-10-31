@@ -3701,6 +3701,7 @@ pub struct CommandListEntry {
     retained_kernels: Vec<KernelEntry>,
     retained_epilogues: Vec<EpilogueEntry>,
     state_uses: Vec<hybrid::StateUse>,
+    state_planes: Vec<(hybrid::StateUse, usize)>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
 }
@@ -5949,6 +5950,7 @@ impl<B: Backend + 'static> Host<B> {
                 paged: Vec::new(),
                 paged_bounds: Vec::new(),
                 state_uses: Vec::new(),
+                state_planes: Vec::new(),
             })
             .map_err(invalid_handle)
     }
@@ -6398,7 +6400,10 @@ impl<B: Backend + 'static> Host<B> {
     {
         let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
-        let mut captured_state = match self.capture_graph_state(&entry.state_uses) {
+        let mut captured_state = match self
+            .validate_state_planes(&entry.state_uses, &entry.state_planes)
+            .and_then(|()| self.capture_graph_state(&entry.state_uses))
+        {
             Ok(captured) => captured,
             Err(error) => {
                 self.release_retained(entry.retained)?;
@@ -6508,6 +6513,10 @@ impl<B: Backend + 'static> Host<B> {
             ));
         }
         if let Err(error) = PagedCheck::validate_all(&entry.paged_bounds, None) {
+            self.release_retained(entry.retained)?;
+            return Err(error);
+        }
+        if let Err(error) = self.validate_state_planes(&entry.state_uses, &entry.state_planes) {
             self.release_retained(entry.retained)?;
             return Err(error);
         }
@@ -10290,7 +10299,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn split_state_plane_lists_cannot_publish_or_capture_partial_updates() {
+        for capture in [false, true] {
+            let (mut host, pool, slot) = convolution_slot_host_planes(2);
+            let input = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+            let weights = host.alloc(compute::Dtype::F32, &[4, 7]).unwrap();
+            let checkpoint = host
+                .begin_paged_append(pool.rep(), 0, 1)
+                .unwrap()
+                .0
+                .unwrap();
+            let lists = [host.command_list().unwrap(), host.command_list().unwrap()];
+            for (plane, list) in lists.iter().enumerate() {
+                let output = host.alloc(compute::Dtype::F32, &[1, 7]).unwrap();
+                host.record_slot_state(
+                    list,
+                    &slot,
+                    0,
+                    u32::try_from(plane).unwrap(),
+                    paged_storage::StateOperation::CausalConvolution,
+                    &[
+                        Resource::new_borrow(input.rep()),
+                        Resource::new_borrow(weights.rep()),
+                    ],
+                    &output,
+                    "",
+                )
+                .unwrap();
+                host.drop_tensor(output).unwrap();
+            }
+            for list in lists {
+                if capture {
+                    assert!(host.create_graph(list).is_err());
+                } else {
+                    assert!(host.prepare_submit(list).is_err());
+                }
+            }
+            assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+            host.rollback_paged_lane_append(pool.rep(), 0, checkpoint)
+                .unwrap();
+            assert_eq!(
+                host.paged_lane_prefix(pool.rep(), 0)
+                    .unwrap()
+                    .sequence
+                    .lock()
+                    .unwrap()
+                    .logical_len(),
+                0
+            );
+        }
+    }
+
     fn convolution_slot_host() -> (
+        Host<CpuBackend>,
+        Resource<PagePoolEntry>,
+        Resource<BatchSlotEntry>,
+    ) {
+        convolution_slot_host_planes(1)
+    }
+
+    fn convolution_slot_host_planes(
+        planes: usize,
+    ) -> (
         Host<CpuBackend>,
         Resource<PagePoolEntry>,
         Resource<BatchSlotEntry>,
@@ -10301,10 +10372,12 @@ mod tests {
             .open_state_slot(
                 &pool,
                 2,
-                vec![paged_storage::StatePlaneDescriptor {
-                    dtype: compute::Dtype::F32,
-                    shape: vec![3, 7],
-                }],
+                (0..planes)
+                    .map(|_| paged_storage::StatePlaneDescriptor {
+                        dtype: compute::Dtype::F32,
+                        shape: vec![3, 7],
+                    })
+                    .collect(),
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,

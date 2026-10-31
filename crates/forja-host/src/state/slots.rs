@@ -25,6 +25,10 @@ pub struct StateSlots<B: Backend> {
 }
 
 impl<B: Backend> StateSlots<B> {
+    pub(crate) fn plane_count(&self) -> usize {
+        self.storage.planes.len()
+    }
+
     /// Creates banks within the pool's available lane capacity.
     ///
     /// # Errors
