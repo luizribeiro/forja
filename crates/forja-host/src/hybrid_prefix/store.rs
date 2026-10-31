@@ -13,6 +13,10 @@ use wasmtime::component::Resource;
 /// Shared physical allocations retained by the hybrid cache.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HybridCacheUsage {
+    /// Sum of complete prefix lengths, including shared prefixes per entry.
+    pub tokens: u64,
+    /// Unique referenced attention pages.
+    pub pages: u64,
     /// Unique attention backing, state images, ledgers and per-entry references.
     pub bytes: u64,
     /// Unique immutable state images and ledgers, excluding attention pages.
@@ -31,6 +35,9 @@ pub struct HybridPrefixStore<B: Backend> {
     allowance: SnapshotAllowance,
     bytes: u64,
     maximum: usize,
+    tokens: u64,
+    pages: u64,
+    enabled: bool,
     metadata_bytes: u64,
     entries: Mutex<Vec<Arc<HybridPrefix<B>>>>,
     _backing: Arc<super::backing::HybridBacking<B>>,
@@ -84,6 +91,9 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
             allowance,
             bytes,
             maximum,
+            tokens: u64::MAX,
+            pages: u64::MAX,
+            enabled: true,
             metadata_bytes,
             entries: Mutex::new(entries),
             _backing: backing,
@@ -129,12 +139,15 @@ impl<B: Backend> HybridPrefixStore<B> {
             bytes: self.metadata_bytes,
             snapshot_bytes: 0,
             entries: 0,
+            tokens: 0,
+            pages: 0,
         };
         for entry in entries {
             usage.entries = usage
                 .entries
                 .checked_add(1)
                 .ok_or_else(|| quota("cache entry count overflow"))?;
+            usage.tokens = add_bytes(usage.tokens, entry.image.position().tokens)?;
             usage.bytes = add_bytes(usage.bytes, entry.metadata_bytes)?;
             usage.snapshot_bytes = add_bytes(usage.snapshot_bytes, entry.metadata_bytes)?;
             for (identity, bytes) in entry.image.retained_allocations() {
@@ -145,6 +158,7 @@ impl<B: Backend> HybridPrefixStore<B> {
             }
             for page in &entry.pages {
                 if pages.insert(*page) {
+                    usage.pages = add_bytes(usage.pages, 1)?;
                     usage.bytes = add_bytes(usage.bytes, self.pool.layout().total_page_bytes())?;
                 }
             }
@@ -170,7 +184,7 @@ impl<B: Backend> HybridPrefixStore<B> {
         namespace: HybridPrefixNamespace,
         prompt: &[u32],
     ) -> Result<Option<Arc<HybridPrefix<B>>>, compute::Error> {
-        if namespace != self.namespace {
+        if !self.enabled || namespace != self.namespace {
             return Ok(None);
         }
         let mut entries = self.entries.lock().map_err(invalid_handle)?;
@@ -210,6 +224,8 @@ impl<B: Backend> HybridPrefixStore<B> {
             if usage.entries <= self.maximum
                 && usage.bytes <= self.bytes
                 && usage.snapshot_bytes <= self.allowance.bytes()
+                && usage.tokens <= self.tokens
+                && usage.pages <= self.pages
             {
                 return Ok(evicted);
             }
@@ -232,6 +248,9 @@ impl<B: Backend> HybridPrefixStore<B> {
         entry: Arc<HybridPrefix<B>>,
         cancelled: &AtomicBool,
     ) -> Result<bool, compute::Error> {
+        if !self.enabled {
+            return Ok(false);
+        }
         let sequence = entry.attention.sequence.lock().map_err(invalid_handle)?;
         if entry.namespace() != self.namespace
             || !self.pool.owns_sequence(&sequence)
@@ -265,3 +284,5 @@ fn add_bytes(left: u64, right: u64) -> Result<u64, compute::Error> {
     left.checked_add(right)
         .ok_or_else(|| quota("cache byte count overflow"))
 }
+
+mod controls;

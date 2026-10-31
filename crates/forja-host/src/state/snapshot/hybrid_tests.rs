@@ -638,3 +638,33 @@ fn paired_lane_admission_refuses_quota_without_installing_state() {
         64
     );
 }
+
+#[test]
+fn hybrid_reference_ceiling_updates_preserve_pins_and_refuse_atomically() {
+    let fixture = hybrid_fixture(262_144);
+    let mut cache = fixture.cache(65_536, 65_536, 2);
+    let entry = fixture.entry();
+    cache
+        .publish(entry.clone(), &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    let before = cache.usage().unwrap();
+    assert!(!cache.evict_lru().unwrap());
+    assert!(cache.reconfigure(1, 63, 1, true).is_err());
+    assert_eq!(cache.usage().unwrap(), before);
+    assert_eq!(before.tokens, 64);
+    assert_eq!(before.pages, 1);
+    drop(entry);
+    cache.reconfigure(1, 63, 1, true).unwrap();
+    assert_eq!(cache.usage().unwrap().entries, 0);
+    assert!(
+        cache
+            .publish(fixture.entry(), &std::sync::atomic::AtomicBool::new(false))
+            .is_err()
+    );
+    cache.reconfigure(2, 129, 2, false).unwrap();
+    assert!(
+        !cache
+            .publish(fixture.entry(), &std::sync::atomic::AtomicBool::new(false))
+            .unwrap()
+    );
+}
