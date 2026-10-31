@@ -12,6 +12,8 @@ mod feedback;
 #[cfg(test)]
 mod fuzz_tests;
 mod hybrid;
+mod hybrid_prefix;
+pub use hybrid_prefix::SnapshotAllowance;
 mod lending;
 mod native;
 mod recovery;
