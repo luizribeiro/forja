@@ -123,3 +123,6 @@ mod tests {
         assert_ne!(correction_sampling_seed(17), 17);
     }
 }
+
+mod prefix_schedule;
+pub use prefix_schedule::CanonicalPrefixSchedule;
