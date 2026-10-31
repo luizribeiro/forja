@@ -349,7 +349,7 @@ impl<B: Backend> SubmittedWork<B> {
 }
 
 impl<B: Backend + 'static> Host<B> {
-    fn lane_state(
+    pub(crate) fn lane_state(
         &self,
         pool: u32,
         lane: u32,

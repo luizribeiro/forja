@@ -205,3 +205,6 @@ async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
 
 #[path = "serving/catalog.rs"]
 mod catalog;
+
+#[path = "serving/prefix.rs"]
+mod prefix;
