@@ -340,3 +340,27 @@ async fn serving_entry_pressure_evicts_the_unpinned_paired_boundary() -> Result<
     assert_eq!((hit.0, hit.1), (original.0, original.1));
     Ok(())
 }
+
+#[tokio::test]
+async fn undeclared_snapshot_allowances_refuse_operator_growth_at_startup_and_reload()
+-> Result<(), TestError> {
+    let mut value = serde_json::to_value(canonical_profile()?)?;
+    value["serving"]
+        .as_object_mut()
+        .unwrap()
+        .remove("state-snapshot-bytes");
+    value["serving"]
+        .as_object_mut()
+        .unwrap()
+        .remove("state-snapshot-interval");
+    let profile: forja_config::Profile = serde_json::from_value(value)?;
+    let mut engine = engine().await?;
+    let mut config = engine.config.clone();
+    config.serving.state_snapshot_bytes =
+        forja_config::Choice::Fixed(forja_config::ByteSize::new(1));
+    assert!(engine.update_policy(1, config.clone()).is_err());
+    assert_eq!(engine.config_generation, 0);
+    engine.config = config;
+    assert!(engine.with_profile_prefixes(&profile).is_err());
+    Ok(())
+}

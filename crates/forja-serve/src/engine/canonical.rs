@@ -19,6 +19,10 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
     /// # Errors
     /// Refuses invalid spacing, missing protected storage or cache ceilings above host quotas.
     pub fn with_profile_prefixes(mut self, profile: &Profile) -> Result<Self, GenerationError> {
+        let effective = self
+            .config
+            .resolve_state_snapshot_bytes(profile)
+            .map_err(GenerationError::new)?;
         let Some(declared) = profile
             .serving()
             .and_then(|serving| serving.state_snapshot_bytes)
@@ -35,10 +39,6 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             GenerationError::new("snapshot allowance requires canonical prompt blocks")
         })?;
         let schedule = CanonicalPrefixSchedule::new(block, interval).map_err(cache_error)?;
-        let effective = self
-            .config
-            .resolve_state_snapshot_bytes(profile)
-            .map_err(GenerationError::new)?;
         let allowance =
             SnapshotAllowance::new(declared.get(), Some(effective)).map_err(cache_error)?;
         let classes = profile
@@ -83,6 +83,12 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         config: &forja_config::HostConfig,
     ) -> Result<(), GenerationError> {
         let Some(cache) = &mut self.canonical_cache else {
+            if matches!(config.serving.state_snapshot_bytes, forja_config::Choice::Fixed(bytes) if bytes.get() > 0)
+            {
+                return Err(GenerationError::new(
+                    "snapshot retention requires a profile declaration",
+                ));
+            }
             return Ok(());
         };
         let effective = match config.serving.state_snapshot_bytes {
