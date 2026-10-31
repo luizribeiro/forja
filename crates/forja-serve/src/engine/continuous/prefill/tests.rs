@@ -180,12 +180,15 @@ async fn paired_cache_configuration_honors_operator_disable_and_restore() -> Res
         .await?
         .with_profile_prefixes(&canonical_profile()?)?;
     assert!(engine.canonical_cache.is_some());
+    assert_eq!(engine.canonical_piece(0, 65, 65)?, 64);
     let mut config = engine.config.clone();
     config.serving.state_snapshot_bytes =
         forja_config::Choice::Fixed(forja_config::ByteSize::new(0));
     engine.update_policy(1, config.clone())?;
+    assert_eq!(engine.canonical_piece(0, 65, 65)?, 65);
     config.serving.state_snapshot_bytes = forja_config::Choice::Auto;
     engine.update_policy(2, config.clone())?;
+    assert_eq!(engine.canonical_piece(0, 65, 65)?, 64);
     config.serving.state_snapshot_bytes =
         forja_config::Choice::Fixed(forja_config::ByteSize::new(268_435_457));
     assert!(engine.update_policy(3, config).is_err());

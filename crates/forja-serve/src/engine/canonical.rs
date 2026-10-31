@@ -167,12 +167,15 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         prompt_tokens: u32,
         proposed: u32,
     ) -> Result<u32, GenerationError> {
-        self.canonical_cache.as_ref().map_or(Ok(proposed), |cache| {
-            cache
-                .schedule
-                .limit(u64::from(position), u64::from(prompt_tokens), proposed)
-                .map_err(cache_error)
-        })
+        self.canonical_cache
+            .as_ref()
+            .filter(|cache| cache.allowance.bytes() > 0)
+            .map_or(Ok(proposed), |cache| {
+                cache
+                    .schedule
+                    .limit(u64::from(position), u64::from(prompt_tokens), proposed)
+                    .map_err(cache_error)
+            })
     }
     pub(super) async fn prefill_pieces(
         &mut self,
