@@ -1,3 +1,4 @@
+use super::canonical::CanonicalPosition;
 use super::{outcome::StateOutcome, paired::PagedInput};
 use forja_core::{PagePoolError, ReleasedStateCheckpoint, StateSequence, StateTransaction};
 use std::sync::Arc;
@@ -51,6 +52,7 @@ pub struct LanePosition {
 }
 
 struct RetainedBoundary {
+    canonical: CanonicalPosition,
     version: Option<ReleasedStateCheckpoint>,
     position: LanePosition,
     feedback: Option<super::feedback::FeedbackBoundary>,
@@ -59,6 +61,7 @@ struct RetainedBoundary {
 }
 
 struct Pending {
+    canonical: CanonicalPosition,
     retired: Option<RetainedBoundary>,
     paged: Option<PagedInput>,
     serial: u64,
@@ -70,6 +73,7 @@ struct Pending {
 }
 
 pub(super) struct StateJournal {
+    canonical: CanonicalPosition,
     selection: std::sync::Weak<()>,
     rollback_paged: Option<PagedInput>,
     retained_paged: Option<PagedInput>,
@@ -96,6 +100,7 @@ impl DerefMut for StateJournal {
 impl StateJournal {
     pub(super) fn new(sequence: StateSequence) -> Self {
         Self {
+            canonical: CanonicalPosition::Empty,
             selection: std::sync::Weak::new(),
             rollback_paged: None,
             retained_paged: None,
@@ -106,6 +111,19 @@ impl StateJournal {
             pending: VecDeque::new(),
             retained: None,
         }
+    }
+
+    pub(super) fn ensure_snapshot_idle(&self) -> Result<(), PagePoolError> {
+        self.sequence.ensure_idle()?;
+        if !self.pending.is_empty() || self.selection.upgrade().is_some() {
+            return Err(PagePoolError::BankInFlight);
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_pristine_state(&self) -> Result<bool, PagePoolError> {
+        self.ensure_snapshot_idle()?;
+        Ok(matches!(self.canonical, CanonicalPosition::Empty))
     }
 
     pub(super) fn attach_feedback(
@@ -168,40 +186,48 @@ impl StateJournal {
             self.retained.take().map_or((None, None), |checkpoint| {
                 (
                     Some(checkpoint.version),
-                    Some((checkpoint.position, checkpoint.feedback, checkpoint.phase)),
+                    Some((
+                        checkpoint.position,
+                        checkpoint.feedback,
+                        checkpoint.phase,
+                        checkpoint.canonical,
+                    )),
                 )
             });
-        let (transaction, released) =
-            match self
-                .sequence
-                .begin_preserving_checkpoint(serial, &mut retained)
-            {
-                Ok(transaction) => transaction,
-                Err(error) => {
-                    self.retained = retained.zip(boundary_before).map(
-                        |(version, (position, feedback, phase))| super::StateLaneCheckpoint {
+        let (transaction, released) = match self
+            .sequence
+            .begin_preserving_checkpoint(serial, &mut retained)
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.retained = retained.zip(boundary_before).map(
+                    |(version, (position, feedback, phase, canonical))| {
+                        super::StateLaneCheckpoint {
                             version,
+                            canonical,
                             position,
                             feedback,
                             phase,
-                        },
-                    );
-                    return Err(error);
-                }
-            };
-        let retired =
-            released
-                .zip(boundary_before)
-                .map(|(version, (position, feedback, phase))| RetainedBoundary {
-                    version: Some(version),
-                    position,
-                    feedback,
-                    phase,
-                    paged: self.retained_paged.take(),
-                });
+                        }
+                    },
+                );
+                return Err(error);
+            }
+        };
+        let retired = released.zip(boundary_before).map(
+            |(version, (position, feedback, phase, canonical))| RetainedBoundary {
+                version: Some(version),
+                canonical,
+                position,
+                feedback,
+                phase,
+                paged: self.retained_paged.take(),
+            },
+        );
         let dependency = self.pending.back().map(|entry| Arc::clone(&entry.outcome));
         self.retained_paged = None;
         self.pending.push_back(Pending {
+            canonical: CanonicalPosition::Recurrent,
             retired,
             paged: None,
             serial,
@@ -235,6 +261,7 @@ impl StateJournal {
             self.retained = Some(super::StateLaneCheckpoint {
                 version,
                 position: retired.position,
+                canonical: retired.canonical,
                 feedback: retired.feedback,
                 phase: retired.phase,
             });
@@ -289,6 +316,7 @@ impl StateJournal {
             if let Some(entry) = self.pending.pop_front() {
                 self.position = entry.position;
                 self.phase = entry.phase;
+                self.canonical = entry.canonical;
                 self.retained = Some(entry.predecessor);
                 self.retained_paged = entry.paged;
                 entry.outcome.finish(true);
@@ -405,6 +433,10 @@ impl StateJournal {
             .transpose()?;
         Ok(super::StateLaneCheckpoint {
             version,
+            canonical: self
+                .pending
+                .back()
+                .map_or_else(|| self.canonical.clone(), |entry| entry.canonical.clone()),
             feedback,
             phase: self
                 .pending
@@ -481,6 +513,7 @@ impl StateJournal {
         feedback.restore(boundary)?;
         self.position = checkpoint.position;
         self.phase = checkpoint.phase;
+        self.canonical = checkpoint.canonical.clone();
         Ok(())
     }
 
@@ -519,6 +552,7 @@ impl StateJournal {
         }
         self.position = checkpoint.position;
         self.phase = checkpoint.phase;
+        self.canonical = checkpoint.canonical.clone();
         self.retained = None;
         self.retained_paged = None;
         Ok(())
@@ -542,6 +576,7 @@ impl StateJournal {
         }
         self.position = checkpoint.position;
         self.phase = checkpoint.phase;
+        self.canonical = checkpoint.canonical.clone();
         self.retained = None;
         Ok(())
     }

@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone)]
 pub struct StateLaneCheckpoint {
     pub(super) version: StateCheckpoint,
+    pub(super) canonical: super::canonical::CanonicalPosition,
     pub(super) position: LanePosition,
     pub(super) feedback: Option<super::feedback::FeedbackBoundary>,
     pub(super) phase: super::journal::SelectionPhase,
@@ -153,6 +154,14 @@ impl<B: Backend> StateSequenceHandle<B> {
     ) -> Result<StateTransaction, PagePoolError> {
         self.lock()
             .begin_action(serial, Some(position), Some(action))
+    }
+
+    /// Whether this sequence still represents its initial, unmodified state.
+    ///
+    /// # Errors
+    /// Refuses outstanding state work.
+    pub fn has_pristine_state(&self) -> Result<bool, PagePoolError> {
+        self.lock().has_pristine_state()
     }
 
     /// Returns the newest declared cursor boundary, including a pending forward operation.

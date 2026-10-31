@@ -62,6 +62,13 @@ impl<B: Backend + 'static> Host<B> {
     }
 }
 
+#[derive(Clone, Default)]
+pub(super) enum CanonicalPosition {
+    #[default]
+    Empty,
+    Recurrent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +122,35 @@ mod tests {
         assert_eq!(host.live_bytes.load(Ordering::Acquire), bytes);
         drop(shared);
         assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn origin_follows_publication_cancellation_and_rewind() {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(131_072, 8, 4096, 32, 4096),
+        );
+        let storage = host
+            .create_state_storage(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 7, 33]).unwrap()])
+                    .unwrap(),
+                1,
+            )
+            .unwrap();
+        let sequence = storage.reserve().unwrap();
+        assert!(sequence.has_pristine_state().unwrap());
+        let pending = sequence.begin(1).unwrap();
+        assert_eq!(
+            sequence.has_pristine_state(),
+            Err(forja_core::PagePoolError::BankInFlight)
+        );
+        sequence.cancel(&pending).unwrap();
+        assert!(sequence.has_pristine_state().unwrap());
+        let pending = sequence.begin(2).unwrap();
+        sequence.lock().mark_submitted(&pending).unwrap();
+        storage.pool.observe_completion(2).unwrap();
+        sequence.lock().finish(&pending, true).unwrap();
+        assert!(!sequence.has_pristine_state().unwrap());
+        sequence.rewind(0).unwrap();
+        assert!(sequence.has_pristine_state().unwrap());
     }
 }
