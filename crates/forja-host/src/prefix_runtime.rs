@@ -130,6 +130,18 @@ impl<B: Backend + Send + Sync + 'static> crate::EngineRunner<B> {
         self.store.data().canonical_prompt(namespace, tokens)
     }
 
+    /// Allocates a charged completed context, including an aligned final boundary.
+    ///
+    /// # Errors
+    /// Refuses empty contexts or exhausted host memory.
+    pub fn canonical_context(
+        &self,
+        namespace: forja_core::HybridPrefixNamespace,
+        tokens: Vec<u32>,
+    ) -> Result<Arc<CanonicalPrompt>, compute::Error> {
+        self.store.data().canonical_context(namespace, tokens)
+    }
+
     /// Constructs a cache within the existing attention-byte and host quotas.
     ///
     /// # Errors

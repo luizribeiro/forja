@@ -204,12 +204,10 @@ impl<B: Backend> StateSlots<B> {
             .serial
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state lane timeline exhausted"))?;
-        let canonical = owner.prompt.as_ref().filter(|prompt| {
-            position.tokens < u64::try_from(prompt.tokens().len()).unwrap_or(u64::MAX)
-                && position
-                    .tokens
-                    .is_multiple_of(u64::from(prompt.namespace().block().get()))
-        });
+        let canonical = owner
+            .prompt
+            .as_ref()
+            .filter(|prompt| prompt.permits_boundary(position.tokens));
         let transaction = match (canonical, action) {
             (Some(prompt), Some(action)) => sequence.begin_prefill(
                 serial,

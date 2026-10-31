@@ -98,7 +98,7 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Copies every plane without scalar conversion or exposure through ordinary guest views.
     ///
     /// # Errors
-    /// Refuses incomplete/generated boundaries, disabled allowances, quota or backend failures.
+    /// Refuses incomplete or recurrent boundaries, disabled allowances, quota or backend failures.
     pub fn capture_snapshot(
         &self,
         allowance: SnapshotAllowance,
