@@ -9997,6 +9997,7 @@ mod tests {
     };
 
     include!("state/paged_lifecycle_tests.rs");
+    include!("recovery_tests.rs");
 
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
