@@ -22,6 +22,7 @@ pub struct StateSlots<B: Backend> {
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
     padding: [Vec<Option<StateCommands<B>>>; 2],
+    selections: [Vec<Option<super::StateSelection<B>>>; 2],
 }
 
 impl<B: Backend> StateSlots<B> {
@@ -62,6 +63,7 @@ impl<B: Backend> StateSlots<B> {
                 serial: 0,
             })
             .collect::<Vec<_>>();
+        let selections = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         let banks = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         let padding = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
         Ok(Self {
@@ -71,6 +73,7 @@ impl<B: Backend> StateSlots<B> {
             lanes,
             banks,
             padding,
+            selections,
         })
     }
 
@@ -125,9 +128,13 @@ impl<B: Backend> StateSlots<B> {
     /// Refuses invalid lanes or pending reservations/execution; committed state stays unchanged.
     pub fn release(&mut self, lane: usize) -> Result<(), compute::Error> {
         if self
-            .banks
+            .selections
             .iter()
             .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+            || self
+                .banks
+                .iter()
+                .any(|bank| bank.get(lane).is_some_and(Option::is_some))
         {
             return Err(invalid_handle("state lane has an unsubmitted transaction"));
         }
@@ -333,6 +340,75 @@ impl<B: Backend> StateSlots<B> {
             .ok_or_else(|| invalid_handle("inactive state bindings are missing"))
     }
 
+    /// Reserves a separate selection after all carry work for this lane has drained.
+    ///
+    /// # Errors
+    /// Refuses invalid or occupied banks, incomplete carry or an unavailable feedback scratch scalar.
+    pub fn begin_selection(
+        &mut self,
+        bank: usize,
+        lane: usize,
+        start: u64,
+    ) -> Result<(), compute::Error> {
+        if self
+            .selections
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .is_none()
+            || self
+                .selections
+                .iter()
+                .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+            || self
+                .banks
+                .iter()
+                .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+        {
+            return Err(invalid_handle("selection bank or lane is unavailable"));
+        }
+        let sequence = self
+            .sequence_handle(lane)?
+            .ok_or_else(|| invalid_handle("selection lane is not admitted"))?;
+        let scratch = bank
+            .checked_mul(self.lanes.len())
+            .and_then(|index| index.checked_add(lane))
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(|| invalid_handle("selection scratch index overflowed"))?;
+        self.selections[bank][lane] = Some(super::StateSelection::new(sequence, start, scratch)?);
+        Ok(())
+    }
+
+    /// Returns the selected lane's private output index for trusted recording code.
+    ///
+    /// # Errors
+    /// Refuses invalid banks or lane indices.
+    pub fn selection_destination(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<Option<u32>, compute::Error> {
+        self.selections
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .map(|selection| selection.as_ref().map(super::StateSelection::destination))
+            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))
+    }
+
+    /// Transfers all selected lanes to one completion owner without publishing them.
+    ///
+    /// # Errors
+    /// Refuses invalid or empty banks and incompatible selection guards.
+    pub fn take_selections(
+        &mut self,
+        bank: usize,
+    ) -> Result<super::StateSelectionBatch<B>, compute::Error> {
+        let bank = self
+            .selections
+            .get_mut(bank)
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))?;
+        super::StateSelectionBatch::new(bank.iter_mut().filter_map(Option::take).collect())
+    }
+
     /// Transfers complete lane transactions to one submission owner.
     ///
     /// # Errors
@@ -346,6 +422,11 @@ impl<B: Backend> StateSlots<B> {
     }
 
     pub(crate) fn cancel_lane(&mut self, bank: usize, lane: usize) -> Result<(), compute::Error> {
+        *self
+            .selections
+            .get_mut(bank)
+            .and_then(|bank| bank.get_mut(lane))
+            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))? = None;
         *self
             .banks
             .get_mut(bank)
@@ -370,6 +451,13 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses an invalid bank index.
     pub fn cancel_unsubmitted_bank(&mut self, bank: usize) -> Result<(), compute::Error> {
+        for selection in self
+            .selections
+            .get_mut(bank)
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))?
+        {
+            *selection = None;
+        }
         let bank = self
             .banks
             .get_mut(bank)

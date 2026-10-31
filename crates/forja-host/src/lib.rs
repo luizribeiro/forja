@@ -10864,6 +10864,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selection_banks_cancel_without_releasing_another_bank_or_lane() {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Forward));
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        assert!(state.begin_selection(2, 0, 0).is_err());
+        assert!(state.begin_selection(0, 1, 0).is_err());
+        assert!(state.begin_selection(0, 0, 1).is_err());
+        state.begin_selection(0, 0, 0).unwrap();
+        let first = state.selection_destination(0, 0).unwrap().unwrap();
+        assert!(state.begin_selection(1, 0, 0).is_err());
+        assert!(state.release(0).is_err());
+        state.cancel_unsubmitted_bank(1).unwrap();
+        assert_eq!(state.selection_destination(0, 0).unwrap(), Some(first));
+        state.cancel_lane(0, 0).unwrap();
+        state.begin_selection(1, 0, 0).unwrap();
+        assert_ne!(state.selection_destination(1, 0).unwrap(), Some(first));
+        state.take_selections(1).unwrap().finish(false).unwrap();
+        assert_eq!(state.selection_destination(1, 0).unwrap(), None);
+        assert_eq!(state.position(0).unwrap().grammar, 0);
+        state.release(0).unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_selection_submission_preserves_awaiting_state_for_retry() {
         let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
         backend.fail_submission = Some(2);
