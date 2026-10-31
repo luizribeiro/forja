@@ -544,3 +544,29 @@ async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
     assert_eq!(engine.runner.state_lane_fingerprint(0)?, parent_bits);
     Ok(())
 }
+
+#[tokio::test]
+async fn short_prompts_bypass_canonical_admission_without_ledger_charges() -> Result<(), TestError>
+{
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let before = engine.memory_usage().live_bytes;
+    for tokens in [vec![], vec![0]] {
+        assert!(engine.canonical_admission(&tokens, true)?.is_none());
+        assert_eq!(engine.memory_usage().live_bytes, before);
+    }
+    let mut input = request();
+    input.prefix_reuse = true;
+    input.tokens = vec![0];
+    input.prompt_tokens = 1;
+    let mut prefill = engine
+        .begin_batch_prefill(input, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert_eq!((prefill.cached, prefill.position), (0, 0));
+    assert!(engine.advance_batch_prefill(&mut prefill, 64).await?);
+    assert!(prefill.selected.is_some());
+    assert_eq!(engine.metrics.snapshot_refusals, 0);
+    Ok(())
+}
