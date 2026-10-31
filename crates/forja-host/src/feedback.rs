@@ -1,5 +1,5 @@
 mod selection;
-pub(crate) use selection::SelectionWrite;
+pub(crate) use selection::{CapturedSelection, SelectionWrite};
 
 use crate::{
     Backend, BatchSlotEntry, CommandListEntry, Host, TensorEntry, compute, hybrid::StateUse,
@@ -108,13 +108,14 @@ impl<B: Backend + 'static> Host<B> {
     ) -> Result<(), compute::Error> {
         let lane = usize::try_from(lane).map_err(invalid_handle)?;
         let list = self.table.get(commands).map_err(invalid_handle)?;
-        let usage = *list
+        let usage = list
             .state_uses
             .iter()
             .find(|usage| usage.slot == slot.rep() && usage.lane == lane)
-            .ok_or_else(|| {
-                invalid_handle("feedback capture requires state updates in the same list")
-            })?;
+            .copied();
+        let Some(usage) = usage else {
+            return self.record_captured_selection(commands, slot, lane, selected);
+        };
         if list
             .captured_feedback
             .iter()
@@ -128,6 +129,22 @@ impl<B: Backend + 'static> Host<B> {
         let list = self.table.get_mut(commands).map_err(invalid_handle)?;
         list.captured_feedback
             .push(CapturedFeedback { usage, destination });
+        Ok(())
+    }
+
+    pub(crate) fn validate_feedback_captures(
+        entry: &CommandListEntry,
+    ) -> Result<(), compute::Error> {
+        if !entry.feedback_writes.is_empty() || !entry.selection_writes.is_empty() {
+            return Err(invalid_handle("concrete feedback cannot be captured"));
+        }
+        if !entry.captured_selections.is_empty()
+            && (!entry.state_uses.is_empty() || !entry.paged.is_empty())
+        {
+            return Err(invalid_handle(
+                "selection capture cannot include carry or paged operations",
+            ));
+        }
         Ok(())
     }
 

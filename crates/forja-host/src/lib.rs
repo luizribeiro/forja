@@ -3709,6 +3709,7 @@ pub struct CommandListEntry {
     feedback_writes: Vec<feedback::FeedbackWrite>,
     selection_writes: Vec<feedback::SelectionWrite>,
     captured_feedback: Vec<feedback::CapturedFeedback>,
+    captured_selections: Vec<feedback::CapturedSelection>,
     slot_capture: Option<slot_capture::SlotCapture>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
@@ -3740,6 +3741,7 @@ impl CommandListEntry {
 #[derive(Debug)]
 pub struct GraphEntry {
     captured_feedback: Vec<feedback::CapturedFeedback>,
+    captured_selections: Vec<feedback::CapturedSelection>,
     captured_state: Vec<hybrid::CapturedState>,
     slot_capture: Option<slot_capture::SlotCapture>,
     graph: Arc<PreparedGraph>,
@@ -5974,6 +5976,7 @@ impl<B: Backend + 'static> Host<B> {
                 feedback_writes: Vec::new(),
                 selection_writes: Vec::new(),
                 captured_feedback: Vec::new(),
+                captured_selections: Vec::new(),
                 slot_capture: None,
             })
             .map_err(invalid_handle)
@@ -6424,14 +6427,9 @@ impl<B: Backend + 'static> Host<B> {
     {
         let started = Instant::now();
         let mut entry = self.table.delete(resource).map_err(invalid_handle)?;
-        if !entry.feedback_writes.is_empty() || !entry.selection_writes.is_empty() {
-            self.release_retained(entry.retained)?;
-            return Err(invalid_handle(
-                "feedback capture requires replay role bindings",
-            ));
-        }
         let mut captured_state = match self
             .validate_state_planes(&entry.state_uses, &entry.state_planes)
+            .and_then(|()| Self::validate_feedback_captures(&entry))
             .and_then(|()| self.validate_slot_token_captures(&entry))
             .and_then(|()| self.capture_graph_state(&entry.state_uses, entry.slot_capture.as_ref()))
         {
@@ -6492,6 +6490,7 @@ impl<B: Backend + 'static> Host<B> {
             };
         let graph_entry = GraphEntry {
             captured_feedback: entry.captured_feedback,
+            captured_selections: entry.captured_selections,
             captured_state,
             slot_capture: entry.slot_capture.clone(),
             graph: Arc::new(graph),
@@ -6543,6 +6542,12 @@ impl<B: Backend + 'static> Host<B> {
             self.release_retained(entry.retained)?;
             return Err(compute::Error::OpSignature(
                 "submit requires a concrete execution command list".to_owned(),
+            ));
+        }
+        if !entry.selection_writes.is_empty() && !entry.paged.is_empty() {
+            self.release_retained(entry.retained)?;
+            return Err(invalid_handle(
+                "selection cannot include paged cache operations",
             ));
         }
         if let Err(error) = PagedCheck::validate_all(&entry.paged_bounds, None) {
@@ -10844,8 +10849,8 @@ mod tests {
         }
     }
 
-    async fn assert_feedback_scalar(
-        host: &Host<CpuBackend>,
+    async fn assert_feedback_scalar<B: Backend + Send + Sync + 'static>(
+        host: &Host<B>,
         slot: &Resource<super::BatchSlotEntry>,
         index: u32,
         token: u32,
@@ -10866,6 +10871,99 @@ mod tests {
                 .unwrap(),
             token.to_ne_bytes()
         );
+    }
+
+    async fn assert_captured_selection<B: Backend + Send + Sync + 'static>(backend: B) {
+        let StateSlotFixture {
+            mut host,
+            slot,
+            operands,
+            output,
+            ..
+        } = state_slot_fixture_action(backend, Some(StateAction::Forward));
+        let commands = host.command_list().unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.prepare_submit(commands).unwrap().run().await.unwrap();
+        let inputs = host
+            .state_input_tensors(slot.rep(), Some(0))
+            .unwrap()
+            .unwrap();
+        let token = host
+            .view(
+                &inputs.selected,
+                compute::ViewOp::Slice(vec![compute::SliceSpec {
+                    start: 0,
+                    len: 1,
+                    step: 1,
+                }]),
+            )
+            .unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.record_slot_feedback(&commands, &slot, 0, &token)
+            .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        for bank in 0..2 {
+            host.table.get_mut(&slot).unwrap().active_bank = bank;
+            let (selected, phase) = {
+                let entry = host.table.get(&slot).unwrap();
+                let input = &entry.inputs.as_ref().unwrap().banks[bank];
+                (input.selected, &input.prompt_phase)
+            };
+            phase.store(bank == 1, Ordering::Release);
+            let expected = u32::try_from(bank + 5).unwrap();
+            host.write(&Resource::new_borrow(selected), &expected.to_ne_bytes())
+                .unwrap();
+            host.state_slots
+                .get_mut(&slot.rep())
+                .unwrap()
+                .begin_selection(bank, 0, 0)
+                .unwrap();
+            let index = host.state_slots[&slot.rep()]
+                .selection_destination(bank, 0)
+                .unwrap()
+                .unwrap();
+            let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+            assert_feedback_scalar(&host, &slot, index, expected).await;
+            assert_eq!(
+                host.state_slots[&slot.rep()].position(0).unwrap().grammar,
+                1
+            );
+        }
+        let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+        assert!(
+            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .is_err()
+        );
+        let state = host.state_slots.get_mut(&slot.rep()).unwrap();
+        state.release(0).unwrap();
+        state.admit(0).unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_selection_rebinds_banks_without_retaining_requests() {
+        assert_captured_selection(CpuBackend::new()).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn metal_captured_selection_rebinds_banks_without_retaining_requests() {
+        assert_captured_selection(forja_metal::MetalBackend::new().unwrap()).await;
     }
 
     #[tokio::test]

@@ -586,6 +586,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut retained = entry.retained.clone();
         let scope = entry.slot_capture.clone();
         let feedback = entry.captured_feedback.clone();
+        let selections = entry.captured_selections.clone();
         let (graph, captures, mut paged, mut checks) = (
             std::sync::Arc::clone(&entry.graph),
             entry.captured_state.clone(),
@@ -633,13 +634,16 @@ impl<B: Backend + 'static> Host<B> {
             }
         }
         crate::PagedCheck::validate_all(&checks, Some(&checked))?;
+        let selections =
+            self.bind_graph_selections(&selections, &mut bound.bindings, &mut retained)?;
         let commands = graph
             .template()
             .instantiate(&checked)
             .map_err(|error| crate::graph_error(&error))?;
         let commands = bound.bindings.apply(commands).map_err(crate::guest_error)?;
         let access = crate::SubmissionAccess::from_commands(&commands, &retained);
-        let (batch, mut owners) = self.prepare_state_work(&bound.usages, &feedback)?;
+        let (batch, mut owners) =
+            self.prepare_protected_work(&bound.usages, &feedback, &selections)?;
         owners.extend(
             captures
                 .iter()
@@ -656,7 +660,7 @@ impl<B: Backend + 'static> Host<B> {
             paged,
             Some(flight),
         );
-        request.protected_batch = batch.map(ProtectedBatch::from);
+        request.protected_batch = batch;
         request.snapshot = Some(snapshot);
         request.state_owners = owners;
         request.captured_state = captures

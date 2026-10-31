@@ -12,7 +12,98 @@ pub(crate) struct SelectionWrite {
     identity: Weak<()>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedSelection {
+    slot: u32,
+    lane: usize,
+    destination: forja_core::Tensor,
+}
+
 impl<B: Backend + 'static> Host<B> {
+    pub(super) fn record_captured_selection(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        slot: &Resource<crate::BatchSlotEntry>,
+        lane: usize,
+        selected: &Resource<TensorEntry>,
+    ) -> Result<(), compute::Error> {
+        self.slot_capture_bank(commands, slot)?;
+        let list = self.table.get(commands).map_err(invalid_handle)?;
+        if lane
+            >= self
+                .table
+                .get(slot)
+                .map_err(invalid_handle)?
+                .binding
+                .lanes
+                .len()
+            || list
+                .captured_selections
+                .iter()
+                .any(|site| site.slot == slot.rep() && site.lane == lane)
+        {
+            return Err(invalid_handle(
+                "selection capture lane is invalid or already recorded",
+            ));
+        }
+        let destination = self.record_feedback_placeholder(commands, selected)?;
+        self.table
+            .get_mut(commands)
+            .map_err(invalid_handle)?
+            .captured_selections
+            .push(CapturedSelection {
+                slot: slot.rep(),
+                lane,
+                destination,
+            });
+        Ok(())
+    }
+
+    pub(crate) fn bind_graph_selections(
+        &mut self,
+        sites: &[CapturedSelection],
+        bindings: &mut forja_core::ReplayBindings,
+        retained: &mut Vec<TensorEntry>,
+    ) -> Result<Vec<SelectionWrite>, compute::Error> {
+        let mut writes = Vec::new();
+        for site in sites {
+            let slot = self
+                .table
+                .get(&Resource::<crate::BatchSlotEntry>::new_borrow(site.slot))
+                .map_err(invalid_handle)?;
+            let bank = slot.active_bank;
+            let Some((identity, index)) = self
+                .state_slots
+                .get(&site.slot)
+                .ok_or_else(|| invalid_handle("state slot is missing"))?
+                .selection_reservation(bank, site.lane)?
+            else {
+                if slot.binding.activity[bank][site.lane].load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(invalid_handle(
+                        "active selection capture has no reserved boundary",
+                    ));
+                }
+                continue;
+            };
+            let loan = self.feedback_destination(site.slot, index)?;
+            let entry = self.entry(&loan).cloned();
+            self.drop_tensor(loan)?;
+            let entry = entry?;
+            bindings
+                .view(site.destination.clone(), entry.tensor.clone())
+                .map_err(crate::guest_error)?;
+            retained.push(entry);
+            writes.push(SelectionWrite {
+                slot: site.slot,
+                bank,
+                lane: site.lane,
+                identity,
+            });
+        }
+        Ok(writes)
+    }
+
     pub(super) fn record_selection_feedback(
         &mut self,
         commands: &Resource<CommandListEntry>,
