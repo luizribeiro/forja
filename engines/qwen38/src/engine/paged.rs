@@ -23,7 +23,7 @@ pub(super) fn forward(
     phase: BatchPhase,
 ) -> Result<Tensor<f32>> {
     let (set, inputs) = inputs(model)?;
-    let anchor = start.clone().checked_mul(0)?;
+    let anchor = start.clone().replay_constant(0);
     let tokens = if phase == BatchPhase::Prompt {
         inputs.prompt.narrow(0, anchor, rows)?
     } else {
@@ -47,7 +47,7 @@ fn forward_decode_rows(model: &mut Model, starts: &[Dim]) -> Result<()> {
         let lane = u32::try_from(lane).map_err(|_| Error::loading("decode lane exceeds u32"))?;
         set.slot()
             .token(lane)?
-            .narrow(0, start.clone().checked_mul(0)?, 1)?
+            .narrow(0, start.clone().replay_constant(0), 1)?
             .copy_into(&mut tokens.narrow(0, lane, 1)?)?;
     }
     model
@@ -64,7 +64,7 @@ pub(super) fn select(
 ) -> Result<Tensor<u32>> {
     let (set, inputs) = inputs(model)?;
     let words = inputs.allow.shape()[1];
-    let row = position.clone().checked_mul(0)?.checked_add(lane)?;
+    let row = position.clone().replay_constant(lane);
     let selected = inputs.logits.narrow(0, row, 1)?.sample_masked(
         &inputs.sampling.narrow(0, lane, 1)?.reshape(&[5])?,
         &inputs.allow.narrow(0, lane, 1)?.reshape(&[words])?,

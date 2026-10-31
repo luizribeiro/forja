@@ -543,7 +543,7 @@ fn bind_replay_start_to_permuted_query<T: Element>(
     sequence: u32,
 ) -> Result<Tensor<T>> {
     if start.is_symbolic() {
-        query.narrow(1, start.clone().checked_mul(0)?, sequence)
+        query.narrow(1, start.clone().replay_constant(0), sequence)
     } else {
         Ok(query)
     }

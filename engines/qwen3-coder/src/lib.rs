@@ -1927,7 +1927,7 @@ impl Qwen3Coder {
                 let graph = forja_sdk::capture(&param_refs, || {
                     let logits = state.logits.narrow(
                         0,
-                        Dim::from(params[0].at(starts[0].unwrap_or(0))).checked_mul(0)?,
+                        Dim::from(params[0].at(starts[0].unwrap_or(0))).replay_constant(0),
                         state.bucket,
                     )?;
                     self.select_masked_graph_rows(

@@ -95,6 +95,15 @@ impl Dim {
         self.id.is_some()
     }
 
+    /// Retains parameter identity so a constant view is re-resolved per replay.
+    #[must_use]
+    pub const fn replay_constant(mut self, value: u32) -> Self {
+        self.scale = 0;
+        self.offset = value;
+        self.value = value;
+        self
+    }
+
     /// Adds a constant offset with checked arithmetic.
     ///
     /// # Errors
@@ -848,6 +857,18 @@ pub(crate) fn clear_kernel_cache() {
 mod tests {
     use super::*;
     use crate::program::ProgramKind;
+
+    #[test]
+    fn constant_replay_views_keep_their_parameter_identity() {
+        let parameter = Param::new(0..=33).unwrap();
+        let position = Dim::from(parameter.at(7));
+        let pinned = position.clone().replay_constant(9);
+        assert_eq!(pinned.value(), 9);
+        assert!(pinned.is_symbolic());
+        assert_eq!(pinned.id, position.id);
+        assert_eq!(pinned.range, position.range);
+        assert_eq!(Dim::from(7).replay_constant(9), Dim::from(9));
+    }
 
     fn program(value: f32) -> sys::Program {
         sys::Program {
