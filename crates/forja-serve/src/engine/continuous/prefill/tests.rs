@@ -322,3 +322,21 @@ async fn snapshot_quota_refusals_preserve_successful_serving_and_cold_state()
     assert_eq!(engine.metrics.snapshot_refusals, 2);
     Ok(())
 }
+
+#[tokio::test]
+async fn serving_entry_pressure_evicts_the_unpinned_paired_boundary() -> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let mut config = engine.config.clone();
+    config.serving.prefix_cache_entries = forja_config::Choice::Fixed(std::num::NonZeroU32::MIN);
+    engine.update_policy(1, config)?;
+    let original = complete_prompt(&mut engine, 0).await?;
+    assert_eq!(complete_prompt(&mut engine, 1).await?.2, 0);
+    let evicted = complete_prompt(&mut engine, 0).await?;
+    assert_eq!(evicted, original);
+    let hit = complete_prompt(&mut engine, 0).await?;
+    assert_eq!(hit.2, 64);
+    assert_eq!((hit.0, hit.1), (original.0, original.1));
+    Ok(())
+}
