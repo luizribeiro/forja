@@ -124,6 +124,18 @@ impl<B: Backend + 'static> Host<B> {
                 "feedback capture is already recorded for this lane",
             ));
         }
+        let destination = self.record_feedback_placeholder(commands, selected)?;
+        let list = self.table.get_mut(commands).map_err(invalid_handle)?;
+        list.captured_feedback
+            .push(CapturedFeedback { usage, destination });
+        Ok(())
+    }
+
+    fn record_feedback_placeholder(
+        &mut self,
+        commands: &Resource<CommandListEntry>,
+        selected: &Resource<TensorEntry>,
+    ) -> Result<forja_core::Tensor, compute::Error> {
         let charge = self.reserve_reference()?;
         let output = self.alloc(compute::Dtype::U32, &[1])?;
         self.table
@@ -141,9 +153,7 @@ impl<B: Backend + 'static> Host<B> {
         result?;
         let list = self.table.get_mut(commands).map_err(invalid_handle)?;
         list.protected.insert(destination.buffer());
-        list.captured_feedback
-            .push(CapturedFeedback { usage, destination });
-        Ok(())
+        Ok(destination)
     }
 
     pub(crate) fn bind_graph_feedback(
