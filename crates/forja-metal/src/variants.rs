@@ -753,7 +753,13 @@ const PAGED_SDPA_STEEL_HALF_128: &[Constraint] = &[
 ];
 
 const PAGED_STEEL_256: &[Constraint] = &[
-    PAGED_SDPA_STEEL[0],
+    value(
+        QUERY_LENGTH,
+        Relation::Range {
+            min: 1,
+            max: u64::MAX,
+        },
+    ),
     value(PAGED_KEY_WIDTH, Relation::Equal(256)),
     PAGED_SDPA_STEEL[2],
     operation(

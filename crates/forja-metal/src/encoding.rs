@@ -9080,7 +9080,7 @@ fn paged_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError>
         .get(3)
         .copied()
         .ok_or(BackendError::InvalidInput)?;
-    Ok(query_length > 1
+    Ok((query_length > 1 || (query_length == 1 && width == 256))
         && width == value_width
         && matches!(width, 64 | 128 | 256)
         && key.layout().shape().get(3) == Some(&width))

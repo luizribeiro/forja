@@ -2085,7 +2085,7 @@ fn metal_paged_steel_256_matches_cpu_and_checks_page_divisibility() {
         (DType::F16, "paged-sdpa.steel-half-256", 16),
         (DType::BF16, "paged-sdpa.steel-half-256", 16),
     ] {
-        for queries in [7, 33] {
+        for queries in [1, 7, 33] {
             let expected =
                 wide_attention::<_, false>(&cpu, dtype, (33, queries), None, 64).unwrap();
             let actual =
@@ -2099,7 +2099,15 @@ fn metal_paged_steel_256_matches_cpu_and_checks_page_divisibility() {
         assert!(
             wide_attention::<_, false>(&metal, dtype, (33, 7), Some(variant), tile / 2).is_err()
         );
-        assert!(wide_attention::<_, false>(&metal, dtype, (33, 1), Some(variant), 64).is_err());
+        if dtype != DType::F32 {
+            let expected = wide_attention::<_, true>(&cpu, dtype, (33, 1), None, 64).unwrap();
+            let actual =
+                wide_attention::<_, true>(&metal, dtype, (33, 1), Some(variant), 64).unwrap();
+            assert!(
+                forja_testing::normwise_relative_error(&expected, &actual)
+                    <= forja_testing::dtype_tolerance(dtype).unwrap()
+            );
+        }
     }
 }
 
