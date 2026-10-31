@@ -272,27 +272,50 @@ impl<B: Backend + 'static> Host<B> {
     }
 }
 
+pub(crate) enum ProtectedBatch<B: Backend> {
+    State(crate::StateBatch<B>),
+    Selection(crate::StateSelectionBatch<B>),
+}
+
+impl<B: Backend> From<crate::StateBatch<B>> for ProtectedBatch<B> {
+    fn from(batch: crate::StateBatch<B>) -> Self {
+        Self::State(batch)
+    }
+}
+
+impl<B: Backend> From<crate::StateSelectionBatch<B>> for ProtectedBatch<B> {
+    fn from(batch: crate::StateSelectionBatch<B>) -> Self {
+        Self::Selection(batch)
+    }
+}
+
 pub(crate) enum SubmittedWork<B: Backend> {
     Plain(B::Submission),
     State(crate::StateBatchSubmission<B>),
+    Selection(crate::StateSelectionSubmission<B>),
 }
 
 impl<B: Backend> SubmittedWork<B> {
     pub(crate) fn queue(
-        batch: Option<crate::StateBatch<B>>,
+        batch: Option<ProtectedBatch<B>>,
         mut owners: Vec<forja_core::CompletionResource>,
         submit: impl FnOnce(
             Vec<forja_core::CompletionResource>,
         ) -> Result<B::Submission, forja_core::BackendError>,
     ) -> Result<Self, forja_core::BackendError> {
+        let queue = |retained| {
+            owners.extend(retained);
+            submit(owners)
+        };
         match batch {
-            None => submit(owners).map(Self::Plain),
-            Some(batch) => batch
-                .submit_using(|retained| {
-                    owners.extend(retained);
-                    submit(owners)
-                })
+            None => queue(Vec::new()).map(Self::Plain),
+            Some(ProtectedBatch::State(batch)) => batch
+                .submit_using(queue)
                 .map(Self::State)
+                .map_err(|_| forja_core::BackendError::ExecutionFailed),
+            Some(ProtectedBatch::Selection(batch)) => batch
+                .submit_using(queue)
+                .map(Self::Selection)
                 .map_err(|_| forja_core::BackendError::ExecutionFailed),
         }
     }
@@ -301,6 +324,7 @@ impl<B: Backend> SubmittedWork<B> {
         match self {
             Self::Plain(submission) => submission,
             Self::State(batch) => batch.submission(),
+            Self::Selection(batch) => batch.submission(),
         }
     }
 
@@ -313,13 +337,15 @@ impl<B: Backend> SubmittedWork<B> {
         let result = taint.check_dependencies(result, timeout);
         let execution = result.as_ref().map(|_| ()).map_err(|error| *error);
         let state = match self {
-            Self::Plain(_) => execution,
-            Self::State(batch) => batch.finish_after(execution).map_err(|_| {
-                execution
-                    .err()
-                    .unwrap_or(forja_core::BackendError::ExecutionFailed)
-            }),
-        };
+            Self::Plain(_) => Ok(()),
+            Self::State(batch) => batch.finish_after(execution),
+            Self::Selection(batch) => batch.finish_after(execution),
+        }
+        .map_err(|_| {
+            execution
+                .err()
+                .unwrap_or(forja_core::BackendError::ExecutionFailed)
+        });
         taint.finish(
             result.and_then(|value| state.map(|()| value)),
             true,
@@ -630,7 +656,7 @@ impl<B: Backend + 'static> Host<B> {
             paged,
             Some(flight),
         );
-        request.state_batch = batch;
+        request.protected_batch = batch.map(ProtectedBatch::from);
         request.snapshot = Some(snapshot);
         request.state_owners = owners;
         request.captured_state = captures

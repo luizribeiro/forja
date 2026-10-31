@@ -6566,7 +6566,7 @@ impl<B: Backend + 'static> Host<B> {
             entry.paged,
             None,
         );
-        request.state_batch = state_batch;
+        request.protected_batch = state_batch.map(hybrid::ProtectedBatch::from);
         request.state_owners = state_owners;
         Ok(request)
     }
@@ -6583,7 +6583,7 @@ impl<B: Backend + 'static> Host<B> {
             backend: Arc::clone(&self.backend),
             snapshot: None,
             captured_state: Vec::new(),
-            state_batch: None,
+            protected_batch: None,
             state_owners: Vec::new(),
             work,
             access,
@@ -7388,7 +7388,7 @@ struct SubmitRequest<B: Backend> {
     snapshot: Option<Arc<state::StateCharge>>,
     work: SubmissionWork,
     captured_state: Vec<StateCapture>,
-    state_batch: Option<StateBatch<B>>,
+    protected_batch: Option<hybrid::ProtectedBatch<B>>,
     state_owners: Vec<forja_core::CompletionResource>,
     access: SubmissionAccess,
     retained: Vec<TensorEntry>,
@@ -8179,7 +8179,7 @@ where
                 snapshot: _snapshot,
                 work,
                 captured_state: _captured_state,
-                state_batch,
+                protected_batch,
                 state_owners,
                 access,
                 retained,
@@ -8205,7 +8205,7 @@ where
                     Ok(reservation) => match taints.begin(&access) {
                         Err(error) => Err(error),
                         Ok(taint) => match hybrid::SubmittedWork::<B>::queue(
-                            state_batch,
+                            protected_batch,
                             state_owners,
                             |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
                         ) {
@@ -10906,47 +10906,56 @@ mod tests {
 
     #[tokio::test]
     async fn failed_selection_submission_preserves_awaiting_state_for_retry() {
-        let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
-        backend.fail_submission = Some(2);
-        let StateSlotFixture {
-            mut host,
-            slot,
-            operands,
-            output,
-            ..
-        } = state_slot_fixture_action(backend, Some(StateAction::Forward));
-        let commands = host.command_list().unwrap();
-        host.record_slot_state(
-            &commands,
-            &slot,
-            0,
-            0,
-            paged_storage::StateOperation::CausalConvolution,
-            &operands,
-            &output,
-            "",
-        )
-        .unwrap();
-        host.prepare_submit(commands).unwrap().run().await.unwrap();
-        let sequence = host.state_slots[&slot.rep()]
-            .sequence_handle(0)
-            .unwrap()
+        for worker in [false, true] {
+            let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
+            backend.fail_submission = Some(2);
+            let StateSlotFixture {
+                mut host,
+                slot,
+                operands,
+                output,
+                ..
+            } = state_slot_fixture_action(backend, Some(StateAction::Forward));
+            let commands = host.command_list().unwrap();
+            host.record_slot_state(
+                &commands,
+                &slot,
+                0,
+                0,
+                paged_storage::StateOperation::CausalConvolution,
+                &operands,
+                &output,
+                "",
+            )
             .unwrap();
-        let before = sequence.position();
-        for failed in [true, false] {
-            let selection = super::StateSelection::new(sequence.clone(), 0, 0).unwrap();
-            let batch = super::StateSelectionBatch::new(vec![selection]).unwrap();
-            let result = batch
-                .submit(forja_core::CommandList::new())
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            let sequence = host.state_slots[&slot.rep()]
+                .sequence_handle(0)
                 .unwrap()
-                .finish();
-            assert_eq!(result.is_err(), failed);
-            if failed {
-                assert_eq!(sequence.position(), before);
-                assert!(sequence.checkpoint_latest().is_err());
-            } else {
-                assert_eq!(sequence.position().tokens, 1);
-                assert_eq!(sequence.checkpoint_latest().unwrap().position().grammar, 1);
+                .unwrap();
+            let before = sequence.position();
+            for failed in [true, false] {
+                let selection = super::StateSelection::new(sequence.clone(), 0, 0).unwrap();
+                let batch = super::StateSelectionBatch::new(vec![selection]).unwrap();
+                let result = if worker {
+                    let commands = host.command_list().unwrap();
+                    let mut request = host.prepare_submit(commands).unwrap();
+                    request.protected_batch = Some(batch.into());
+                    request.run().await.map(|_| ())
+                } else {
+                    batch
+                        .submit(forja_core::CommandList::new())
+                        .unwrap()
+                        .finish()
+                };
+                assert_eq!(result.is_err(), failed);
+                if failed {
+                    assert_eq!(sequence.position(), before);
+                    assert!(sequence.checkpoint_latest().is_err());
+                } else {
+                    assert_eq!(sequence.position().tokens, 1);
+                    assert_eq!(sequence.checkpoint_latest().unwrap().position().grammar, 1);
+                }
             }
         }
     }
