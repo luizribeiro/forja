@@ -366,6 +366,13 @@ where
             .checked_add(count)
             .ok_or_else(|| GenerationError::new("prompt position overflowed"))?;
         prefill.consumed = usize::try_from(prefill.position).unwrap_or(usize::MAX);
+        self.publish_canonical_boundary(
+            prefill.slot,
+            prefill.position,
+            prefill.request.prompt_tokens,
+            prefill.request.prefix_reuse,
+            &prefill.request.control,
+        )?;
         observe(&mut self.metrics.suffix_prefill_time, started.elapsed());
         Ok(prefill.consumed == prefill.request.tokens.len())
     }

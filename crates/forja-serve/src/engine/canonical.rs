@@ -1,4 +1,4 @@
-use super::{GenerationError, ServingEngine, prefix_limits};
+use super::{GenerationControl, GenerationError, ServingEngine, prefix_limits};
 use forja_config::Profile;
 use forja_core::{Backend, CanonicalPrefixSchedule, HybridPrefixNamespace};
 use forja_host::{CanonicalPrompt, HybridPrefix, HybridPrefixStore, SnapshotAllowance};
@@ -179,6 +179,43 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 .limit(u64::from(position), u64::from(prompt_tokens), proposed)
                 .map_err(cache_error)
         })
+    }
+    pub(super) fn publish_canonical_boundary(
+        &mut self,
+        lane: u32,
+        position: u32,
+        prompt_tokens: u32,
+        reuse: bool,
+        control: &GenerationControl,
+    ) -> Result<(), GenerationError> {
+        let Some(cache) = &self.canonical_cache else {
+            return Ok(());
+        };
+        let Some(store) = &cache.store else {
+            return Ok(());
+        };
+        if cache.allowance.bytes() == 0
+            || !reuse
+            || !self.config.serving.prefix_reuse
+            || control.is_cancelled()
+            || !cache
+                .schedule
+                .contains(u64::from(position), u64::from(prompt_tokens))
+        {
+            return Ok(());
+        }
+        let result = self
+            .runner
+            .capture_canonical_prefix(lane, cache.allowance)
+            .and_then(|entry| store.publish(entry, &control.cancellation.cancelled));
+        match result {
+            Ok(_) => Ok(()),
+            Err(forja_host::bindings::l9o::gpu::compute::Error::Quota(_)) => {
+                self.metrics.snapshot_refusals = self.metrics.snapshot_refusals.saturating_add(1);
+                Ok(())
+            }
+            Err(error) => Err(cache_error(error)),
+        }
     }
 }
 

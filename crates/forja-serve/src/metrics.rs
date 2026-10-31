@@ -7,6 +7,7 @@ pub struct ServingMetrics {
     pub(crate) hits: u64,
     pub(crate) misses: u64,
     pub(crate) reused_tokens: u64,
+    pub(crate) snapshot_refusals: u64,
     pub(crate) match_time: [u64; 32],
     pub(crate) suffix_prefill_time: [u64; 32],
     pub(crate) ttft: [u64; 32],
@@ -44,6 +45,11 @@ impl ServingMetrics {
             &mut output,
             "forja_prefix_reused_tokens_total",
             self.reused_tokens,
+        );
+        counter(
+            &mut output,
+            "forja_prefix_snapshot_refusals_total",
+            self.snapshot_refusals,
         );
         histogram(&mut output, "forja_prefix_match_seconds", &self.match_time);
         histogram(

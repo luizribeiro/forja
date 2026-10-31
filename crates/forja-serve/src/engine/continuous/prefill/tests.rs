@@ -199,17 +199,6 @@ async fn paired_serving_admission_resumes_the_longest_boundary_and_replays_tail(
         .await
         .map_err(|(_, error)| error)?;
     assert!(!engine.advance_batch_prefill(&mut cold, 64).await?);
-    let entry = engine
-        .runner
-        .capture_canonical_prefix(0, forja_host::SnapshotAllowance::new(1 << 28, None)?)?;
-    engine
-        .canonical_cache
-        .as_ref()
-        .unwrap()
-        .store
-        .as_ref()
-        .unwrap()
-        .publish(entry, &std::sync::atomic::AtomicBool::new(false))?;
     assert!(engine.advance_batch_prefill(&mut cold, 64).await?);
     let expected = engine.runner.state_lane_fingerprint(0)?.1;
     assert!(engine.release_failed_lane(0).is_none());
@@ -224,5 +213,46 @@ async fn paired_serving_admission_resumes_the_longest_boundary_and_replays_tail(
     assert_eq!(hit.selected, cold.selected);
     assert_eq!(engine.runner.state_lane_fingerprint(7)?.1, expected);
     assert_eq!((engine.metrics.hits, engine.metrics.reused_tokens), (1, 64));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_publication_leaves_the_paired_cache_empty() -> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let mut pending = engine
+        .begin_batch_prefill(request(), 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert!(!engine.advance_batch_prefill(&mut pending, 64).await?);
+    pending.request.control.cancel();
+    engine.publish_canonical_boundary(0, 64, 65, true, &pending.request.control)?;
+    assert_eq!(
+        engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .usage()?
+            .entries,
+        0
+    );
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.publish_canonical_boundary(0, 64, 65, true, &control)?;
+    assert_eq!(
+        engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap()
+            .usage()?
+            .entries,
+        1
+    );
     Ok(())
 }
