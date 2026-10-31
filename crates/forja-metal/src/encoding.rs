@@ -1556,6 +1556,8 @@ unsafe impl Send for PreparedMetalGraph {}
 unsafe impl Sync for PreparedMetalGraph {}
 
 pub(super) struct Completion {
+    pub(super) outcome: Arc<OnceLock<Result<(), BackendError>>>,
+    timeout: Duration,
     pub(super) successful: Arc<AtomicBool>,
     state: Mutex<CompletionState>,
     ready: Condvar,
@@ -1614,6 +1616,7 @@ impl Completion {
         timestamps: Option<GpuTimestamps>,
         tracker: Weak<InFlightTracker>,
         dependencies: Vec<Arc<Completion>>,
+        timeout: Duration,
     ) -> Arc<Self> {
         Arc::new_cyclic(|completion: &Weak<Self>| {
             let callback_completion = completion.clone();
@@ -1637,6 +1640,8 @@ impl Completion {
                 options.addFeedbackHandler(RcBlock::as_ptr(&handler));
             }
             Self {
+                outcome: Arc::new(OnceLock::new()),
+                timeout,
                 state: Mutex::new(CompletionState {
                     retained: Vec::new(),
                     feedback: None,
@@ -1713,9 +1718,6 @@ impl Completion {
                 state.resolving = true;
                 drop(state);
                 self.resolve_timestamps();
-                if let Some(tracker) = self.tracker.upgrade() {
-                    tracker.drain_done();
-                }
                 if result.is_ok() {
                     result = self.check_error_flags();
                 }
@@ -1744,8 +1746,13 @@ impl Completion {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let result = *state.result.get_or_insert(result);
                 self.successful.store(result.is_ok(), Ordering::Release);
+                let _ = self.outcome.set(result);
                 state.resolving = false;
                 self.ready.notify_all();
+                drop(state);
+                if let Some(tracker) = self.tracker.upgrade() {
+                    tracker.drain_done();
+                }
                 return result;
             }
             let remaining = timeout.saturating_sub(started.elapsed());
@@ -2268,6 +2275,15 @@ impl InFlightTracker {
             return;
         }
         for completed in &done {
+            let completion = &completed.completion;
+            let resolving = completion
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resolving;
+            if !resolving {
+                let _ = completion.wait(completion.timeout);
+            }
             completed.completion.resolve_timestamps();
             drop(completed.completion.take_retained());
         }
@@ -8206,6 +8222,7 @@ impl MetalBackend {
             Some(timestamps),
             Arc::downgrade(&self.in_flight),
             dependencies,
+            self.gpu_timeout,
         );
         for access in accesses {
             buffers.get_mut(&access.tensor)?.track(
@@ -12735,6 +12752,27 @@ mod tests {
         ));
         backend.write(&ids, &1_u32.to_le_bytes()).unwrap();
         backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+    }
+
+    #[test]
+    fn dropped_submission_outcome_survives_completion_retirement() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let ids = backend.alloc(DType::U32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        backend.write(&ids, &99_u32.to_ne_bytes()).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Embed, &[&source, &ids], &output)
+            .unwrap();
+        let submission = backend.submit(commands).unwrap();
+        let outcome = Arc::clone(&submission.completion.outcome);
+        drop(submission);
+        backend.in_flight.drain(Duration::from_secs(10));
+        assert!(matches!(
+            outcome.get(),
+            Some(Err(BackendError::DeviceErrorFlag { value: 99, .. }))
+        ));
     }
 
     #[test]
