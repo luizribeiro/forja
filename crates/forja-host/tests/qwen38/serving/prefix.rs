@@ -109,20 +109,21 @@ async fn canonical_prefix_replays_tail_with_identical_logits_and_state()
 
 pub(crate) async fn assert_shared_parent<B: Backend + Send + Sync + 'static>(
     mut runner: EngineRunner<B>,
+    parent_tokens: u32,
 ) -> Result<(), Box<dyn Error>> {
     let namespace = runner.canonical_prefix_namespace([8; 32], &["test-fixed"])?;
     let cache =
         runner.create_canonical_prefix_store(namespace, SnapshotAllowance::new(2 << 30, None)?)?;
-    let parent = (0..65).map(|i| i % 33).collect::<Vec<_>>();
+    let parent = (0..parent_tokens).map(|i| i % 33).collect::<Vec<_>>();
     let original = evaluate(&mut runner, &cache, &parent, false, 0, true).await?;
     let mut children = Vec::new();
     for lane in [1, 2] {
-        let tokens = (0..129)
-            .map(|i| (i + if i >= 64 { lane } else { 0 }) % 33)
+        let tokens = (0..parent_tokens + 64)
+            .map(|i| (i + if i >= parent_tokens - 1 { lane } else { 0 }) % 33)
             .collect::<Vec<_>>();
         let cold = evaluate(&mut runner, &cache, &tokens, false, 0, false).await?;
         let hit = evaluate(&mut runner, &cache, &tokens, true, lane, false).await?;
-        assert_eq!(hit.2, 64);
+        assert_eq!(hit.2, u64::from(parent_tokens - 1));
         assert_eq!(cold.0, hit.0);
         assert_eq!(cold.1, hit.1);
         children.push((lane, hit.1));
@@ -131,7 +132,7 @@ pub(crate) async fn assert_shared_parent<B: Backend + Send + Sync + 'static>(
         assert_eq!(runner.state_lane_fingerprint(lane)?.1, digest);
     }
     let again = evaluate(&mut runner, &cache, &parent, true, 0, false).await?;
-    assert_eq!(again.2, 64);
+    assert_eq!(again.2, u64::from(parent_tokens - 1));
     assert_eq!(original.0, again.0);
     assert_eq!(original.1, again.1);
     Ok(())
@@ -140,5 +141,12 @@ pub(crate) async fn assert_shared_parent<B: Backend + Send + Sync + 'static>(
 #[tokio::test]
 async fn shared_canonical_parent_survives_two_live_branch_writers() -> Result<(), Box<dyn Error>> {
     let runner = runner_with_context(forja_cpu::CpuBackend::new(), true, 8192).await?;
-    assert_shared_parent(runner).await
+    assert_shared_parent(runner, 65).await
+}
+
+#[tokio::test]
+async fn canonical_branches_replay_across_the_sparse_snapshot_interval()
+-> Result<(), Box<dyn Error>> {
+    let runner = runner_with_context(forja_cpu::CpuBackend::new(), true, 8192).await?;
+    assert_shared_parent(runner, 4097).await
 }

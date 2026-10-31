@@ -22,5 +22,5 @@ async fn metal_real_canonical_sparse_boundaries_preserve_logits_and_state_bits()
 async fn metal_real_shared_canonical_parent_survives_two_live_branch_writers()
 -> Result<(), Box<dyn Error>> {
     let (runner, _) = load_configured(true, None, Some(512)).await?;
-    crate::qwen38::serving::prefix::assert_shared_parent(runner).await
+    crate::qwen38::serving::prefix::assert_shared_parent(runner, 65).await
 }
