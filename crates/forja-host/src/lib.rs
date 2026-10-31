@@ -11531,6 +11531,21 @@ mod tests {
         state.take_selections(1).unwrap().finish(false).unwrap();
         assert_eq!(state.selection_destination(1, 0).unwrap(), None);
         assert_eq!(state.position(0).unwrap().grammar, 0);
+        let lease = state.begin_shared_selection(0, 0, 0).unwrap();
+        assert_eq!(state.selection_count(0).unwrap(), 1);
+        assert!(state.release(0).is_err());
+        drop(lease);
+        assert_eq!(state.selection_count(0).unwrap(), 0);
+        assert_eq!(state.selection_destination(0, 0).unwrap(), None);
+        let lease = state.begin_shared_selection(1, 0, 0).unwrap();
+        let (boundary, scalar) = lease.boundary().unwrap();
+        state.cancel_selections(1).unwrap();
+        assert!(!lease.is_pending().unwrap());
+        assert!(boundary.verify_selected(scalar).is_err());
+        boundary.restore().unwrap();
+        let lease = state.begin_shared_selection(0, 0, 0).unwrap();
+        state.take_selections(0).unwrap().finish(false).unwrap();
+        assert!(!lease.is_pending().unwrap());
         state.release(0).unwrap();
     }
 

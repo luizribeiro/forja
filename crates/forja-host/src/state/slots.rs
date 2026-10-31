@@ -1,3 +1,6 @@
+mod selection;
+use selection::SelectionFrame;
+
 #[cfg(test)]
 mod inactive_tests;
 
@@ -22,7 +25,7 @@ pub struct StateSlots<B: Backend> {
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
     padding: [Vec<Option<StateCommands<B>>>; 2],
-    selections: [Vec<Option<super::StateSelection<B>>>; 2],
+    selections: [Vec<Option<SelectionFrame<B>>>; 2],
 }
 
 impl<B: Backend> StateSlots<B> {
@@ -127,10 +130,7 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses invalid lanes or pending reservations/execution; committed state stays unchanged.
     pub fn release(&mut self, lane: usize) -> Result<(), compute::Error> {
-        if self
-            .selections
-            .iter()
-            .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+        if self.selection_reserved(lane)?
             || self
                 .banks
                 .iter()
@@ -355,10 +355,7 @@ impl<B: Backend> StateSlots<B> {
             .get(bank)
             .and_then(|bank| bank.get(lane))
             .is_none()
-            || self
-                .selections
-                .iter()
-                .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+            || self.selection_reserved(lane)?
             || self
                 .banks
                 .iter()
@@ -374,24 +371,73 @@ impl<B: Backend> StateSlots<B> {
             .and_then(|index| index.checked_add(lane))
             .and_then(|index| u32::try_from(index).ok())
             .ok_or_else(|| invalid_handle("selection scratch index overflowed"))?;
-        self.selections[bank][lane] = Some(super::StateSelection::new(sequence, start, scratch)?);
+        self.selections[bank][lane] = Some(SelectionFrame::Owned(super::StateSelection::new(
+            sequence, start, scratch,
+        )?));
         Ok(())
+    }
+
+    /// Reserves a guard whose unsubmitted lifetime belongs to the returned scope.
+    ///
+    /// # Errors
+    /// Refuses unavailable lanes, positions, feedback scratch or quota.
+    pub fn begin_shared_selection(
+        &mut self,
+        bank: usize,
+        lane: usize,
+        start: u64,
+    ) -> Result<super::StateSelectionLease<B>, compute::Error> {
+        self.begin_selection(bank, lane, start)?;
+        let selection = self.selections[bank][lane]
+            .take()
+            .ok_or_else(|| invalid_handle("selection guard is missing"))?
+            .take()?
+            .ok_or_else(|| invalid_handle("selection guard was transferred"))?;
+        let lease = selection.share();
+        self.selections[bank][lane] = Some(SelectionFrame::Shared(Arc::downgrade(&lease.inner)));
+        Ok(lease)
+    }
+
+    fn with_selection<T>(
+        &self,
+        bank: usize,
+        lane: usize,
+        action: impl FnOnce(&super::StateSelection<B>) -> Result<T, compute::Error>,
+    ) -> Result<Option<T>, compute::Error> {
+        self.selections
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))?
+            .as_ref()
+            .map(|frame| frame.with(action))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn selection_reserved(&self, lane: usize) -> Result<bool, compute::Error> {
+        for frame in self
+            .selections
+            .iter()
+            .filter_map(|bank| bank.get(lane))
+            .flatten()
+        {
+            if frame.with(|_| Ok(()))?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Returns the selected lane's private output index for trusted recording code.
     ///
     /// # Errors
-    /// Refuses invalid banks or lane indices.
+    /// Refuses invalid geometry or poisoned ownership.
     pub fn selection_destination(
         &self,
         bank: usize,
         lane: usize,
     ) -> Result<Option<u32>, compute::Error> {
-        self.selections
-            .get(bank)
-            .and_then(|bank| bank.get(lane))
-            .map(|selection| selection.as_ref().map(super::StateSelection::destination))
-            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))
+        self.with_selection(bank, lane, |selection| Ok(selection.destination()))
     }
 
     pub(crate) fn selection_reservation(
@@ -399,18 +445,19 @@ impl<B: Backend> StateSlots<B> {
         bank: usize,
         lane: usize,
     ) -> Result<Option<(std::sync::Weak<()>, u32)>, compute::Error> {
-        self.selections
-            .get(bank)
-            .and_then(|bank| bank.get(lane))
-            .map(|selection| selection.as_ref().map(super::StateSelection::reservation))
-            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))
+        self.with_selection(bank, lane, |selection| Ok(selection.reservation()))
     }
 
     pub(crate) fn selection_count(&self, bank: usize) -> Result<usize, compute::Error> {
-        self.selections
+        let bank = self
+            .selections
             .get(bank)
-            .map(|bank| bank.iter().flatten().count())
-            .ok_or_else(|| invalid_handle("selection bank is out of range"))
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))?;
+        bank.iter().flatten().try_fold(0, |count, frame| {
+            frame
+                .with(|_| Ok(()))
+                .map(|selection| count + usize::from(selection.is_some()))
+        })
     }
 
     /// Transfers all selected lanes to one completion owner without publishing them.
@@ -425,7 +472,13 @@ impl<B: Backend> StateSlots<B> {
             .selections
             .get_mut(bank)
             .ok_or_else(|| invalid_handle("selection bank is out of range"))?;
-        super::StateSelectionBatch::new(bank.iter_mut().filter_map(Option::take).collect())
+        let mut selections = Vec::new();
+        for frame in bank.iter_mut().filter_map(Option::take) {
+            if let Some(selection) = frame.take()? {
+                selections.push(selection);
+            }
+        }
+        super::StateSelectionBatch::new(selections)
     }
 
     /// Transfers complete lane transactions to one submission owner.
@@ -447,11 +500,15 @@ impl<B: Backend> StateSlots<B> {
     }
 
     pub(crate) fn cancel_lane(&mut self, bank: usize, lane: usize) -> Result<(), compute::Error> {
-        *self
+        if let Some(frame) = self
             .selections
             .get_mut(bank)
             .and_then(|bank| bank.get_mut(lane))
-            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))? = None;
+            .ok_or_else(|| invalid_handle("selection bank or lane is out of range"))?
+            .take()
+        {
+            drop(frame.take()?);
+        }
         *self
             .banks
             .get_mut(bank)
@@ -471,18 +528,27 @@ impl<B: Backend> StateSlots<B> {
         Ok(())
     }
 
+    /// Cancels selection guards without changing any carry transaction in this bank.
+    ///
+    /// # Errors
+    /// Refuses invalid banks or poisoned ownership.
+    pub fn cancel_selections(&mut self, bank: usize) -> Result<(), compute::Error> {
+        let bank = self
+            .selections
+            .get_mut(bank)
+            .ok_or_else(|| invalid_handle("selection bank is out of range"))?;
+        for frame in bank.iter_mut().filter_map(Option::take) {
+            drop(frame.take()?);
+        }
+        Ok(())
+    }
+
     /// Releases unsubmitted reservations; submitted owners retain their own versions until drain.
     ///
     /// # Errors
     /// Refuses an invalid bank index.
     pub fn cancel_unsubmitted_bank(&mut self, bank: usize) -> Result<(), compute::Error> {
-        for selection in self
-            .selections
-            .get_mut(bank)
-            .ok_or_else(|| invalid_handle("selection bank is out of range"))?
-        {
-            *selection = None;
-        }
+        self.cancel_selections(bank)?;
         let bank = self
             .banks
             .get_mut(bank)
