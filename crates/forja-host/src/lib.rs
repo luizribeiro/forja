@@ -1950,9 +1950,6 @@ where
         }
         let bucket = input.shape.bucket;
         let logits_resource = Resource::new_borrow(logits.handle);
-        if let Err(error) = self.validate_batch_logits(&info, bucket, &logits_resource) {
-            return Ok(Err(error));
-        }
         let Some(pool) = self.page_pool else {
             return Ok(Err(invalid_handle("batch serving requires a paged pool")));
         };
@@ -1960,6 +1957,26 @@ where
             Ok(slot) => slot,
             Err(error) => return Ok(Err(error)),
         };
+        if !self.store.data().state_slots.contains_key(&slot)
+            && let Err(error) = self.validate_batch_logits(&info, bucket, &logits_resource)
+        {
+            return Ok(Err(error));
+        }
+        if let Err(error) = self
+            .stage_selection_logits(
+                pool,
+                &logits_resource,
+                bucket,
+                input
+                    .lanes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(lane, value)| value.as_ref().map(|_| lane)),
+            )
+            .await
+        {
+            return Ok(Err(error));
+        }
         if let Err(error) = self.store.data().write_state_selection_inputs(pool, &input) {
             return Ok(Err(error));
         }
@@ -2110,6 +2127,19 @@ where
                 runner_id: self.id,
             },
         }))
+    }
+
+    async fn stage_selection_logits(
+        &mut self,
+        pool: u32,
+        logits: &Resource<TensorEntry>,
+        bucket: u32,
+        active: impl Iterator<Item = usize> + Send,
+    ) -> Result<(), compute::Error> {
+        self.store
+            .data_mut()
+            .stage_selection_logits(&Resource::new_borrow(pool), logits, bucket, active)
+            .await
     }
 
     fn paged_batch_slot(&self, pool: u32) -> Result<u32, compute::Error> {
@@ -2343,6 +2373,18 @@ where
             return Ok(Err(invalid_handle(
                 "engine tensor belongs to another runner",
             )));
+        }
+        if let Some(pool) = self.page_pool
+            && let Err(error) = self
+                .stage_selection_logits(
+                    pool,
+                    &Resource::new_borrow(logits.handle),
+                    1,
+                    std::iter::once(0),
+                )
+                .await
+        {
+            return Ok(Err(error));
         }
         if let Some(pool) = self.page_pool
             && let Err(error) = self
@@ -10757,6 +10799,89 @@ mod tests {
             host.prepare_selection_logits(pool.rep(), &destination, 8, std::iter::once(7))
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn rank_one_selection_logits_refuse_quota_and_keep_failed_sources_tainted() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            ..
+        } = state_slot_fixture(CpuBackend::new());
+        let source = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let expected = f32_bytes(&[-7.0, -1.0, 0.0, 1.0, 3.0, 2.0, 4.0]);
+        host.write(&source, &expected).unwrap();
+        host.stage_selection_logits(&pool, &source, 1, std::iter::once(0))
+            .await
+            .unwrap();
+        let handle = host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks[0]
+            .logits;
+        let destination = Resource::new_borrow(handle);
+        assert_eq!(
+            host.prepare_read(&destination)
+                .unwrap()
+                .run()
+                .await
+                .unwrap(),
+            expected
+        );
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(matches!(
+            host.stage_selection_logits(&pool, &source, 1, std::iter::once(0))
+                .await,
+            Err(compute::Error::Quota(_))
+        ));
+        host.limits = GENEROUS;
+        let fail = |host: &Host<CpuBackend>, tensor: &Resource<TensorEntry>| {
+            let buffer = host.entry(tensor).unwrap().tensor.buffer();
+            let mut access = super::SubmissionAccess::default();
+            access.writes.insert(buffer);
+            assert!(
+                host.taints
+                    .begin(&access)
+                    .unwrap()
+                    .finish::<()>(Err(BackendError::ExecutionFailed), true, Duration::ZERO)
+                    .is_err()
+            );
+            buffer
+        };
+        let buffer = fail(&host, &source);
+        assert!(
+            host.stage_selection_logits(&pool, &source, 1, std::iter::once(0))
+                .await
+                .is_err()
+        );
+        assert!(host.taints.check(buffer).is_err());
+        assert_eq!(
+            host.prepare_read(&destination)
+                .unwrap()
+                .run()
+                .await
+                .unwrap(),
+            expected
+        );
+        let buffer = fail(&host, &destination);
+        assert!(
+            host.stage_selection_logits(&pool, &destination, 1, std::iter::once(0))
+                .await
+                .is_err()
+        );
+        assert!(host.taints.check(buffer).is_err());
+        assert_eq!(
+            host.backend
+                .read(&host.entry(&destination).unwrap().tensor)
+                .unwrap(),
+            expected
         );
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
