@@ -107,7 +107,22 @@ impl Engine for Qwen38 {
             max_context: 262_144,
             tap_layers: (1..=c.layers).collect(),
             router_layers: Vec::new(),
-            serving: None,
+            serving: Some(forja_sdk::ServingInfo {
+                page_tokens: 64,
+                active_lanes: 8,
+                max_context: 262_144,
+                prefill_chunk_multiple: None,
+                batch_shapes: Self::serving_shapes(),
+                planes: (0..c.layers / c.attention_interval)
+                    .flat_map(|layer| {
+                        ["key", "value"].map(move |kind| forja_sdk::CachePlane {
+                            elements_per_token: u64::from(c.kv_heads * c.head_dim),
+                            alignment: 256,
+                            label: format!("layer-{layer}-{kind}"),
+                        })
+                    })
+                    .collect(),
+            }),
         }
     }
     fn load(weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self> {

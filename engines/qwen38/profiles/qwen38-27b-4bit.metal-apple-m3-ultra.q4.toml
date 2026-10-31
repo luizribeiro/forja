@@ -25,16 +25,18 @@ kv-cache = "f16"
 kind = "causal-lm"
 batch = 1
 max-context = 32768
-prefill-chunk = 64
+prefill-chunk = 2048
 
 [serving]
-prompt-token-budget = 64
-paged-cache = false
+prompt-token-budget = 2048
+paged-cache = true
 
 [variants.fixed]
 quant = "quant-matmul.portable"
 attention = "sdpa.vector-256-two-pass"
 sample = "sample.parallel"
+"paged-attention.prefill" = "paged-sdpa.steel-half-256"
+"paged-attention.decode" = "paged-sdpa.vector-256-two-pass"
 delta-prefill = "delta-rule-block.wy64-mma-v32"
 
 [quantization]

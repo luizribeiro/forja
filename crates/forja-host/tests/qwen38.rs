@@ -338,7 +338,7 @@ fn eager_engine_feedback_matches_explicit_tokens() -> Result<(), Box<dyn Error>>
             })
             .is_err()
     );
-    assert!(qwen38::Qwen38::describe().serving.is_none());
+    assert!(qwen38::Qwen38::describe().serving.is_some());
     Ok(())
 }
 
@@ -350,13 +350,13 @@ mod metal;
 mod execution;
 
 #[test]
-fn component_metadata_declares_the_text_only_single_lane_contract() -> Result<(), Box<dyn Error>> {
+fn component_metadata_declares_the_text_only_batched_contract() -> Result<(), Box<dyn Error>> {
     use forja_sdk::Engine;
     let profile = forja_config::read_profile(&std::fs::read(test_guests::qwen38())?)?;
     assert_eq!(profile.family(), "qwen38");
     assert_eq!(profile.workload().max_context.get(), 32768);
     assert!(
-        !profile
+        profile
             .serving()
             .ok_or("missing serving settings")?
             .paged_cache
@@ -364,7 +364,31 @@ fn component_metadata_declares_the_text_only_single_lane_contract() -> Result<()
     let info = qwen38::Qwen38::describe();
     assert_eq!(info.vocab, 248_320);
     assert_eq!(info.tap_layers.len(), 64);
-    assert!(info.serving.is_none());
+    let serving = info.serving.ok_or("missing serving geometry")?;
+    assert_eq!(
+        (
+            serving.page_tokens,
+            serving.active_lanes,
+            serving.planes.len()
+        ),
+        (64, 8, 32)
+    );
+    assert!(
+        serving
+            .planes
+            .iter()
+            .all(|plane| plane.elements_per_token == 1024 && plane.alignment == 256)
+    );
+    assert_eq!(serving.batch_shapes.len(), 15);
+    assert_eq!(profile.workload().prefill_chunk.get(), 2048);
+    assert_eq!(
+        profile
+            .serving()
+            .ok_or("missing serving settings")?
+            .prompt_token_budget
+            .get(),
+        2048
+    );
     Ok(())
 }
 
