@@ -1,10 +1,11 @@
 //! Minimal engine component exported through the SDK macro.
 
 use forja_sdk::{
-    BatchInput, BatchPhase, BatchSelection, BatchShape, BeginDecodeInput, CachePlane, DecodeInput,
-    DecodeOutput, Dim, Engine, EngineInfo, EngineLoadConfig, Graph, KvCacheFormat, PagedCacheSet,
-    PagedPool, Param, Result, ServingInfo, StepInput, StepOutput, Tensor, Weights, export_engine,
-    nn::blocks::ChunkedPrefill, target::metal::Variant,
+    BatchInput, BatchOutput, BatchPhase, BatchSelectInput, BatchSelection, BatchShape,
+    BeginDecodeInput, CachePlane, DecodeInput, DecodeOutput, Dim, Engine, EngineInfo,
+    EngineLoadConfig, Graph, KvCacheFormat, PagedCacheSet, PagedPool, Param, Result, ServingInfo,
+    StepInput, StepOutput, Tensor, Weights, export_engine, nn::blocks::ChunkedPrefill,
+    target::metal::Variant,
 };
 
 const MAX_CONTEXT: u32 = 1_024;
@@ -161,6 +162,32 @@ impl Engine for ConstantEngine {
         }
         forja_sdk::eval()?;
         inputs.logits.narrow(0, 0, input.shape.bucket)
+    }
+
+    fn batch_select(&mut self, input: BatchSelectInput<'_>) -> Result<BatchOutput> {
+        let inputs = input
+            .slot
+            .tensors()?
+            .inputs
+            .ok_or_else(|| forja_sdk::Error::loading("selection inputs are missing"))?;
+        for (lane, active) in input.lanes.iter().enumerate() {
+            if let Some(active) = active {
+                let lane = u32::try_from(lane)
+                    .map_err(|_| forja_sdk::Error::loading("lane exceeds u32"))?;
+                let selected = inputs.logits.narrow(0, lane, 1)?.sample_masked(
+                    &inputs.sampling.narrow(0, lane, 1)?.reshape(&[5])?,
+                    &inputs.allow.narrow(0, lane, 1)?.reshape(&[1])?,
+                    active.start_pos,
+                )?;
+                selected.copy_into(&mut inputs.selected.narrow(0, lane, 1)?)?;
+                input.slot.store_feedback(lane, &selected)?;
+            }
+        }
+        forja_sdk::eval()?;
+        Ok(BatchOutput {
+            logits: inputs.logits.narrow(0, 0, input.shape.bucket)?,
+            tokens: inputs.selected.narrow(0, 0, input.shape.bucket)?,
+        })
     }
 
     fn finish_decode(

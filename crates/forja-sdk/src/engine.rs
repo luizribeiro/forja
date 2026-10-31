@@ -259,7 +259,8 @@ pub struct BatchSelectInput<'a> {
     pub slot: PagedSlot<'a>,
     /// Exact declared graph shape selected by the host.
     pub shape: BatchShape,
-    /// Bucket-shaped logits produced by forward-only execution.
+    /// Bucket-shaped logits, or one supplied row when exactly one physical lane is selected.
+    /// Stateful engines read the host-staged physical rows through the slot inputs.
     pub logits: &'a Tensor<f32>,
     /// Bucket-sized lane list; `None` denotes inert padding.
     pub lanes: Vec<Option<BatchSelectLane>>,

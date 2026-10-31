@@ -277,8 +277,20 @@ fn engine_batch_exports() -> proc_macro2::TokenStream {
         ) -> ::std::result::Result<BatchOut, compute::Error> {
             let vocab = <ExportedEngine as ::forja_sdk::Engine>::describe().vocab;
             let shape = batch_shape(input.shape);
-            let logits = logits.view(&compute::ViewOp::Reshape(vec![shape.bucket, vocab]))?;
-            let logits = ::forja_sdk::Tensor::from_guest(logits, vec![shape.bucket, vocab]);
+            let dimensions = vec![shape.bucket, vocab];
+            let elements = u64::from(shape.bucket).checked_mul(u64::from(vocab))
+                .ok_or_else(|| compute::Error::Layout("batch logits element count overflowed".into()))?;
+            let single_lane_mismatch = format!("reshape cannot change element count from {vocab} to {elements}");
+            let (logits, dimensions) = match logits.view(&compute::ViewOp::Reshape(dimensions.clone())) {
+                Ok(logits) => (logits, dimensions),
+                Err(compute::Error::Layout(message))
+                    if message == single_lane_mismatch && input.lanes.iter().flatten().count() == 1 => {
+                    let dimensions = vec![1, vocab];
+                    (logits.view(&compute::ViewOp::Reshape(dimensions.clone()))?, dimensions)
+                }
+                Err(error) => return Err(error),
+            };
+            let logits = ::forja_sdk::Tensor::from_guest(logits, dimensions);
             let lanes = input.lanes.into_iter().map(|lane| lane.map(|lane| {
                 ::forja_sdk::BatchSelectLane {
                     start_pos: lane.start_pos,

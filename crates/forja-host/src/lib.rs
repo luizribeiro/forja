@@ -1933,6 +1933,24 @@ where
         logits: EngineTensor,
         input: EngineBatchSelect,
     ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
+        let active = input
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(lane, value)| value.as_ref().map(|value| (lane, value.start_pos)));
+        let attempt = match self.begin_selection_attempt(active) {
+            Ok(attempt) => attempt,
+            Err(error) => return Ok(Err(error)),
+        };
+        let result = self.batch_select_work(logits, input).await;
+        self.finish_selection_attempt(attempt, result)
+    }
+
+    async fn batch_select_work(
+        &mut self,
+        logits: EngineTensor,
+        input: EngineBatchSelect,
+    ) -> wasmtime::Result<Result<EngineBatchOutput, compute::Error>> {
         if logits.runner_id != self.id {
             return Ok(Err(invalid_handle(
                 "engine tensor belongs to another runner",
@@ -14280,6 +14298,68 @@ mod tests {
         fs::remove_file(weights).unwrap();
     }
 
+    async fn assert_batched_selection_subset<B: Backend + Send + Sync + 'static>(
+        runner: &mut EngineRunner<B>,
+        slot: u32,
+        shape: BatchShape,
+    ) {
+        let source = runner
+            .store
+            .data_mut()
+            .alloc(compute::Dtype::F32, &[1, 4])
+            .unwrap();
+        runner
+            .store
+            .data_mut()
+            .write(
+                &source,
+                &[100.0_f32, 3.0, 4.0, 2.0].map(f32::to_ne_bytes).concat(),
+            )
+            .unwrap();
+        let source = super::EngineTensor {
+            handle: source.rep(),
+            runner_id: runner.id,
+        };
+        for (pass, lane) in [1, 0].into_iter().enumerate() {
+            let mut lanes = vec![None; 2];
+            lanes[lane] = Some(EngineBatchSelectLane {
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+                allow: vec![1, 2],
+            });
+            let output = runner
+                .batch_select(
+                    &source,
+                    EngineBatchSelect {
+                        shape: BatchShape {
+                            selection: BatchSelection::Masked,
+                            ..shape
+                        },
+                        lanes,
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let selected = runner.read(&output.tokens).await.unwrap();
+            assert_eq!(&selected[lane * 4..lane * 4 + 4], 2_u32.to_ne_bytes());
+            let host = runner.store.data();
+            assert_eq!(
+                host.table
+                    .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+                    .unwrap()
+                    .active_bank,
+                (pass + 1) % 2
+            );
+            for peer in 0..2 {
+                let position = host.state_slots[&slot].position(peer).unwrap();
+                assert_eq!(position.tokens, 1);
+                assert_eq!(position.grammar, u64::from(peer == 1 || pass == 1));
+            }
+        }
+        runner.discard_tensor(&source).unwrap();
+    }
+
     async fn assert_batched_selection_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
         let weights = test_weight_file();
         let mut runner =
@@ -14338,6 +14418,7 @@ mod tests {
                 .unwrap();
             assert_eq!((position.tokens, position.grammar), (1, 0));
         }
+        assert_batched_selection_subset(&mut runner, slot, shape).await;
         fs::remove_file(weights).unwrap();
     }
 
