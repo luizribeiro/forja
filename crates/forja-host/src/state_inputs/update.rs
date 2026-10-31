@@ -149,7 +149,12 @@ impl<B: Backend + 'static> Host<B> {
             explicit,
             prompt,
             allow,
-        )
+        )?;
+        bank.prompt_phase.store(
+            phase == BatchPhase::Prompt,
+            std::sync::atomic::Ordering::Release,
+        );
+        Ok(())
     }
 
     fn write_state_input_words(

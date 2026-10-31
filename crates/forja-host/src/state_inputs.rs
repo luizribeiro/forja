@@ -2,11 +2,13 @@ mod recovery;
 mod update;
 
 use crate::{Backend, Host, compute, invalid_handle, paged_storage};
+use std::sync::atomic::AtomicBool;
 
 // Table ownership and cloned layouts remain live until the scalar allocation retires.
 const FEEDBACK_REFERENCE_BYTES: u64 = 1024;
 
 pub(crate) struct StateInputBank {
+    pub(crate) prompt_phase: AtomicBool,
     pub(crate) sampling: u32,
     pub(crate) tokens: u32,
     pub(crate) explicit: u32,
@@ -180,6 +182,7 @@ impl<B: Backend + 'static> Host<B> {
             };
             let mut bank = || {
                 Ok::<_, compute::Error>(StateInputBank {
+                    prompt_phase: AtomicBool::new(false),
                     sampling: alloc(compute::Dtype::U32, &[lanes, 5])?,
                     tokens: alloc(compute::Dtype::U32, &[lanes])?,
                     explicit: alloc(compute::Dtype::U32, &[lanes])?,

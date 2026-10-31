@@ -10397,6 +10397,19 @@ mod tests {
         host.table.get_mut(&slot).unwrap().active_bank = 1;
         host.write_state_batch_inputs(pool.rep(), &input).unwrap();
         assert_eq!(read(&host, prompt), before);
+        input.shape.phase = BatchPhase::Decode;
+        input.lanes[0].as_mut().unwrap().tokens = Some(vec![2]);
+        host.write_state_batch_inputs(pool.rep(), &input).unwrap();
+        let banks = &host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks;
+        assert!(banks[0].prompt_phase.load(Ordering::Acquire));
+        assert!(!banks[1].prompt_phase.load(Ordering::Acquire));
     }
 
     #[test]
