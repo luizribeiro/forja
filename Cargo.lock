@@ -917,6 +917,10 @@ name = "forja-program-conversions"
 version = "0.0.0"
 
 [[package]]
+name = "forja-sampling"
+version = "0.0.0"
+
+[[package]]
 name = "forja-sdk"
 version = "0.0.0"
 dependencies = [
