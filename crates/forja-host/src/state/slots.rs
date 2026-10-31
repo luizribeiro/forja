@@ -25,6 +25,14 @@ pub struct StateSlots<B: Backend> {
 }
 
 impl<B: Backend> StateSlots<B> {
+    /// Allocates independent poisoned lane bindings for a graph trace.
+    ///
+    /// # Errors
+    /// Refuses metadata or backend allocation beyond the existing storage budget.
+    pub fn trace(&self) -> Result<super::StateTrace<B>, compute::Error> {
+        super::StateTrace::new(&self.storage, self.inactive_access, self.lanes.len())
+    }
+
     pub(crate) fn plane_count(&self) -> usize {
         self.storage.planes.len()
     }
