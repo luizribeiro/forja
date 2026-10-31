@@ -63,9 +63,14 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         cell.set_profile_context(profile.is_some(), scope);
         let mut access = SubmissionAccess::default();
         access.record(inputs, std::slice::from_ref(output));
+        let order = taints
+            .queue
+            .lock()
+            .map_err(|_| guest_error(BackendError::ExecutionFailed))?;
         let flight = taints.begin(&access).map_err(guest_error)?;
         let started = Instant::now();
         let result = run(cell, limits);
+        drop(order);
         let submitted = cell.was_submitted();
         crate::record_submission_profile(profile.as_ref(), cell.take_profile());
         let outcome = flight.finish(
@@ -464,7 +469,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .tainted
-                    .insert(id, BackendError::ExecutionFailed);
+                    .insert(id, (0, BackendError::ExecutionFailed));
             } else {
                 control.failure.store(2, Ordering::Release);
             }

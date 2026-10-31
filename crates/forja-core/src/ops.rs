@@ -136,6 +136,12 @@ impl Tensor {
         self.writable
     }
 
+    /// Reports whether a dense write through this view initializes the entire allocation.
+    #[must_use]
+    pub fn covers_allocation(&self) -> bool {
+        self.layout.is_contiguous() && self.layout.byte_span() == (0..self.buffer.byte_len())
+    }
+
     /// Lends the same validated extent without granting write access.
     #[must_use]
     pub fn read_only(&self) -> Self {

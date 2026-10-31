@@ -7515,6 +7515,7 @@ impl PagedUse {
 
 #[derive(Clone, Debug, Default)]
 struct SubmissionAccess {
+    initialized: HashSet<BufferId>,
     reads: HashSet<BufferId>,
     writes: HashSet<BufferId>,
 }
@@ -7526,30 +7527,49 @@ impl SubmissionAccess {
         inputs: &[TensorEntry],
         outputs: &[TensorEntry],
     ) {
-        self.record(inputs, outputs);
+        self.record_conditional(inputs, outputs);
         if template_operation_kind(operation) == forja_core::OperationKind::PagedSdpaAppend {
             self.reads
                 .extend(outputs.iter().skip(1).map(|entry| entry.tensor.buffer()));
         }
     }
 
-    fn record(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
-        self.reads
-            .extend(inputs.iter().map(|entry| entry.tensor.buffer()));
+    fn record_conditional(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
+        self.record(inputs, &[]);
         self.writes
             .extend(outputs.iter().map(|entry| entry.tensor.buffer()));
+    }
+
+    fn record(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
+        self.reads.extend(
+            inputs
+                .iter()
+                .map(|entry| entry.tensor.buffer())
+                .filter(|buffer| !self.initialized.contains(buffer)),
+        );
+        self.writes
+            .extend(outputs.iter().map(|entry| entry.tensor.buffer()));
+        self.initialized.extend(
+            outputs
+                .iter()
+                .filter(|entry| entry.symbolic.is_none() && entry.tensor.covers_allocation())
+                .map(|entry| entry.tensor.buffer()),
+        );
     }
 }
 
 #[derive(Debug, Default)]
 struct BufferTaints {
+    queue: Mutex<()>,
     state: Mutex<BufferTaintState>,
 }
 
 #[derive(Debug, Default)]
 struct BufferTaintState {
-    tainted: HashMap<BufferId, BackendError>,
-    pending_writes: HashMap<BufferId, Vec<Weak<SubmissionOutcome>>>,
+    tainted: HashMap<BufferId, (u64, BackendError)>,
+    initialized: HashMap<BufferId, u64>,
+    serial: u64,
+    pending_writes: HashMap<BufferId, Vec<(u64, Weak<SubmissionOutcome>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -7599,19 +7619,26 @@ impl BufferTaints {
         if let Some(error) = access
             .reads
             .iter()
-            .find_map(|buffer| state.tainted.get(buffer).copied())
+            .find_map(|buffer| state.tainted.get(buffer).map(|(_, error)| *error))
         {
             return Err(error);
         }
+        let serial = state
+            .serial
+            .checked_add(1)
+            .ok_or(BackendError::ExecutionFailed)?;
+        state.serial = serial;
         let mut seen = HashSet::new();
         let mut dependencies = Vec::new();
         for buffer in &access.reads {
+            let initialized = state.initialized.get(buffer).copied().unwrap_or(0);
             if let Some(pending) = state.pending_writes.get_mut(buffer) {
-                pending.retain(|outcome| outcome.strong_count() != 0);
+                pending.retain(|(_, outcome)| outcome.strong_count() != 0);
                 dependencies.extend(
                     pending
                         .iter()
-                        .filter_map(Weak::upgrade)
+                        .filter(|(serial, _)| *serial > initialized)
+                        .filter_map(|(_, outcome)| outcome.upgrade())
                         .filter(|outcome| seen.insert(Arc::as_ptr(outcome) as usize)),
                 );
             }
@@ -7622,9 +7649,11 @@ impl BufferTaints {
                 .pending_writes
                 .entry(*buffer)
                 .or_default()
-                .push(Arc::downgrade(&outcome));
+                .push((serial, Arc::downgrade(&outcome)));
         }
         Ok(TaintFlight {
+            serial,
+            initialized: access.initialized.iter().copied().collect(),
             owner: Arc::clone(self),
             outcome,
             dependencies,
@@ -7639,14 +7668,19 @@ impl BufferTaints {
                 .state
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
-            if let Some(error) = state.tainted.get(&buffer) {
+            if let Some((_, error)) = state.tainted.get(&buffer) {
                 return Err(*error);
             }
+            let initialized = state.initialized.get(&buffer).copied().unwrap_or(0);
             let Some(pending) = state.pending_writes.get_mut(&buffer) else {
                 return Ok(());
             };
-            pending.retain(|outcome| outcome.strong_count() != 0);
-            pending.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+            pending.retain(|(_, outcome)| outcome.strong_count() != 0);
+            pending
+                .iter()
+                .filter(|(serial, _)| *serial > initialized)
+                .filter_map(|(_, outcome)| outcome.upgrade())
+                .collect::<Vec<_>>()
         };
         for outcome in pending {
             outcome.wait(timeout)?;
@@ -7656,7 +7690,7 @@ impl BufferTaints {
             .map_err(|_| BackendError::ExecutionFailed)?
             .tainted
             .get(&buffer)
-            .copied()
+            .map(|(_, error)| *error)
             .map_or(Ok(()), Err)
     }
 
@@ -7666,19 +7700,22 @@ impl BufferTaints {
             .map_err(|_| BackendError::ExecutionFailed)?
             .tainted
             .get(&buffer)
-            .copied()
+            .map(|(_, error)| *error)
             .map_or(Ok(()), Err)
     }
 
     fn release(&self, buffer: BufferId) {
         if let Ok(mut state) = self.state.lock() {
             state.tainted.remove(&buffer);
+            state.initialized.remove(&buffer);
             state.pending_writes.remove(&buffer);
         }
     }
 }
 
 struct TaintFlight {
+    serial: u64,
+    initialized: Vec<BufferId>,
     owner: Arc<BufferTaints>,
     outcome: Arc<SubmissionOutcome>,
     dependencies: Vec<Arc<SubmissionOutcome>>,
@@ -7713,32 +7750,48 @@ impl TaintFlight {
         timeout: Duration,
     ) -> Result<T, BackendError> {
         result = self.check_dependencies(result, timeout);
-        if committed
-            && let Err(error) = result
-            && let Ok(mut state) = self.owner.state.lock()
-        {
-            for buffer in &self.writes {
-                state.tainted.entry(*buffer).or_insert(error);
-            }
+        if committed {
+            self.record_result(result.as_ref().map(|_| ()).map_err(|error| *error));
         }
         self.outcome
             .complete(result.as_ref().map(|_| ()).map_err(|error| *error));
         self.finished = true;
         result
     }
+    fn record_result(&self, result: Result<(), BackendError>) {
+        if let Ok(mut state) = self.owner.state.lock() {
+            if result.is_ok() {
+                for buffer in &self.initialized {
+                    let initialized = state.initialized.entry(*buffer).or_default();
+                    *initialized = (*initialized).max(self.serial);
+                    if state
+                        .tainted
+                        .get(buffer)
+                        .is_some_and(|(serial, _)| *serial <= self.serial)
+                    {
+                        state.tainted.remove(buffer);
+                    }
+                }
+            } else if let Err(error) = result {
+                for buffer in &self.writes {
+                    if state.initialized.get(buffer).copied().unwrap_or(0) < self.serial
+                        && state
+                            .tainted
+                            .get(buffer)
+                            .is_none_or(|(serial, _)| *serial < self.serial)
+                    {
+                        state.tainted.insert(*buffer, (self.serial, error));
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for TaintFlight {
     fn drop(&mut self) {
         if !self.finished {
-            if let Ok(mut state) = self.owner.state.lock() {
-                for buffer in &self.writes {
-                    state
-                        .tainted
-                        .entry(*buffer)
-                        .or_insert(BackendError::ExecutionFailed);
-                }
-            }
+            self.record_result(Err(BackendError::ExecutionFailed));
             self.outcome.complete(Err(BackendError::ExecutionFailed));
         }
     }
@@ -7931,24 +7984,28 @@ where
                 taints,
                 profile,
             } = self;
-            let submitted = match reservation {
-                Err(error) => Err(error),
-                Ok(reservation) => match taints.begin(&access) {
+            let submitted = taints
+                .queue
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)
+                .and_then(|_order| match reservation {
                     Err(error) => Err(error),
-                    Ok(taint) => match hybrid::SubmittedWork::<B>::queue(
-                        state_batch,
-                        state_owners,
-                        |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
-                    ) {
-                        Err(error) => Err(taint.refuse(error, timeout)),
-                        Ok(submission) => {
-                            let serial = submission.backend().completion_serial();
-                            let marked = PagedUse::mark_all(&paged, serial);
-                            Ok((submission, reservation, taint, serial, marked))
-                        }
+                    Ok(reservation) => match taints.begin(&access) {
+                        Err(error) => Err(error),
+                        Ok(taint) => match hybrid::SubmittedWork::<B>::queue(
+                            state_batch,
+                            state_owners,
+                            |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
+                        ) {
+                            Err(error) => Err(taint.refuse(error, timeout)),
+                            Ok(submission) => {
+                                let serial = submission.backend().completion_serial();
+                                let marked = PagedUse::mark_all(&paged, serial);
+                                Ok((submission, reservation, taint, serial, marked))
+                            }
+                        },
                     },
-                },
-            };
+                });
             let (submission, reservation, taint, serial, marked) = match submitted {
                 Ok(submitted) => {
                     publish_queued_submission(&queued_submissions, started);
@@ -9766,7 +9823,7 @@ mod tests {
             .lock()
             .unwrap()
             .tainted
-            .insert(input_buffer, BackendError::ExecutionFailed);
+            .insert(input_buffer, (0, BackendError::ExecutionFailed));
         assert!(host.prepare_submit(commands).unwrap().run().await.is_err());
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
         host.taints
@@ -13443,6 +13500,77 @@ mod tests {
         assert_eq!(runner.read(&output.logits).await.unwrap().len(), 16);
         drop(runner);
         fs::remove_file(weights).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_scratch_initialization_recovers_a_failed_graph() {
+        let gate = Arc::new(SubmitGate::default());
+        let mut host = Host::new(
+            AccountingBackend::failing_nth(Arc::clone(&gate), 1),
+            GENEROUS,
+        );
+        let source = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let scratch = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let sink = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let bytes = [3.0_f32; 7]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        host.write(&source, &bytes).unwrap();
+        let commands = host.command_list().unwrap();
+        for (input, output) in [(&source, &scratch), (&scratch, &sink)] {
+            host.dispatch(
+                &commands,
+                compute::Op::Copy,
+                &[Resource::new_borrow(input.rep())],
+                output,
+            )
+            .unwrap();
+        }
+        let graph = host.create_graph(commands).unwrap();
+        let failed = tokio::spawn(host.prepare_replay(&graph, Vec::new()).unwrap().run());
+        gate.wait_for(1);
+        gate.release();
+        assert!(failed.await.unwrap().is_err());
+        assert!(host.prepare_read(&scratch).unwrap().run().await.is_err());
+        host.prepare_replay(&graph, Vec::new())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            host.prepare_read(&sink).unwrap().run().await.unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn successful_overwrite_survives_an_older_late_failure() {
+        let taints = Arc::new(super::BufferTaints::default());
+        let buffer = BufferId::new(1, 1, 4);
+        let mut access = super::SubmissionAccess::default();
+        access.writes.insert(buffer);
+        access.initialized.insert(buffer);
+        let first = taints.begin(&access).unwrap();
+        let outcome = Arc::clone(&first.outcome);
+        let second = taints.begin(&access).unwrap();
+        second.finish(Ok(()), true, Duration::ZERO).unwrap();
+        assert!(
+            first
+                .finish::<()>(Err(BackendError::ExecutionFailed), true, Duration::ZERO)
+                .is_err()
+        );
+        assert_eq!(
+            outcome.wait(Duration::ZERO),
+            Err(BackendError::ExecutionFailed)
+        );
+        taints.wait_for_writes(buffer, Duration::ZERO).unwrap();
+        access.reads.insert(buffer);
+        taints
+            .begin(&access)
+            .unwrap()
+            .finish(Ok(()), true, Duration::ZERO)
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
