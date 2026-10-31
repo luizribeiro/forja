@@ -4676,6 +4676,14 @@ impl<B: Backend + 'static> Host<B> {
         let lane_index = usize::try_from(lane)
             .map_err(|_| compute::Error::Layout("paged lane exceeds usize".to_owned()))?;
         let used = binding.lane(lane_index)?.used.load(Ordering::Acquire);
+        if self
+            .state_slots
+            .get(&slot_rep)
+            .is_some_and(|state| state.has_unsubmitted_update(lane_index))
+        {
+            self.rollback_paged_lane_append(pool_rep, lane, checkpoint)?;
+            return Err(invalid_handle("protected carry update was not submitted"));
+        }
         if used {
             Ok(Some(checkpoint))
         } else {
@@ -10983,6 +10991,66 @@ mod tests {
     #[tokio::test]
     async fn metal_captured_selection_rebinds_banks_without_retaining_requests() {
         assert_captured_selection(forja_metal::MetalBackend::new().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn paged_only_append_refuses_unsubmitted_carry_and_restores_both_boundaries() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture(CpuBackend::new());
+        host.drain_slot_state(slot.rep(), 0).unwrap();
+        for complete in [false, true] {
+            let checkpoint = host
+                .begin_paged_lane_append(pool.rep(), 0, 0, 1)
+                .unwrap()
+                .0
+                .unwrap();
+            let commands = host.command_list().unwrap();
+            record_paged_rows(
+                &mut host,
+                &commands,
+                (&slot, 0),
+                (wit_affine(None, 0, 0), 1),
+                paged_storage::CopyDirection::IntoPages,
+                None,
+            )
+            .await
+            .unwrap();
+            if complete {
+                host.record_slot_state(
+                    &commands,
+                    &slot,
+                    0,
+                    0,
+                    paged_storage::StateOperation::CausalConvolution,
+                    &operands,
+                    &output,
+                    "",
+                )
+                .unwrap();
+            }
+            host.prepare_submit(commands).unwrap().run().await.unwrap();
+            let result = host.finish_paged_lane_append(pool.rep(), 0, checkpoint);
+            assert_eq!(result.is_ok(), complete);
+            let expected = u64::from(complete);
+            assert_eq!(
+                host.state_slots[&slot.rep()].position(0).unwrap().tokens,
+                expected
+            );
+            assert_eq!(
+                host.paged_lane_prefix(pool.rep(), 0)
+                    .unwrap()
+                    .sequence
+                    .lock()
+                    .unwrap()
+                    .logical_len(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

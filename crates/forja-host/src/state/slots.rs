@@ -440,6 +440,12 @@ impl<B: Backend> StateSlots<B> {
         StateBatch::new(bank.iter_mut().filter_map(Option::take).collect())
     }
 
+    pub(crate) fn has_unsubmitted_update(&self, lane: usize) -> bool {
+        self.banks
+            .iter()
+            .any(|bank| bank.get(lane).is_some_and(Option::is_some))
+    }
+
     pub(crate) fn cancel_lane(&mut self, bank: usize, lane: usize) -> Result<(), compute::Error> {
         *self
             .selections
