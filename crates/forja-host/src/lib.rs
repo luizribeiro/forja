@@ -7649,26 +7649,75 @@ impl SubmissionAccess {
     }
 
     fn record_conditional(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
-        self.record(inputs, &[]);
-        self.writes
-            .extend(outputs.iter().map(|entry| entry.tensor.buffer()));
+        self.record_tensors(
+            inputs.iter().map(|entry| &entry.tensor),
+            outputs.iter().map(|entry| (&entry.tensor, false)),
+        );
     }
 
     fn record(&mut self, inputs: &[TensorEntry], outputs: &[TensorEntry]) {
-        self.reads.extend(
-            inputs
-                .iter()
-                .map(|entry| entry.tensor.buffer())
-                .filter(|buffer| !self.initialized.contains(buffer)),
-        );
-        self.writes
-            .extend(outputs.iter().map(|entry| entry.tensor.buffer()));
-        self.initialized.extend(
+        self.record_tensors(
+            inputs.iter().map(|entry| &entry.tensor),
             outputs
                 .iter()
-                .filter(|entry| entry.symbolic.is_none() && entry.tensor.covers_allocation())
-                .map(|entry| entry.tensor.buffer()),
+                .map(|entry| (&entry.tensor, entry.symbolic.is_none())),
         );
+    }
+
+    fn record_tensors<'a>(
+        &mut self,
+        inputs: impl Iterator<Item = &'a Tensor>,
+        outputs: impl Iterator<Item = (&'a Tensor, bool)>,
+    ) {
+        for tensor in inputs {
+            if !self.initialized.contains(&tensor.buffer()) {
+                self.reads.insert(tensor.buffer());
+            }
+        }
+        for (tensor, definite) in outputs {
+            self.writes.insert(tensor.buffer());
+            if definite && tensor.covers_allocation() {
+                self.initialized.insert(tensor.buffer());
+            }
+        }
+    }
+
+    fn from_commands(commands: &CommandList, retained: &[TensorEntry]) -> Self {
+        let visible = retained
+            .iter()
+            .map(|entry| entry.tensor.buffer())
+            .collect::<HashSet<_>>();
+        let mut access = Self::default();
+        for dispatch in commands.dispatches() {
+            let (inputs, outputs, definite) = match dispatch.op() {
+                Op::State(_) => (dispatch.inputs().len().saturating_sub(4), 1, true),
+                Op::PagedCopy {
+                    direction: PagedCopyDirection::IntoPages,
+                    ..
+                } => (1, 0, false),
+                Op::PagedCopy {
+                    direction: PagedCopyDirection::OutOfPages,
+                    ..
+                } => (0, 1, false),
+                Op::PagedSdpa { .. } => (1, 1, false),
+                Op::PagedSdpaAppend { .. } => (3, 1, false),
+                _ => (usize::MAX, usize::MAX, true),
+            };
+            access.record_tensors(
+                dispatch
+                    .inputs()
+                    .iter()
+                    .take(inputs)
+                    .filter(|tensor| visible.contains(&tensor.buffer())),
+                dispatch
+                    .outputs()
+                    .iter()
+                    .take(outputs)
+                    .filter(|tensor| visible.contains(&tensor.buffer()))
+                    .map(|tensor| (tensor, definite)),
+            );
+        }
+        access
     }
 }
 
@@ -10080,6 +10129,84 @@ mod tests {
         assert_eq!(other.slot.rep(), slot.rep());
         assert!(capture.validate(&other.host, false).is_err());
         assert!(host.prepare_submit(commands).is_err());
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_slot_replays_taint_the_current_bank_and_recover_after_drain() {
+        let mut backend = AccountingBackend::new(None, None, Duration::ZERO);
+        backend.fail_submission = Some(1);
+        let StateSlotFixture {
+            mut host,
+            slot,
+            pool,
+            ..
+        } = state_slot_fixture(backend);
+        let (tokens, selected) = {
+            let banks = &host
+                .table
+                .get(&slot)
+                .unwrap()
+                .inputs
+                .as_ref()
+                .unwrap()
+                .banks;
+            (
+                [banks[0].tokens, banks[1].tokens],
+                [banks[0].selected, banks[1].selected],
+            )
+        };
+        for (handle, value) in tokens.into_iter().zip([3_u32, 17]) {
+            host.write(&Resource::new_borrow(handle), &value.to_ne_bytes())
+                .unwrap();
+        }
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(tokens[0])],
+            &Resource::new_borrow(selected[0]),
+        )
+        .unwrap();
+        let graph = host.create_graph(commands).unwrap();
+        host.table.get_mut(&slot).unwrap().active_bank = 1;
+        for failed in [true, false] {
+            if !failed {
+                host.write_state_single_inputs(
+                    pool.rep(),
+                    BatchPhase::Decode,
+                    Some(&[17]),
+                    SamplingParams::default(),
+                )
+                .unwrap();
+            }
+            let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+            let result = host
+                .prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .unwrap()
+                .run()
+                .await;
+            assert_eq!(result.is_err(), failed);
+            let bytes = host
+                .prepare_read(&Resource::new_borrow(selected[1]))
+                .unwrap()
+                .run()
+                .await;
+            if failed {
+                assert!(bytes.is_err());
+            } else {
+                assert_eq!(bytes.unwrap(), 17_u32.to_ne_bytes());
+            }
+            assert_eq!(
+                host.prepare_read(&Resource::new_borrow(selected[0]))
+                    .unwrap()
+                    .run()
+                    .await
+                    .unwrap(),
+                0_u32.to_ne_bytes()
+            );
+        }
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 

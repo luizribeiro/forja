@@ -553,14 +553,14 @@ impl<B: Backend + 'static> Host<B> {
         if let Some(capture) = &entry.slot_capture {
             capture.validate(self, !entry.captured_state.is_empty())?;
         }
-        if entry.captured_state.is_empty() {
+        if entry.captured_state.is_empty() && entry.slot_capture.is_none() {
             return self.prepare_replay_with_flight(resource, values, flight);
         }
         let snapshot = self.reserve_references(entry.retained.len())?;
         let mut retained = entry.retained.clone();
-        let (graph, access, captures, mut paged, mut checks) = (
+        let scope = entry.slot_capture.clone();
+        let (graph, captures, mut paged, mut checks) = (
             std::sync::Arc::clone(&entry.graph),
-            entry.access.clone(),
             entry.captured_state.clone(),
             entry.paged.clone(),
             entry.paged_bounds.clone(),
@@ -568,7 +568,26 @@ impl<B: Backend + 'static> Host<B> {
         let checked = graph
             .values(values.clone())
             .map_err(|error| crate::graph_error(&error))?;
-        let bound = self.bind_graph_state(&captures)?;
+        let mut bound = self.bind_graph_state(&captures)?;
+        if captures.is_empty()
+            && let Some(scope) = scope
+        {
+            let slot = self
+                .table
+                .get(&Resource::<crate::BatchSlotEntry>::new_borrow(scope.slot))
+                .map_err(invalid_handle)?;
+            let bank = slot.active_bank;
+            bound
+                .banks
+                .push((std::sync::Arc::clone(&slot.binding), bank));
+            self.bind_slot_bank_buffers(
+                scope.slot,
+                0,
+                bank,
+                &mut bound.bindings,
+                &mut bound.retained,
+            )?;
+        }
         retained.extend(bound.retained);
         for usage in paged
             .iter_mut()
@@ -583,6 +602,12 @@ impl<B: Backend + 'static> Host<B> {
             }
         }
         crate::PagedCheck::validate_all(&checks, Some(&checked))?;
+        let commands = graph
+            .template()
+            .instantiate(&checked)
+            .map_err(|error| crate::graph_error(&error))?;
+        let commands = bound.bindings.apply(commands).map_err(crate::guest_error)?;
+        let access = crate::SubmissionAccess::from_commands(&commands, &retained);
         let (batch, mut owners) = self.prepare_state_work(&bound.usages, &[])?;
         owners.extend(
             captures
