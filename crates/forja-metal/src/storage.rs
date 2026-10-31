@@ -278,7 +278,7 @@ impl MetalBuffer {
         let mut written = forja_core::WrittenRanges::default();
         let mut retained = Vec::new();
         for pending in std::mem::take(&mut self.pending).into_iter().rev() {
-            let Some(_completion) = pending.completion.upgrade() else {
+            let Some(completion) = pending.completion.upgrade() else {
                 if pending
                     .initializes
                     .as_ref()
@@ -288,12 +288,15 @@ impl MetalBuffer {
                 }
                 continue;
             };
+            let completed = completion.result();
             if pending.writes {
-                for range in written.uncovered(pending.range.clone()) {
-                    retained.push(PendingCompletion {
-                        range,
-                        ..pending.clone()
-                    });
+                if completed != Some(Ok(())) {
+                    for range in written.uncovered(pending.range.clone()) {
+                        retained.push(PendingCompletion {
+                            range,
+                            ..pending.clone()
+                        });
+                    }
                 }
                 if pending
                     .initializes
@@ -302,7 +305,7 @@ impl MetalBuffer {
                 {
                     written.record(pending.range);
                 }
-            } else {
+            } else if completed.is_none() {
                 retained.push(pending);
             }
         }
@@ -1740,6 +1743,63 @@ mod tests {
         assert!(!tokens.consume(1));
         tokens.refill(started + Duration::from_hours(72));
         assert!(tokens.consume(2));
+    }
+
+    #[test]
+    fn completed_buffer_accesses_retire_while_the_submission_is_retained() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[4097]).unwrap();
+        let mut commands = CommandList::new();
+        for index in 0..33 {
+            let row = |tensor: &Tensor| {
+                backend
+                    .view(
+                        tensor,
+                        ViewOp::Slice(vec![Slice::new(index, index + 7, 1).unwrap()]),
+                    )
+                    .unwrap()
+            };
+            commands
+                .dispatch(Op::Copy, &[&row(&source)], &row(&output))
+                .unwrap();
+        }
+        let retained = backend.submit(commands).unwrap();
+        retained.wait().unwrap();
+        let mut buffers = backend.buffers.lock().unwrap();
+        for tensor in [&source, &output] {
+            let buffer = buffers.get_mut(tensor).unwrap();
+            assert!(!buffer.pending.is_empty());
+            buffer.prune_superseded();
+            assert!(buffer.pending.is_empty());
+        }
+        drop(buffers);
+        retained.wait().unwrap();
+    }
+
+    #[test]
+    fn failed_writes_remain_after_completed_reads_retire() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let ids = backend.alloc(DType::U32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        backend.write(&ids, &99_u32.to_ne_bytes()).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Embed, &[&source, &ids], &output)
+            .unwrap();
+        let retained = backend.submit(commands).unwrap();
+        assert!(retained.wait().is_err());
+        let mut buffers = backend.buffers.lock().unwrap();
+        for tensor in [&source, &ids, &output] {
+            let buffer = buffers.get_mut(tensor).unwrap();
+            buffer.prune_superseded();
+            assert_eq!(buffer.pending.is_empty(), tensor != &output);
+        }
+        drop(buffers);
+        assert!(backend.read(&source).is_ok());
+        assert!(backend.read(&output).is_err());
+        assert!(retained.wait().is_err());
     }
 
     #[test]
