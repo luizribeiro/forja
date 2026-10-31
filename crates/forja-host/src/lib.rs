@@ -6563,7 +6563,7 @@ impl<B: Backend + 'static> Host<B> {
         let mut captured_state = match self
             .validate_state_planes(&entry.state_uses, &entry.state_planes)
             .and_then(|()| Self::validate_feedback_captures(&entry))
-            .and_then(|()| self.validate_slot_token_captures(&entry))
+            .and_then(|()| self.validate_slot_capture_roles(&entry))
             .and_then(|()| self.capture_graph_state(&entry.state_uses, entry.slot_capture.as_ref()))
         {
             Ok(captured) => captured,
@@ -11899,6 +11899,77 @@ mod tests {
         assert_prompt_state_replay(forja_metal::MetalBackend::new().unwrap()).await;
     }
 
+    async fn record_prompt_paged_probe<B: Backend + Send + Sync + 'static>(
+        host: &mut Host<B>,
+        commands: &Resource<super::CommandListEntry>,
+        slot: &Resource<BatchSlotEntry>,
+    ) -> Resource<TensorEntry> {
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 7 }])
+            .unwrap();
+        let source = bind_replay_space(host, &params, &[1, 2]);
+        let concrete = host.alloc(compute::Dtype::F32, &[1, 2]).unwrap();
+        host.write(&concrete, &[13.0_f32, 17.0].map(f32::to_ne_bytes).concat())
+            .unwrap();
+        host.dispatch(
+            commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(concrete.rep())],
+            &source,
+        )
+        .unwrap();
+        let output = bind_replay_space(host, &params, &[1, 2]);
+        let invalid = host.command_list().unwrap();
+        host.declare_slot_capture(&invalid, slot, true).unwrap();
+        for (list, lane, ordinary, direction) in [
+            (
+                &invalid,
+                1,
+                &source,
+                paged_storage::CopyDirection::IntoPages,
+            ),
+            (
+                commands,
+                0,
+                &source,
+                paged_storage::CopyDirection::IntoPages,
+            ),
+            (
+                commands,
+                0,
+                &output,
+                paged_storage::CopyDirection::OutOfPages,
+            ),
+        ] {
+            <Host<B> as paged_storage::Host>::record_paged_copy(
+                host,
+                Resource::new_borrow(list.rep()),
+                Resource::new_borrow(slot.rep()),
+                lane,
+                paged_storage::PagedSpan {
+                    plane: 0,
+                    start: wit_affine(Some(0), 1, 0),
+                    len: 1,
+                },
+                Resource::new_borrow(ordinary.rep()),
+                direction,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        assert!(host.create_graph(invalid).is_err());
+        let result = host.alloc(compute::Dtype::F32, &[1, 2]).unwrap();
+        host.dispatch(
+            commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(output.rep())],
+            &result,
+        )
+        .unwrap();
+        result
+    }
+
     async fn assert_prompt_state_replay<B: Backend + Send + Sync + 'static>(backend: B) {
         let StateSlotFixture {
             mut host,
@@ -11944,6 +12015,7 @@ mod tests {
         host.record_slot_feedback(&commands, &slot, 0, &selected)
             .unwrap();
         let probe = record_prompt_row_probes(&mut host, &commands, &slot, &selected);
+        let paged = record_prompt_paged_probe(&mut host, &commands, &slot).await;
         let graph = host.create_graph(commands).unwrap();
         for step in 0..2 {
             host.select_paged_batch_bank(slot.rep()).unwrap();
@@ -11963,12 +12035,12 @@ mod tests {
             binding.activity[bank][0].store(true, Ordering::Release);
             let flight = ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
             assert!(
-                host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                host.prepare_state_replay_with_flight(&graph, vec![step], flight)
                     .is_err()
             );
             binding.activity[bank][0].store(false, Ordering::Release);
             let flight = ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
-            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+            host.prepare_state_replay_with_flight(&graph, vec![step], flight)
                 .unwrap()
                 .run()
                 .await
@@ -11981,6 +12053,10 @@ mod tests {
             );
             assert_feedback_scalar(&host, &slot, destination, 5).await;
             assert_prompt_row_probes(&host, &slot, &probe).await;
+            assert_eq!(
+                host.prepare_read(&paged).unwrap().run().await.unwrap(),
+                [13.0_f32, 17.0].map(f32::to_ne_bytes).concat()
+            );
             host.finish_paged_lane_append(pool.rep(), 7, checkpoint)
                 .unwrap();
             host.advance_paged_batch_bank(slot.rep()).unwrap();

@@ -71,10 +71,20 @@ impl crate::TensorEntry {
 }
 
 impl<B: Backend + 'static> Host<B> {
-    pub(crate) fn validate_slot_token_captures(
+    pub(crate) fn validate_slot_capture_roles(
         &self,
         commands: &crate::CommandListEntry,
     ) -> Result<(), compute::Error> {
+        if commands
+            .slot_capture
+            .as_ref()
+            .is_some_and(|scope| scope.prefill)
+            && commands.paged.iter().any(|usage| usage.lane != 0)
+        {
+            return Err(invalid_handle(
+                "prompt capture requires logical paged lane zero",
+            ));
+        }
         for entry in &commands.retained {
             let Some(source) = entry.slot_token else {
                 continue;
@@ -91,6 +101,7 @@ impl<B: Backend + 'static> Host<B> {
                 )
                 .map_err(invalid_handle)?;
             if source.slot != scope.slot
+                || (scope.prefill && source.lane != 0)
                 || usize::try_from(source.lane).map_err(invalid_handle)? >= slot.binding.lanes.len()
                 || entry.tensor.layout().element_count() != 1
                 || entry.tensor.is_writable()

@@ -570,7 +570,13 @@ struct BoundState {
 }
 
 impl BoundState {
-    fn rebind_paged(&self, paged: &mut [crate::PagedUse], checks: &mut [crate::PagedCheck]) {
+    fn rebind_paged(
+        &self,
+        paged: &mut [crate::PagedUse],
+        checks: &mut [crate::PagedCheck],
+        scope: Option<&crate::slot_capture::SlotCapture>,
+        remap: Option<PromptReplayLane>,
+    ) {
         for usage in paged
             .iter_mut()
             .chain(checks.iter_mut().map(|check| &mut check.usage))
@@ -581,6 +587,9 @@ impl BoundState {
                 .find(|(binding, _)| std::sync::Arc::ptr_eq(binding, &usage.binding))
             {
                 usage.bank = *bank;
+                if let Some(scope) = scope {
+                    usage.lane = PromptReplayLane::map(remap, scope.slot, usage.lane);
+                }
             }
         }
     }
@@ -630,11 +639,12 @@ impl<B: Backend + 'static> Host<B> {
                 scope.slot,
                 0,
                 bank,
+                remap,
                 &mut bound.bindings,
                 &mut bound.retained,
             )?;
         }
-        bound.rebind_paged(&mut paged, &mut checks);
+        bound.rebind_paged(&mut paged, &mut checks, scope.as_ref(), remap);
         let rows = self.bind_prompt_rows(remap, &retained, &checked, &mut bound.bindings)?;
         retained.extend(rows);
         retained.extend(bound.retained);
@@ -745,6 +755,7 @@ impl<B: Backend + 'static> Host<B> {
                     original.slot,
                     original.bank,
                     bank,
+                    remap,
                     &mut bound.bindings,
                     &mut bound.retained,
                 )?;
@@ -784,9 +795,11 @@ impl<B: Backend + 'static> Host<B> {
         slot: u32,
         original: usize,
         bank: usize,
+        remap: Option<PromptReplayLane>,
         bindings: &mut forja_core::ReplayBindings,
         retained: &mut Vec<crate::TensorEntry>,
     ) -> Result<(), compute::Error> {
+        let slot_rep = slot;
         let slot = self
             .table
             .get(&Resource::<crate::BatchSlotEntry>::new_borrow(slot))
@@ -803,8 +816,11 @@ impl<B: Backend + 'static> Host<B> {
             .zip(
                 slot.tables[bank]
                     .iter()
-                    .chain(&slot.metadata[bank])
-                    .copied()
+                    .enumerate()
+                    .map(|(lane, _)| {
+                        slot.tables[bank][PromptReplayLane::map(remap, slot_rep, lane)]
+                    })
+                    .chain(slot.metadata[bank].iter().copied())
                     .chain(
                         slot.inputs
                             .iter()
