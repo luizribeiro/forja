@@ -30,7 +30,18 @@ impl Affine {
     pub fn forward(&self, input: &Tensor<bf16>, pick: Option<&Variant>) -> Result<Tensor<bf16>> {
         match pick {
             Some(pick) => {
-                input.quant_matmul_with(&self.packed, &self.scales, &self.biases, 4, 64, pick)
+                let [rows, width]: [u32; 2] = input.shape().try_into().map_err(|_| {
+                    forja_sdk::Error::loading("projection requires row-major input")
+                })?;
+                if pick.name() == "quant-matmul.tiled" && (1..16).contains(&rows) {
+                    let padded = Tensor::zeros(&[16, width])?;
+                    input.copy_into(&mut padded.narrow(0, 0, rows)?)?;
+                    padded
+                        .quant_matmul_with(&self.packed, &self.scales, &self.biases, 4, 64, pick)?
+                        .narrow(0, 0, rows)
+                } else {
+                    input.quant_matmul_with(&self.packed, &self.scales, &self.biases, 4, 64, pick)
+                }
             }
             None => input.quant_matmul(&self.packed, &self.scales, &self.biases, 4, 64),
         }
