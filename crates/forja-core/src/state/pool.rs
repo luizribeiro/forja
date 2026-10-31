@@ -9,7 +9,7 @@ use std::{
 use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence, StateLayout};
 
 mod checkpoint;
-pub use checkpoint::StateCheckpoint;
+pub use checkpoint::{ReleasedStateCheckpoint, StateCheckpoint};
 
 const VERSIONS: u64 = 3;
 

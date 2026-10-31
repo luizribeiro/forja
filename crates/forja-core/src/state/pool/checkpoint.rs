@@ -19,6 +19,14 @@ pub struct StateCheckpoint {
     published: Option<Arc<AtomicBool>>,
 }
 
+/// Unpinned predecessor recoverable only by cancelling its unsubmitted reservation.
+pub struct ReleasedStateCheckpoint {
+    identity: Arc<()>,
+    version: u32,
+    published: Option<Arc<AtomicBool>>,
+    serial: u64,
+}
+
 impl StateCheckpoint {
     /// Version retained for rollback after physical descendants drain.
     #[must_use]
@@ -57,28 +65,77 @@ impl StateSequence {
         serial: u64,
         checkpoint: &mut Option<StateCheckpoint>,
     ) -> Result<StateTransaction, PagePoolError> {
+        self.begin_preserving_checkpoint(serial, checkpoint)
+            .map(|(transaction, _)| transaction)
+    }
+
+    /// Releases a predecessor pin while retaining the right to undo an unsubmitted reservation.
+    ///
+    /// # Errors
+    /// Refuses foreign checkpoints, unavailable versions or invalid serials without losing the pin.
+    pub fn begin_preserving_checkpoint(
+        &mut self,
+        serial: u64,
+        checkpoint: &mut Option<StateCheckpoint>,
+    ) -> Result<(StateTransaction, Option<ReleasedStateCheckpoint>), PagePoolError> {
         if checkpoint
             .as_ref()
             .is_some_and(|checkpoint| !Arc::ptr_eq(&self.identity, &checkpoint.identity))
         {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        let previous = checkpoint.take().map(|checkpoint| {
-            let bookmark = (checkpoint.version(), checkpoint.published.clone());
-            drop(checkpoint);
-            bookmark
-        });
+        let release = |checkpoint: StateCheckpoint| ReleasedStateCheckpoint {
+            version: checkpoint.version(),
+            identity: Arc::clone(&checkpoint.identity),
+            published: checkpoint.published.clone(),
+            serial,
+        };
+        let mut previous = checkpoint.take().map(release);
         match self.begin(serial) {
-            Ok(transaction) => Ok(transaction),
+            Ok(transaction) => Ok((transaction, previous)),
             Err(error) => {
-                if let Some((version, published)) = previous {
-                    let mut restored = self.pin(version)?;
-                    restored.published = published;
-                    *checkpoint = Some(restored);
+                if let Some(previous) = previous.take() {
+                    *checkpoint = Some(self.restore_pin(&previous)?);
                 }
                 Err(error)
             }
         }
+    }
+
+    /// Cancels a reservation and recovers its released predecessor before any GPU write.
+    ///
+    /// # Errors
+    /// Refuses submitted, foreign or mismatched reservations without consuming the recovery right.
+    pub fn cancel_preserving_checkpoint(
+        &mut self,
+        transaction: &StateTransaction,
+        released: &mut Option<ReleasedStateCheckpoint>,
+    ) -> Result<Option<StateCheckpoint>, PagePoolError> {
+        self.pending_index(transaction)?;
+        if transaction.submitted.load(Ordering::Acquire) != 0
+            || released.as_ref().is_some_and(|checkpoint| {
+                checkpoint.serial != transaction.serial()
+                    || !Arc::ptr_eq(&checkpoint.identity, &self.identity)
+            })
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let restored = released
+            .as_ref()
+            .map(|released| self.restore_pin(released))
+            .transpose()?;
+        self.cancel_unsubmitted(transaction)?;
+        *released = None;
+        Ok(restored)
+    }
+
+    fn restore_pin(
+        &self,
+        released: &ReleasedStateCheckpoint,
+    ) -> Result<StateCheckpoint, PagePoolError> {
+        let mut checkpoint = self.pin(released.version)?;
+        checkpoint.published.clone_from(&released.published);
+        Ok(checkpoint)
     }
 
     /// Retains the input version of a live speculative transaction.
@@ -166,6 +223,71 @@ mod tests {
         assert!(retained.is_none());
         sequence.cancel_unsubmitted(&second).unwrap();
         sequence.rewind(&caller).unwrap();
+    }
+
+    #[test]
+    fn cancelled_reservations_restore_recycled_predecessor_pins() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            2,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let mut retained = Some(sequence.checkpoint().unwrap());
+        let version = retained.as_ref().unwrap().version();
+        let first = sequence.begin(1).unwrap();
+        sequence.mark_submitted(&first).unwrap();
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&first, true).unwrap();
+        let (second, mut released) = sequence
+            .begin_preserving_checkpoint(2, &mut retained)
+            .unwrap();
+        assert!(retained.is_none());
+        assert_eq!(sequence.checkpoint_latest().unwrap().version(), version);
+        let mut foreign = pool.reserve().unwrap();
+        let foreign_update = foreign.begin(2).unwrap();
+        assert!(
+            foreign
+                .cancel_preserving_checkpoint(&foreign_update, &mut released)
+                .is_err()
+        );
+        assert!(released.is_some());
+        retained = sequence
+            .cancel_preserving_checkpoint(&second, &mut released)
+            .unwrap();
+        assert!(released.is_none());
+        sequence.rewind(retained.as_ref().unwrap()).unwrap();
+        assert_eq!(sequence.checkpoint().unwrap().version(), version);
+    }
+
+    #[test]
+    fn submitted_writes_revoke_checkpoint_recovery() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            1,
+            65536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let mut retained = Some(sequence.checkpoint().unwrap());
+        let (update, mut released) = sequence
+            .begin_preserving_checkpoint(1, &mut retained)
+            .unwrap();
+        sequence.mark_submitted(&update).unwrap();
+        assert!(
+            sequence
+                .cancel_preserving_checkpoint(&update, &mut released)
+                .is_err()
+        );
+        assert!(released.is_some());
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&update, true).unwrap();
+        assert!(
+            sequence
+                .cancel_preserving_checkpoint(&update, &mut released)
+                .is_err()
+        );
     }
 
     #[test]
