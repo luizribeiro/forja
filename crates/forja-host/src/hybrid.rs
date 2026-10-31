@@ -559,6 +559,7 @@ impl<B: Backend + 'static> Host<B> {
         let snapshot = self.reserve_references(entry.retained.len())?;
         let mut retained = entry.retained.clone();
         let scope = entry.slot_capture.clone();
+        let feedback = entry.captured_feedback.clone();
         let (graph, captures, mut paged, mut checks) = (
             std::sync::Arc::clone(&entry.graph),
             entry.captured_state.clone(),
@@ -591,6 +592,8 @@ impl<B: Backend + 'static> Host<B> {
         retained.extend(bound.retained);
         let sources = self.bind_graph_token_sources(&retained, &checked, &mut bound.bindings)?;
         retained.extend(sources);
+        let feedback =
+            self.bind_graph_feedback(&feedback, &bound.usages, &mut bound.bindings, &mut retained)?;
         for usage in paged
             .iter_mut()
             .chain(checks.iter_mut().map(|check| &mut check.usage))
@@ -610,7 +613,7 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(|error| crate::graph_error(&error))?;
         let commands = bound.bindings.apply(commands).map_err(crate::guest_error)?;
         let access = crate::SubmissionAccess::from_commands(&commands, &retained);
-        let (batch, mut owners) = self.prepare_state_work(&bound.usages, &[])?;
+        let (batch, mut owners) = self.prepare_state_work(&bound.usages, &feedback)?;
         owners.extend(
             captures
                 .iter()

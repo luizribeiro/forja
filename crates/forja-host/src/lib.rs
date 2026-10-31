@@ -3706,6 +3706,7 @@ pub struct CommandListEntry {
     state_uses: Vec<hybrid::StateUse>,
     state_planes: Vec<(hybrid::StateUse, usize)>,
     feedback_writes: Vec<feedback::FeedbackWrite>,
+    captured_feedback: Vec<feedback::CapturedFeedback>,
     slot_capture: Option<slot_capture::SlotCapture>,
     paged: Vec<PagedUse>,
     paged_bounds: Vec<PagedCheck>,
@@ -3736,6 +3737,7 @@ impl CommandListEntry {
 /// Host-owned state behind a guest graph resource.
 #[derive(Debug)]
 pub struct GraphEntry {
+    captured_feedback: Vec<feedback::CapturedFeedback>,
     captured_state: Vec<hybrid::CapturedState>,
     slot_capture: Option<slot_capture::SlotCapture>,
     graph: Arc<PreparedGraph>,
@@ -5968,6 +5970,7 @@ impl<B: Backend + 'static> Host<B> {
                 state_uses: Vec::new(),
                 state_planes: Vec::new(),
                 feedback_writes: Vec::new(),
+                captured_feedback: Vec::new(),
                 slot_capture: None,
             })
             .map_err(invalid_handle)
@@ -6485,6 +6488,7 @@ impl<B: Backend + 'static> Host<B> {
                 }
             };
         let graph_entry = GraphEntry {
+            captured_feedback: entry.captured_feedback,
             captured_state,
             slot_capture: entry.slot_capture.clone(),
             graph: Arc::new(graph),
@@ -10832,6 +10836,125 @@ mod tests {
                 0
             );
         }
+    }
+
+    async fn assert_feedback_scalar(
+        host: &Host<CpuBackend>,
+        slot: &Resource<super::BatchSlotEntry>,
+        index: u32,
+        token: u32,
+    ) {
+        let handle = host
+            .table
+            .get(slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .feedback[usize::try_from(index).unwrap()];
+        assert_eq!(
+            host.prepare_read(&Resource::new_borrow(handle))
+                .unwrap()
+                .run()
+                .await
+                .unwrap(),
+            token.to_ne_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_feedback_follows_versions_and_discards_forward_selection() {
+        let StateSlotFixture {
+            mut host,
+            pool,
+            slot,
+            operands,
+            output,
+        } = state_slot_fixture_action(CpuBackend::new(), Some(StateAction::Combined));
+        host.write_state_single_inputs(
+            pool.rep(),
+            BatchPhase::Decode,
+            Some(&[3]),
+            SamplingParams::default(),
+        )
+        .unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        let token = host
+            .state_input_token_in_bank(slot.rep(), 0, Some(0))
+            .unwrap();
+        host.record_slot_state(
+            &commands,
+            &slot,
+            0,
+            0,
+            paged_storage::StateOperation::CausalConvolution,
+            &operands,
+            &output,
+            "",
+        )
+        .unwrap();
+        host.record_slot_feedback(&commands, &slot, 0, &token)
+            .unwrap();
+        assert!(
+            host.record_slot_feedback(&commands, &slot, 0, &token)
+                .is_err()
+        );
+        let graph = host.create_graph(commands).unwrap();
+        for step in 0..3 {
+            if step != 0 {
+                host.advance_paged_batch_bank(slot.rep()).unwrap();
+                host.select_paged_batch_bank(slot.rep()).unwrap();
+                host.begin_paged_lane_update(
+                    pool.rep(),
+                    0,
+                    step,
+                    1,
+                    Some(if step == 2 {
+                        StateAction::Forward
+                    } else {
+                        StateAction::Combined
+                    }),
+                )
+                .unwrap();
+                host.write_state_single_inputs(
+                    pool.rep(),
+                    BatchPhase::Decode,
+                    None,
+                    SamplingParams::default(),
+                )
+                .unwrap();
+            }
+            let bank = host.table.get(&slot).unwrap().active_bank;
+            let destination = host.state_slots[&slot.rep()]
+                .feedback_output(bank, 0)
+                .unwrap()
+                .map(|(_, index)| index);
+            let flight = super::ReplayFlight::acquire(host.replay_state(&graph).unwrap()).unwrap();
+            host.prepare_state_replay_with_flight(&graph, Vec::new(), flight)
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+            let state = host.state_slots[&slot.rep()]
+                .sequence_handle(0)
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.position().tokens, u64::from(step + 1));
+            if step == 2 {
+                assert!(state.checkpoint_latest().is_err());
+                assert_eq!(state.position().sampler, 1);
+                assert_eq!(state.position().grammar, 2);
+            } else {
+                state.checkpoint_latest().unwrap();
+                let index = destination.unwrap();
+                assert_feedback_scalar(&host, &slot, index, 3).await;
+            }
+        }
+        assert_eq!(
+            host.prepare_read(&output).unwrap().run().await.unwrap(),
+            6_f32.to_ne_bytes().repeat(7)
+        );
     }
 
     #[tokio::test]
