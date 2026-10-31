@@ -711,10 +711,28 @@ impl<B: Backend + 'static> Host<B> {
         for (old, new) in slot.tables[original]
             .iter()
             .chain(&slot.metadata[original])
-            .zip(slot.tables[bank].iter().chain(&slot.metadata[bank]))
+            .copied()
+            .chain(
+                slot.inputs
+                    .iter()
+                    .flat_map(|inputs| inputs.banks[original].handles()),
+            )
+            .zip(
+                slot.tables[bank]
+                    .iter()
+                    .chain(&slot.metadata[bank])
+                    .copied()
+                    .chain(
+                        slot.inputs
+                            .iter()
+                            .flat_map(|inputs| inputs.banks[bank].handles()),
+                    ),
+            )
         {
-            let old = self.entry(&Resource::new_borrow(*old))?.tensor.buffer();
-            let new = self.entry(&Resource::new_borrow(*new))?.clone();
+            let old = self.entry(&Resource::new_borrow(old))?.tensor.buffer();
+            let charge = self.reserve_reference()?;
+            let mut new = self.entry(&Resource::new_borrow(new))?.clone();
+            new.reference_charge = Some(charge);
             bindings
                 .buffer(old, new.tensor.buffer())
                 .map_err(invalid_handle)?;

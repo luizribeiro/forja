@@ -8823,6 +8823,40 @@ impl<B> paged_storage::Host for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn capture_slot(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+        prefill: bool,
+    ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
+        std::future::ready(Ok(self.declare_slot_capture(&commands, &slot, prefill)))
+    }
+
+    fn capture_tensors(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+    ) -> impl Future<Output = wasmtime::Result<Result<paged_storage::SlotTensors, compute::Error>>> + Send
+    {
+        let result = self
+            .slot_capture_bank(&commands, &slot)
+            .and_then(|bank| self.slot_tensors(slot.rep(), bank));
+        std::future::ready(Ok(result))
+    }
+
+    fn capture_token(
+        &mut self,
+        commands: Resource<CommandListEntry>,
+        slot: Resource<BatchSlotEntry>,
+        lane: u32,
+    ) -> impl Future<Output = wasmtime::Result<Result<Resource<TensorEntry>, compute::Error>>> + Send
+    {
+        let result = self
+            .slot_capture_bank(&commands, &slot)
+            .and_then(|bank| self.state_input_token_in_bank(slot.rep(), lane, bank));
+        std::future::ready(Ok(result))
+    }
+
     fn record_feedback(
         &mut self,
         commands: Resource<CommandListEntry>,
@@ -9936,6 +9970,79 @@ mod tests {
                 assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn capture_imports_lend_the_trace_bank_while_another_bank_is_selected() {
+        let (mut host, _pool, slot) = convolution_slot_host();
+        let banks = &host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks;
+        let tokens = [banks[0].tokens, banks[1].tokens];
+        for (handle, value) in tokens.into_iter().zip([3_u32, 17]) {
+            host.write(&Resource::new_borrow(handle), &value.to_ne_bytes())
+                .unwrap();
+        }
+        host.table.get_mut(&slot).unwrap().active_bank = 1;
+        let commands = host.command_list().unwrap();
+        <Host<CpuBackend> as paged_storage::Host>::capture_slot(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let token = <Host<CpuBackend> as paged_storage::Host>::capture_token(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let tensors = <Host<CpuBackend> as paged_storage::Host>::capture_tensors(
+            &mut host,
+            Resource::new_borrow(commands.rep()),
+            Resource::new_borrow(slot.rep()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let inputs = tensors.inputs.unwrap();
+        let current = host.state_input_token(slot.rep(), 0).unwrap();
+        for (resource, expected) in [(&token, 3_u32), (&inputs.tokens, 3), (&current, 17)] {
+            assert_eq!(
+                host.prepare_read(resource).unwrap().run().await.unwrap(),
+                expected.to_ne_bytes()
+            );
+        }
+        assert!(host.write(&token, &0_u32.to_ne_bytes()).is_err());
+        for resource in [
+            tensors.logical_lengths,
+            tensors.query_starts,
+            tensors.absolute_positions,
+            inputs.sampling,
+            inputs.tokens,
+            inputs.explicit,
+            inputs.prompt,
+            inputs.allow,
+            inputs.logits,
+            inputs.selected,
+            token,
+            current,
+        ] {
+            host.drop_tensor(resource).unwrap();
+        }
+        host.drop_command_list(commands).unwrap();
+        assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 
     #[test]

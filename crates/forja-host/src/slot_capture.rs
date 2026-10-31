@@ -62,15 +62,27 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         }
         let binding = Arc::downgrade(&self.table.get(slot).map_err(invalid_handle)?.binding);
         let charge = self.reserve_reference()?;
+        let slot_entry = self.table.get(slot).map_err(invalid_handle)?;
+        let handles = slot_entry.metadata[0].into_iter().chain(
+            slot_entry
+                .inputs
+                .iter()
+                .flat_map(|inputs| inputs.banks[0].handles()),
+        );
+        let buffers = handles
+            .map(|handle| {
+                self.entry(&Resource::new_borrow(handle))
+                    .map(|entry| entry.tensor.buffer())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let trace = self
             .state_slots
             .get(&slot.rep())
             .ok_or_else(|| invalid_handle("capture slot has no state"))?
             .trace()?;
-        self.table
-            .get_mut(commands)
-            .map_err(invalid_handle)?
-            .slot_capture = Some(SlotCapture {
+        let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
+        entry.protected.extend(buffers);
+        entry.slot_capture = Some(SlotCapture {
             slot: slot.rep(),
             prefill,
             binding,
