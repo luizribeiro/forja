@@ -1,3 +1,4 @@
+mod prefix;
 mod selection;
 use selection::SelectionFrame;
 
@@ -15,6 +16,7 @@ use std::sync::Arc;
 struct Lane<B: Backend> {
     sequence: Option<StateSequenceHandle<B>>,
     serial: u64,
+    prompt: Option<Arc<super::CanonicalPrompt>>,
 }
 
 /// Two rebinding banks of lane transactions over one private state pool.
@@ -64,6 +66,7 @@ impl<B: Backend> StateSlots<B> {
             .map(|_reservation| Lane {
                 sequence: None,
                 serial: 0,
+                prompt: None,
             })
             .collect::<Vec<_>>();
         let selections = std::array::from_fn(|_| (0..lanes.len()).map(|_| None).collect());
@@ -146,6 +149,7 @@ impl<B: Backend> StateSlots<B> {
             sequence.lock().ensure_idle().map_err(pool_error)?;
         }
         lane.sequence = None;
+        lane.prompt = None;
         Ok(())
     }
 
@@ -195,9 +199,22 @@ impl<B: Backend> StateSlots<B> {
             .serial
             .checked_add(1)
             .ok_or_else(|| invalid_handle("state lane timeline exhausted"))?;
-        let transaction = match action {
-            Some(action) => sequence.begin_action_at(serial, position, action),
-            None => sequence.begin_at(serial, position),
+        let canonical = owner.prompt.as_ref().filter(|prompt| {
+            position.tokens < u64::try_from(prompt.tokens().len()).unwrap_or(u64::MAX)
+                && position
+                    .tokens
+                    .is_multiple_of(u64::from(prompt.namespace().block().get()))
+        });
+        let transaction = match (canonical, action) {
+            (Some(prompt), Some(action)) => sequence.begin_prefill(
+                serial,
+                prompt.clone(),
+                position.tokens,
+                position.reserved_tokens,
+                action,
+            ),
+            (_, Some(action)) => sequence.begin_action_at(serial, position, action),
+            (_, None) => sequence.begin_at(serial, position),
         }
         .map_err(pool_error)?;
         owner.serial = serial;
