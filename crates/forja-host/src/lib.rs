@@ -8790,48 +8790,7 @@ where
         resource: Resource<BatchSlotEntry>,
     ) -> impl Future<Output = wasmtime::Result<Result<paged_storage::SlotTensors, compute::Error>>> + Send
     {
-        let result = (|| {
-            let (lanes, handles) = {
-                let slot = self.table.get(&resource).map_err(invalid_handle)?;
-                let bank = slot.active_bank;
-                let [logical_lengths, query_starts, absolute_positions, _activity] =
-                    slot.metadata[bank];
-                (
-                    u32::try_from(slot.binding.lanes.len()).map_err(|_| {
-                        compute::Error::Layout("paged lane count exceeds u32".to_owned())
-                    })?,
-                    [logical_lengths, query_starts, absolute_positions],
-                )
-            };
-            let aliases = self.alias_paged_tensors(&handles)?;
-            let inputs = match self.state_input_tensors(resource.rep()) {
-                Ok(inputs) => inputs,
-                Err(error) => {
-                    for alias in aliases {
-                        let _ = self.drop_tensor(alias);
-                    }
-                    return Err(error);
-                }
-            };
-            let mut aliases = aliases.into_iter();
-            let logical_lengths = aliases
-                .next()
-                .ok_or_else(|| invalid_handle("paged logical lengths are missing"))?;
-            let query_starts = aliases
-                .next()
-                .ok_or_else(|| invalid_handle("paged query starts are missing"))?;
-            let absolute_positions = aliases
-                .next()
-                .ok_or_else(|| invalid_handle("paged absolute positions are missing"))?;
-            Ok(paged_storage::SlotTensors {
-                lanes,
-                logical_lengths,
-                query_starts,
-                absolute_positions,
-                inputs,
-            })
-        })();
-        std::future::ready(Ok(result))
+        std::future::ready(Ok(self.slot_tensors(resource.rep(), None)))
     }
 
     fn drop(
@@ -10344,22 +10303,18 @@ mod tests {
         }
         host.limits = GENEROUS;
         let mut seen = Vec::new();
-        for bank in 0..2 {
-            host.table.get_mut(&slot).unwrap().active_bank = bank;
-            let tensors = <Host<CpuBackend> as paged_storage::HostBatchSlot>::tensors(
-                &mut host,
-                Resource::new_borrow(slot.rep()),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        for (active, requested) in [(0, None), (1, None), (1, Some(0))] {
+            host.table.get_mut(&slot).unwrap().active_bank = active;
+            let tensors = host.slot_tensors(slot.rep(), requested).unwrap();
+            let bank = requested.unwrap_or(active);
             let inputs = tensors.inputs.unwrap();
             assert_eq!((inputs.vocab, inputs.prompt_tokens), (33, 7));
             assert_eq!(
                 host.entry(&inputs.allow).unwrap().tensor.layout().shape(),
                 [1, 2]
             );
-            seen.push(host.entry(&inputs.logits).unwrap().tensor.buffer());
+            let buffer = host.entry(&inputs.logits).unwrap().tensor.buffer();
+            seen.push(buffer);
             let expected = host
                 .table
                 .get(&slot)
@@ -10370,7 +10325,7 @@ mod tests {
                 .banks[bank]
                 .logits;
             assert_eq!(
-                seen[bank],
+                buffer,
                 host.entry(&Resource::new_borrow(expected))
                     .unwrap()
                     .tensor
@@ -10392,6 +10347,9 @@ mod tests {
             }
         }
         assert_ne!(seen[0], seen[1]);
+        assert_eq!(seen[0], seen[2]);
+        assert!(host.slot_tensors(slot.rep(), Some(2)).is_err());
+        assert_eq!(host.live_handles, handles_before);
     }
 
     #[test]
@@ -10610,6 +10568,15 @@ mod tests {
             host.drop_tensor(token).unwrap();
         }
         assert_ne!(buffers[0], buffers[1]);
+        let fixed = host
+            .state_input_token_in_bank(slot.rep(), 0, Some(0))
+            .unwrap();
+        assert_eq!(host.entry(&fixed).unwrap().tensor.buffer(), buffers[0]);
+        host.drop_tensor(fixed).unwrap();
+        assert!(
+            host.state_input_token_in_bank(slot.rep(), 0, Some(2))
+                .is_err()
+        );
         assert!(host.state_input_token(slot.rep(), 1).is_err());
         let bytes = host.live_bytes.load(Ordering::Acquire);
         let handles = host.live_handles;

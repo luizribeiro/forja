@@ -53,6 +53,15 @@ impl<B: Backend + 'static> Host<B> {
         slot: u32,
         lane: u32,
     ) -> Result<wasmtime::component::Resource<crate::TensorEntry>, compute::Error> {
+        self.state_input_token_in_bank(slot, lane, None)
+    }
+
+    pub(crate) fn state_input_token_in_bank(
+        &mut self,
+        slot: u32,
+        lane: u32,
+        bank: Option<usize>,
+    ) -> Result<wasmtime::component::Resource<crate::TensorEntry>, compute::Error> {
         use wasmtime::component::Resource;
         let entry = self
             .table
@@ -65,14 +74,17 @@ impl<B: Backend + 'static> Host<B> {
             .inputs
             .as_ref()
             .ok_or_else(|| invalid_handle("slot has no state inputs"))?;
-        let source = self
-            .state_slots
-            .get(&slot)
-            .ok_or_else(|| invalid_handle("slot has no protected state"))?
-            .feedback_source(
-                entry.active_bank,
-                usize::try_from(lane).map_err(invalid_handle)?,
-            )?;
+        let source = if bank.is_some() {
+            None
+        } else {
+            self.state_slots
+                .get(&slot)
+                .ok_or_else(|| invalid_handle("slot has no protected state"))?
+                .feedback_source(
+                    entry.active_bank,
+                    usize::try_from(lane).map_err(invalid_handle)?,
+                )?
+        };
         let (handle, start) = if let Some(index) = source {
             (
                 *inputs
@@ -82,7 +94,14 @@ impl<B: Backend + 'static> Host<B> {
                 0,
             )
         } else {
-            (inputs.banks[entry.active_bank].tokens, lane)
+            (
+                inputs
+                    .banks
+                    .get(bank.unwrap_or(entry.active_bank))
+                    .ok_or_else(|| invalid_handle("token input bank is out of range"))?
+                    .tokens,
+                lane,
+            )
         };
         self.lend_view(
             &Resource::new_borrow(handle),
@@ -120,9 +139,59 @@ impl<B: Backend + 'static> Host<B> {
         Ok(aliases)
     }
 
+    pub(crate) fn slot_tensors(
+        &mut self,
+        slot: u32,
+        bank: Option<usize>,
+    ) -> Result<paged_storage::SlotTensors, compute::Error> {
+        let resource = wasmtime::component::Resource::<crate::BatchSlotEntry>::new_borrow(slot);
+        let (lanes, handles) = {
+            let slot = self.table.get(&resource).map_err(invalid_handle)?;
+            let selected = bank.unwrap_or(slot.active_bank);
+            let [logical_lengths, query_starts, absolute_positions, _activity] = *slot
+                .metadata
+                .get(selected)
+                .ok_or_else(|| invalid_handle("slot input bank is out of range"))?;
+            (
+                u32::try_from(slot.binding.lanes.len()).map_err(|_| {
+                    compute::Error::Layout("paged lane count exceeds u32".to_owned())
+                })?,
+                [logical_lengths, query_starts, absolute_positions],
+            )
+        };
+        let aliases = self.alias_paged_tensors(&handles)?;
+        let inputs = match self.state_input_tensors(resource.rep(), bank) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                for alias in aliases {
+                    let _ = self.drop_tensor(alias);
+                }
+                return Err(error);
+            }
+        };
+        let mut aliases = aliases.into_iter();
+        let logical_lengths = aliases
+            .next()
+            .ok_or_else(|| invalid_handle("paged logical lengths are missing"))?;
+        let query_starts = aliases
+            .next()
+            .ok_or_else(|| invalid_handle("paged query starts are missing"))?;
+        let absolute_positions = aliases
+            .next()
+            .ok_or_else(|| invalid_handle("paged absolute positions are missing"))?;
+        Ok(paged_storage::SlotTensors {
+            lanes,
+            logical_lengths,
+            query_starts,
+            absolute_positions,
+            inputs,
+        })
+    }
+
     pub(crate) fn state_input_tensors(
         &mut self,
         slot: u32,
+        bank: Option<usize>,
     ) -> Result<Option<paged_storage::StateInputTensors>, compute::Error> {
         let entry = self
             .table
@@ -131,7 +200,11 @@ impl<B: Backend + 'static> Host<B> {
         let Some(inputs) = &entry.inputs else {
             return Ok(None);
         };
-        let handles = inputs.banks[entry.active_bank].handles();
+        let handles = inputs
+            .banks
+            .get(bank.unwrap_or(entry.active_bank))
+            .ok_or_else(|| invalid_handle("state input bank is out of range"))?
+            .handles();
         let layout = entry
             .input_layout
             .as_ref()
