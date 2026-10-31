@@ -505,7 +505,10 @@ mod tests {
         drop(replacement);
     }
 
-    fn failed_predecessor_taints_queued_descendant<B: Backend + 'static>(backend: B) {
+    fn failed_predecessor_taints_queued_descendant<B: Backend + 'static>(
+        backend: B,
+        check_failed_read: impl FnOnce(Result<Vec<u8>, forja_core::BackendError>),
+    ) {
         let host = Host::new(backend, Limits::new(65536, 8, 4096, 128, 4096));
         let layout =
             StateLayout::new(vec![StatePlane::new(DType::F32, vec![1, 1]).unwrap()]).unwrap();
@@ -537,7 +540,7 @@ mod tests {
         assert!(first.finish().is_err());
         assert!(sequence.begin(3).is_err());
         assert!(second.finish().is_err());
-        assert_eq!(host.backend.read(&y).unwrap(), 9_f32.to_le_bytes());
+        check_failed_read(host.backend.read(&y));
         let retry = sequence.begin(3).unwrap();
         let mut retry = storage.record(&sequence, retry).unwrap();
         retry.causal_convolution(0, &x, &weights, &y).unwrap();
@@ -547,12 +550,22 @@ mod tests {
 
     #[test]
     fn failed_state_submission_restores_checkpoint_after_descendant_drain() {
-        failed_predecessor_taints_queued_descendant(forja_cpu::CpuBackend::new());
+        failed_predecessor_taints_queued_descendant(forja_cpu::CpuBackend::new(), |read| {
+            assert_eq!(read.unwrap(), 9_f32.to_le_bytes());
+        });
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_failed_state_submission_restores_checkpoint_after_descendant_drain() {
-        failed_predecessor_taints_queued_descendant(forja_metal::MetalBackend::new().unwrap());
+        failed_predecessor_taints_queued_descendant(
+            forja_metal::MetalBackend::new().unwrap(),
+            |read| {
+                assert!(matches!(
+                    read,
+                    Err(forja_core::BackendError::DeviceErrorFlag { .. })
+                ));
+            },
+        );
     }
 }

@@ -72,11 +72,11 @@ fn metal_state_authentication_preserves_canaries_and_ignores_poisoned_lanes() {
             .write(&inputs[metadata_start + 1], &[0; 12])
             .unwrap();
         assert!(run(&backend, access, kind, &inputs, &outputs).is_err());
-        assert_eq!(super::drained_canary_bytes(&backend, &y), before_y);
+        assert_eq!(super::refused_read_canary_bytes(&backend, &y), before_y);
         assert_private_canaries();
         backend.write(&inputs[metadata_start], &[0xff; 16]).unwrap();
         assert!(run(&backend, access, kind, &inputs, &outputs).is_err());
-        assert_eq!(super::drained_canary_bytes(&backend, &y), before_y);
+        assert_eq!(super::refused_read_canary_bytes(&backend, &y), before_y);
         assert_private_canaries();
         backend.write(&inputs[metadata_start + 2], &[0; 4]).unwrap();
         run(&backend, access, kind, &inputs, &outputs).unwrap();

@@ -8201,7 +8201,7 @@ impl MetalBackend {
                 dependencies.extend(
                     buffers
                         .get_mut(tensor)?
-                        .dependencies(&tensor.layout().byte_span())
+                        .dependencies(&tensor.layout().byte_span())?
                         .into_iter()
                         .filter(|completion| {
                             seen_dependencies.insert(Arc::as_ptr(completion) as usize)
@@ -13703,7 +13703,7 @@ mod tests {
         ));
         drop(submission);
         assert_eq!(
-            backend.read(&output).unwrap(),
+            crate::storage::refused_read_canary_bytes(&backend, &output),
             vec![0; usize::try_from(columns * 4).unwrap()]
         );
     }
@@ -16119,8 +16119,10 @@ mod tests {
                     ..
                 }) if value == expected
             ));
-            let _completion_error = backend.read(&output);
-            assert_eq!(backend.read(&output).unwrap(), vec![0_u8; bytes.len() * 7]);
+            assert_eq!(
+                crate::storage::refused_read_canary_bytes(&backend, &output),
+                vec![0_u8; bytes.len() * 7]
+            );
         }
     }
 }

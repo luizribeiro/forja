@@ -273,7 +273,7 @@ fn metal_paged_copy_reports_corrupt_entries_without_writing_pool() {
             ..
         }
     ));
-    assert_eq!(super::drained_canary_bytes(&backend, &pool), canary);
+    assert_eq!(super::refused_read_canary_bytes(&backend, &pool), canary);
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn metal_paged_copy_isolates_rejected_row_from_other_rows_in_same_dispatch() {
         }
     ));
     assert_eq!(
-        decode_f32(&super::drained_canary_bytes(&backend, &pool)),
+        decode_f32(&super::refused_read_canary_bytes(&backend, &pool)),
         vec![9.0, 9.0, 1.0, 2.0, 5.0, 6.0]
     );
 }
@@ -400,7 +400,7 @@ fn metal_paged_copy_rejects_wide_row_spanning_multiple_threadgroups() {
             ..
         }
     ));
-    assert_eq!(super::drained_canary_bytes(&backend, &pool), canary);
+    assert_eq!(super::refused_read_canary_bytes(&backend, &pool), canary);
 }
 
 #[test]
@@ -482,7 +482,18 @@ fn seeded_query_values(
         .collect()
 }
 
-fn finish_sdpa<B: Backend>(
+fn failed_output_bytes<B: Backend + 'static>(
+    backend: &B,
+    tensor: &Tensor,
+) -> Result<Vec<u8>, BackendError> {
+    if let Some(metal) = (backend as &dyn Any).downcast_ref::<forja_metal::MetalBackend>() {
+        Ok(super::refused_read_canary_bytes(metal, tensor))
+    } else {
+        backend.read(tensor)
+    }
+}
+
+fn finish_sdpa<B: Backend + 'static>(
     backend: &B,
     output: &Tensor,
     submission: B::Submission,
@@ -491,7 +502,7 @@ fn finish_sdpa<B: Backend>(
     if let Err(error) = submission.wait() {
         drop(submission);
         if let Some(capture) = rejected_output {
-            *capture = decode_f32(&backend.read(output)?);
+            *capture = decode_f32(&failed_output_bytes(backend, output)?);
         }
         return Err(error);
     }
@@ -735,7 +746,11 @@ fn run_sdpa_with_page_tokens<B: Backend + 'static, const WIDTH: u32, const REDUC
     let result = finish_sdpa(backend, &output, backend.submit(commands)?, rejected_output);
     if let Some(operands) = append {
         for (pool, operand) in [&key, &value].into_iter().zip(operands) {
-            let actual = backend.read(pool)?;
+            let actual = if result.is_err() {
+                failed_output_bytes(backend, pool)?
+            } else {
+                backend.read(pool)?
+            };
             if !active {
                 assert_eq!(actual, operand.before);
             } else if result.is_ok() {

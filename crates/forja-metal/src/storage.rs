@@ -99,9 +99,31 @@ pub(super) struct MetalBuffer {
 #[derive(Clone)]
 struct PendingCompletion {
     completion: Weak<Completion>,
+    outcome: Arc<OnceLock<Result<(), BackendError>>>,
     range: std::ops::Range<u64>,
     writes: bool,
     initializes: Option<Arc<AtomicBool>>,
+}
+
+impl PendingCompletion {
+    fn result(&self) -> Option<Result<(), BackendError>> {
+        self.outcome.get().copied().or_else(|| {
+            self.completion
+                .upgrade()
+                .is_none()
+                .then_some(Err(BackendError::ExecutionFailed))
+        })
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<(), BackendError> {
+        self.outcome.get().copied().unwrap_or_else(|| {
+            self.completion
+                .upgrade()
+                .map_or(Err(BackendError::ExecutionFailed), |completion| {
+                    completion.wait(timeout)
+                })
+        })
+    }
 }
 
 // SAFETY: Buffer access and pending-submission tracking are serialized by the backend registry
@@ -141,9 +163,7 @@ impl MetalBuffer {
     ) -> Result<(), BackendError> {
         self.prune_superseded();
         for pending in &self.pending {
-            if let Some(completion) = pending.completion.upgrade()
-                && completion.wait(timeout) == Err(BackendError::Timeout)
-            {
+            if pending.wait(timeout) == Err(BackendError::Timeout) {
                 return Err(BackendError::Timeout);
             }
         }
@@ -152,10 +172,7 @@ impl MetalBuffer {
         self.write(range, source);
         let pending = std::mem::take(&mut self.pending);
         for pending in pending {
-            let Some(completion) = pending.completion.upgrade() else {
-                continue;
-            };
-            if !pending.writes || completion.result() == Some(Ok(())) {
+            if !pending.writes || pending.result() == Some(Ok(())) {
                 continue;
             }
             for range in [
@@ -200,22 +217,14 @@ impl MetalBuffer {
         self.prune_superseded();
         let mut result = Ok(());
         for pending in std::mem::take(&mut self.pending) {
-            let Some(completion) = pending.completion.upgrade() else {
-                continue;
-            };
-            if let Err(error) = completion.wait(timeout)
+            if let Err(error) = pending.wait(timeout)
                 && (pending.writes || error == BackendError::Timeout)
             {
                 if result != Err(BackendError::Timeout) {
                     result = Err(error);
                 }
                 if retain_failed || error == BackendError::Timeout {
-                    self.pending.push(PendingCompletion {
-                        completion: Arc::downgrade(&completion),
-                        range: pending.range,
-                        writes: pending.writes,
-                        initializes: pending.initializes.clone(),
-                    });
+                    self.pending.push(pending);
                 }
             }
         }
@@ -230,13 +239,10 @@ impl MetalBuffer {
         self.prune_superseded();
         let mut result = Ok(());
         self.pending.retain(|pending| {
-            let Some(completion) = pending.completion.upgrade() else {
-                return false;
-            };
             if pending.range.start >= range.end || range.start >= pending.range.end {
                 return true;
             }
-            match completion.wait(timeout) {
+            match pending.wait(timeout) {
                 Err(error) if pending.writes => {
                     result = Err(error);
                     true
@@ -256,6 +262,7 @@ impl MetalBuffer {
     ) {
         self.pending.push(PendingCompletion {
             completion: Arc::downgrade(completion),
+            outcome: Arc::clone(&completion.outcome),
             range: tensor.layout().byte_span(),
             writes,
             initializes: initializes.then(|| Arc::clone(&completion.successful)),
@@ -265,9 +272,7 @@ impl MetalBuffer {
     pub(super) fn drain_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
         self.prune_superseded();
         for pending in &self.pending {
-            if let Some(completion) = pending.completion.upgrade()
-                && completion.wait(timeout) == Err(BackendError::Timeout)
-            {
+            if pending.wait(timeout) == Err(BackendError::Timeout) {
                 return Err(BackendError::Timeout);
             }
         }
@@ -278,17 +283,7 @@ impl MetalBuffer {
         let mut written = forja_core::WrittenRanges::default();
         let mut retained = Vec::new();
         for pending in std::mem::take(&mut self.pending).into_iter().rev() {
-            let Some(completion) = pending.completion.upgrade() else {
-                if pending
-                    .initializes
-                    .as_ref()
-                    .is_some_and(|success| success.load(Ordering::Acquire))
-                {
-                    written.record(pending.range);
-                }
-                continue;
-            };
-            let completed = completion.result();
+            let completed = pending.result();
             if pending.writes {
                 if completed != Some(Ok(())) {
                     for range in written.uncovered(pending.range.clone()) {
@@ -313,39 +308,39 @@ impl MetalBuffer {
         self.pending = retained;
     }
 
-    pub(super) fn dependencies(&mut self, range: &std::ops::Range<u64>) -> Vec<Arc<Completion>> {
+    pub(super) fn dependencies(
+        &mut self,
+        range: &std::ops::Range<u64>,
+    ) -> Result<Vec<Arc<Completion>>, BackendError> {
         self.prune_superseded();
         let mut dependencies = Vec::new();
         let mut written = forja_core::WrittenRanges::default();
-        self.pending.reverse();
-        self.pending.retain(|pending| {
-            let Some(completion) = pending.completion.upgrade() else {
-                return false;
-            };
+        for pending in self.pending.iter().rev() {
+            let completion = pending.completion.upgrade();
             let touched = pending.range.start.max(range.start)..pending.range.end.min(range.end);
             if pending.writes && touched.start < touched.end && !written.covers(&touched) {
-                dependencies.push(Arc::clone(&completion));
+                if let Some(completion) = &completion {
+                    dependencies.push(Arc::clone(completion));
+                } else {
+                    pending.wait(Duration::ZERO)?;
+                }
             }
-            if pending.initializes.is_some() && completion.event_value().is_some() {
+            if pending.initializes.is_some()
+                && completion.is_some_and(|c| c.event_value().is_some())
+            {
                 written.record(pending.range.clone());
             }
-            true
-        });
-        self.pending.reverse();
-        dependencies
+        }
+        Ok(dependencies)
     }
 
     pub(super) fn pending_event_value(&mut self) -> Option<u64> {
         self.prune_superseded();
-        let mut maximum = None;
-        self.pending.retain(|pending| {
-            let Some(completion) = pending.completion.upgrade() else {
-                return false;
-            };
-            maximum = maximum.max(completion.event_value());
-            true
-        });
-        maximum
+        self.pending
+            .iter()
+            .filter_map(|pending| pending.completion.upgrade())
+            .filter_map(|completion| completion.event_value())
+            .max()
     }
 }
 
@@ -1778,6 +1773,52 @@ mod tests {
     }
 
     #[test]
+    fn dropped_failed_write_taint_survives_retirement_and_partial_overwrite() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let ids = backend.alloc(DType::U32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        backend.write(&ids, &99_u32.to_ne_bytes()).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Embed, &[&source, &ids], &output)
+            .unwrap();
+        drop(backend.submit(commands).unwrap());
+        backend.in_flight.drain(Duration::from_secs(10));
+        assert!(backend.read(&output).is_err());
+        let one = backend
+            .view(
+                &output,
+                ViewOp::Slice(vec![
+                    Slice::new(0, 1, 1).unwrap(),
+                    Slice::new(0, 1, 1).unwrap(),
+                ]),
+            )
+            .unwrap();
+        backend.write(&one, &3_f32.to_ne_bytes()).unwrap();
+        assert_eq!(
+            backend.read_replay_output(&one).unwrap(),
+            3_f32.to_ne_bytes()
+        );
+        assert!(backend.read(&output).is_err());
+        backend
+            .write(&output, &4_f32.to_ne_bytes().repeat(7))
+            .unwrap();
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            4_f32.to_ne_bytes().repeat(7)
+        );
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&output], &source).unwrap();
+        drop(backend.submit(commands).unwrap());
+        backend.in_flight.drain(Duration::from_secs(10));
+        assert_eq!(
+            backend.read(&source).unwrap(),
+            4_f32.to_ne_bytes().repeat(7)
+        );
+    }
+
+    #[test]
     fn failed_writes_remain_after_completed_reads_retire() {
         let backend = MetalBackend::new().unwrap();
         let source = backend.alloc(DType::F32, &[1, 7]).unwrap();
@@ -2001,6 +2042,15 @@ pub(crate) fn drained_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> V
     let buffer = buffers.get_mut(tensor).unwrap();
     buffer.drain_pending(backend.gpu_timeout).unwrap();
     gather(buffer.bytes(), tensor.layout()).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn refused_read_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> Vec<u8> {
+    assert!(matches!(
+        backend.read(tensor),
+        Err(BackendError::DeviceErrorFlag { .. })
+    ));
+    drained_canary_bytes(backend, tensor)
 }
 
 #[cfg(test)]

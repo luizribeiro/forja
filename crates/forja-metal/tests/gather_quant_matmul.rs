@@ -757,7 +757,10 @@ fn assert_error_and_zero_output(
         }) if actual_operation == operation && value == index
     ));
     drop(submission);
-    assert_eq!(metal.read(output).unwrap(), vec![0; len]);
+    assert_eq!(
+        super::refused_read_canary_bytes(metal, output),
+        vec![0; len]
+    );
 }
 
 fn assert_case(cpu: &CpuBackend, metal: &MetalBackend, shape: [u32; 5], dtype: DType) {
