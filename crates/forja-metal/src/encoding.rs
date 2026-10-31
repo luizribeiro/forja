@@ -10,7 +10,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1556,6 +1556,7 @@ unsafe impl Send for PreparedMetalGraph {}
 unsafe impl Sync for PreparedMetalGraph {}
 
 pub(super) struct Completion {
+    pub(super) successful: Arc<AtomicBool>,
     state: Mutex<CompletionState>,
     ready: Condvar,
     event: InFlightEvent,
@@ -1647,6 +1648,7 @@ impl Completion {
                     result: None,
                     resolving: false,
                 }),
+                successful: Arc::new(AtomicBool::new(false)),
                 ready: Condvar::new(),
                 event,
                 resources,
@@ -1741,6 +1743,7 @@ impl Completion {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let result = *state.result.get_or_insert(result);
+                self.successful.store(result.is_ok(), Ordering::Release);
                 state.resolving = false;
                 self.ready.notify_all();
                 return result;
@@ -8143,7 +8146,7 @@ impl MetalBackend {
 
     fn retain_tensors(
         &self,
-        accesses: &[(Tensor, bool)],
+        accesses: &[CompletionAccess],
         event: InFlightEvent,
         resources: CommandResources,
         residency: InFlightResidency,
@@ -8153,7 +8156,7 @@ impl MetalBackend {
         let mut seen = HashSet::<BufferId>::new();
         let unique = accesses
             .iter()
-            .map(|(tensor, _)| tensor)
+            .map(|access| &access.tensor)
             .filter(|tensor| seen.insert(tensor.buffer()))
             .collect::<Vec<_>>();
         let mut buffers = self
@@ -8168,11 +8171,17 @@ impl MetalBackend {
             if order_on_queue {
                 dependency = dependency.max(buffer.pending_event_value());
             } else {
-                buffer.wait_pending(self.gpu_timeout)?;
+                buffer.drain_pending(self.gpu_timeout)?;
             }
         }
-        for (tensor, writes) in accesses {
-            if !writes {
+        let mut initialized = HashMap::<BufferId, forja_core::WrittenRanges>::new();
+        for access in accesses {
+            let tensor = &access.tensor;
+            if !access.writes
+                && !initialized
+                    .get(&tensor.buffer())
+                    .is_some_and(|written| written.covers(&tensor.layout().byte_span()))
+            {
                 dependencies.extend(
                     buffers
                         .get_mut(tensor)?
@@ -8183,6 +8192,12 @@ impl MetalBackend {
                         }),
                 );
             }
+            if access.initializes {
+                initialized
+                    .entry(tensor.buffer())
+                    .or_default()
+                    .record(tensor.layout().byte_span());
+            }
         }
         let completion = Completion::new(
             resources,
@@ -8192,8 +8207,13 @@ impl MetalBackend {
             Arc::downgrade(&self.in_flight),
             dependencies,
         );
-        for (tensor, writes) in accesses {
-            buffers.get_mut(tensor)?.track(tensor, &completion, *writes);
+        for access in accesses {
+            buffers.get_mut(&access.tensor)?.track(
+                &access.tensor,
+                &completion,
+                access.writes,
+                access.initializes,
+            );
         }
         Ok((completion, dependency))
     }
@@ -8201,7 +8221,7 @@ impl MetalBackend {
     fn commit(
         &self,
         command_buffer: &Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-        accesses: &[(Tensor, bool)],
+        accesses: &[CompletionAccess],
         resources: CommandResources,
         residency: CommitResidency,
         timestamps: GpuTimestamps,
@@ -10315,21 +10335,49 @@ fn program_compile_failed(hash: ProgramHash) -> BackendError {
     BackendError::ExecutionFailed
 }
 
-fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = (Tensor, bool)> + '_ {
+struct CompletionAccess {
+    tensor: Tensor,
+    writes: bool,
+    initializes: bool,
+}
+
+impl CompletionAccess {
+    fn read(tensor: &Tensor) -> Self {
+        Self {
+            tensor: tensor.clone(),
+            writes: false,
+            initializes: false,
+        }
+    }
+    fn write(tensor: &Tensor, definite: bool) -> Self {
+        Self {
+            tensor: tensor.clone(),
+            writes: true,
+            initializes: definite && tensor.layout().is_contiguous(),
+        }
+    }
+}
+
+fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = CompletionAccess> + '_ {
     let inactive = matches!(dispatch.op(), Op::State(op) if !op.access().is_active());
+    let definite = !inactive
+        && !matches!(
+            dispatch.op(),
+            Op::PagedCopy { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+        );
     dispatch
         .inputs()
         .iter()
         .enumerate()
         .filter(move |(index, _)| !inactive || index + 4 != dispatch.inputs().len())
-        .map(|(_, tensor)| (tensor.clone(), false))
+        .map(|(_, tensor)| CompletionAccess::read(tensor))
         .chain(
             dispatch
                 .outputs()
                 .iter()
                 .enumerate()
                 .filter(move |(index, _)| !inactive || *index != 1)
-                .map(|(_, tensor)| (tensor.clone(), true)),
+                .map(move |(_, tensor)| CompletionAccess::write(tensor, definite)),
         )
 }
 
@@ -12689,6 +12737,63 @@ mod tests {
     }
 
     #[test]
+    fn dense_overwrites_recover_failed_scratch_ranges() {
+        let backend = MetalBackend::new().unwrap();
+        let source = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let ids = backend.alloc(DType::U32, &[1]).unwrap();
+        let shared = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let sink = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let bytes = [3.0_f32; 7]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        backend.write(&source, &bytes).unwrap();
+        backend.write(&ids, &99_u32.to_ne_bytes()).unwrap();
+        let mut failing = CommandList::new();
+        failing
+            .dispatch(Op::Embed, &[&source, &ids], &shared)
+            .unwrap();
+        let failed = backend.submit(failing).unwrap();
+        assert!(failed.wait().is_err());
+        let one = |tensor: &Tensor| {
+            backend
+                .view(
+                    tensor,
+                    ViewOp::Slice(vec![
+                        Slice::new(0, 1, 1).unwrap(),
+                        Slice::new(0, 1, 1).unwrap(),
+                    ]),
+                )
+                .unwrap()
+        };
+        let source_one = one(&source);
+        let shared_one = one(&shared);
+        let mut partial = CommandList::new();
+        partial
+            .dispatch(Op::Copy, &[&source_one], &shared_one)
+            .unwrap();
+        backend.submit(partial).unwrap().wait().unwrap();
+        assert_eq!(
+            backend.read_replay_output(&shared_one).unwrap(),
+            3.0_f32.to_ne_bytes()
+        );
+        assert!(backend.read(&shared).is_err());
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .dispatch(Op::Copy, &[&source.into()], &shared.clone().into())
+            .unwrap();
+        graph
+            .dispatch(Op::Copy, &[&shared.clone().into()], &sink.clone().into())
+            .unwrap();
+        let graph = backend.prepare_graph(graph).unwrap();
+        backend.replay(&graph, Vec::new()).unwrap().wait().unwrap();
+        assert_eq!(backend.read(&shared).unwrap(), bytes);
+        assert_eq!(backend.read(&sink).unwrap(), bytes);
+        assert!(failed.wait().is_err());
+    }
+
+    #[test]
     fn failed_replay_taints_later_graph_reads() {
         let backend = MetalBackend::new().unwrap();
         let table = backend.alloc(DType::F32, &[1, 7]).unwrap();
@@ -12891,7 +12996,10 @@ mod tests {
         backend
             .commit(
                 &command_buffer,
-                &[(source, false), (output.clone(), true)],
+                &[
+                    CompletionAccess::read(&source),
+                    CompletionAccess::write(&output, true),
+                ],
                 resources,
                 CommitResidency {
                     sets: vec![residency],

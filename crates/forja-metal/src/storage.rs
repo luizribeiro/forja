@@ -6,7 +6,7 @@ use std::{
     slice,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -101,6 +101,7 @@ struct PendingCompletion {
     completion: Weak<Completion>,
     range: std::ops::Range<u64>,
     writes: bool,
+    initializes: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: Buffer access and pending-submission tracking are serialized by the backend registry
@@ -138,6 +139,7 @@ impl MetalBuffer {
         source: &[u8],
         timeout: Duration,
     ) -> Result<(), BackendError> {
+        self.prune_superseded();
         for pending in &self.pending {
             if let Some(completion) = pending.completion.upgrade()
                 && completion.wait(timeout) == Err(BackendError::Timeout)
@@ -195,6 +197,7 @@ impl MetalBuffer {
         timeout: Duration,
         retain_failed: bool,
     ) -> Result<(), BackendError> {
+        self.prune_superseded();
         let mut result = Ok(());
         for pending in std::mem::take(&mut self.pending) {
             let Some(completion) = pending.completion.upgrade() else {
@@ -211,6 +214,7 @@ impl MetalBuffer {
                         completion: Arc::downgrade(&completion),
                         range: pending.range,
                         writes: pending.writes,
+                        initializes: pending.initializes.clone(),
                     });
                 }
             }
@@ -223,6 +227,7 @@ impl MetalBuffer {
         range: &std::ops::Range<u64>,
         timeout: Duration,
     ) -> Result<(), BackendError> {
+        self.prune_superseded();
         let mut result = Ok(());
         self.pending.retain(|pending| {
             let Some(completion) = pending.completion.upgrade() else {
@@ -242,33 +247,93 @@ impl MetalBuffer {
         result
     }
 
-    pub(super) fn track(&mut self, tensor: &Tensor, completion: &Arc<Completion>, writes: bool) {
+    pub(super) fn track(
+        &mut self,
+        tensor: &Tensor,
+        completion: &Arc<Completion>,
+        writes: bool,
+        initializes: bool,
+    ) {
         self.pending.push(PendingCompletion {
             completion: Arc::downgrade(completion),
             range: tensor.layout().byte_span(),
             writes,
+            initializes: initializes.then(|| Arc::clone(&completion.successful)),
         });
     }
 
+    pub(super) fn drain_pending(&mut self, timeout: Duration) -> Result<(), BackendError> {
+        self.prune_superseded();
+        for pending in &self.pending {
+            if let Some(completion) = pending.completion.upgrade()
+                && completion.wait(timeout) == Err(BackendError::Timeout)
+            {
+                return Err(BackendError::Timeout);
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_superseded(&mut self) {
+        let mut written = forja_core::WrittenRanges::default();
+        let mut retained = Vec::new();
+        for pending in std::mem::take(&mut self.pending).into_iter().rev() {
+            let Some(_completion) = pending.completion.upgrade() else {
+                if pending
+                    .initializes
+                    .as_ref()
+                    .is_some_and(|success| success.load(Ordering::Acquire))
+                {
+                    written.record(pending.range);
+                }
+                continue;
+            };
+            if pending.writes {
+                for range in written.uncovered(pending.range.clone()) {
+                    retained.push(PendingCompletion {
+                        range,
+                        ..pending.clone()
+                    });
+                }
+                if pending
+                    .initializes
+                    .as_ref()
+                    .is_some_and(|success| success.load(Ordering::Acquire))
+                {
+                    written.record(pending.range);
+                }
+            } else {
+                retained.push(pending);
+            }
+        }
+        retained.reverse();
+        self.pending = retained;
+    }
+
     pub(super) fn dependencies(&mut self, range: &std::ops::Range<u64>) -> Vec<Arc<Completion>> {
+        self.prune_superseded();
         let mut dependencies = Vec::new();
+        let mut written = forja_core::WrittenRanges::default();
+        self.pending.reverse();
         self.pending.retain(|pending| {
             let Some(completion) = pending.completion.upgrade() else {
                 return false;
             };
-            if completion.result() == Some(Ok(())) {
-                return false;
+            let touched = pending.range.start.max(range.start)..pending.range.end.min(range.end);
+            if pending.writes && touched.start < touched.end && !written.covers(&touched) {
+                dependencies.push(Arc::clone(&completion));
             }
-            if pending.writes && pending.range.start < range.end && range.start < pending.range.end
-            {
-                dependencies.push(completion);
+            if pending.initializes.is_some() && completion.event_value().is_some() {
+                written.record(pending.range.clone());
             }
             true
         });
+        self.pending.reverse();
         dependencies
     }
 
     pub(super) fn pending_event_value(&mut self) -> Option<u64> {
+        self.prune_superseded();
         let mut maximum = None;
         self.pending.retain(|pending| {
             let Some(completion) = pending.completion.upgrade() else {
