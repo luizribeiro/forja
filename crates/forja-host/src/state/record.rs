@@ -132,6 +132,7 @@ impl<B: Backend> StateStorage<B> {
             )
         };
         self.pool.validate_slot(&slot).map_err(pool_error)?;
+        sequence.materialize_snapshot()?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
         let table = slot
             .table()

@@ -47,6 +47,7 @@ impl Drop for RecordingGuard {
 /// Shared sequence ownership retained by every recording and completion guard.
 pub struct StateSequenceHandle<B: Backend> {
     inner: Arc<Mutex<StateJournal>>,
+    pub(super) snapshot: Arc<Mutex<Option<Arc<super::StateSnapshot<B>>>>>,
     drain: Arc<RecordingDrain>,
     pub(super) storage: Arc<StateStorage<B>>,
 }
@@ -55,6 +56,7 @@ impl<B: Backend> Clone for StateSequenceHandle<B> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            snapshot: Arc::clone(&self.snapshot),
             drain: Arc::clone(&self.drain),
             storage: Arc::clone(&self.storage),
         }
@@ -70,6 +72,7 @@ impl<B: Backend> StateSequenceHandle<B> {
         Self {
             inner: Arc::new(Mutex::new(StateJournal::new(sequence))),
             drain: Arc::default(),
+            snapshot: Arc::default(),
             storage,
         }
     }

@@ -126,6 +126,19 @@ impl StateJournal {
         Ok(matches!(self.canonical, CanonicalPosition::Empty))
     }
 
+    pub(super) fn attach_snapshot(
+        &mut self,
+        prompt: Arc<super::CanonicalPrompt>,
+        position: LanePosition,
+    ) -> Result<(), PagePoolError> {
+        if !self.has_pristine_state()? || self.feedback.is_some() {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        self.canonical = CanonicalPosition::Prefill(prompt, position.tokens);
+        self.position = position;
+        Ok(())
+    }
+
     pub(super) fn begin_prefill(
         &mut self,
         serial: u64,

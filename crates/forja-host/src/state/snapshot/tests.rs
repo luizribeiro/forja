@@ -109,3 +109,48 @@ fn immutable_images_preserve_all_float_payload_bits_and_charges() {
     );
     assert_eq!(limited.live_bytes.load(Ordering::Acquire), before);
 }
+
+#[test]
+fn attachments_share_immutable_planes_until_the_first_update() {
+    let (host, parent, expected) = prepared(262_144);
+    let allowance = SnapshotAllowance::new(65_536, None).unwrap();
+    let image = parent.capture_snapshot(allowance).unwrap();
+    let storage = Arc::clone(&parent.storage);
+    drop(parent);
+    let children = [storage.reserve().unwrap(), storage.reserve().unwrap()];
+    for child in &children {
+        child
+            .attach_snapshot(Arc::clone(&image), image.namespace(), 257)
+            .unwrap();
+        assert!(child.snapshot.lock().unwrap().is_some());
+        let copy = child.capture_snapshot(allowance).unwrap();
+        for (plane, bytes) in copy.planes.iter().zip(&expected) {
+            assert_eq!(host.backend.read(plane).unwrap(), *bytes);
+        }
+    }
+    let transaction = children[0].begin(2).unwrap();
+    let recording = storage.record(&children[0], transaction).unwrap();
+    assert!(children[0].snapshot.lock().unwrap().is_none());
+    assert!(children[1].snapshot.lock().unwrap().is_some());
+    let journal = children[0].lock();
+    let record = journal
+        .allocation_table()
+        .unwrap()
+        .resolve(journal.checkpoint().unwrap().version())
+        .unwrap();
+    drop(journal);
+    for (plane, bytes) in expected.iter().enumerate() {
+        let private = storage.version_view(plane, record).unwrap();
+        assert_eq!(host.backend.read(&private).unwrap(), *bytes);
+        host.backend.write(&private, &vec![0; bytes.len()]).unwrap();
+        assert_eq!(host.backend.read(&image.planes[plane]).unwrap(), *bytes);
+    }
+    drop(recording);
+    assert_eq!(children[0].position().tokens, 64);
+    assert_eq!(children[1].position().tokens, 64);
+    assert!(
+        children[0]
+            .attach_snapshot(image.clone(), image.namespace(), 257)
+            .is_err()
+    );
+}

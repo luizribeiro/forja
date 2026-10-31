@@ -59,6 +59,7 @@ impl<B: Backend> StateSequenceHandle<B> {
             .resolve(checkpoint.version())
             .map_err(invalid_handle)?;
         let position = journal.position;
+        let attached = self.snapshot.lock().map_err(invalid_handle)?.clone();
         drop(journal);
         let count = usize::try_from(end).map_err(|_| quota("snapshot token count overflow"))?;
         let layout = self.storage.pool.layout();
@@ -105,7 +106,10 @@ impl<B: Backend> StateSequenceHandle<B> {
                     .alloc(descriptor.dtype(), descriptor.shape())
                     .map_err(guest_error)?,
             );
-            let source = self.storage.version_view(plane, record)?;
+            let source = match &attached {
+                Some(image) => image.planes[plane].clone(),
+                None => self.storage.version_view(plane, record)?,
+            };
             let data = image
                 .backend
                 .read_replay_output(&source)
@@ -131,3 +135,5 @@ impl<B: Backend> Drop for StateSnapshot<B> {
 
 #[cfg(test)]
 mod tests;
+
+mod attach;
