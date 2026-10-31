@@ -283,3 +283,42 @@ async fn serial_prefill_uses_the_same_canonical_tail_as_continuous_serving() -> 
     assert_eq!(engine.runner.state_lane_fingerprint(0)?.1, expected_state);
     Ok(())
 }
+
+async fn complete_prompt(
+    engine: &mut ServingEngine<forja_cpu::CpuBackend>,
+    token: u32,
+) -> Result<(Option<u32>, [u8; 32], u32), TestError> {
+    let mut input = request();
+    input.prefix_reuse = true;
+    input.tokens.fill(token);
+    let mut pending = engine
+        .begin_batch_prefill(input, 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    while !engine.advance_batch_prefill(&mut pending, 64).await? {}
+    let result = (
+        pending.selected,
+        engine.runner.state_lane_fingerprint(0)?.1,
+        pending.cached,
+    );
+    assert!(engine.release_failed_lane(0).is_none());
+    Ok(result)
+}
+
+#[tokio::test]
+async fn snapshot_quota_refusals_preserve_successful_serving_and_cold_state()
+-> Result<(), TestError> {
+    let mut engine = engine()
+        .await?
+        .with_profile_prefixes(&canonical_profile()?)?;
+    let mut config = engine.config.clone();
+    config.serving.state_snapshot_bytes =
+        forja_config::Choice::Fixed(forja_config::ByteSize::new(1));
+    engine.update_policy(1, config)?;
+    let cold = complete_prompt(&mut engine, 0).await?;
+    let again = complete_prompt(&mut engine, 0).await?;
+    assert_eq!(cold, again);
+    assert_eq!(again.2, 0);
+    assert_eq!(engine.metrics.snapshot_refusals, 2);
+    Ok(())
+}
