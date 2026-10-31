@@ -144,12 +144,34 @@ impl FeedbackVersions {
         scratch: u32,
         selected: &FeedbackPin,
     ) -> Result<(), PagePoolError> {
-        self.validate_selection(expected, scratch, selected)?;
-        let scratch = usize::try_from(scratch).map_err(|_| PagePoolError::ArithmeticOverflow)?;
-        std::mem::swap(
-            &mut self.records[expected.record],
-            &mut self.scratch[scratch],
-        );
+        self.publish_selections(&[(expected, scratch, selected)])
+    }
+
+    /// Publishes distinct selections only after every association passes validation.
+    ///
+    /// # Errors
+    /// Refuses stale, foreign or overlapping records and scratch without changing any association.
+    pub fn publish_selections(
+        &mut self,
+        selections: &[(&FeedbackCheckpoint, u32, &FeedbackPin)],
+    ) -> Result<(), PagePoolError> {
+        for (index, &(expected, scratch, selected)) in selections.iter().enumerate() {
+            self.validate_selection(expected, scratch, selected)?;
+            if selections[..index]
+                .iter()
+                .any(|(other, slot, _)| other.record == expected.record || *slot == scratch)
+            {
+                return Err(PagePoolError::InvalidCheckpoint);
+            }
+        }
+        for &(expected, scratch, _) in selections {
+            let scratch =
+                usize::try_from(scratch).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+            std::mem::swap(
+                &mut self.records[expected.record],
+                &mut self.scratch[scratch],
+            );
+        }
         Ok(())
     }
 
@@ -219,6 +241,33 @@ mod tests {
             versions.checkpoint(0).unwrap().scalar().index(),
             input.scalar().index()
         );
+    }
+
+    #[test]
+    fn batch_selection_preflights_every_lane_before_publication() {
+        let mut versions = FeedbackVersions::new(6, 4).unwrap();
+        let a = versions.checkpoint(0).unwrap();
+        let b = versions.checkpoint(3).unwrap();
+        let x = versions.claim_scratch(0).unwrap();
+        let y = versions.claim_scratch(2).unwrap();
+        let before = [a.scalar().index(), b.scalar().index()];
+        let foreign = FeedbackVersions::new(6, 4).unwrap().checkpoint(3).unwrap();
+        for second in [(&foreign, 2, &y), (&b, 0, &x), (&a, 2, &y)] {
+            assert!(versions.publish_selections(&[(&a, 0, &x), second]).is_err());
+            assert_eq!(
+                [
+                    versions.checkpoint(0).unwrap().scalar().index(),
+                    versions.checkpoint(3).unwrap().scalar().index()
+                ],
+                before
+            );
+        }
+        versions
+            .publish_selections(&[(&a, 0, &x), (&b, 2, &y)])
+            .unwrap();
+        assert_eq!(versions.checkpoint(0).unwrap().scalar().index(), x.index());
+        assert_eq!(versions.checkpoint(3).unwrap().scalar().index(), y.index());
+        assert!(versions.publish_selections(&[(&a, 0, &x)]).is_err());
     }
 
     #[test]
