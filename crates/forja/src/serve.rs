@@ -279,10 +279,6 @@ where
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
-    let retained_bytes = runner
-        .memory_usage()
-        .accounted_bytes()
-        .ok_or_else(|| "retained runtime charge overflowed".to_owned())?;
     let engine = forja_serve::ServingEngine::new(
         profile.model().id.clone(),
         runner,
@@ -297,7 +293,12 @@ where
         profile.workload().prefill_chunk.get(),
         identity,
     )
+    .and_then(|engine| engine.with_profile_prefixes(&profile))
     .map_err(|error| error.to_string())?;
+    let retained_bytes = engine
+        .memory_usage()
+        .accounted_bytes()
+        .ok_or_else(|| "retained runtime charge overflowed".to_owned())?;
     Ok(Loaded {
         service: engine,
         retained_bytes,
@@ -931,7 +932,8 @@ mod tests {
                 .map_or(1, |serving| serving.prompt_token_budget.get()),
             profile.workload().prefill_chunk.get(),
             identity,
-        )?)
+        )?
+        .with_profile_prefixes(&profile)?)
     }
 
     #[cfg(target_os = "macos")]
@@ -1037,6 +1039,7 @@ mod tests {
                 .map_or(1, |serving| serving.prompt_token_budget.get()),
             profile.workload().prefill_chunk.get(),
             identity,
-        )?)
+        )?
+        .with_profile_prefixes(&profile)?)
     }
 }

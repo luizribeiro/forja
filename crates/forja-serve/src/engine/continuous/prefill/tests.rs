@@ -364,3 +364,12 @@ async fn undeclared_snapshot_allowances_refuse_operator_growth_at_startup_and_re
     assert!(engine.with_profile_prefixes(&profile).is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn retained_runtime_memory_includes_the_paired_prefix_index() -> Result<(), TestError> {
+    let engine = engine().await?;
+    let before = engine.memory_usage().accounted_bytes().unwrap();
+    let engine = engine.with_profile_prefixes(&canonical_profile()?)?;
+    assert!(engine.memory_usage().accounted_bytes().unwrap() > before);
+    Ok(())
+}

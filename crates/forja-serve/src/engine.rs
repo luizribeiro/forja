@@ -1034,6 +1034,12 @@ where
         &self.model
     }
 
+    /// Returns memory attributed to the runner, including prefix index allocations.
+    #[must_use]
+    pub fn memory_usage(&self) -> forja_host::EngineMemory {
+        self.runner.memory_usage()
+    }
+
     /// Returns bounded aggregate serving measurements.
     #[must_use]
     pub const fn metrics(&self) -> &ServingMetrics {
