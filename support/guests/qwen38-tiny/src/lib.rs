@@ -11,7 +11,6 @@ use forja_sdk::{
 
 enum Tiny {
     Full(qwen38::Qwen38),
-    Slotted(Box<qwen38::Model>),
     Recurrent(qwen38::DeltaNet),
     Decoder(qwen38::DecoderLayer),
     Attention(qwen38::Attention),
@@ -55,9 +54,8 @@ impl Engine for Tiny {
             return Self::load(weights, load);
         };
         if load.tunings.is_empty() {
-            return qwen38::Model::load_paged(weights, &load, qwen38::Config::tiny(), pool)
-                .map(Box::new)
-                .map(Self::Slotted);
+            return qwen38::Qwen38::with_paged_config(weights, &load, qwen38::Config::tiny(), pool)
+                .map(Self::Full);
         }
         if load.tunings.iter().any(|name| name == "attention-fixture") {
             let context = load.max_context.unwrap_or(64);
@@ -101,17 +99,6 @@ impl Engine for Tiny {
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         match self {
             Self::Full(engine) => engine.step(input),
-            Self::Slotted(model) => {
-                let output = model.forward_paged(
-                    &input.tokens,
-                    &forja_sdk::Dim::from(input.start_pos),
-                    0,
-                    input.phase,
-                    input.taps,
-                )?;
-                forja_sdk::eval()?;
-                Ok(output)
-            }
             Self::Attention(layer) => {
                 let values = input.tokens.to_vec()?;
                 let rows = u32::try_from(values.len())
@@ -171,7 +158,7 @@ impl Engine for Tiny {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.decode(input),
-            Self::Slotted(_) | Self::Recurrent(_) | Self::Decoder(_) | Self::Attention(_) => {
+            Self::Recurrent(_) | Self::Decoder(_) | Self::Attention(_) => {
                 Err(forja_sdk::Error::loading("recurrent fixture uses step"))
             }
         }

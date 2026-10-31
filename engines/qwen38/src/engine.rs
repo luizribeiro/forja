@@ -5,10 +5,15 @@ use forja_sdk::{
     DecodeInput, DecodeOutput, Engine, EngineInfo, EngineLoadConfig, Error, Result, StepInput,
     StepOutput, Weights,
 };
-/// Single-lane text engine with eager feedback and no prefix or graph reuse.
+enum Feedback {
+    Eager(Box<EagerFeedback>),
+    Paged,
+}
+
+/// Text engine with private eager feedback or host-owned serving state.
 pub struct Qwen38 {
     model: Model,
-    feedback: EagerFeedback,
+    feedback: Feedback,
 }
 impl Qwen38 {
     /// Returns the finite serving shapes; the eight-lane shapes execute eagerly.
@@ -38,6 +43,22 @@ impl Qwen38 {
             }))
             .collect()
     }
+    /// Loads an explicit architecture into a host-owned serving pool.
+    ///
+    /// # Errors
+    /// Refuses invalid configuration, weights, selections or serving capacity.
+    pub fn with_paged_config(
+        weights: &Weights<'_>,
+        load: &EngineLoadConfig,
+        config: Config,
+        pool: forja_sdk::PagedPool<'_>,
+    ) -> Result<Self> {
+        Ok(Self {
+            model: Model::load_paged(weights, load, config, pool)?,
+            feedback: Feedback::Paged,
+        })
+    }
+
     /// Loads an explicit architecture for trusted native tests.
     ///
     /// # Errors
@@ -53,7 +74,7 @@ impl Qwen38 {
             .ok_or_else(|| Error::loading("profile context is missing"))?;
         Ok(Self {
             model,
-            feedback: EagerFeedback::new(context, config.vocab)?,
+            feedback: Feedback::Eager(Box::new(EagerFeedback::new(context, config.vocab)?)),
         })
     }
 }
@@ -73,8 +94,31 @@ impl Engine for Qwen38 {
     fn load(weights: &Weights<'_>, config: EngineLoadConfig) -> Result<Self> {
         Self::with_config(weights, &config, Config::model())
     }
+    fn load_paged(
+        weights: &Weights<'_>,
+        pool: Option<forja_sdk::PagedPool<'_>>,
+        config: EngineLoadConfig,
+    ) -> Result<Self> {
+        match pool {
+            Some(pool) => Self::with_paged_config(weights, &config, Config::model(), pool),
+            None => Self::load(weights, config),
+        }
+    }
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
-        self.feedback.invalidate();
+        match &mut self.feedback {
+            Feedback::Eager(feedback) => feedback.invalidate(),
+            Feedback::Paged => {
+                let output = self.model.forward_paged(
+                    &input.tokens,
+                    &forja_sdk::Dim::from(input.start_pos),
+                    0,
+                    input.phase,
+                    input.taps,
+                )?;
+                forja_sdk::eval()?;
+                return Ok(output);
+            }
+        }
         match input.phase {
             forja_sdk::BatchPhase::Prompt => {
                 self.model
@@ -87,6 +131,9 @@ impl Engine for Qwen38 {
         }
     }
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
-        self.feedback.decode(&mut self.model, input)
+        match &mut self.feedback {
+            Feedback::Eager(feedback) => feedback.decode(&mut self.model, input),
+            Feedback::Paged => Err(Error::loading("paged decode requires banked sampling")),
+        }
     }
 }
