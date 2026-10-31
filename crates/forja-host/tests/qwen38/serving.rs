@@ -207,4 +207,4 @@ async fn constrained_selection_and_retained_rewind_preserve_hybrid_bits()
 mod catalog;
 
 #[path = "serving/prefix.rs"]
-mod prefix;
+pub(super) mod prefix;

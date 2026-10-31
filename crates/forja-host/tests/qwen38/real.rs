@@ -2,6 +2,8 @@ use super::{Error, verification};
 use std::{env, path::PathBuf, time::Duration};
 
 type Runner = forja_host::EngineRunner<forja_metal::MetalBackend>;
+#[path = "real/prefix.rs"]
+mod prefix;
 #[path = "real/serving.rs"]
 mod serving;
 
@@ -11,6 +13,14 @@ async fn load() -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn E
 async fn load_with(
     replay: bool,
     layers: Option<u32>,
+) -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
+    load_configured(replay, layers, layers.map(|_| 64)).await
+}
+
+async fn load_configured(
+    replay: bool,
+    layers: Option<u32>,
+    context: Option<u32>,
 ) -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
     let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?)
         .join("Qwen3.8-27B-4bit");
@@ -55,8 +65,8 @@ async fn load_with(
     .await?;
     let mut config = crate::common::load_config(&component)?;
     config.replay = replay;
-    if layers.is_some() {
-        config.max_context = Some(64);
+    if let Some(context) = context {
+        config.max_context = Some(context);
     }
     engine
         .load_with_selections(layers, &config)

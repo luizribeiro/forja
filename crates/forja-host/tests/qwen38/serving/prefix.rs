@@ -11,18 +11,22 @@ async fn evaluate<B: Backend + Send + Sync + 'static>(
     cache: &HybridPrefixStore<B>,
     tokens: &[u32],
     reuse: bool,
+    lane: u32,
+    publish: bool,
 ) -> Result<(Vec<u8>, [u8; 32], u64), Box<dyn Error>> {
     let namespace = cache.namespace();
     let schedule = CanonicalPrefixSchedule::new(namespace.block(), NonZeroU32::new(4096).unwrap())?;
-    let allowance = SnapshotAllowance::new(1 << 28, None)?;
+    let allowance = SnapshotAllowance::new(2 << 30, None)?;
     let hit = if reuse {
         cache.lookup(namespace, tokens)?
     } else {
         None
     };
     let prompt = runner.canonical_prompt(namespace, tokens.to_vec())?;
-    runner.prepare_paged_lane(0, None, 0)?;
-    let mut position = runner.prepare_canonical_lane(0, prompt, hit.as_ref(), 8192)?;
+    runner.prepare_paged_lane(lane, None, 0)?;
+    let mut position = runner
+        .prepare_canonical_lane(lane, prompt, hit.as_ref(), u64::try_from(tokens.len())? + 1)
+        .map_err(|error| format!("admit len={} reuse={reuse}: {error}", tokens.len()))?;
     let cached = position;
     let mut logits = Vec::new();
     while position < tokens.len() as u64 {
@@ -45,38 +49,60 @@ async fn evaluate<B: Backend + Send + Sync + 'static>(
                     selection: BatchSelection::Combined,
                 },
                 lanes: vec![Some(EngineBatchLane {
-                    slot: 0,
+                    slot: lane,
                     tokens: Some(tokens[start..end].to_vec()),
                     start_pos: u32::try_from(position)?,
                     sampling: SamplingParams::default(),
                 })],
             })
-            .await??;
+            .await?
+            .map_err(|error| format!("piece len={} start={position}: {error}", tokens.len()))?;
         logits = runner.read(&output.logits).await?;
-        runner.read(&output.tokens).await?;
+        runner.read_queued_batch_tokens(output).await?;
         position += u64::from(count);
-        if schedule.contains(position, tokens.len() as u64) {
-            let entry = runner.capture_canonical_prefix(0, allowance)?;
+        if publish && schedule.contains(position, tokens.len() as u64) {
+            let entry = runner
+                .capture_canonical_prefix(lane, allowance)
+                .map_err(|error| format!("capture len={} end={position}: {error}", tokens.len()))?;
             cache.publish(entry, &AtomicBool::new(false))?;
         }
     }
-    let (position, digest) = runner.state_lane_fingerprint(0)?;
+    let (position, digest) = runner.state_lane_fingerprint(lane)?;
     assert_eq!(position.tokens, tokens.len() as u64);
     Ok((logits, digest, cached))
+}
+
+pub(crate) async fn assert_boundaries<B: Backend + Send + Sync + 'static>(
+    mut runner: EngineRunner<B>,
+    lengths: &[u32],
+) -> Result<(), Box<dyn Error>> {
+    let namespace = runner.canonical_prefix_namespace([7; 32], &["test-fixed"])?;
+    for &length in lengths {
+        let cache = runner
+            .create_canonical_prefix_store(namespace, SnapshotAllowance::new(2 << 30, None)?)?;
+        let tokens = (0..length).map(|i| i % 33).collect::<Vec<_>>();
+        let cold = evaluate(&mut runner, &cache, &tokens, false, 0, true).await?;
+        assert_eq!(
+            cache.usage()?.entries,
+            if length <= 64 {
+                0
+            } else if length == 4161 {
+                2
+            } else {
+                1
+            }
+        );
+        let hit = evaluate(&mut runner, &cache, &tokens, true, 0, false).await?;
+        assert_eq!(cold.0, hit.0, "logits at {length}");
+        assert_eq!(cold.1, hit.1, "state at {length}");
+        assert_eq!(hit.2, u64::from((length - 1) / 64 * 64));
+    }
+    Ok(())
 }
 
 #[tokio::test]
 async fn canonical_prefix_replays_tail_with_identical_logits_and_state()
 -> Result<(), Box<dyn Error>> {
-    let mut runner = runner_with_context(forja_cpu::CpuBackend::new(), false, 8192).await?;
-    let namespace = runner.canonical_prefix_namespace([7; 32], &["test-fixed"])?;
-    let cache =
-        runner.create_canonical_prefix_store(namespace, SnapshotAllowance::new(1 << 28, None)?)?;
-    let tokens = (0..65).map(|i| i % 33).collect::<Vec<_>>();
-    let cold = evaluate(&mut runner, &cache, &tokens, false).await?;
-    let hit = evaluate(&mut runner, &cache, &tokens, true).await?;
-    assert_eq!(cold.0, hit.0);
-    assert_eq!(cold.1, hit.1);
-    assert_eq!(hit.2, 64);
-    Ok(())
+    let runner = runner_with_context(forja_cpu::CpuBackend::new(), false, 8192).await?;
+    assert_boundaries(runner, &[63, 64, 65, 4096, 4097, 4161]).await
 }
