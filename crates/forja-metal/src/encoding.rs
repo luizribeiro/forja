@@ -1437,9 +1437,12 @@ fn reset_allocator(allocator: &ProtocolObject<dyn MTL4CommandAllocator>) {
     allocator.reset();
 }
 
+// Bound each driver heap request while retaining the full logical timeline.
+const TIMESTAMP_HEAP_ENTRIES: usize = 1024;
+
 #[derive(Clone)]
 struct GpuTimestamps {
-    heap: Retained<ProtocolObject<dyn MTL4CounterHeap>>,
+    heaps: Arc<[Retained<ProtocolObject<dyn MTL4CounterHeap>>]>,
     frequency: u64,
     entry_size: usize,
     count: usize,
@@ -1453,12 +1456,51 @@ unsafe impl Send for GpuTimestamps {}
 unsafe impl Sync for GpuTimestamps {}
 
 impl GpuTimestamps {
+    fn entry(
+        &self,
+        index: usize,
+    ) -> Result<(&ProtocolObject<dyn MTL4CounterHeap>, usize), BackendError> {
+        if index >= self.count {
+            return Err(BackendError::InvalidInput);
+        }
+        self.heaps
+            .get(index / TIMESTAMP_HEAP_ENTRIES)
+            .map(|heap| (heap.as_ref(), index % TIMESTAMP_HEAP_ENTRIES))
+            .ok_or(BackendError::InvalidInput)
+    }
+
+    fn write_command(
+        &self,
+        command: &ProtocolObject<dyn objc2_metal::MTL4CommandBuffer>,
+        index: usize,
+    ) -> Result<(), BackendError> {
+        let (heap, index) = self.entry(index)?;
+        // SAFETY: The logical index was checked and translated to its retained heap entry.
+        unsafe {
+            command.writeTimestampIntoHeap_atIndex(heap, index);
+        }
+        Ok(())
+    }
+
     fn resolve(self) -> Option<ResolvedTimestamps> {
-        // SAFETY: The range covers the heap, GPU completion has been observed, and the tracker
-        // resolves the data before returning the heap's slot to the reusable pool.
-        let data = unsafe { self.heap.resolveCounterRange(NSRange::new(0, self.count)) }?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(self.count.checked_mul(self.entry_size)?)
+            .ok()?;
+        for (index, heap) in self.heaps.iter().enumerate() {
+            let count = self
+                .count
+                .checked_sub(index.checked_mul(TIMESTAMP_HEAP_ENTRIES)?)?
+                .min(TIMESTAMP_HEAP_ENTRIES);
+            // SAFETY: The range covers this page, and GPU completion was observed before resolution.
+            let data = unsafe { heap.resolveCounterRange(NSRange::new(0, count)) }?.to_vec();
+            if data.len() != count.checked_mul(self.entry_size)? {
+                return None;
+            }
+            bytes.extend_from_slice(&data);
+        }
         Some(ResolvedTimestamps {
-            bytes: data.to_vec(),
+            bytes,
             frequency: self.frequency,
             entry_size: self.entry_size,
         })
@@ -2892,11 +2934,7 @@ impl MetalBackend {
         } else {
             objects.timestamps()?
         };
-        // SAFETY: `make_timestamps` always reserves at least two entries, so indices 0 and 1 are
-        // in range.
-        unsafe {
-            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
-        }
+        timestamps.write_command(&command_buffer, 0)?;
         let encoding_started = PROFILE.then(Instant::now);
         let mut temporary_profile = TemporaryProfileScope::enter(PROFILE);
         let mut argument_writer = ArgumentWriter::new(objects.argument_buffer()?);
@@ -2963,11 +3001,7 @@ impl MetalBackend {
             profile.residency =
                 residency_started.map_or(Duration::ZERO, |started| started.elapsed());
         }
-        // SAFETY: `make_timestamps` always reserves at least two entries, so indices 0 and 1 are
-        // in range.
-        unsafe {
-            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
-        }
+        timestamps.write_command(&command_buffer, 1)?;
         command_buffer.endCommandBuffer();
         let dispatch_profiles = if PROFILE {
             let mut facts = crate::route_facts::RouteFacts::default();
@@ -3052,12 +3086,12 @@ impl MetalBackend {
                     timestamps,
                     timestamp_granularity,
                     1 + index * 2,
-                );
+                )?;
             }
             if barrier {
                 encode_dispatch_barrier(&encoder);
             }
-            write_dispatch_timestamp(&encoder, timestamps, timestamp_granularity, 2 + index * 2);
+            write_dispatch_timestamp(&encoder, timestamps, timestamp_granularity, 2 + index * 2)?;
             if timestamps.is_some() {
                 internal_profiles.extend(internal_dispatch_profiles(
                     dispatch,
@@ -3115,7 +3149,7 @@ impl MetalBackend {
                 timestamps,
                 timestamp_granularity,
                 1 + plan.dispatches.len() * 2,
-            );
+            )?;
         }
         encoder.endEncoding();
         let argument_usage = (arguments.offset > 0).then(|| ArgumentUsage {
@@ -8060,15 +8094,26 @@ impl MetalBackend {
     fn make_timestamps(&self, count: usize) -> Result<GpuTimestamps, BackendError> {
         let descriptor = MTL4CounterHeapDescriptor::new();
         descriptor.setType(MTL4CounterHeapType::Timestamp);
-        // SAFETY: The descriptor count matches all timestamp indices encoded by the caller.
-        unsafe {
-            descriptor.setCount(count);
+        if count < 2 {
+            return Err(BackendError::InvalidInput);
         }
-        let heap = self.allocate_device_object(|| {
-            self.device
-                .newCounterHeapWithDescriptor_error(&descriptor)
-                .map_err(|_| BackendError::ExecutionFailed)
-        })?;
+        let mut heaps = Vec::new();
+        let mut remaining = count;
+        while remaining != 0 {
+            let entries = remaining.min(TIMESTAMP_HEAP_ENTRIES);
+            // SAFETY: All encoded indices are translated to this page's checked entry range.
+            unsafe {
+                descriptor.setCount(entries);
+            }
+            heaps.push(self.allocate_device_object(|| {
+                self.device
+                    .newCounterHeapWithDescriptor_error(&descriptor)
+                    .map_err(|_| BackendError::ExecutionFailed)
+            })?);
+            remaining = remaining
+                .checked_sub(entries)
+                .ok_or(BackendError::InvalidInput)?;
+        }
         let frequency = self.device.queryTimestampFrequency();
         let entry_size = self
             .device
@@ -8077,7 +8122,7 @@ impl MetalBackend {
             return Err(BackendError::ExecutionFailed);
         }
         Ok(GpuTimestamps {
-            heap,
+            heaps: heaps.into(),
             frequency,
             entry_size,
             count,
@@ -9391,24 +9436,25 @@ fn write_dispatch_timestamp(
     timestamps: Option<&GpuTimestamps>,
     granularity: ProfileTimestampGranularity,
     index: usize,
-) {
+) -> Result<(), BackendError> {
     use objc2_metal::MTL4ComputeCommandEncoder;
 
     let Some(timestamps) = timestamps else {
-        return;
+        return Ok(());
     };
-    // SAFETY: Profiled heaps reserve `2 + 2 * dispatches + internal` entries. Outer indices stay
-    // below `2 + 2 * dispatches`; the checked internal writer uses that value as its lower bound.
+    let (heap, index) = timestamps.entry(index)?;
+    // SAFETY: The logical index was checked and translated to its retained heap entry.
     unsafe {
         encoder.writeTimestampWithGranularity_intoHeap_atIndex(
             match granularity {
                 ProfileTimestampGranularity::Relaxed => MTL4TimestampGranularity::Relaxed,
                 ProfileTimestampGranularity::Precise => MTL4TimestampGranularity::Precise,
             },
-            &timestamps.heap,
+            heap,
             index,
         );
     }
+    Ok(())
 }
 
 fn write_internal_timestamp(
@@ -9426,7 +9472,7 @@ fn write_internal_timestamp(
             Some(timestamps),
             ProfileTimestampGranularity::Precise,
             *next_timestamp,
-        );
+        )?;
         *next_timestamp = next_timestamp
             .checked_add(1)
             .ok_or(BackendError::ExecutionFailed)?;
@@ -12104,6 +12150,35 @@ mod tests {
     }
 
     #[test]
+    fn metal_large_profiles_resolve_every_timestamp_across_heap_pages() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1]).unwrap();
+        let mut commands = CommandList::new();
+        for _ in 0..513 {
+            commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        }
+        let submission = backend.submit_profiled(commands).unwrap();
+        submission.wait().unwrap();
+        let profile = submission.profile().unwrap();
+        assert_eq!(profile.per_dispatch.len(), 513);
+        assert!(
+            profile
+                .per_dispatch
+                .iter()
+                .all(|dispatch| dispatch.gpu_time > Duration::ZERO)
+        );
+        let intervals: Duration = profile.per_dispatch.iter().map(|row| row.gpu_time).sum();
+        assert!(intervals <= profile.per_dispatch.last().unwrap().gpu_end);
+        assert!(
+            profile
+                .per_dispatch
+                .windows(2)
+                .all(|rows| rows[0].gpu_end <= rows[1].gpu_start)
+        );
+    }
+
+    #[test]
     fn metal_profile_timestamp_granularity_preserves_submission_timing() {
         let backend = MetalBackend::new().unwrap();
         let input = backend.alloc(DType::F32, &[1]).unwrap();
@@ -13048,8 +13123,8 @@ mod tests {
         let timestamps = backend.make_timestamps(2).unwrap();
         // SAFETY: The heap has two entries and remains live through completion.
         unsafe {
-            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 0);
-            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heap, 1);
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heaps[0], 0);
+            command_buffer.writeTimestampIntoHeap_atIndex(&timestamps.heaps[0], 1);
         }
         command_buffer.endCommandBuffer();
         backend
