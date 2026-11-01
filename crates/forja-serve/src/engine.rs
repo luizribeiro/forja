@@ -2929,7 +2929,7 @@ mod tests {
             model: "test".to_owned(),
             messages: vec![crate::Message {
                 role: "user".to_owned(),
-                content: Some("hello".to_owned()),
+                content: Some("hello".to_owned().into()),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,

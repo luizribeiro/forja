@@ -8,7 +8,7 @@ use forja_config::{Choice, HostConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ChatInfo, SamplingDefaults};
+use crate::{ChatInfo, MessageContent, SamplingDefaults};
 
 const MAX_SCHEMA_VISITS: usize = 65_536;
 
@@ -27,7 +27,7 @@ macro_rules! openai_record {
 #[serde(deny_unknown_fields)]
 pub struct Message {
     pub role: String,
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,9 +250,14 @@ pub(crate) fn validate_chat_input(
             request
                 .messages
                 .iter()
-                .flat_map(|message| [message.content.as_ref(), message.reasoning_content.as_ref()])
-                .flatten()
-                .map(String::len)
+                .flat_map(|message| {
+                    message
+                        .content
+                        .iter()
+                        .flat_map(MessageContent::chunks)
+                        .chain(message.reasoning_content.iter().map(String::as_str))
+                })
+                .map(str::len)
                 .chain(std::iter::once(option_bytes)),
         )?,
         config,
@@ -783,7 +788,7 @@ mod tests {
             model: "qwen".to_owned(),
             messages: vec![Message {
                 role: "user".to_owned(),
-                content: Some("hello".to_owned()),
+                content: Some("hello".to_owned().into()),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -828,6 +833,26 @@ mod tests {
                 .get("reasoning_content")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn text_parts_share_the_aggregate_text_ceiling() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test", "messages":[{"role":"user","content":[
+                {"type":"text","text":"he"}, {"type":"text","text":"llo"}
+            ]}]
+        }))
+        .unwrap();
+        let mut config = HostConfig::default();
+        config.request.max_text_bytes = forja_config::ByteSize::new(5);
+        let defaults = info(SamplingDefaults::default());
+        assert!(validate_chat_input(&request, &config, &defaults, 151_936).is_ok());
+        if let Some(MessageContent::Parts(parts)) = &mut request.messages[0].content {
+            parts.push(crate::TextPart::Text {
+                text: "!".to_owned(),
+            });
+        }
+        assert!(validate_chat_input(&request, &config, &defaults, 151_936).is_err());
     }
 
     fn resolve_chat(
@@ -1113,14 +1138,14 @@ mod tests {
             messages: vec![
                 Message {
                     role: "user".to_owned(),
-                    content: Some("a".repeat(limit)),
+                    content: Some("a".repeat(limit).into()),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
                 },
                 Message {
                     role: "user".to_owned(),
-                    content: Some("b".to_owned()),
+                    content: Some("b".to_owned().into()),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,

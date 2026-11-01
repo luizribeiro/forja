@@ -8,6 +8,7 @@ mod generation;
 #[doc(hidden)]
 pub mod guidance;
 mod http;
+mod message;
 mod metrics;
 mod prefix;
 mod request;
@@ -25,6 +26,7 @@ pub use engine::{
 };
 pub use generation::{LoadPlan, ProcessLedger};
 pub use http::{ChatService, DrainHandle, chat_router, operational_router, serving_router};
+pub use message::{MessageContent, TextPart};
 pub use metrics::ServingMetrics;
 pub use prefix::PrefixIdentity;
 pub use request::{
