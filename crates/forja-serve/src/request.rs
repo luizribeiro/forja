@@ -21,7 +21,18 @@ macro_rules! openai_record {
     };
 }
 
-openai_record!(Message { role: String, content: Option<String>, tool_calls: Option<Vec<ToolCall>>, tool_call_id: Option<String> });
+/// One chat message with optional assistant reasoning history.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Message {
+    pub role: String,
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
 openai_record!(Tool {
     r#type: String,
     function: FunctionDefinition
@@ -239,7 +250,9 @@ pub(crate) fn validate_chat_input(
             request
                 .messages
                 .iter()
-                .filter_map(|message| message.content.as_ref().map(String::len))
+                .flat_map(|message| [message.content.as_ref(), message.reasoning_content.as_ref()])
+                .flatten()
+                .map(String::len)
                 .chain(std::iter::once(option_bytes)),
         )?,
         config,
@@ -773,9 +786,48 @@ mod tests {
                 content: Some("hello".to_owned()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             }],
             params,
         }
+    }
+
+    #[test]
+    fn reasoning_history_round_trips_and_counts_against_the_text_ceiling() {
+        let mut request = chat(CompletionParams::default());
+        request.messages[0].role = "assistant".to_owned();
+        request.messages[0].reasoning_content = Some("reasoning".to_owned());
+        let encoded = serde_json::to_value(&request.messages[0]).unwrap();
+        assert_eq!(encoded["reasoning_content"], "reasoning");
+        let decoded: Message = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, request.messages[0]);
+        let mut config = HostConfig::default();
+        config.request.max_text_bytes = forja_config::ByteSize::new(5);
+        assert!(
+            validate_chat_input(
+                &request,
+                &config,
+                &info(SamplingDefaults::default()),
+                151_936
+            )
+            .is_err()
+        );
+        request.messages[0].reasoning_content = None;
+        assert!(
+            validate_chat_input(
+                &request,
+                &config,
+                &info(SamplingDefaults::default()),
+                151_936
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::to_value(&request.messages[0])
+                .unwrap()
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     fn resolve_chat(
@@ -1064,12 +1116,14 @@ mod tests {
                     content: Some("a".repeat(limit)),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "user".to_owned(),
                     content: Some("b".to_owned()),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
             params: CompletionParams::default(),
