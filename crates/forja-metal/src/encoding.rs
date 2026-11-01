@@ -8408,7 +8408,7 @@ fn dispatch_profile(
     physical_dispatches: u64,
 ) -> Result<DispatchProfile, BackendError> {
     let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
-    let cost = crate::profile_cost::logical(dispatch).ok_or(BackendError::InvalidInput)?;
+    let cost = crate::profile_cost::of(dispatch).ok_or(BackendError::InvalidInput)?;
     let padded_flops = crate::profile_cost::state_block::padded_flops(dispatch)
         .or_else(|| model.padded_flops(dispatch, cost))
         .ok_or(BackendError::InvalidInput)?;
@@ -8455,17 +8455,25 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
     ) {
         return delta_block_kernels(dispatch).to_vec();
     }
-    if matches!(
-        dispatch.op(),
-        Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
-    ) && paged_gqa_blocks(selected_variant(dispatch)).is_some()
+    if let Some((_, second)) = paged_attention_parts(dispatch)
         && let Ok(first) = dispatch_kernel(dispatch)
-        && let Some(&width) = dispatch.output().layout().shape().last()
-        && let Ok(second) = paged_gqa_second_pass(width)
     {
         return vec![first, second];
     }
     internal_gather_dispatch_names(dispatch).to_vec()
+}
+
+pub(crate) fn paged_attention_parts(dispatch: &Dispatch) -> Option<(u32, &'static str)> {
+    if !matches!(
+        dispatch.op(),
+        Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+    ) {
+        return None;
+    }
+    Some((
+        paged_gqa_blocks(selected_variant(dispatch))?,
+        paged_gqa_second_pass(*dispatch.output().layout().shape().last()?).ok()?,
+    ))
 }
 
 pub(crate) fn delta_block_mma_panel(dispatch: &Dispatch) -> Option<u32> {

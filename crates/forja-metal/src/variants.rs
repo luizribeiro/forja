@@ -2809,6 +2809,39 @@ mod tests {
     }
 
     #[test]
+    fn paged_attention_composite_preserves_scratch_and_counts_kv_once() {
+        for name in [
+            "paged-sdpa.vector-256-two-pass",
+            "paged-sdpa.vector-bounded-256-two-pass",
+        ] {
+            for dtype in [forja_core::DType::F32, forja_core::DType::F16] {
+                let dispatch = paged_sdpa_dispatch_with_heads(dtype, 6, 1, 256);
+                let variant = resolve(&dispatch, name, METAL4).unwrap();
+                let dispatch =
+                    dispatch.with_backend_data(forja_core::BackendDispatchData::new(variant));
+                let total = crate::profile_cost::of(&dispatch).unwrap();
+                let first = crate::profile_cost::internal(
+                    &dispatch,
+                    "paged_sdpa_2pass_1_independent_256",
+                    Some(32),
+                )
+                .unwrap();
+                let second =
+                    crate::profile_cost::internal(&dispatch, "paged_sdpa_2pass_2_256", Some(32))
+                        .unwrap();
+                assert_eq!(first.checked_add(second), Some(total));
+                assert_eq!(
+                    total.kv_bytes,
+                    forja_core::KernelCost::of(&dispatch).unwrap().kv_bytes
+                );
+                assert!(total.scratch_read_bytes > 0);
+                assert_eq!(total.scratch_write_bytes, total.scratch_read_bytes);
+                assert_eq!(total.metadata_read_bytes, first.metadata_read_bytes);
+            }
+        }
+    }
+
+    #[test]
     fn bounded_costs_leave_legacy_and_reduced_vector_arithmetic_unchanged() {
         for (bounded, legacy, dispatch) in [
             (

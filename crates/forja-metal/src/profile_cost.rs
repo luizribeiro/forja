@@ -10,6 +10,14 @@ pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
     Some(cost)
 }
 
+pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
+    let Some((blocks, second)) = crate::encoding::paged_attention_parts(dispatch) else {
+        return logical(dispatch);
+    };
+    let first = crate::encoding::dispatch_kernel(dispatch).ok()?;
+    internal(dispatch, first, Some(blocks))?.checked_add(internal(dispatch, second, Some(blocks))?)
+}
+
 fn product(values: &[u64]) -> Option<u64> {
     values
         .iter()
@@ -42,11 +50,14 @@ pub(crate) fn internal(
             return Some(KernelCost {
                 read_bytes: partials,
                 write_bytes: cost.write_bytes,
+                scratch_read_bytes: partials,
+                sfu_ops: product(&[u64::from(query[0]), u64::from(blocks)])?,
                 scalar_ops: product(&[u64::from(query[0]), u64::from(blocks), width, 3])?,
                 ..KernelCost::default()
             });
         }
         cost.write_bytes = partials;
+        cost.scratch_write_bytes = partials;
         return Some(cost);
     }
     if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) {
