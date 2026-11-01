@@ -375,6 +375,8 @@ void paged_sdpa_2pass_1_gqa_body(
     float result[HPT][elements_per_thread];
     float maximum[HPT];
     float denominator[HPT];
+    float completed[HPT][elements_per_thread] = {};
+    float completed_denominator[HPT] = {};
     for (uint local_head = 0; local_head < HPT; ++local_head) {
         uint head = query_head + first_head + local_head;
         ulong q_base = params.q_offset + ulong(head) * params.q_strides[0];
@@ -469,6 +471,22 @@ void paged_sdpa_2pass_1_gqa_body(
                             result[local_head][element] = result[local_head][element]
                                 * previous_factor + score_factor * value_values[element];
                         }
+                        if constexpr (IndependentHeads) {
+                            if (attention_bounded_sums != 0 && input1_dtype == 0) {
+                                completed_denominator[local_head] *= previous_factor;
+                                for (uint element = 0; element < elements_per_thread; ++element) {
+                                    completed[local_head][element] *= previous_factor;
+                                }
+                                if ((key_row - chunk_start + 1) % ATTENTION_PARTIAL_PERIOD == 0) {
+                                    completed_denominator[local_head] += denominator[local_head];
+                                    denominator[local_head] = 0.0f;
+                                    for (uint element = 0; element < elements_per_thread; ++element) {
+                                        completed[local_head][element] += result[local_head][element];
+                                        result[local_head][element] = 0.0f;
+                                    }
+                                }
+                            }
+                        }
                     }
                     k_base += key_row_stride;
                     v_base += value_row_stride;
@@ -478,6 +496,14 @@ void paged_sdpa_2pass_1_gqa_body(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if constexpr (IndependentHeads) {
+        if (attention_bounded_sums != 0 && input1_dtype == 0) {
+            denominator[0] += completed_denominator[0];
+            for (uint element = 0; element < elements_per_thread; ++element) {
+                result[0][element] += completed[0][element];
+            }
+        }
+    }
     if constexpr (KVPTG > 1) {
         uint head = query_head + head_group;
         ulong partial_row = ulong(head) * params.blocks + block;

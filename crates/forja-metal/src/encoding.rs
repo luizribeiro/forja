@@ -3832,6 +3832,7 @@ impl MetalBackend {
             (3, dtype_code(value.layout.dtype())),
             (216, u32::from(has_activity)),
             (218, u32::from(append)),
+            (219, u32::from(bounded_attention(dispatch))),
         ];
         let validation = self
             .pipelines
@@ -8957,7 +8958,7 @@ fn steel_attention_tile(kernel: SdpaKernel, width: u32) -> Result<(u32, u32), Ba
 fn steel_attention_constants(
     dispatch: &Dispatch,
     kernel: SdpaKernel,
-) -> Result<[(u32, u32); 7], BackendError> {
+) -> Result<[(u32, u32); 8], BackendError> {
     let [query, key, value] = dispatch.inputs() else {
         return Err(BackendError::InvalidInput);
     };
@@ -8975,6 +8976,7 @@ fn steel_attention_constants(
         (211, u32::from(key_length % block_key == 0)),
         (212, u32::from(causal)),
         (217, steel_vectorized_loaders()),
+        (219, u32::from(bounded_attention(dispatch))),
     ])
 }
 
@@ -9041,6 +9043,12 @@ fn pinned_variant(dispatch: &Dispatch) -> Option<MetalVariant> {
         .backend_data::<crate::ValidatedVariant>()
         .copied()
         .map(crate::ValidatedVariant::implementation)
+}
+
+fn bounded_attention(dispatch: &Dispatch) -> bool {
+    dispatch
+        .backend_data::<crate::ValidatedVariant>()
+        .is_some_and(|variant| variant.uses_bounded_attention())
 }
 
 fn selected_variant(dispatch: &Dispatch) -> Option<MetalVariant> {

@@ -92,6 +92,12 @@ pub(crate) enum MetalVariant {
     SampleParallel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MetalImplementation {
+    kernel: MetalVariant,
+    bounded_attention: bool,
+}
+
 /// A registry variant resolved and checked for one concrete dispatch.
 #[derive(Clone, Copy, Debug)]
 pub struct ValidatedVariant {
@@ -125,7 +131,11 @@ impl ValidatedVariant {
     }
 
     pub(crate) const fn implementation(self) -> MetalVariant {
-        REGISTRY[self.index].implementation
+        REGISTRY[self.index].implementation.kernel
+    }
+
+    pub(crate) fn uses_bounded_attention(self) -> bool {
+        REGISTRY[self.index].implementation.bounded_attention
     }
 
     pub(crate) const fn needs_replay_validation(self) -> bool {
@@ -798,7 +808,7 @@ macro_rules! variant {
         VariantDef {
             name: $name,
             operation: OperationKind::$operation,
-            implementation: MetalVariant::$implementation,
+            implementation: MetalImplementation { kernel: MetalVariant::$implementation, bounded_attention: false },
             cost: MetalVariant::$implementation.cost_model(),
             availability: METAL4,
             constraints: $constraints,
@@ -842,7 +852,7 @@ const DELTA_BLOCK_KEYS: &[Constraint] = &[value(
     },
 )];
 
-pub(crate) static REGISTRY: &[VariantDef<MetalVariant>] = &[
+pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
     batch_invariant_variant!(
         "matmul.portable",
         Matmul,
@@ -1625,10 +1635,10 @@ pub(crate) fn resolve(
 }
 
 fn variant_constraints(
-    definition: &'static VariantDef<MetalVariant>,
+    definition: &'static VariantDef<MetalImplementation>,
     input_count: usize,
 ) -> &'static [Constraint] {
-    match (definition.implementation, input_count) {
+    match (definition.implementation.kernel, input_count) {
         (MetalVariant::GatherQuantMatmulVector8, 6) => WEIGHTED_VECTOR,
         (MetalVariant::GatherQuantMatmulPortable | MetalVariant::GatherQuantMatmulRouteGemv, 6) => {
             WEIGHTED_NARROW
@@ -1815,7 +1825,7 @@ fn definition(
     operation: OperationKind,
     name: &str,
     capabilities: &[DeviceCapability],
-) -> Result<(usize, &'static VariantDef<MetalVariant>), VariantError> {
+) -> Result<(usize, &'static VariantDef<MetalImplementation>), VariantError> {
     let Some((index, definition)) = REGISTRY
         .iter()
         .enumerate()
@@ -2706,7 +2716,7 @@ mod tests {
                     .clone()
                     .with_backend_data(forja_core::BackendDispatchData::new(validated));
                 assert!(
-                    crate::encoding::variant_supported(&selected, definition.implementation)
+                    crate::encoding::variant_supported(&selected, definition.implementation.kernel)
                         .unwrap(),
                     "{} accepted a dispatch its encoder gate refused",
                     definition.name
@@ -2760,7 +2770,7 @@ mod tests {
         let validated = resolve(&gemv, "matmul.gemv", METAL4).unwrap();
         assert_eq!(validated.name(), "matmul.gemv");
         assert_eq!(
-            REGISTRY[validated.index].implementation,
+            REGISTRY[validated.index].implementation.kernel,
             MetalVariant::MatmulGemv
         );
 
@@ -3510,7 +3520,10 @@ mod tests {
         let definition = REGISTRY.iter().find(|entry| entry.name == name).unwrap();
         let validated = resolve(&dispatch, name, METAL4).unwrap();
         let selected = dispatch.with_backend_data(forja_core::BackendDispatchData::new(validated));
-        assert!(crate::encoding::variant_supported(&selected, definition.implementation).unwrap());
+        assert!(
+            crate::encoding::variant_supported(&selected, definition.implementation.kernel)
+                .unwrap()
+        );
         assert_eq!(crate::encoding::dispatch_kernel(&selected).unwrap(), kernel);
     }
 

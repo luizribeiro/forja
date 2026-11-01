@@ -116,6 +116,9 @@ void steel_attention_body(
     SteelMMATile<TileT, 1, 1> value_mma;
     SteelMMATile<float, 1, TD> result;
     result.clear();
+    SteelMMATile<float, 1, TD> completed;
+    completed.clear();
+    float completed_denominator = 0.0f;
 
     short2 coordinate = Fragment::coordinate(lane);
     short row = coordinate.y;
@@ -186,6 +189,10 @@ void steel_attention_body(
         scores.template row_reduce<SteelSum>(block_sum);
         denominator[0] = denominator[0] * adjustment[0] + block_sum[0];
         result.template row_apply<SteelMultiply>(adjustment);
+        if (attention_bounded_sums != 0 && is_same_v<TileT, float>) {
+            completed.template row_apply<SteelMultiply>(adjustment);
+            completed_denominator *= adjustment[0];
+        }
         if constexpr (!is_same_v<TileT, float>) {
             for (short element = 0; element < scores.element_count; ++element) {
                 probabilities.elements()[element] = TileT(scores.elements()[element]);
@@ -210,9 +217,26 @@ void steel_attention_body(
                 }
             }
         }
+        // Bounded partial sums avoid linear float32 drift over long contexts.
+        if (attention_bounded_sums != 0 && is_same_v<TileT, float>) {
+            if ((key_block + 1) % ATTENTION_PARTIAL_PERIOD == 0) {
+                for (short dimension = 0; dimension < TD; ++dimension) {
+                    completed.at(0, dimension) += result.at(0, dimension);
+                }
+                completed_denominator += denominator[0];
+                result.clear();
+                denominator[0] = 0.0f;
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    if (attention_bounded_sums != 0 && is_same_v<TileT, float>) {
+        for (short dimension = 0; dimension < TD; ++dimension) {
+            result.at(0, dimension) += completed.at(0, dimension);
+        }
+        denominator[0] += completed_denominator;
+    }
     result.template row_apply<SteelDivide>(denominator);
     uint output_row = first_query + query_row;
     if (output_row >= params.query_length) {
