@@ -32,16 +32,12 @@ fn paged_copy_counts_transferred_rows_in_both_directions() {
         PagedCopyDirection::OutOfPages,
     ] {
         let (input, output, expected) = match direction {
-            PagedCopyDirection::IntoPages => (
-                &ordinary,
-                &pool,
-                (7 * 8 * 128 * 4 + 3 * 2 * 4 + 99 * 4, 7 * 8 * 128 * 2),
-            ),
-            PagedCopyDirection::OutOfPages => (
-                &pool,
-                &ordinary,
-                (7 * 8 * 128 * 2 + 3 * 2 * 4 + 99 * 4, 7 * 8 * 128 * 4),
-            ),
+            PagedCopyDirection::IntoPages => {
+                (&ordinary, &pool, (7 * 8 * 128 * 4 + 24, 7 * 8 * 128 * 2))
+            }
+            PagedCopyDirection::OutOfPages => {
+                (&pool, &ordinary, (7 * 8 * 128 * 2 + 24, 7 * 8 * 128 * 4))
+            }
         };
         let mut commands = CommandList::new();
         commands

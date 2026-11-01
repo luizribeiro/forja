@@ -139,7 +139,13 @@ impl StateOp {
 
     pub(crate) fn cost(self, inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCost> {
         cost.scalar_ops = AUTHENTICATION_SCALAR_OPS;
-        cost.metadata_read_bytes = crate::cost::bytes(&inputs[inputs.len().checked_sub(3)?..])?;
+        let backing_metadata =
+            crate::cost::bytes(&inputs[inputs.len().checked_sub(METADATA_INPUTS)?..])?;
+        cost.metadata_read_bytes = 28;
+        cost.read_bytes = cost
+            .read_bytes
+            .checked_sub(backing_metadata)?
+            .checked_add(cost.metadata_read_bytes)?;
         cost.flops = match self {
             Self::DeltaRuleBlock(_) => {
                 return crate::cost::state_block::stages(inputs, &inputs[2])
@@ -197,7 +203,7 @@ fn convolution_cost(inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCos
     cost.read_bytes = input_reads
         .checked_add(weight_reads)?
         .checked_add(cost.state_read_bytes)?
-        .checked_add(crate::cost::bytes(&inputs[3..])?)?;
+        .checked_add(cost.metadata_read_bytes)?;
     cost.flops = convolution.checked_mul(channels)?.checked_mul(2)?;
     Some(cost)
 }

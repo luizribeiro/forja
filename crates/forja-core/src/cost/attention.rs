@@ -4,20 +4,8 @@ use super::{bytes, product, tensor_bytes};
 
 pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
     let input = dispatch.primitive_inputs();
-    if let Op::PagedCopy { direction, .. } = dispatch.op() {
-        let (ordinary, pool) = match direction {
-            PagedCopyDirection::IntoPages => (&input[0], dispatch.output()),
-            PagedCopyDirection::OutOfPages => (dispatch.output(), &input[0]),
-        };
-        let elements = ordinary.layout().element_count();
-        let pool_bytes = elements.checked_mul(pool.layout().dtype().byte_size())?;
-        (cost.read_bytes, cost.write_bytes) = match direction {
-            PagedCopyDirection::IntoPages => (tensor_bytes(ordinary)?, pool_bytes),
-            PagedCopyDirection::OutOfPages => (pool_bytes, tensor_bytes(ordinary)?),
-        };
-        cost.metadata_read_bytes = bytes(&input[1..])?;
-        cost.read_bytes = cost.read_bytes.checked_add(cost.metadata_read_bytes)?;
-        return Some(cost);
+    if matches!(dispatch.op(), Op::PagedCopy { .. }) {
+        return copy(dispatch, cost);
     }
     let (causal, q_start, key_length, paged) = match dispatch.op() {
         Op::Sdpa {
@@ -79,8 +67,12 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
     ])?;
     cost.read_bytes = tensor_bytes(&input[0])?.checked_add(cost.kv_bytes)?;
     if paged {
-        cost.metadata_read_bytes = bytes(&input[3..])?;
-        cost.read_bytes = cost.read_bytes.checked_add(cost.metadata_read_bytes)?;
+        let (Op::PagedSdpa { page_tokens, .. } | Op::PagedSdpaAppend { page_tokens, .. }) =
+            dispatch.op()
+        else {
+            return None;
+        };
+        cost = cost.checked_add(metadata(0, key_length, page_tokens, bytes(&input[5..])?)?)?;
     }
     if matches!(dispatch.op(), Op::PagedSdpaAppend { .. }) {
         cost.read_bytes = cost.read_bytes.checked_add(bytes(&input[1..3])?)?;
@@ -95,6 +87,53 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         }
     }
     Some(cost)
+}
+
+fn copy(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
+    let Op::PagedCopy {
+        direction,
+        start,
+        page_tokens,
+    } = dispatch.op()
+    else {
+        return None;
+    };
+    let input = dispatch.primitive_inputs();
+    let (ordinary, pool) = match direction {
+        PagedCopyDirection::IntoPages => (&input[0], dispatch.output()),
+        PagedCopyDirection::OutOfPages => (dispatch.output(), &input[0]),
+    };
+    let elements = ordinary.layout().element_count();
+    let pool_bytes = elements.checked_mul(pool.layout().dtype().byte_size())?;
+    (cost.read_bytes, cost.write_bytes) = match direction {
+        PagedCopyDirection::IntoPages => (tensor_bytes(ordinary)?, pool_bytes),
+        PagedCopyDirection::OutOfPages => (pool_bytes, tensor_bytes(ordinary)?),
+    };
+    cost.checked_add(metadata(
+        u64::from(start),
+        u64::from(ordinary.layout().shape()[0]),
+        page_tokens,
+        bytes(&input[3..])?,
+    )?)
+}
+
+fn metadata(start: u64, tokens: u64, page_tokens: u32, activity_bytes: u64) -> Option<KernelCost> {
+    let page_tokens = u64::from(page_tokens);
+    let last = start
+        .checked_add(tokens.checked_sub(1)?)?
+        .checked_div(page_tokens)?;
+    let pages = last
+        .checked_sub(start.checked_div(page_tokens)?)?
+        .checked_add(1)?;
+    let bytes = pages.checked_mul(12)?.checked_add(activity_bytes)?;
+    Some(KernelCost {
+        read_bytes: bytes,
+        metadata_read_bytes: bytes,
+        scalar_ops: pages
+            .checked_mul(3)?
+            .checked_add(u64::from(activity_bytes != 0))?,
+        ..KernelCost::default()
+    })
 }
 
 #[cfg(test)]
@@ -125,11 +164,11 @@ mod tests {
             )
             .unwrap();
         let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
-        assert_eq!(cost.metadata_read_bytes, 8 + 396);
+        assert_eq!(cost.metadata_read_bytes, 12);
         assert_eq!(cost.flops, 8192);
         assert_eq!(cost.write_bytes, 12288);
         assert_eq!(cost.kv_bytes, 4096);
-        assert_eq!(cost.read_bytes, 8192 + 8192 + 4096 + 8 + 396);
+        assert_eq!(cost.read_bytes, 8192 + 8192 + 4096 + 12);
     }
 
     #[test]
@@ -161,28 +200,32 @@ mod tests {
 
     #[test]
     fn paged_attention_ignores_unused_pool_capacity() {
-        let query = tensor(1, DType::F32, &[16, 1, 128]);
-        let key = tensor(2, DType::F16, &[99, 16, 8, 128]);
-        let value = tensor(3, DType::F16, &[99, 16, 8, 128]);
-        let table = tensor(4, DType::U32, &[3, 2]);
-        let generations = tensor(5, DType::U32, &[99]);
-        let output = tensor(6, DType::F32, &[16, 1, 128]);
-        let mut commands = CommandList::new();
-        commands
-            .dispatch(
-                Op::PagedSdpa {
-                    scale: 1.0,
-                    causal: true,
-                    q_start: 32,
-                    key_length: 33,
-                    page_tokens: 16,
-                },
-                &[&query, &key, &value, &table, &generations],
-                &output,
-            )
-            .unwrap();
-        let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
-        assert_eq!(cost.flops, 4 * 16 * 33 * 128);
-        assert_eq!(cost.kv_bytes, 2 * 8 * 33 * 128 * 2);
+        for capacity in [99, 4097] {
+            let query = tensor(1, DType::F32, &[16, 1, 128]);
+            let key = tensor(2, DType::F16, &[capacity, 16, 8, 128]);
+            let value = tensor(3, DType::F16, &[capacity, 16, 8, 128]);
+            let table = tensor(4, DType::U32, &[3, 2]);
+            let generations = tensor(5, DType::U32, &[capacity]);
+            let output = tensor(6, DType::F32, &[16, 1, 128]);
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    Op::PagedSdpa {
+                        scale: 1.0,
+                        causal: true,
+                        q_start: 32,
+                        key_length: 33,
+                        page_tokens: 16,
+                    },
+                    &[&query, &key, &value, &table, &generations],
+                    &output,
+                )
+                .unwrap();
+            let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+            assert_eq!(cost.flops, 4 * 16 * 33 * 128);
+            assert_eq!(cost.metadata_read_bytes, 36);
+            assert_eq!(cost.read_bytes, 16 * 128 * 4 + 2 * 8 * 33 * 128 * 2 + 36);
+            assert_eq!(cost.kv_bytes, 2 * 8 * 33 * 128 * 2);
+        }
     }
 }
