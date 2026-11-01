@@ -209,6 +209,7 @@ impl BatchLane {
             .take()
             .and_then(|constraint| constraint.parser);
         let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
+        let reason = crate::engine::tool_finish_reason(reason, &tool_call);
         Ok(Completion {
             text: self.text.clone(),
             tool_calls: tool_call,

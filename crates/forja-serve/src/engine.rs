@@ -193,6 +193,7 @@ struct ToolParser {
     trigger: String,
     prompt: Arc<StdMutex<PromptArtifacts<ChatFormat>>>,
     output: ToolOutput,
+    triggered: bool,
 }
 
 impl ToolParser {
@@ -210,10 +211,12 @@ impl ToolParser {
             trigger: plan.trigger.clone(),
             prompt,
             output: ToolOutput::new(&plan.tools, plan.selected.clone(), plan.parallel),
+            triggered: false,
         })
     }
 
     async fn seed(&mut self) -> Result<Vec<ToolDelta>, GenerationError> {
+        self.triggered = true;
         let trigger = self.trigger.clone();
         self.parse(trigger).await
     }
@@ -322,13 +325,15 @@ async fn finish_tool_parser(
     generation: &Result<FinishReason, GenerationError>,
     parser: Option<ToolParser>,
 ) -> Result<Vec<GeneratedToolCall>, GenerationError> {
-    let call = if matches!(generation, Ok(FinishReason::ToolCalls)) {
-        parser
-            .as_ref()
-            .ok_or_else(|| GenerationError::new("tool parser is missing"))?
-            .finish()
-    } else {
-        Ok(Vec::new())
+    let call = match parser.as_ref() {
+        Some(parser) if matches!(generation, Ok(FinishReason::Length)) => {
+            Ok(parser.output.completed_calls())
+        }
+        Some(parser) if generation.is_ok() && parser.triggered => parser.finish(),
+        None if matches!(generation, Ok(FinishReason::ToolCalls)) => {
+            Err(GenerationError::new("tool parser is missing"))
+        }
+        _ => Ok(Vec::new()),
     };
     if let Some(parser) = parser {
         parser.reset().await;
@@ -1685,6 +1690,7 @@ fn finish_completion(
         (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
     };
     let tool_call = tool_call?;
+    let finish_reason = tool_finish_reason(finish_reason, &tool_call);
     Ok(Completion {
         text,
         tool_calls: tool_call,
@@ -1692,6 +1698,14 @@ fn finish_completion(
         usage,
         token_ids,
     })
+}
+
+fn tool_finish_reason(reason: FinishReason, calls: &[GeneratedToolCall]) -> FinishReason {
+    if reason == FinishReason::Stop && !calls.is_empty() {
+        FinishReason::ToolCalls
+    } else {
+        reason
+    }
 }
 
 type PendingDecode = (EngineDecodeOutput, u32);
@@ -3174,7 +3188,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(parser.finish().unwrap()[0].arguments, r#"{"path":"a.rs"}"#);
-        parser.reset().await;
+        let calls = finish_tool_parser(&Ok(FinishReason::Stop), Some(parser))
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            tool_finish_reason(FinishReason::Stop, &calls),
+            FinishReason::ToolCalls
+        );
     }
 
     #[tokio::test]

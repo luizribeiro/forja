@@ -88,9 +88,13 @@ impl ToolOutput {
         Ok(deltas)
     }
 
+    pub(crate) fn completed_calls(&self) -> Vec<GeneratedToolCall> {
+        self.completed.clone()
+    }
+
     pub(crate) fn finish(&self) -> Result<Vec<GeneratedToolCall>, String> {
         match &self.phase {
-            Phase::Closed => Ok(self.completed.clone()),
+            Phase::Closed => Ok(self.completed_calls()),
             Phase::BeforeCall | Phase::Call(_) => {
                 Err("chat format did not close its tool call".to_owned())
             }
@@ -519,5 +523,19 @@ mod tests {
         bytes.apply(events()).unwrap();
         bytes.input_argument_bytes = MAX_ARGUMENT_BYTES;
         assert!(bytes.apply(events()).is_err());
+    }
+    #[test]
+    fn truncation_retains_only_fully_validated_calls() {
+        let tool: Tool = serde_json::from_value(serde_json::json!({"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}})).unwrap();
+        let mut output = ToolOutput::new(&[tool], None, true);
+        output
+            .apply(vec![
+                ChatEvent::CallStart("lookup".to_owned()),
+                ChatEvent::CallEnd,
+                ChatEvent::CallStart("lookup".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(output.completed_calls().len(), 1);
+        assert!(output.finish().is_err());
     }
 }
