@@ -617,8 +617,8 @@ async fn run_metal(
             "results": results,
         });
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
-            report["worker"] = serde_json::json!({"protocol":2,"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,"pid": std::process::id(), "runner_loads": runners.loads,
-                "instance_loads": runners.instance_loads, "cache_state": "prefix-fork-per-worker",
+            report["worker"] = serde_json::json!({"protocol":runners.protocol(),"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,"pid": std::process::id(), "runner_loads": runners.loads,
+                "instance_loads": runners.instance_loads, "cache_state": runners.cache_state(),
                 "configured_priming_passes": options.warmups, "priming_policy":"once-per-worker-shape; at most two decode steps", "phase_timers": runners.times.report(started.elapsed())?});
         }
         if let Some(path) = output {
@@ -2114,7 +2114,7 @@ async fn benchmark_output(
     sampling: SamplingParams,
     runners: &resident::Runners,
 ) -> Result<(String, u64), Box<dyn Error>> {
-    let digest = if runners.retains() {
+    let digest = if runners.uses_prefixes() {
         let prefix = runners
             .prefixes
             .get(&(resident::Phase::Single, prompt.len()))
@@ -2147,31 +2147,36 @@ async fn probe_output(
     steps: usize,
     sampling: SamplingParams,
 ) -> Result<String, Box<dyn Error>> {
+    runner.prepare_paged_request(None, 0)?;
+    prepare_benchmark_runner(
+        runner,
+        prompt
+            .len()
+            .checked_add(steps)
+            .and_then(|n| n.checked_add(1))
+            .ok_or("probe reservation overflow")?,
+    )?;
     let mut tokens = Vec::with_capacity(steps);
     let mut logits = Vec::new();
     for index in 0..steps {
-        let output = runner
-            .decode(EngineDecode {
-                phase: if index == 0 {
-                    forja_host::BatchPhase::Prompt
-                } else {
-                    forja_host::BatchPhase::Decode
-                },
-                tokens: (index == 0).then(|| prompt.to_vec()),
-                start_pos: if index == 0 {
-                    0
-                } else {
-                    u32::try_from(
+        let output = if index == 0 {
+            decode_prompt(runner, prompt, sampling).await?
+        } else {
+            runner
+                .decode(EngineDecode {
+                    phase: forja_host::BatchPhase::Decode,
+                    tokens: None,
+                    start_pos: u32::try_from(
                         prompt
                             .len()
                             .checked_add(index - 1)
                             .ok_or("decode position overflowed")?,
-                    )?
-                },
-                sampling,
-            })
-            .await?
-            .map_err(|error| format!("engine decode failed: {error:?}"))?;
+                    )?,
+                    sampling,
+                })
+                .await?
+                .map_err(|error| format!("engine decode failed: {error:?}"))?
+        };
         tokens.push(read_token(&runner.read(&output.token).await?)?);
         if index + 1 == steps {
             logits = runner.read(&output.logits).await?;
@@ -2299,10 +2304,41 @@ async fn measure_record_decode(
     runners: &mut resident::Runners,
     prime: bool,
 ) -> Result<Sample, Box<dyn Error>> {
-    if runners.retains() {
+    if runners.uses_prefixes() {
         prefix::measure(runner, prompt, steps, options, runners, prime).await
     } else {
-        measure_decode(runner, prompt, steps, options).await
+        if runners.retains() {
+            runner.prepare_paged_request(None, 0)?;
+            let reserved = prompt
+                .len()
+                .checked_add(steps)
+                .and_then(|n| n.checked_add(1))
+                .ok_or("decode reservation overflow")?;
+            prepare_benchmark_runner(runner, reserved)?;
+        }
+        let started = Instant::now();
+        let sample = measure_decode(
+            runner,
+            prompt,
+            if prime {
+                runners.prime_steps(steps)
+            } else {
+                steps
+            },
+            options,
+        )
+        .await?;
+        if prime {
+            runners.times.add(timing::Stage::Prime, started.elapsed());
+        } else {
+            let measured = Duration::from_secs_f64(sample.wall_seconds);
+            runners.times.add(
+                timing::Stage::Setup,
+                started.elapsed().saturating_sub(measured),
+            );
+            runners.times.add(timing::Stage::Measured, measured);
+        }
+        Ok(sample)
     }
 }
 
@@ -2402,9 +2438,42 @@ async fn prepare_decode(
     prompt: &[u32],
     options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
-    let token = select_from_tokens(runner, prompt.to_vec(), 0, options).await?;
+    let token = if options.host_argmax {
+        select_from_tokens(runner, prompt.to_vec(), 0, options).await?
+    } else {
+        let output = decode_prompt(runner, prompt, options.sampling).await?;
+        read_token(&runner.read(&output.token).await?)?
+    };
     settle_submission_metrics(runner).await?;
     Ok(token)
+}
+
+#[cfg(target_os = "macos")]
+async fn decode_prompt(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    prompt: &[u32],
+    sampling: SamplingParams,
+) -> Result<forja_host::EngineDecodeOutput, Box<dyn Error>> {
+    let block = runner.describe().await?.prompt_block_tokens;
+    let mut last = None;
+    let mut start = 0_u32;
+    for tokens in profile_prompt_chunks(prompt, block)? {
+        let output = runner
+            .decode(EngineDecode {
+                phase: BatchPhase::Prompt,
+                tokens: Some(tokens.to_vec()),
+                start_pos: start,
+                sampling,
+            })
+            .await?
+            .map_err(|error| format!("prompt preparation failed: {error:?}"))?;
+        read_token(&runner.read(&output.token).await?)?;
+        start = start
+            .checked_add(u32::try_from(tokens.len())?)
+            .ok_or("prompt position overflow")?;
+        last = Some(output);
+    }
+    last.ok_or_else(|| "empty decode prompt".into())
 }
 
 #[cfg(target_os = "macos")]

@@ -18,6 +18,7 @@ type Loaded = (EngineRunner<forja_metal::MetalBackend>, EngineInfo, String);
 
 pub(super) struct Runners {
     retain: bool,
+    prefix_reuse: bool,
     pub(super) batch_prefixes: std::collections::BTreeMap<usize, super::PagedPrefix>,
     pub(super) prefix_builds: u64,
     primed: std::collections::BTreeSet<Prime>,
@@ -32,6 +33,7 @@ impl Runners {
     pub(super) const fn new(retain: bool) -> Self {
         Self {
             retain,
+            prefix_reuse: true,
             batch_prefixes: std::collections::BTreeMap::new(),
             prefix_builds: 0,
             primed: std::collections::BTreeSet::new(),
@@ -45,6 +47,22 @@ impl Runners {
 
     pub(super) const fn retains(&self) -> bool {
         self.retain
+    }
+
+    pub(super) const fn uses_prefixes(&self) -> bool {
+        self.retain && self.prefix_reuse
+    }
+
+    pub(super) const fn protocol(&self) -> u32 {
+        if self.uses_prefixes() { 2 } else { 3 }
+    }
+
+    pub(super) const fn cache_state(&self) -> &'static str {
+        if self.uses_prefixes() {
+            "prefix-fork-per-worker"
+        } else {
+            "fresh-request"
+        }
     }
 
     pub(super) fn prefix_entries(&self) -> usize {
@@ -103,7 +121,9 @@ impl Runners {
             .ok_or("runner load count overflow")?;
         let count = self.instance_loads.entry(phase).or_default();
         *count = count.checked_add(1).ok_or("instance load count overflow")?;
-        load_benchmark_runner(options, point, component).await
+        let loaded = load_benchmark_runner(options, point, component).await?;
+        self.prefix_reuse &= loaded.0.supports_prefix_reuse();
+        Ok(loaded)
     }
 
     pub(super) async fn release(&mut self, loaded: Loaded) -> Result<(), Box<dyn Error>> {
@@ -193,10 +213,15 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
             .acquire_phase(options, &options.points[0], &options.engines[0], phase)
             .await?;
         runners.release_phase(phase, loaded).await?;
+        if !runners.uses_prefixes()
+            && options.mode.batch_measurements != crate::args::BatchMeasurements::Omit
+        {
+            return Err("fresh-request workers require --batch-measurements omit; use HTTP for serving batches".into());
+        }
     }
     println!(
         "FORJA_BENCH_READY {}",
-        serde_json::json!({"protocol":2,"pid":std::process::id(),
+        serde_json::json!({"protocol":runners.protocol(),"pid":std::process::id(),
         "runner_loads":runners.loads,"instance_loads":runners.instance_loads,"startup_seconds":started.elapsed().as_secs_f64()})
     );
     std::io::stdout().flush()?;
@@ -208,7 +233,7 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
         super::run_metal(options, &mut runners, Some(&request.output)).await?;
         println!(
             "FORJA_BENCH_RESULT {}",
-            serde_json::json!({"id":request.id,"protocol":2,"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,
+            serde_json::json!({"id":request.id,"protocol":runners.protocol(),"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,
             "pid":std::process::id(),"runner_loads":runners.loads,
             "instance_loads":runners.instance_loads,"wall_seconds":started.elapsed().as_secs_f64()})
         );
@@ -221,6 +246,25 @@ pub(super) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_protocol_declares_whether_prefix_restoration_is_supported() {
+        let mut runners = Runners::new(true);
+        assert_eq!(
+            (runners.protocol(), runners.cache_state()),
+            (2, "prefix-fork-per-worker")
+        );
+        runners.prefix_reuse = false;
+        assert!(runners.retains());
+        assert!(!runners.uses_prefixes());
+        assert_eq!(
+            (runners.protocol(), runners.cache_state()),
+            (3, "fresh-request")
+        );
+        assert_eq!(runners.warmup_count(Prime::Decode(4096), 3), 1);
+        assert_eq!(runners.warmup_count(Prime::Decode(4096), 3), 0);
+        assert_eq!(runners.prime_steps(128), 2);
+    }
 
     #[test]
     #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
