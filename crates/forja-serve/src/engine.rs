@@ -281,8 +281,8 @@ async fn emit_tool_deltas(
     };
     for delta in deltas {
         let event = match delta {
-            ToolDelta::Start(name) => GenerationEvent::ToolCallStart(name),
-            ToolDelta::Arguments(arguments) => GenerationEvent::ToolArguments(arguments),
+            ToolDelta::Start(name) => GenerationEvent::ToolCallStart(0, name),
+            ToolDelta::Arguments(arguments) => GenerationEvent::ToolArguments(0, arguments),
         };
         send_event(sender, event, control).await?;
     }
@@ -431,8 +431,8 @@ pub struct Usage {
 pub struct Completion {
     /// Decoded text before any matched stop.
     pub text: String,
-    /// A validated function call, when constrained generation completed one.
-    pub tool_call: Option<GeneratedToolCall>,
+    /// Validated function calls in generation order.
+    pub tool_calls: Vec<GeneratedToolCall>,
     /// Why generation ended.
     pub finish_reason: FinishReason,
     /// Request token counts.
@@ -455,10 +455,10 @@ pub enum GenerationEvent {
     Role,
     /// Decoded content safe to expose to the client.
     Content(String),
-    /// Begins the only function call in a streamed turn.
-    ToolCallStart(String),
+    /// Begins the function call at the supplied index.
+    ToolCallStart(u32, String),
     /// Appends canonical JSON to the streamed function arguments.
-    ToolArguments(String),
+    ToolArguments(u32, String),
     /// The terminal choice chunk.
     Finished(FinishReason, Usage),
     /// Optional usage-only chunk.
@@ -1685,7 +1685,7 @@ fn finish_completion(
     let tool_call = tool_call?;
     Ok(Completion {
         text,
-        tool_call,
+        tool_calls: tool_call.into_iter().collect(),
         finish_reason,
         usage,
         token_ids,

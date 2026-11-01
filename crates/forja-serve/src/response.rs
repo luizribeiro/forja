@@ -13,20 +13,22 @@ pub fn chat_response(
     model: &str,
     completion: &Completion,
 ) -> Result<Value, GenerationError> {
-    let message = completion.tool_call.as_ref().map_or_else(
-        || json!({"role": "assistant", "content": completion.text}),
-        |call| {
-            json!({
-                "role": "assistant",
-                "content": (!completion.text.is_empty()).then_some(&completion.text),
-                "tool_calls": [{
-                    "id": "call_0",
-                    "type": "function",
+    let message = if completion.tool_calls.is_empty() {
+        json!({"role": "assistant", "content": completion.text})
+    } else {
+        let calls: Vec<Value> = completion
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                json!({
+                    "id": format!("call_{index}"), "type": "function",
                     "function": {"name": call.name, "arguments": call.arguments},
-                }],
+                })
             })
-        },
-    );
+            .collect();
+        json!({"role": "assistant", "content": (!completion.text.is_empty()).then_some(&completion.text), "tool_calls": calls})
+    };
     Ok(json!({
         "id": id,
         "object": "chat.completion",
@@ -96,7 +98,7 @@ mod tests {
     fn completion() -> Completion {
         Completion {
             text: "hello".to_owned(),
-            tool_call: None,
+            tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: Usage {
                 prompt_tokens: 7,
@@ -125,7 +127,7 @@ mod tests {
         let mut completion = completion();
         completion.text.clear();
         completion.finish_reason = FinishReason::ToolCalls;
-        completion.tool_call = Some(crate::GeneratedToolCall {
+        completion.tool_calls.push(crate::GeneratedToolCall {
             name: "read_file".to_owned(),
             arguments: r#"{"path":"a.rs"}"#.to_owned(),
         });
@@ -134,5 +136,25 @@ mod tests {
         assert!(choice["message"]["content"].is_null());
         assert_eq!(choice["message"]["tool_calls"][0]["id"], "call_0");
         assert_eq!(choice["finish_reason"], "tool_calls");
+    }
+    #[test]
+    fn serializes_multiple_calls_with_distinct_ids() {
+        let mut completion = completion();
+        completion.finish_reason = FinishReason::ToolCalls;
+        completion.tool_calls = vec![
+            crate::GeneratedToolCall {
+                name: "lookup".to_owned(),
+                arguments: "{}".to_owned()
+            };
+            2
+        ];
+        let response = chat_response("id", 0, "model", &completion).unwrap();
+        let calls = response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_0");
+        assert_eq!(calls[1]["id"], "call_1");
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
     }
 }

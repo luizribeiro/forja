@@ -1458,22 +1458,22 @@ fn stream_data(event: GenerationEvent, id: &str, created: u64, model: &str, chat
             "choices": [{"index": 0, "text": text, "finish_reason": Value::Null}],
         })
         .to_string(),
-        GenerationEvent::ToolCallStart(name) if chat => json!({
+        GenerationEvent::ToolCallStart(index, name) if chat => json!({
             "id": id, "object": object, "created": created, "model": model,
             "choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": 0, "id": "call_0", "type": "function",
+                "index": index, "id": format!("call_{index}"), "type": "function",
                 "function": {"name": name, "arguments": ""}
             }]}, "finish_reason": Value::Null}],
         })
         .to_string(),
-        GenerationEvent::ToolArguments(arguments) if chat => json!({
+        GenerationEvent::ToolArguments(index, arguments) if chat => json!({
             "id": id, "object": object, "created": created, "model": model,
             "choices": [{"index": 0, "delta": {"tool_calls": [{
-                "index": 0, "function": {"arguments": arguments}
+                "index": index, "function": {"arguments": arguments}
             }]}, "finish_reason": Value::Null}],
         })
         .to_string(),
-        GenerationEvent::ToolCallStart(_) | GenerationEvent::ToolArguments(_) => {
+        GenerationEvent::ToolCallStart(..) | GenerationEvent::ToolArguments(..) => {
             error_value("text completions cannot emit tool calls", "server_error").to_string()
         }
         GenerationEvent::Finished(reason, _) if chat => json!({
@@ -1734,7 +1734,7 @@ mod tests {
     fn smoke_completion() -> Completion {
         Completion {
             text: "forged".to_owned(),
-            tool_call: None,
+            tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: Usage {
                 prompt_tokens: 4,
@@ -1987,7 +1987,7 @@ mod tests {
                 }
                 Ok(Completion {
                     text: "forged".to_owned(),
-                    tool_call: None,
+                    tool_calls: Vec::new(),
                     finish_reason: FinishReason::Stop,
                     usage: Usage {
                         prompt_tokens: 4,
@@ -2243,14 +2243,14 @@ mod tests {
             true,
         );
         let call = stream_data(
-            GenerationEvent::ToolCallStart("read_file".to_owned()),
+            GenerationEvent::ToolCallStart(0, "read_file".to_owned()),
             "id",
             1,
             "model",
             true,
         );
         let arguments = stream_data(
-            GenerationEvent::ToolArguments("{\"path\":\"a.rs\"}".to_owned()),
+            GenerationEvent::ToolArguments(0, "{\"path\":\"a.rs\"}".to_owned()),
             "id",
             1,
             "model",
@@ -2301,7 +2301,7 @@ mod tests {
             .finish();
         let completion = Completion {
             text: "secret prompt completion and tool body".to_owned(),
-            tool_call: None,
+            tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             usage: Usage {
                 prompt_tokens: 7,
@@ -3138,5 +3138,31 @@ mod tests {
         bytes.extend(header);
         bytes.extend_from_slice(&0_f32.to_le_bytes());
         bytes
+    }
+    #[test]
+    fn streamed_tool_deltas_retain_their_call_indices() {
+        let start: Value = serde_json::from_str(&stream_data(
+            GenerationEvent::ToolCallStart(1, "lookup".to_owned()),
+            "id",
+            0,
+            "model",
+            true,
+        ))
+        .unwrap();
+        let arguments: Value = serde_json::from_str(&stream_data(
+            GenerationEvent::ToolArguments(1, "{}".to_owned()),
+            "id",
+            0,
+            "model",
+            true,
+        ))
+        .unwrap();
+        let call = &start["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 1);
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(
+            arguments["choices"][0]["delta"]["tool_calls"][0]["index"],
+            1
+        );
     }
 }

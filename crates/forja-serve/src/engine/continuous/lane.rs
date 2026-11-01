@@ -211,7 +211,7 @@ impl BatchLane {
         let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
         Ok(Completion {
             text: self.text.clone(),
-            tool_call,
+            tool_calls: tool_call.into_iter().collect(),
             finish_reason: reason,
             usage: Usage {
                 prompt_tokens: self.prompt_tokens,

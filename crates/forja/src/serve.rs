@@ -662,8 +662,9 @@ mod tests {
             let mut done = false;
             while let Some(event) = receiver.recv().await {
                 match event {
-                    GenerationEvent::ToolCallStart(value) => name = Some(value),
-                    GenerationEvent::ToolArguments(value) => arguments.push_str(&value),
+                    GenerationEvent::ToolCallStart(0, value) => name = Some(value),
+                    GenerationEvent::ToolArguments(0, value) => arguments.push_str(&value),
+                    GenerationEvent::ToolCallStart(..) | GenerationEvent::ToolArguments(..) => return Err("unexpected second tool call".into()),
                     GenerationEvent::Finished(reason, _) => finished = Some(reason),
                     GenerationEvent::Done => done = true,
                     GenerationEvent::Error(error) => return Err(error.into()),
