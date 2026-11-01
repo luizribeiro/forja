@@ -8408,9 +8408,7 @@ fn dispatch_profile(
     physical_dispatches: u64,
 ) -> Result<DispatchProfile, BackendError> {
     let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
-    let cost = crate::profile_cost::state_block::composite(dispatch)
-        .or_else(|| forja_core::KernelCost::of(dispatch))
-        .ok_or(BackendError::InvalidInput)?;
+    let cost = crate::profile_cost::logical(dispatch).ok_or(BackendError::InvalidInput)?;
     let padded_flops = crate::profile_cost::state_block::padded_flops(dispatch)
         .or_else(|| model.padded_flops(dispatch, cost))
         .ok_or(BackendError::InvalidInput)?;

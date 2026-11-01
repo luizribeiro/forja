@@ -1,5 +1,14 @@
 use forja_core::{Dispatch, KernelCost, Op};
+mod bounded;
 pub(crate) mod state_block;
+
+pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
+    let mut cost = state_block::composite(dispatch).or_else(|| KernelCost::of(dispatch))?;
+    cost.scalar_ops = cost
+        .scalar_ops
+        .checked_add(bounded::scalar_ops(dispatch)?)?;
+    Some(cost)
+}
 
 fn product(values: &[u64]) -> Option<u64> {
     values
@@ -18,7 +27,7 @@ pub(crate) fn internal(
     ) {
         return block_internal(dispatch, kernel);
     }
-    let mut cost = KernelCost::of(dispatch)?;
+    let mut cost = logical(dispatch)?;
     let input = dispatch.primitive_inputs();
     if let Some(blocks) = blocks {
         let query = input[0].layout().shape();

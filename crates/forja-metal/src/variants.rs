@@ -2809,6 +2809,59 @@ mod tests {
     }
 
     #[test]
+    fn bounded_costs_leave_legacy_and_reduced_vector_arithmetic_unchanged() {
+        for (bounded, legacy, dispatch) in [
+            (
+                "sdpa.steel-bounded",
+                "sdpa.steel",
+                sdpa_dispatch(forja_core::DType::F32, 6, 7, 4097, 64, 64),
+            ),
+            (
+                "sdpa.steel-bounded",
+                "sdpa.steel",
+                sdpa_dispatch(forja_core::DType::F32, 6, 7, 4097, 128, 128),
+            ),
+            (
+                "sdpa.steel-bounded-256",
+                "sdpa.steel-256",
+                sdpa_dispatch(forja_core::DType::F32, 6, 7, 4097, 256, 256),
+            ),
+            (
+                "paged-sdpa.steel-bounded-256",
+                "paged-sdpa.steel-256",
+                paged_sdpa_dispatch(forja_core::DType::F32, 7, 256),
+            ),
+            (
+                "paged-sdpa.vector-bounded-256-two-pass",
+                "paged-sdpa.vector-256-two-pass",
+                paged_sdpa_dispatch_with_heads(forja_core::DType::F32, 6, 1, 256),
+            ),
+            (
+                "paged-sdpa.vector-bounded-256-two-pass",
+                "paged-sdpa.vector-256-two-pass",
+                paged_sdpa_dispatch_with_heads(forja_core::DType::F16, 6, 1, 256),
+            ),
+        ] {
+            let cost = |name| {
+                let variant = resolve(&dispatch, name, METAL4).unwrap();
+                crate::profile_cost::logical(
+                    &dispatch
+                        .clone()
+                        .with_backend_data(forja_core::BackendDispatchData::new(variant)),
+                )
+                .unwrap()
+            };
+            let old = cost(legacy);
+            let mut new = cost(bounded);
+            let unchanged = bounded.contains("vector")
+                && dispatch.inputs()[1].layout().dtype() == forja_core::DType::F16;
+            assert_eq!(new.scalar_ops == old.scalar_ops, unchanged);
+            new.scalar_ops = old.scalar_ops;
+            assert_eq!(new, old);
+        }
+    }
+
+    #[test]
     fn bounded_attention_has_explicit_configuration_and_distinct_classes() {
         for (bounded, legacy) in [
             ("sdpa.steel-bounded", "sdpa.steel"),
