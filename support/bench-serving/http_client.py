@@ -56,7 +56,7 @@ class OpenAIClient:
         route = "/v1/chat/completions" if case["route"] == "chat" else "/v1/completions"
         return self._request(route, body, case.get("cancel_after_tokens", 0), on_first_token)
 
-    def chat(self, messages: list[dict[str, object]], output_tokens: int) -> dict[str, object]:
+    def chat(self, messages: list[dict[str, object]], output_tokens: int, template_options=None) -> dict[str, object]:
         """Execute one streaming greedy chat request with an explicit history."""
         body = {
             "model": self.model,
@@ -68,6 +68,8 @@ class OpenAIClient:
             "top_k": 0,
             "top_p": 1.0,
         }
+        if template_options is not None:
+            body["chat_template_kwargs"] = template_options
         return self._request("/v1/chat/completions", body, 0)
 
     def _request(
@@ -120,6 +122,7 @@ class OpenAIClient:
         arrivals = []
         output = []
         usage = {}
+        message = {"role": "assistant", "content": ""}
         cancelled = False
         limit = cancel_after_tokens
         while line := response.readline():
@@ -136,6 +139,8 @@ class OpenAIClient:
             if payload.get("usage"):
                 usage = payload["usage"]
             choices = payload.get("choices", [])
+            if choices:
+                merge_message(message, choices[0].get("delta", {}))
             if choices and has_content(choices[0]):
                 arrivals.append(time.perf_counter())
                 output.append(response_output(payload))
@@ -152,7 +157,7 @@ class OpenAIClient:
             response.close()
         first = arrivals[0] if arrivals else ended
         itl = [right - left for left, right in zip(arrivals, arrivals[1:])]
-        return sample(
+        result = sample(
             started,
             first,
             ended,
@@ -163,6 +168,29 @@ class OpenAIClient:
             cancelled,
             "".join(output),
         )
+        result.update(usage=usage, assistant_message=message,
+                      content_events=len(arrivals),
+                      decode_window=[first, arrivals[-1] if arrivals else ended])
+        return result
+
+
+def merge_message(message, delta):
+    """Reconstruct actual assistant history, including streamed tool arguments."""
+    for key in ("content", "reasoning_content"):
+        if delta.get(key):
+            message[key] = message.get(key, "") + delta[key]
+    for call in delta.get("tool_calls", []):
+        calls = message.setdefault("tool_calls", [])
+        index = call["index"]
+        if index < 0 or index > len(calls):
+            raise ValueError("non-contiguous streamed tool-call index")
+        if index == len(calls):
+            calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        target = calls[index]
+        if call.get("id"):
+            target["id"] = call["id"]
+        for key in ("name", "arguments"):
+            target["function"][key] += call.get("function", {}).get(key, "")
 
 
 def request_body(case: dict[str, object], model: str) -> dict[str, object]:
