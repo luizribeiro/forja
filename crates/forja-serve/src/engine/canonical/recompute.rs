@@ -220,10 +220,16 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                     .checked_add(prompt.charged_bytes())
                     .is_some_and(|bytes| bytes <= cache.allowance.bytes()) =>
             {
+                let bound = usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX);
+                debug_assert!(bound >= 1);
+                if bound == 0 {
+                    self.metrics.snapshot_refusals =
+                        self.metrics.snapshot_refusals.saturating_add(1);
+                    return;
+                }
                 self.metrics.recompute_queued = self.metrics.recompute_queued.saturating_add(1);
                 self.metrics.recompute_pending = true;
-                let bound = usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX);
-                if cache.pending_recomputes.len() == bound {
+                while cache.pending_recomputes.len() >= bound {
                     cache.pending_recomputes.pop_front();
                     self.metrics.recompute_superseded =
                         self.metrics.recompute_superseded.saturating_add(1);

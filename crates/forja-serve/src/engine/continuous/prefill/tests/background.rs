@@ -297,3 +297,38 @@ async fn published_reply_boundary_short_circuits_without_another_canonical_block
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn pending_reply_fifo_trims_to_a_shrunken_lane_bound() -> Result<(), TestError> {
+    let mut engine = configured().await?;
+    engine.scheduler.active_lanes = 4;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    for token in 0..4 {
+        if token == 3 {
+            engine.scheduler.active_lanes = 1;
+        }
+        engine.queue_canonical_recompute(
+            &PrefixLedger::new(vec![token; 63]),
+            63,
+            &[3],
+            &control,
+            true,
+        );
+    }
+    assert_eq!(engine.metrics.recompute_superseded, 3);
+    finish_recompute(&mut engine).await;
+    assert_eq!(engine.metrics.recompute_completed, 1);
+    for token in 0..4 {
+        let mut next = vec![token; 63];
+        next.extend([3, 2]);
+        assert_eq!(
+            engine
+                .canonical_admission(&next, true)?
+                .unwrap()
+                .1
+                .is_some(),
+            token == 3
+        );
+    }
+    Ok(())
+}
