@@ -18,13 +18,15 @@ pub struct GeneratedToolCall {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ToolDelta {
-    Start(String),
-    Arguments(String),
+    Start(u32, String),
+    Arguments(u32, String),
 }
 
 pub(crate) struct ToolOutput {
     tools: BTreeMap<String, Tool>,
     selected: Option<String>,
+    parallel: bool,
+    completed: Vec<GeneratedToolCall>,
     phase: Phase,
     events: usize,
     input_argument_bytes: usize,
@@ -34,7 +36,7 @@ pub(crate) struct ToolOutput {
 enum Phase {
     BeforeCall,
     Call(Box<Call>),
-    Closed(GeneratedToolCall),
+    Closed,
 }
 
 struct Call {
@@ -47,7 +49,7 @@ struct Call {
 }
 
 impl ToolOutput {
-    pub(crate) fn new(tools: &[Tool], selected: Option<String>) -> Self {
+    pub(crate) fn new(tools: &[Tool], selected: Option<String>, parallel: bool) -> Self {
         Self {
             tools: tools
                 .iter()
@@ -55,6 +57,8 @@ impl ToolOutput {
                 .map(|tool| (tool.function.name.clone(), tool))
                 .collect(),
             selected,
+            parallel,
+            completed: Vec::new(),
             phase: Phase::BeforeCall,
             events: 0,
             input_argument_bytes: 0,
@@ -84,17 +88,18 @@ impl ToolOutput {
         Ok(deltas)
     }
 
-    pub(crate) fn finish(&self) -> Result<GeneratedToolCall, String> {
+    pub(crate) fn finish(&self) -> Result<Vec<GeneratedToolCall>, String> {
         match &self.phase {
-            Phase::Closed(call) => Ok(call.clone()),
+            Phase::Closed => Ok(self.completed.clone()),
             Phase::BeforeCall | Phase::Call(_) => {
-                Err("chat format did not close one tool call".to_owned())
+                Err("chat format did not close its tool call".to_owned())
             }
         }
     }
 
     fn start(&mut self, name: String, deltas: &mut Vec<ToolDelta>) -> Result<(), String> {
-        if !matches!(self.phase, Phase::BeforeCall)
+        if !(matches!(self.phase, Phase::BeforeCall)
+            || (self.parallel && matches!(self.phase, Phase::Closed)))
             || self
                 .selected
                 .as_ref()
@@ -129,7 +134,7 @@ impl ToolOutput {
             current: None,
             last_index: None,
         }));
-        deltas.push(ToolDelta::Start(name));
+        deltas.push(ToolDelta::Start(self.call_index()?, name));
         Ok(())
     }
 
@@ -196,11 +201,16 @@ impl ToolOutput {
             .map_err(|error| format!("cannot encode tool arguments: {error}"))?;
         let closing = if call.values.is_empty() { "{}" } else { "}" };
         self.push_arguments(closing.to_owned(), deltas)?;
-        self.phase = Phase::Closed(GeneratedToolCall {
+        self.completed.push(GeneratedToolCall {
             name: call.tool.function.name,
             arguments,
         });
+        self.phase = Phase::Closed;
         Ok(())
+    }
+
+    fn call_index(&self) -> Result<u32, String> {
+        u32::try_from(self.completed.len()).map_err(|_| "tool call index exceeds u32".to_owned())
     }
 
     fn push_arguments(
@@ -213,7 +223,7 @@ impl ToolOutput {
             .checked_add(arguments.len())
             .filter(|&bytes| bytes <= MAX_ARGUMENT_BYTES)
             .ok_or_else(|| "canonical tool arguments exceed the request byte limit".to_owned())?;
-        deltas.push(ToolDelta::Arguments(arguments));
+        deltas.push(ToolDelta::Arguments(self.call_index()?, arguments));
         Ok(())
     }
 }
@@ -353,7 +363,7 @@ mod tests {
 
     #[test]
     fn validates_order_and_builds_canonical_argument_deltas() {
-        let mut output = ToolOutput::new(&[tool()], None);
+        let mut output = ToolOutput::new(&[tool()], None, false);
         let deltas = output
             .apply(vec![
                 ChatEvent::CallStart("read_file".to_owned()),
@@ -366,29 +376,29 @@ mod tests {
         assert_eq!(
             deltas,
             [
-                ToolDelta::Start("read_file".to_owned()),
-                ToolDelta::Arguments("{\"path\":\"a.rs\"".to_owned()),
-                ToolDelta::Arguments(",\"content\":\"forged\"".to_owned()),
-                ToolDelta::Arguments(",\"mode\":\"create\"".to_owned()),
-                ToolDelta::Arguments("}".to_owned()),
+                ToolDelta::Start(0, "read_file".to_owned()),
+                ToolDelta::Arguments(0, "{\"path\":\"a.rs\"".to_owned()),
+                ToolDelta::Arguments(0, ",\"content\":\"forged\"".to_owned()),
+                ToolDelta::Arguments(0, ",\"mode\":\"create\"".to_owned()),
+                ToolDelta::Arguments(0, "}".to_owned()),
             ]
         );
         assert_eq!(
-            output.finish().unwrap().arguments,
+            output.finish().unwrap()[0].arguments,
             r#"{"path":"a.rs","content":"forged","mode":"create"}"#
         );
     }
 
     #[test]
     fn rejects_wrong_names_order_types_and_missing_end() {
-        let mut wrong_name = ToolOutput::new(&[tool()], None);
+        let mut wrong_name = ToolOutput::new(&[tool()], None, false);
         assert!(
             wrong_name
                 .apply(vec![ChatEvent::CallStart("write".to_owned())])
                 .is_err()
         );
 
-        let mut out_of_order = ToolOutput::new(&[tool()], None);
+        let mut out_of_order = ToolOutput::new(&[tool()], None, false);
         assert!(
             out_of_order
                 .apply(vec![
@@ -399,7 +409,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut wrong_type = ToolOutput::new(&[tool()], None);
+        let mut wrong_type = ToolOutput::new(&[tool()], None, false);
         assert!(
             wrong_type
                 .apply(vec![
@@ -412,7 +422,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut missing_end = ToolOutput::new(&[tool()], None);
+        let mut missing_end = ToolOutput::new(&[tool()], None, false);
         missing_end
             .apply(vec![ChatEvent::CallStart("read_file".to_owned())])
             .unwrap();
@@ -421,20 +431,20 @@ mod tests {
 
     #[test]
     fn rejects_malformed_sequences_and_aggregate_floods() {
-        let mut selected = ToolOutput::new(&[tool()], Some("other".to_owned()));
+        let mut selected = ToolOutput::new(&[tool()], Some("other".to_owned()), false);
         assert!(
             selected
                 .apply(vec![ChatEvent::CallStart("read_file".to_owned())])
                 .is_err()
         );
 
-        let mut text = ToolOutput::new(&[tool()], None);
+        let mut text = ToolOutput::new(&[tool()], None, false);
         assert!(
             text.apply(vec![ChatEvent::TextDelta("forged".to_owned())])
                 .is_err()
         );
 
-        let mut before_start = ToolOutput::new(&[tool()], None);
+        let mut before_start = ToolOutput::new(&[tool()], None, false);
         assert!(
             before_start
                 .apply(vec![ChatEvent::ArgumentDelta((
@@ -444,7 +454,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut duplicate = ToolOutput::new(&[tool()], None);
+        let mut duplicate = ToolOutput::new(&[tool()], None, false);
         assert!(
             duplicate
                 .apply(vec![
@@ -454,7 +464,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut events = ToolOutput::new(&[tool()], None);
+        let mut events = ToolOutput::new(&[tool()], None, false);
         events
             .apply(vec![ChatEvent::CallStart("read_file".to_owned())])
             .unwrap();
@@ -468,7 +478,7 @@ mod tests {
         }
         assert!(events.apply(vec![ChatEvent::CallEnd]).is_err());
 
-        let mut bytes = ToolOutput::new(&[tool()], None);
+        let mut bytes = ToolOutput::new(&[tool()], None, false);
         assert!(
             bytes
                 .apply(vec![
@@ -480,5 +490,34 @@ mod tests {
                 ])
                 .is_err()
         );
+    }
+    #[test]
+    fn multiple_calls_have_distinct_indices_and_share_request_limits() {
+        let events = || {
+            vec![
+                ChatEvent::CallStart("read_file".to_owned()),
+                ChatEvent::ArgumentDelta(("path".to_owned(), "a.rs".to_owned())),
+                ChatEvent::ArgumentDelta(("content".to_owned(), "forged".to_owned())),
+                ChatEvent::ArgumentDelta(("mode".to_owned(), "create".to_owned())),
+                ChatEvent::CallEnd,
+            ]
+        };
+        let mut output = ToolOutput::new(&[tool()], None, true);
+        for index in 0..2 {
+            assert_eq!(
+                output.apply(events()).unwrap()[0],
+                ToolDelta::Start(index, "read_file".to_owned())
+            );
+        }
+        assert_eq!(output.finish().unwrap().len(), 2);
+        let mut single = ToolOutput::new(&[tool()], None, false);
+        single.apply(events()).unwrap();
+        assert!(single.apply(events()).is_err());
+        output.events = MAX_EVENTS - 1;
+        assert!(output.apply(events()).is_err());
+        let mut bytes = ToolOutput::new(&[tool()], None, true);
+        bytes.apply(events()).unwrap();
+        bytes.input_argument_bytes = MAX_ARGUMENT_BYTES;
+        assert!(bytes.apply(events()).is_err());
     }
 }

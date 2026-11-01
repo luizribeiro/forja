@@ -131,7 +131,7 @@ pub struct CompletionParams {
     pub tools: Option<Vec<Tool>>,
     /// Optional tool selection.
     pub tool_choice: Option<ToolChoice>,
-    /// Accepted API compatibility flag; generation remains single-call.
+    /// Whether the selected format may produce multiple calls in one turn.
     pub parallel_tool_calls: Option<bool>,
     /// Structured response selection; only text is accepted.
     pub response_format: Option<ResponseFormat>,
@@ -522,7 +522,7 @@ fn validate_messages(messages: &[Message]) -> Result<(), ValidationError> {
             message.tool_call_id.is_some()
                 || (message.content.is_none() && message.tool_calls.is_none())
                 || message.tool_calls.as_ref().is_some_and(|calls| {
-                    calls.len() != 1
+                    calls.is_empty()
                         || calls.iter().any(|call| {
                             call.r#type != "function"
                                 || !valid_name(&call.function.name)
@@ -1337,5 +1337,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.top_k, 100);
+    }
+    #[test]
+    fn accepts_multiple_calls_in_assistant_history_but_refuses_empty_calls() {
+        let mut request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_0","type":"function","function":{"name":"lookup","arguments":"{}"}},
+                {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},{"role":"tool","content":"first","tool_call_id":"call_0"},{"role":"tool","content":"second","tool_call_id":"call_1"}]
+        })).unwrap();
+        assert!(
+            validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936).is_ok()
+        );
+        request.messages[1].tool_calls.as_mut().unwrap().clear();
+        assert!(
+            validate_chat_input(&request, &HostConfig::default(), &default_info(), 151_936)
+                .is_err()
+        );
     }
 }

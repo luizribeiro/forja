@@ -185,6 +185,7 @@ struct ConstraintPlan {
     forced: bool,
     tools: Vec<crate::Tool>,
     selected: Option<String>,
+    parallel: bool,
 }
 
 struct ToolParser {
@@ -208,7 +209,7 @@ impl ToolParser {
             stream,
             trigger: plan.trigger.clone(),
             prompt,
-            output: ToolOutput::new(&plan.tools, plan.selected.clone()),
+            output: ToolOutput::new(&plan.tools, plan.selected.clone(), plan.parallel),
         })
     }
 
@@ -238,7 +239,7 @@ impl ToolParser {
         })
     }
 
-    fn finish(&self) -> Result<GeneratedToolCall, GenerationError> {
+    fn finish(&self) -> Result<Vec<GeneratedToolCall>, GenerationError> {
         self.output.finish().map_err(|error| {
             GenerationError::new(format!("chat format event invariant failed: {error}"))
         })
@@ -281,8 +282,10 @@ async fn emit_tool_deltas(
     };
     for delta in deltas {
         let event = match delta {
-            ToolDelta::Start(name) => GenerationEvent::ToolCallStart(0, name),
-            ToolDelta::Arguments(arguments) => GenerationEvent::ToolArguments(0, arguments),
+            ToolDelta::Start(index, name) => GenerationEvent::ToolCallStart(index, name),
+            ToolDelta::Arguments(index, arguments) => {
+                GenerationEvent::ToolArguments(index, arguments)
+            }
         };
         send_event(sender, event, control).await?;
     }
@@ -318,15 +321,14 @@ async fn seed_tool_parser(
 async fn finish_tool_parser(
     generation: &Result<FinishReason, GenerationError>,
     parser: Option<ToolParser>,
-) -> Result<Option<GeneratedToolCall>, GenerationError> {
+) -> Result<Vec<GeneratedToolCall>, GenerationError> {
     let call = if matches!(generation, Ok(FinishReason::ToolCalls)) {
         parser
             .as_ref()
             .ok_or_else(|| GenerationError::new("tool parser is missing"))?
             .finish()
-            .map(Some)
     } else {
-        Ok(None)
+        Ok(Vec::new())
     };
     if let Some(parser) = parser {
         parser.reset().await;
@@ -1673,7 +1675,7 @@ where
 fn finish_completion(
     generation: Result<FinishReason, GenerationError>,
     cleanup: Result<(), GenerationError>,
-    tool_call: Result<Option<GeneratedToolCall>, GenerationError>,
+    tool_call: Result<Vec<GeneratedToolCall>, GenerationError>,
     text: String,
     token_ids: Vec<u32>,
     usage: Usage,
@@ -1685,7 +1687,7 @@ fn finish_completion(
     let tool_call = tool_call?;
     Ok(Completion {
         text,
-        tool_calls: tool_call.into_iter().collect(),
+        tool_calls: tool_call,
         finish_reason,
         usage,
         token_ids,
@@ -2527,14 +2529,7 @@ where
     let choice = serde_json::to_string(&request.params.tool_choice)
         .map_err(|error| GenerationError::new(format!("cannot encode tool choice: {error}")))?;
     let constraint_tools = request.params.tools.clone().unwrap_or_default();
-    let selected = request
-        .params
-        .tool_choice
-        .as_ref()
-        .and_then(|choice| match choice {
-            ToolChoice::Named(choice) => Some(choice.function.name.clone()),
-            ToolChoice::Mode(_) => None,
-        });
+    let selected = selected_tool_name(request.params.tool_choice.as_ref());
     let response = serde_json::to_string(&request.params.response_format)
         .map_err(|error| GenerationError::new(format!("cannot encode response format: {error}")))?;
     let options = serde_json::to_string(&serde_json::json!({
@@ -2546,6 +2541,7 @@ where
     }))
     .map_err(|error| GenerationError::new(format!("cannot encode render options: {error}")))?;
     let max_rendered_bytes = config.request.max_text_bytes.get();
+    let parallel = request.params.parallel_tool_calls.unwrap_or(true);
     let (tokens, constraint) = tokio::task::spawn_blocking(move || {
         let mut prompt = prompt
             .lock()
@@ -2587,6 +2583,7 @@ where
                     forced,
                     tools: constraint_tools.clone(),
                     selected: selected.clone(),
+                    parallel,
                 })
             })
             .transpose()?;
@@ -2603,6 +2600,13 @@ where
     let finished = finish_prompt(tokens, params, limits, control, "rendered prompt")?;
     let (tokens, prompt_tokens, params) = finished;
     Ok((tokens, prompt_tokens, params, constraint))
+}
+
+fn selected_tool_name(choice: Option<&ToolChoice>) -> Option<String> {
+    match choice {
+        Some(ToolChoice::Named(choice)) => Some(choice.function.name.clone()),
+        _ => None,
+    }
 }
 
 fn constraint_mode(request: &ChatCompletionRequest) -> Option<bool> {
@@ -3087,6 +3091,7 @@ mod tests {
             forced: false,
             tools: Vec::new(),
             selected: None,
+            parallel: true,
         };
         let control = GenerationControl::new(Duration::from_secs(1));
         let mut ordinary = BoundaryState::new(&[], None);
@@ -3148,6 +3153,7 @@ mod tests {
             forced: true,
             tools: vec![tool],
             selected: None,
+            parallel: true,
         };
         let format = ChatFormat::load(
             test_guests::qwen3_coder_chat_format(),
@@ -3167,7 +3173,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(parser.finish().unwrap().arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(parser.finish().unwrap()[0].arguments, r#"{"path":"a.rs"}"#);
         parser.reset().await;
     }
 
