@@ -25,3 +25,8 @@ def test_observer_preserves_native_steps_and_sets_only_requested_cache_bound(tmp
     assert rows[0]['cached_tokens'] == 0
     assert rows[1]['byte_ceiling'] == 4097
     assert rows[2]['prompt_ids'] == ['1','2']
+    unobserved = SimpleNamespace(LRUPromptCache=Cache,BatchGenerator=Batch,ModelProvider=object)
+    server_adapter.install(unobserved,None,4097)
+    assert unobserved.BatchGenerator is Batch
+    assert unobserved.ModelProvider is object
+    assert unobserved.LRUPromptCache(10).max_bytes == 4097
