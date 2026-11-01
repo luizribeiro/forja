@@ -24,9 +24,13 @@ mod matmul;
 mod memory;
 #[cfg(target_os = "macos")]
 mod profile_cost;
+#[cfg(target_os = "macos")]
+mod registers;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../tests/common/rounding_program.rs"]
 mod rounding_program;
+#[cfg(target_os = "macos")]
+pub use registers::private_accumulator_values_per_thread;
 #[cfg(target_os = "macos")]
 mod route_facts;
 mod scalar_codegen;

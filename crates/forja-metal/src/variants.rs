@@ -2153,6 +2153,12 @@ impl MetalVariant {
     }
 }
 
+pub(crate) fn bounded_name(name: &str) -> bool {
+    REGISTRY
+        .iter()
+        .any(|entry| entry.name == name && entry.implementation.bounded_attention)
+}
+
 pub(crate) fn profile_selection(
     dispatch: &Dispatch,
 ) -> (
