@@ -1,5 +1,5 @@
 use super::{Attention, Cache};
-use forja_sdk::{Dim, Error, Result, Tensor, bf16, f16, target::metal::Variant};
+use forja_sdk::{Dim, Error, Result, Tensor, bf16, target::metal::Variant};
 
 impl Attention {
     pub(crate) fn decode_rows(
@@ -26,8 +26,8 @@ impl Attention {
             return Err(Error::loading("attention has no serving slot"));
         };
         let projected = self.project(input, positions, quant)?;
-        let keys = projected.key.to_dtype::<f16>()?;
-        let values = projected.value.to_dtype::<f16>()?;
+        let keys = &projected.key;
+        let values = &projected.value;
         let width = self
             .config
             .query_heads

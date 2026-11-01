@@ -14,6 +14,15 @@ pub(super) async fn runner_with_context<B: forja_core::Backend + Send + Sync + '
     replay: bool,
     context: u32,
 ) -> Result<EngineRunner<B>, Box<dyn Error>> {
+    runner_with_storage(backend, replay, context, forja_host::KvCacheFormat::F16).await
+}
+
+async fn runner_with_storage<B: forja_core::Backend + Send + Sync + 'static>(
+    backend: B,
+    replay: bool,
+    context: u32,
+    storage: forja_host::KvCacheFormat,
+) -> Result<EngineRunner<B>, Box<dyn Error>> {
     let mut runner = EngineRunner::new(
         test_guests::qwen38_tiny(),
         backend,
@@ -28,7 +37,7 @@ pub(super) async fn runner_with_context<B: forja_core::Backend + Send + Sync + '
                 max_context: Some(context),
                 replay,
                 paged_cache: true,
-                kv_cache: forja_host::KvCacheFormat::F16,
+                kv_cache: storage,
                 ..Default::default()
             },
         )
@@ -208,3 +217,91 @@ mod catalog;
 
 #[path = "serving/prefix.rs"]
 pub(super) mod prefix;
+
+#[tokio::test]
+async fn paged_cache_precisions_match_eager_at_page_boundaries() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    for replay in [false, true] {
+        let mut reduced_bytes: Option<u64> = None;
+        for (host_storage, guest_storage) in [
+            (
+                forja_host::KvCacheFormat::F16,
+                forja_sdk::KvCacheFormat::F16,
+            ),
+            (
+                forja_host::KvCacheFormat::F32,
+                forja_sdk::KvCacheFormat::F32,
+            ),
+        ] {
+            let mut runner =
+                runner_with_storage(forja_cpu::CpuBackend::new(), replay, 128, host_storage)
+                    .await?;
+            let info = runner
+                .describe()
+                .await?
+                .serving
+                .ok_or("missing serving geometry")?;
+            let pages =
+                u64::from(128_u32.div_ceil(info.page_tokens)) + u64::from(info.active_lanes);
+            let generations = pages.checked_mul(4).ok_or("generation byte overflow")?;
+            let bytes = runner
+                .paged_memory_usage()?
+                .ok_or("missing pool")?
+                .slab_bytes
+                .checked_sub(generations)
+                .ok_or("slab excludes generations")?;
+            assert!(bytes > 0);
+            if let Some(reduced) = reduced_bytes {
+                assert_eq!(bytes, reduced.checked_mul(2).unwrap());
+            } else {
+                reduced_bytes = Some(bytes);
+            }
+            let mut load = verification::tiny_load();
+            load.max_context = Some(128);
+            load.kv_cache = guest_storage;
+            let mut eager = qwen38::Qwen38::with_config(&weights, &load, qwen38::Config::tiny())?;
+            for position in 0..=64 {
+                let tokens = vec![position % 33];
+                let phase = if position == 0 {
+                    BatchPhase::Prompt
+                } else {
+                    BatchPhase::Decode
+                };
+                let expected = eager
+                    .decode(DecodeInput {
+                        phase: if position == 0 {
+                            forja_sdk::BatchPhase::Prompt
+                        } else {
+                            forja_sdk::BatchPhase::Decode
+                        },
+                        tokens: Some(Tensor::from_slice(&tokens, &[1])?),
+                        start_pos: position,
+                        sampling: forja_sdk::SamplingParams::default(),
+                    })?
+                    .logits
+                    .to_vec()?;
+                let actual = runner
+                    .decode(EngineDecode {
+                        phase,
+                        tokens: Some(tokens),
+                        start_pos: position,
+                        sampling: SamplingParams::default(),
+                    })
+                    .await??;
+                if [0, 63, 64].contains(&position) {
+                    let bytes = runner.read(&actual.logits).await?;
+                    let (words, remainder) = bytes.as_chunks::<4>();
+                    assert_eq!(remainder, &[] as &[u8]);
+                    let values = words
+                        .iter()
+                        .copied()
+                        .map(f32::from_le_bytes)
+                        .collect::<Vec<_>>();
+                    let error = golden_fixtures::normwise_relative_error(&expected, &values)?;
+                    assert!(error <= 1e-2, "position={position} error={error}");
+                }
+            }
+        }
+    }
+    Ok(())
+}

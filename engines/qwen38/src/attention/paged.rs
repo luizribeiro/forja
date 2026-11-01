@@ -91,24 +91,22 @@ impl Attention {
         let end = start.clone().checked_add(rows)?;
         let cache = set.layer_at(*lane, *layer)?;
         let scale = crate::numerics::inverse_sqrt_width(self.config.head_dim)?;
-        cache.append(
-            &projected.key.to_dtype::<f16>()?,
-            &projected.value.to_dtype::<f16>()?,
-            start,
-        )?;
-        let attended = if prefill && !self.config.cpu {
-            cache
-                .attention(
-                    &projected.query.to_dtype::<f16>()?,
-                    scale,
-                    start,
-                    &end,
-                    attention,
-                )?
-                .to_dtype::<f32>()?
-        } else {
-            cache.attention(&projected.query, scale, start, &end, attention)?
-        };
+        cache.append(&projected.key, &projected.value, start)?;
+        let attended =
+            if prefill && !self.config.cpu && self.config.kv_cache == forja_sdk::KvCacheFormat::F16
+            {
+                cache
+                    .attention(
+                        &projected.query.to_dtype::<f16>()?,
+                        scale,
+                        start,
+                        &end,
+                        attention,
+                    )?
+                    .to_dtype::<f32>()?
+            } else {
+                cache.attention(&projected.query, scale, start, &end, attention)?
+            };
         self.output(&attended, &projected.gate, quant)
     }
 }
