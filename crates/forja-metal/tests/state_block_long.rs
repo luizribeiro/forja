@@ -110,7 +110,7 @@ fn inputs(
     ]
 }
 
-fn compare(log_decay: f32, beta: f32) {
+fn measure(log_decay: f32, beta: f32) -> Vec<f64> {
     let backend = forja_metal::MetalBackend::new().unwrap();
     let mut inputs = inputs(&backend, log_decay, beta);
     let state_elements = usize::try_from(VALUE_HEADS * WIDTH * WIDTH).unwrap();
@@ -148,6 +148,7 @@ fn compare(log_decay: f32, beta: f32) {
                 .elements()],
         )
         .unwrap();
+    let mut errors = Vec::new();
     let mut completed = 0_u32;
     for checkpoint in [64, 32_768, 131_072, 262_144] {
         while completed < checkpoint {
@@ -190,11 +191,28 @@ fn compare(log_decay: f32, beta: f32) {
         eprintln!(
             "correctness diagnostic: recurrent tokens={completed} log_decay={log_decay} beta={beta} normwise_f64_reference_error={error}"
         );
+        assert!(error.is_finite());
+        errors.push(error);
+    }
+    errors
+}
+
+fn compare(log_decay: f32, beta: f32) {
+    for error in measure(log_decay, beta) {
         assert!(
             error <= forja_testing::F32_TOLERANCE,
             "long-state drift {error}"
         );
     }
+}
+
+#[test]
+fn metal_near_identity_recurrent_decay_reports_global_drift() {
+    let errors = measure(-1.0e-7, 0.25);
+    assert!(errors[0] <= forja_testing::F32_TOLERANCE);
+    eprintln!(
+        "correctness diagnostic only: near-identity global errors={errors:?}; long-state qualification remains separate from per-block operator tolerance"
+    );
 }
 
 #[test]
