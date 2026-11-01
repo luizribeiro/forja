@@ -37,7 +37,17 @@ openai_record!(Tool {
     r#type: String,
     function: FunctionDefinition
 });
-openai_record!(FunctionDefinition { name: String, description: Option<String>, parameters: Value });
+/// One declared function schema with optional strictness metadata.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
 openai_record!(ToolCall {
     id: String,
     r#type: String,
@@ -853,6 +863,38 @@ mod tests {
             });
         }
         assert!(validate_chat_input(&request, &config, &defaults, 151_936).is_err());
+    }
+
+    #[test]
+    fn strict_function_metadata_survives_validation_and_serialization() {
+        let tool: Tool = serde_json::from_value(serde_json::json!({
+            "type":"function", "function":{"name":"lookup", "strict":true,
+                "parameters":{"type":"object","properties":{},"additionalProperties":false}}
+        }))
+        .unwrap();
+        let request = chat(CompletionParams {
+            tools: Some(vec![tool]),
+            ..CompletionParams::default()
+        });
+        assert!(
+            validate_chat_input(
+                &request,
+                &HostConfig::default(),
+                &info(SamplingDefaults::default()),
+                151_936
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.params.tools).unwrap()[0]["function"]["strict"],
+            true
+        );
+        assert!(
+            serde_json::from_value::<FunctionDefinition>(serde_json::json!({
+                "name":"lookup", "parameters":{}, "strict":"yes"
+            }))
+            .is_err()
+        );
     }
 
     fn resolve_chat(
