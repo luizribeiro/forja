@@ -99,6 +99,7 @@ pub(crate) fn report(
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
             "Host snapshot capture/materialization transfers are outside GPU kernel work; prefix preparation is separate from the measured step.",
             "Sampling scalar/SFU counts describe the logical stochastic path; greedy/conditional branches may execute less work.",
+            "Parallel sampling models an unfiltered stochastic draw plus chunk reduction; scratch traffic uses allocated partial capacity. Ranked/nucleus fallback rescans are not data-dependent instruction counts.",
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
             "Scalar/SFU and integer throughput are uncalibrated; Floating-point work uses an optimistic MMA-equivalent ceiling, including scalar FMA kernels.",
             "Persistent f32 carry panels risk register spills; register residency and occupancy require device profiling.",

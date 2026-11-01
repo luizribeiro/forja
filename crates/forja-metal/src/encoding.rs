@@ -3334,7 +3334,15 @@ impl MetalBackend {
                         self.encode_sample(encoder, table, dispatch, params, bindings, arguments)?
                     }
                     Some(MetalVariant::SampleParallel) => self.encode_sample_parallel(
-                        encoder, table, dispatch, params, None, bindings, arguments,
+                        encoder,
+                        table,
+                        dispatch,
+                        params,
+                        None,
+                        bindings,
+                        arguments,
+                        timestamps,
+                        internal_timestamp,
                     )?,
                     _ => return Err(BackendError::InvalidInput),
                 };
@@ -3364,6 +3372,8 @@ impl MetalBackend {
                     Some(allow),
                     bindings,
                     arguments,
+                    timestamps,
+                    internal_timestamp,
                 )?;
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "sample-masked"));
                 buffers
@@ -7457,6 +7467,8 @@ impl MetalBackend {
         allow: Option<&Tensor>,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
+        timestamps: Option<&GpuTimestamps>,
+        internal_timestamp: &mut usize,
     ) -> Result<EncodedEmbed, BackendError> {
         let [logits, sampling, ..] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
@@ -7563,6 +7575,7 @@ impl MetalBackend {
         dispatch_threadgroups(encoder, chunk_groups, threads);
 
         encode_dispatch_barrier(encoder);
+        write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         set_pipeline(encoder, &finalize_pipeline);
         for (index, buffer) in [
             &logits_buffer,
@@ -8497,6 +8510,9 @@ fn dispatch_profile(
 }
 
 fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
+    if parallel_sampling(dispatch) {
+        return vec!["sample_masked_partials", "sample_masked_finalize"];
+    }
     if matches!(
         dispatch.op(),
         Op::State(forja_core::StateOp::DeltaRuleBlock(_))
@@ -8514,6 +8530,12 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
         return vec![first, second];
     }
     internal_gather_dispatch_names(dispatch).to_vec()
+}
+
+pub(crate) fn parallel_sampling(dispatch: &Dispatch) -> bool {
+    matches!(dispatch.op(), Op::SampleMasked { .. })
+        || matches!(dispatch.op(), Op::Sample { .. })
+            && selected_variant(dispatch) == Some(MetalVariant::SampleParallel)
 }
 
 pub(crate) fn paged_validation_split(dispatch: &Dispatch) -> bool {

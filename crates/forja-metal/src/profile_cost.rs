@@ -1,5 +1,6 @@
 use forja_core::{Dispatch, KernelCost, Op};
 mod bounded;
+mod sampling;
 pub(crate) mod state_block;
 
 pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
@@ -11,6 +12,10 @@ pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
 }
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
+    if crate::encoding::parallel_sampling(dispatch) {
+        let [partials, finalize] = sampling::stages(dispatch)?;
+        return partials.checked_add(finalize);
+    }
     if crate::encoding::paged_validation_split(dispatch) {
         return logical(dispatch)?.checked_add(validation(dispatch)?);
     }
@@ -32,6 +37,9 @@ pub(crate) fn internal(
     kernel: &str,
     blocks: Option<u32>,
 ) -> Option<KernelCost> {
+    if crate::encoding::parallel_sampling(dispatch) {
+        return sampling::internal(dispatch, kernel);
+    }
     if matches!(
         dispatch.op(),
         Op::State(forja_core::StateOp::DeltaRuleBlock(_))
