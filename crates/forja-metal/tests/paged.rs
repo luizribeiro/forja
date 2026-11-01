@@ -2221,3 +2221,6 @@ fn metal_wide_steel_page_divisibility_covers_near_multiples() {
         }
     }
 }
+
+#[path = "paged/attention.rs"]
+mod attention;
