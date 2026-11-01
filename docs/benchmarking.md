@@ -332,15 +332,37 @@ perturbation remains unknown. Step shares use unprofiled wall time; host overhea
 is therefore visible as unassigned time. Traffic counts logical operands, not
 hardware DRAM transactions. Routed expert reuse produces a footprint interval;
 proven unique routes tighten it. Padding/tile FLOPs are separate from logical
-matrix FLOPs. Scalar/SFU/integer throughput has no calibrated ceiling.
+matrix FLOPs. Scalar/SFU/integer throughput has no calibrated ceiling. Floating-point counts
+use an optimistic MMA-equivalent ceiling, including scalar FMA kernels; this is
+not an instruction-throughput estimate. Sampling work describes the logical
+stochastic path, so greedy or conditional branches may execute less work.
 
-Decode's model bound streams touched matrix weights plus KV once. Prefill uses
+Decode's model bound streams touched matrix weights and KV once, then includes
+the declared state, block scratch and authentication traffic. Prefill uses
 aggregate memory/compute rooflines. Both include the physical dispatch-count floor;
 per-dispatch bounds additionally constrain serial execution. These optimistic
 bounds omit scalar limitations and cache/occupancy effects. Efficiency above 100%
 or a dispatch below its floor signals a probe/model/timestamp mismatch to
 investigate, not negative recoverable time. Threadgroup bandwidth is recorded for
 kernel investigation but is not used as a logical global-memory ceiling.
+
+Work totals retain scalar/SFU counts and state, scratch and authentication-byte
+subsets. Subsets are already included in reads/writes; SFU operations are already
+included in scalar work. Engine-declared layer types have GPU and wall shares.
+Kernel groups use internal stages when measured, while call-site groups retain
+the enclosing composite; do not add the two rankings together.
+
+Register-risk annotations count source-level persistent carry/result values per
+thread. They exclude temporaries and compiler allocation, so they identify a
+possible spill risk rather than an observed spill or an occupancy prediction.
+An absent annotation does not establish that a kernel cannot spill.
+
+Private state snapshots currently use host read/write transfers. Their time is
+outside GPU kernel attribution; cached-prefix preparation is reported separately.
+GPU COW and ordinary copy commands count the transferred views, including partial
+page tails. A suffix profile reports both full context and measured tokens;
+decode reports one measured token. Use a profile with sufficient declared context
+capacity to include the requested decode position.
 
 A `[! >100%]` marker identifies a displayed percentage above 100%.
 `[! outside calibration CI]` identifies an interval shorter than the optimistic
