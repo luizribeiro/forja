@@ -2504,8 +2504,43 @@ async fn prepare_profile_context(
     let prefill = context_start
         .checked_sub(1)
         .ok_or("profile context must follow a prefill token")?;
-    let token = select_from_tokens(runner, tokens[..prefill].to_vec(), 0, options).await?;
+    runner.prepare_paged_request(None, 0)?;
+    prepare_benchmark_runner(
+        runner,
+        context_start
+            .checked_add(1)
+            .ok_or("profile context overflow")?,
+    )?;
+    let prompt = tokens
+        .get(..prefill)
+        .ok_or("profile prompt is incomplete")?;
+    let block = runner.describe().await?.prompt_block_tokens;
+    let mut token = None;
+    let mut start = 0_usize;
+    for chunk in profile_prompt_chunks(prompt, block)? {
+        token =
+            Some(select_from_tokens(runner, chunk.to_vec(), u32::try_from(start)?, options).await?);
+        start = start
+            .checked_add(chunk.len())
+            .ok_or("profile prompt offset overflow")?;
+    }
+    let token = token.ok_or("profile requires a nonempty prompt")?;
     select_next(runner, token, u32::try_from(prefill)?, options).await
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn profile_prompt_chunks(
+    tokens: &[u32],
+    block: Option<std::num::NonZeroU32>,
+) -> Result<std::slice::Chunks<'_, u32>, Box<dyn Error>> {
+    let length = block
+        .map(|block| usize::try_from(block.get()))
+        .transpose()?
+        .unwrap_or(tokens.len());
+    if length == 0 || tokens.is_empty() {
+        return Err("profile requires a nonempty prompt".into());
+    }
+    Ok(tokens.chunks(length))
 }
 
 #[cfg(target_os = "macos")]
@@ -3163,6 +3198,32 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn profile_prompt_priming_preserves_declared_blocks_and_true_tails() {
+        for length in [1, 7, 33, 4097] {
+            let tokens = vec![17; length];
+            let pieces = profile_prompt_chunks(&tokens, std::num::NonZeroU32::new(64))
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pieces
+                    .iter()
+                    .flat_map(|piece| piece.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                tokens
+            );
+            assert!(
+                pieces[..pieces.len() - 1]
+                    .iter()
+                    .all(|piece| piece.len() == 64)
+            );
+            assert!((1..=64).contains(&pieces.last().unwrap().len()));
+            assert_eq!(profile_prompt_chunks(&tokens, None).unwrap().count(), 1);
+        }
+        assert!(profile_prompt_chunks(&[], None).is_err());
+    }
+
     #[test]
     fn merges_serving_prefill_step_profiles() {
         let profiles = [2_u64, 3].map(|milliseconds| EngineStepProfile {
