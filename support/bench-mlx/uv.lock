@@ -67,12 +67,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "mlx" },
     { name = "mlx-lm" },
+    { name = "transformers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "mlx", specifier = "==0.32.2" },
     { name = "mlx-lm", specifier = "==0.31.3" },
+    { name = "transformers", specifier = "==5.17.0" },
 ]
 
 [[package]]

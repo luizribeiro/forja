@@ -18,6 +18,7 @@ mod config_show;
 mod engine;
 mod generate;
 mod host_schema;
+mod http_benchmark;
 mod kernel_benchmark;
 mod logging;
 mod machine_load;
@@ -56,6 +57,9 @@ fn main() -> ExitCode {
 }
 
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
+    if let args::Command::BenchHttp(options) = command {
+        return http_benchmark::run(&options);
+    }
     if let args::Command::Build(options) = command {
         println!(
             "{}",
@@ -110,6 +114,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::BenchHttp(_) => unreachable!("HTTP benchmarks own their client process"),
         args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
         args::Command::BenchSnapshot(options, config) => benchmark_snapshot::run(&options, &config),
         args::Command::Build(_) => unreachable!("build commands return before runtime"),

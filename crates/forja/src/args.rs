@@ -233,9 +233,13 @@ struct ProfileArgs {
 
 #[derive(Args)]
 #[command(
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true,
     long_about = "Benchmark engines with fixed repetitions (classic mode). Use --reps 30 --no-early-stop explicitly for classic sampling. Accelerated randomized gates use resident A/B workers through support/bench_gate.py; --process-per-leg disables worker reuse, and --no-early-stop, --all-rows and --fresh-competitor restore full measurement. --worker exposes the fixed-workload sample protocol. --accept-from adopts matching measurements; --accept --remeasure always measures again."
 )]
 struct BenchArgs {
+    #[command(subcommand)]
+    http: Option<HttpMode>,
     /// WebAssembly engine component. Repeat to compare engines.
     #[arg(long = "engine", required = true)]
     engines: Vec<PathBuf>,
@@ -272,6 +276,12 @@ struct BenchArgs {
     tuning: TuningBenchArgs,
     #[command(flatten)]
     record: RecordBenchArgs,
+}
+
+#[derive(Subcommand)]
+enum HttpMode {
+    /// Measure a conversation through the shared HTTP client (requires Python).
+    Http(Box<crate::http_benchmark::Options>),
 }
 
 #[derive(Args)]
@@ -344,6 +354,7 @@ enum AxisClass {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Command {
     Bench(Bench),
+    BenchHttp(crate::http_benchmark::Options),
     BenchKernel(crate::kernel_benchmark::Options, Box<DevConfig>),
     BenchSnapshot(crate::benchmark_snapshot::Options, Box<DevConfig>),
     Build(Build),
@@ -577,6 +588,15 @@ fn parse_with(
         }
         ParsedCommand::BenchSnapshot(options) => {
             Command::BenchSnapshot(options, Box::new(layered.config))
+        }
+        ParsedCommand::Bench(mut options) if options.http.is_some() => {
+            let Some(HttpMode::Http(http)) = options.http.take() else {
+                return Err(Cli::command().error(
+                    clap::error::ErrorKind::MissingSubcommand,
+                    "missing HTTP mode",
+                ));
+            };
+            Command::BenchHttp(*http)
         }
         ParsedCommand::Bench(options) => Command::Bench(options.with_config(
             &layered,
