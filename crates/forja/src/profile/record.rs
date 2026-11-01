@@ -18,13 +18,14 @@ pub(super) fn timeline(dispatches: &[DispatchProfile]) -> Result<Vec<Value>, &'s
             "variant": dispatch.variant, "alternatives": dispatch.alternatives,
             "shape": super::shape(dispatch), "cost": dispatch.cost.json(), "padded_flops": dispatch.padded_flops,
             "physical_dispatches": dispatch.physical_dispatches,
+            "register_spill_risk": register_pressure(dispatch, dispatch.kernel),
             "compute_dtype": super::dtype_name(dispatch.compute_dtype),
             "start_seconds": dispatch.gpu_start.as_secs_f64(), "end_seconds": dispatch.gpu_end.as_secs_f64(),
             "gap_before_seconds": dispatch.gap_before.as_secs_f64(), "gpu_time_seconds": dispatch.gpu_time.as_secs_f64(),
             "barrier_before": dispatch.barrier, "bytes": bytes,
             "gigabytes_per_second": super::throughput(bytes, dispatch.gpu_time),
             "internal": dispatch.internal.iter().map(|kernel| json!({"kernel": kernel.kernel,
-                "cost": kernel.cost.map(forja_core::KernelCost::json), "start_seconds": kernel.gpu_start.as_secs_f64(),
+                "cost": kernel.cost.map(forja_core::KernelCost::json), "register_spill_risk": register_pressure(dispatch, kernel.kernel), "start_seconds": kernel.gpu_start.as_secs_f64(),
                 "end_seconds": kernel.gpu_end.as_secs_f64(), "gpu_time_seconds": kernel.gpu_time.as_secs_f64()})).collect::<Vec<_>>() }))
     }).collect()
 }
@@ -57,4 +58,20 @@ pub(super) fn inputs(options: &Profile) -> Result<Value, Box<dyn Error>> {
         "warmups": options.warmups, "sampling": options.sampling,
         "model_path": options.model_dir, "weights_hash_source": "embedded-profile" }),
     )
+}
+
+fn register_pressure(dispatch: &DispatchProfile, kernel: &str) -> Value {
+    #[cfg(target_os = "macos")]
+    let values = forja_metal::private_accumulator_values_per_thread(dispatch, kernel);
+    #[cfg(not(target_os = "macos"))]
+    let values = {
+        let _ = (dispatch, kernel);
+        None::<u64>
+    };
+    values.map_or(Value::Null, |values| json!({
+        "private_f32_accumulator_values_per_thread": values,
+        "basis": "source-level persistent carry/result arrays; excludes temporaries and compiler allocation",
+        "spill_risk": "private arrays may spill; confirm with compiler/device profiling",
+        "spill_observed": null, "register_ceiling": "uncalibrated"
+    }))
 }

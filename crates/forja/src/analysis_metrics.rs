@@ -146,7 +146,7 @@ impl Attribution {
         "layer_type": dispatch.scope.as_ref().map_or("unscoped", |scope| scope.layer_type.as_str()),
         "layer": dispatch.scope.as_ref().and_then(|scope| scope.layer), "op": dispatch.op, "kernel": kernel,
         "variant": dispatch.variant, "alternatives": dispatch.alternatives, "shape": dispatch.shape,
-        "scalar_sfu_ceiling": "uncalibrated", "compute_dtype": dispatch.compute_dtype, "arithmetic_mode": format!("{}_native", dispatch.compute_dtype), "cost": cost.json(), "physical_dispatches": count,
+        "register_spill_risk": dispatch.register_spill_risk, "scalar_sfu_ceiling": "uncalibrated", "compute_dtype": dispatch.compute_dtype, "arithmetic_mode": format!("{}_native", dispatch.compute_dtype), "cost": cost.json(), "physical_dispatches": count,
         "profiled_gpu_seconds": raw, "preceding_gap_seconds": gap, "attributed_gpu_seconds": current,
         "share_of_step_percent": share,
         "raw_gigabytes_per_second_range": [minimum_bytes / raw / 1e9, maximum_bytes / raw / 1e9],
@@ -187,6 +187,7 @@ mod tests {
                 ..KernelCost::default()
             },
             padded_flops: [6000; 2],
+            register_spill_risk: Value::Null,
             internal: vec![],
         };
         let attribution = Attribution {

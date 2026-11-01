@@ -47,6 +47,8 @@ fn optional_cost<'de, D: serde::Deserializer<'de>>(
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Interval {
     pub(crate) kernel: String,
+    #[serde(default)]
+    pub(crate) register_spill_risk: Value,
     pub(crate) gpu_time_seconds: f64,
     #[serde(deserialize_with = "optional_cost")]
     pub(crate) cost: Option<KernelCost>,
@@ -60,6 +62,8 @@ pub(crate) struct Dispatch {
     pub(crate) shape: String,
     pub(crate) op: String,
     pub(crate) kernel: String,
+    #[serde(default)]
+    pub(crate) register_spill_risk: Value,
     pub(crate) variant: Option<String>,
     pub(crate) alternatives: Vec<String>,
     pub(crate) gpu_time_seconds: f64,

@@ -30,6 +30,12 @@ pub(super) fn aggregate(rows: &[Value], field: &str) -> Result<Vec<Value>, Box<d
         }
         let first = rows[0];
         let mut group = json!({"name": first[field], "kernel": first["kernel"], "variant": first["variant"], "bound": first["bound"], "instances": rows.len()});
+        let mut risks = Vec::new();
+        for row in &rows {
+            if let Some(risk) = row.get("register_spill_risk").filter(|value| !value.is_null())
+                && !risks.contains(risk) { risks.push(risk.clone()); }
+        }
+        group["register_spill_risks"] = json!(risks);
         group["cost"] = cost.json();
         group["physical_dispatches"] = json!(dispatches);
         for &key in SUMS {
@@ -138,6 +144,17 @@ pub(crate) fn human(report: &Value) -> String {
             row["arithmetic_modes"]
         );
         let _ = writeln!(out, "    screen: {}", row["alternatives"]);
+    }
+    for row in report["by_kernel"].as_array().into_iter().flatten() {
+        for risk in row["register_spill_risks"].as_array().into_iter().flatten() {
+            let _ = writeln!(
+                out,
+                "Register risk: {} / {}: {} f32 accumulator values/thread (source estimate; spills unmeasured)",
+                row["kernel"].as_str().unwrap_or("?"),
+                row["variant"].as_str().unwrap_or("?"),
+                risk["private_f32_accumulator_values_per_thread"]
+            );
+        }
     }
     for row in report["unmeasured_kernels"]
         .as_array()

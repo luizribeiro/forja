@@ -76,6 +76,7 @@ pub(crate) fn report(
                         gap,
                         1,
                     )?;
+                    inner["register_spill_risk"] = kernel.register_spill_risk.clone();
                     inner["submission"] = json!(submission.index);
                     inner["dispatch"] = json!(dispatch.index);
                     inner["phase"] = submission.phase.clone();
@@ -156,7 +157,7 @@ mod tests {
             "variant": "test.current", "alternatives": ["test.alternative"], "gpu_time_seconds": 4.0, "gap_before_seconds": 0.0,
             "physical_dispatches": if index == 0 {2} else {1}, "compute_dtype": "f32", "cost": cost(read, flops), "padded_flops": [flops, flops], "internal": internal })
         };
-        let internal = json!([{"kernel": "read-a", "gpu_time_seconds": 1.5, "cost": cost(40, 0)}, {"kernel": "read-b", "gpu_time_seconds": 2.5, "cost": cost(60, 0)}]);
+        let internal = json!([{"kernel": "read-a", "gpu_time_seconds": 1.5, "cost": cost(40, 0)}, {"kernel": "read-b", "gpu_time_seconds": 2.5, "cost": cost(60, 0), "register_spill_risk": {"private_f32_accumulator_values_per_thread": 64}}]);
         let timeline = json!([
             dispatch(0, "composite", 100, 0, internal),
             dispatch(1, "compute", 0, 500, json!([]))
@@ -259,6 +260,7 @@ mod tests {
             .map(|row| row["cost"]["read_bytes"].as_u64().unwrap())
             .sum();
         assert_eq!(read_bytes, 200);
+        assert!(ranking::human(&report).contains("64 f32 accumulator values/thread"));
 
         let mut invalid = profile;
         invalid.schema_version = 1;
