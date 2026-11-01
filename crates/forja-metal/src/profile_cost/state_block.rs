@@ -43,6 +43,10 @@ pub(super) fn stages(dispatch: &Dispatch, panel: u32) -> Option<[KernelCost; 4]>
     let value_bytes = inputs[2].layout().dtype().byte_size();
     let beta_bytes = inputs[4].layout().dtype().byte_size();
     let auth = |threads| mul(&[threads, 28]);
+    costs[0].metadata_read_bytes = auth(mul(&[512, block_heads])?)?;
+    costs[1].metadata_read_bytes = auth(mul(&[128, block_heads, rhs_panels])?)?;
+    costs[2].metadata_read_bytes = auth(mul(&[4, heads, value_panels, u64::from(panel)])?)?;
+    costs[3].metadata_read_bytes = auth(mul(&[256, block_heads, output_panels])?)?;
     let gram_operands = across(tokens, heads, |n| {
         if n <= 32 {
             mul(&[n, 3])

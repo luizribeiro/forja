@@ -62,6 +62,7 @@ pub(crate) fn stages(inputs: &[Tensor], output: &Tensor) -> Option<[KernelCost; 
     let gram_write = checked(&[matrix, 2, 4])?.checked_add(checked(&[rows, 2, 4])?)?;
     let gram = KernelCost {
         read_bytes: gram_read,
+        metadata_read_bytes: auth(matrix)?,
         write_bytes: gram_write,
         scratch_write_bytes: gram_write,
         flops: add(&[
@@ -85,6 +86,7 @@ pub(crate) fn stages(inputs: &[Tensor], output: &Tensor) -> Option<[KernelCost; 
             checked(&[rows, keys, 4])?,
             auth(checked(&[blocks, heads, panel])?)?,
         ])?,
+        metadata_read_bytes: auth(checked(&[blocks, heads, panel])?)?,
         write_bytes: solve_write,
         scratch_read_bytes: solve_read_scratch,
         scratch_write_bytes: solve_write,
@@ -112,6 +114,7 @@ pub(crate) fn stages(inputs: &[Tensor], output: &Tensor) -> Option<[KernelCost; 
             checked(&[key_values, 2, 4])?,
             auth(checked(&[heads, values])?)?,
         ])?,
+        metadata_read_bytes: auth(checked(&[heads, values])?)?,
         write_bytes: state.checked_add(carry_write_scratch)?,
         state_read_bytes: state,
         state_write_bytes: state,
@@ -146,6 +149,7 @@ fn publish_cost(
     let output_scratch = add(&[checked(&[pairs, values, 8])?, checked(&[rows, 4])?])?;
     Some(KernelCost {
         read_bytes: output_scratch.checked_add(checked(&[rows, metadata])?)?,
+        metadata_read_bytes: checked(&[rows, metadata])?,
         write_bytes: checked(&[rows, dtype_bytes])?,
         scratch_read_bytes: output_scratch,
         flops: add(&[checked(&[pairs, values, 2])?, rows])?,

@@ -13,6 +13,8 @@ pub(crate) struct Cost {
     #[serde(default)]
     sfu_ops: u64,
     #[serde(default)]
+    metadata_read_bytes: u64,
+    #[serde(default)]
     state_read_bytes: u64,
     #[serde(default)]
     state_write_bytes: u64,

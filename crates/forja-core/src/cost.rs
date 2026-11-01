@@ -31,6 +31,8 @@ pub struct KernelCost {
     pub scalar_ops: u64,
     /// Logical special functions included in scalar operations; their ceiling is uncalibrated.
     pub sfu_ops: u64,
+    /// Authentication table, generation and activity bytes included in total reads.
+    pub metadata_read_bytes: u64,
     /// Private state bytes read, included in total reads.
     pub state_read_bytes: u64,
     /// Private state bytes written, included in total writes.
@@ -60,6 +62,9 @@ impl KernelCost {
             flops: self.flops.checked_add(rhs.flops)?,
             scalar_ops: self.scalar_ops.checked_add(rhs.scalar_ops)?,
             sfu_ops: self.sfu_ops.checked_add(rhs.sfu_ops)?,
+            metadata_read_bytes: self
+                .metadata_read_bytes
+                .checked_add(rhs.metadata_read_bytes)?,
             state_read_bytes: self.state_read_bytes.checked_add(rhs.state_read_bytes)?,
             state_write_bytes: self.state_write_bytes.checked_add(rhs.state_write_bytes)?,
             scratch_read_bytes: self
@@ -88,7 +93,7 @@ impl KernelCost {
     pub fn json(self) -> serde_json::Value {
         serde_json::json!({"read_bytes": self.read_bytes, "write_bytes": self.write_bytes,
             "flops": self.flops, "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops,
-            "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
+            "metadata_read_bytes": self.metadata_read_bytes, "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
             "scratch_read_bytes": self.scratch_read_bytes, "scratch_write_bytes": self.scratch_write_bytes,
             "weight_bytes": self.weight_bytes, "kv_bytes": self.kv_bytes,
             "minimum_weight_bytes": self.minimum_weight_bytes,
@@ -198,6 +203,7 @@ mod tests {
             minimum_weight_bytes: 16,
             maximum_weight_bytes: 48,
             kv_bytes: 8,
+            metadata_read_bytes: 24,
         };
         assert_eq!(cost.checked_add(KernelCost::default()), Some(cost));
         assert!(
@@ -216,6 +222,7 @@ mod tests {
             ..cost
         })
         .unwrap();
+        assert_eq!(sum.metadata_read_bytes, 48);
         assert_eq!(sum.scratch_read_bytes, 128);
         assert_eq!(sum.state_read_bytes, 64);
         assert_eq!(sum.sfu_ops, 6);

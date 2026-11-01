@@ -57,6 +57,7 @@ fn delta_contract_refuses_alias_and_shape_errors_and_costs_state_traffic() {
     assert_eq!(cost.read_bytes, 3280);
     assert_eq!(cost.write_bytes, (3 * 33 + 3 * 7 * 33) * 4);
     assert_eq!(cost.scalar_ops, 8);
+    assert_eq!(cost.metadata_read_bytes, 32);
     assert_eq!(
         (cost.state_read_bytes, cost.state_write_bytes),
         (2772, 2772)

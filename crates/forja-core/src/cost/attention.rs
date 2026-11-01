@@ -15,7 +15,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
             PagedCopyDirection::IntoPages => (tensor_bytes(ordinary)?, pool_bytes),
             PagedCopyDirection::OutOfPages => (pool_bytes, tensor_bytes(ordinary)?),
         };
-        cost.read_bytes = cost.read_bytes.checked_add(bytes(&input[1..])?)?;
+        cost.metadata_read_bytes = bytes(&input[1..])?;
+        cost.read_bytes = cost.read_bytes.checked_add(cost.metadata_read_bytes)?;
         return Some(cost);
     }
     let (causal, q_start, key_length, paged) = match dispatch.op() {
@@ -78,7 +79,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
     ])?;
     cost.read_bytes = tensor_bytes(&input[0])?.checked_add(cost.kv_bytes)?;
     if paged {
-        cost.read_bytes = cost.read_bytes.checked_add(bytes(&input[3..])?)?;
+        cost.metadata_read_bytes = bytes(&input[3..])?;
+        cost.read_bytes = cost.read_bytes.checked_add(cost.metadata_read_bytes)?;
     }
     if matches!(dispatch.op(), Op::PagedSdpaAppend { .. }) {
         cost.read_bytes = cost.read_bytes.checked_add(bytes(&input[1..3])?)?;
@@ -123,6 +125,7 @@ mod tests {
             )
             .unwrap();
         let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+        assert_eq!(cost.metadata_read_bytes, 8 + 396);
         assert_eq!(cost.flops, 8192);
         assert_eq!(cost.write_bytes, 12288);
         assert_eq!(cost.kv_bytes, 4096);

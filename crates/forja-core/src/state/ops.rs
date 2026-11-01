@@ -139,6 +139,7 @@ impl StateOp {
 
     pub(crate) fn cost(self, inputs: &[Tensor], mut cost: KernelCost) -> Option<KernelCost> {
         cost.scalar_ops = AUTHENTICATION_SCALAR_OPS;
+        cost.metadata_read_bytes = crate::cost::bytes(&inputs[inputs.len().checked_sub(3)?..])?;
         cost.flops = match self {
             Self::DeltaRuleBlock(_) => {
                 return crate::cost::state_block::stages(inputs, &inputs[2])
