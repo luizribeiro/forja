@@ -15,10 +15,12 @@ pub(super) struct Recompute {
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
     pub(in crate::engine) async fn advance_canonical_recompute(&mut self) -> bool {
-        let job = self
-            .canonical_cache
-            .as_mut()
-            .and_then(|cache| cache.recompute.take());
+        let job = self.canonical_cache.as_mut().and_then(|cache| {
+            cache
+                .recompute
+                .take()
+                .or_else(|| cache.pending_recomputes.pop_front())
+        });
         let Some(mut job) = job else {
             return false;
         };
@@ -146,23 +148,32 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
     }
 
     pub(in crate::engine) fn stop_canonical_recompute(&mut self) -> Result<(), GenerationError> {
-        let job = self
-            .canonical_cache
-            .as_mut()
-            .and_then(|cache| cache.recompute.take());
-        let Some(job) = job else {
+        let Some(cache) = &mut self.canonical_cache else {
             return Ok(());
         };
-        if job.control.is_cancelled() {
-            self.metrics.recompute_cancelled = self.metrics.recompute_cancelled.saturating_add(1);
-        } else {
-            self.metrics.recompute_preempted = self.metrics.recompute_preempted.saturating_add(1);
+        let mut jobs = std::mem::take(&mut cache.pending_recomputes);
+        if let Some(active) = cache.recompute.take() {
+            jobs.push_front(active);
         }
-        self.release_recompute(&job)
+        let mut result = Ok(());
+        for job in jobs {
+            if job.control.is_cancelled() {
+                self.metrics.recompute_cancelled =
+                    self.metrics.recompute_cancelled.saturating_add(1);
+            } else {
+                self.metrics.recompute_preempted =
+                    self.metrics.recompute_preempted.saturating_add(1);
+            }
+            result = result.and(self.release_recompute(&job));
+        }
+        result
     }
 
     fn release_recompute(&mut self, job: &Recompute) -> Result<(), GenerationError> {
-        self.metrics.recompute_pending = false;
+        self.metrics.recompute_pending = self
+            .canonical_cache
+            .as_ref()
+            .is_some_and(|cache| cache.recompute.is_some() || !cache.pending_recomputes.is_empty());
         if job.position.is_some() {
             self.runner
                 .prepare_paged_lane(0, None, 0)
@@ -195,8 +206,9 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         if tokens.len() < cache.namespace.block().get() as usize
             || cache
                 .recompute
-                .as_ref()
-                .is_some_and(|job| !job.control.is_cancelled() && job.prompt.tokens() == tokens)
+                .iter()
+                .chain(&cache.pending_recomputes)
+                .any(|job| !job.control.is_cancelled() && job.prompt.tokens() == tokens)
         {
             return;
         }
@@ -205,7 +217,13 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             Ok(prompt) if prompt.charged_bytes() <= cache.allowance.bytes() => {
                 self.metrics.recompute_queued = self.metrics.recompute_queued.saturating_add(1);
                 self.metrics.recompute_pending = true;
-                cache.recompute = Some(Recompute {
+                let bound = usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX);
+                if cache.pending_recomputes.len() == bound {
+                    cache.pending_recomputes.pop_front();
+                    self.metrics.recompute_superseded =
+                        self.metrics.recompute_superseded.saturating_add(1);
+                }
+                cache.pending_recomputes.push_back(Recompute {
                     prompt,
                     control: control.clone(),
                     position: None,

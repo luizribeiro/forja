@@ -459,7 +459,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     guidance: GuidanceWorker,
     prefix_namespace: PrefixNamespace,
     prefix_index: Option<PrefixIndex>,
-    canonical_cache: Option<canonical::CanonicalCache<B>>,
+    canonical_cache: Option<Box<canonical::CanonicalCache<B>>>,
     metrics: ServingMetrics,
     config_generation: u64,
     scheduler: SchedulerConfig,

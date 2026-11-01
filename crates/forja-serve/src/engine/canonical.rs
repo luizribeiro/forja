@@ -4,7 +4,7 @@ use super::{GenerationControl, GenerationError, ServingEngine, prefix_limits};
 use forja_config::Profile;
 use forja_core::{Backend, CanonicalPrefixSchedule, HybridPrefixNamespace};
 use forja_host::{CanonicalPrompt, HybridPrefix, HybridPrefixStore, SnapshotAllowance};
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 type Admission<B> = (Arc<CanonicalPrompt>, Option<Arc<HybridPrefix<B>>>);
 
 pub(super) struct CanonicalCache<B: Backend> {
@@ -13,6 +13,7 @@ pub(super) struct CanonicalCache<B: Backend> {
     allowance: SnapshotAllowance,
     declared: u64,
     recompute: Option<recompute::Recompute>,
+    pending_recomputes: VecDeque<recompute::Recompute>,
     pub(super) store: Option<HybridPrefixStore<B>>,
 }
 
@@ -61,14 +62,15 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .runner
             .canonical_prefix_namespace(self.prefix_namespace.0, &classes)
             .map_err(cache_error)?;
-        self.canonical_cache = Some(CanonicalCache {
+        self.canonical_cache = Some(Box::new(CanonicalCache {
             schedule,
             namespace,
             allowance,
             declared: declared.get(),
             recompute: None,
+            pending_recomputes: VecDeque::new(),
             store: None,
-        });
+        }));
         self.configure_canonical_cache(&self.config.clone())?;
         Ok(self)
     }

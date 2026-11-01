@@ -236,3 +236,39 @@ async fn serial_generation_keeps_the_canonical_idle_worker() -> Result<(), TestE
     assert!(!observed.recompute_pending);
     Ok(())
 }
+
+#[tokio::test]
+async fn pending_reply_fifo_supersedes_only_its_oldest_entry_at_the_lane_bound()
+-> Result<(), TestError> {
+    let mut engine = configured().await?;
+    let mut config = engine.config.clone();
+    config.serving.max_active_sequences =
+        forja_config::Choice::Fixed(std::num::NonZeroU32::new(2).unwrap());
+    engine.update_policy(1, config)?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    for token in 0..3 {
+        engine.queue_canonical_recompute(
+            &PrefixLedger::new(vec![token; 63]),
+            63,
+            &[3],
+            &control,
+            true,
+        );
+    }
+    assert_eq!(engine.metrics.recompute_superseded, 1);
+    finish_recompute(&mut engine).await;
+    assert_eq!(engine.metrics.recompute_completed, 2);
+    for token in 0..3 {
+        let mut next = vec![token; 63];
+        next.extend([3, 2]);
+        assert_eq!(
+            engine
+                .canonical_admission(&next, true)?
+                .unwrap()
+                .1
+                .is_some(),
+            token > 0
+        );
+    }
+    Ok(())
+}

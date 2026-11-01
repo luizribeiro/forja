@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 use forja_core::Backend;
 use forja_host::{

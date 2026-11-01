@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "batch/tests.rs"]
+mod recompute_tests;
+
 use std::collections::{BTreeMap, VecDeque};
 
 use forja_core::Backend;

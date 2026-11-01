@@ -9,6 +9,7 @@ pub struct ServingMetrics {
     pub(crate) reused_tokens: u64,
     pub(crate) snapshot_refusals: u64,
     pub(crate) recompute_queued: u64,
+    pub(crate) recompute_superseded: u64,
     pub(crate) recompute_completed: u64,
     pub(crate) recompute_preempted: u64,
     pub(crate) recompute_cancelled: u64,
@@ -60,6 +61,7 @@ impl ServingMetrics {
         );
         for (name, value) in [
             ("queued", self.recompute_queued),
+            ("superseded", self.recompute_superseded),
             ("completed", self.recompute_completed),
             ("preempted", self.recompute_preempted),
             ("cancelled", self.recompute_cancelled),

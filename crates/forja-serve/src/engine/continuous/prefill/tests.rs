@@ -15,7 +15,7 @@ async fn engine() -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
     engine_with_context(128, 64).await
 }
 
-async fn engine_with_context(
+pub(in crate::engine::continuous) async fn engine_with_context(
     context: u32,
     chunk: u32,
 ) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
@@ -67,7 +67,7 @@ async fn engine_with_context(
     )?)
 }
 
-fn request() -> PreparedRequest {
+pub(in crate::engine::continuous) fn request() -> PreparedRequest {
     let (reply, _receiver) = tokio::sync::oneshot::channel();
     PreparedRequest {
         prefix_reuse: false,
@@ -164,7 +164,8 @@ async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> R
     Ok(())
 }
 
-fn canonical_profile() -> Result<forja_config::Profile, TestError> {
+pub(in crate::engine::continuous) fn canonical_profile() -> Result<forja_config::Profile, TestError>
+{
     Ok(serde_json::from_value(serde_json::json!({
         "schema-version": 1, "family": "hybrid",
         "model": { "id": "test/hybrid", "revision": "0".repeat(40), "weights-sha256": format!("sha256:{}", "0".repeat(64)) },
