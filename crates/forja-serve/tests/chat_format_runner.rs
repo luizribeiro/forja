@@ -204,3 +204,34 @@ fn reuses_a_profile_component_for_multibyte_tool_conversations() {
         format.reset(stream).unwrap();
     }
 }
+
+#[test]
+fn grammar_receives_bounded_opaque_request_options() {
+    let options = r#"{"echo_options":true,"parallel_tool_calls":false}"#;
+    let mut format = ChatFormat::load(
+        test_guests::chat_format_smoke(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        format
+            .grammar_with_options("[]", "null", "null", options)
+            .unwrap()
+            .unwrap()
+            .grammar,
+        options
+    );
+    let mut limited = ChatFormat::load(
+        test_guests::chat_format_smoke(),
+        ChatFormatLimits {
+            input_bytes: options.len(),
+            ..ChatFormatLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        limited
+            .grammar_with_options("[]", "null", "null", options)
+            .is_err()
+    );
+}

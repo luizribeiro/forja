@@ -342,6 +342,16 @@ trait PromptRenderer: Send {
         options: &str,
     ) -> Result<String, GenerationError>;
 
+    fn grammar_options(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response: &str,
+        _options: &str,
+    ) -> Result<crate::GrammarOutput, GenerationError> {
+        self.grammar(tools, choice, response)
+    }
+
     fn grammar(
         &mut self,
         tools: &str,
@@ -366,6 +376,18 @@ impl PromptRenderer for ChatFormat {
         options: &str,
     ) -> Result<String, GenerationError> {
         self.render(messages, tools, options)
+            .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
+            .map_err(GenerationError::invalid)
+    }
+
+    fn grammar_options(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response: &str,
+        options: &str,
+    ) -> Result<crate::GrammarOutput, GenerationError> {
+        self.grammar_with_options(tools, choice, response, options)
             .map_err(|error| GenerationError::new(format!("chat format failed: {error}")))?
             .map_err(GenerationError::invalid)
     }
@@ -2538,7 +2560,9 @@ where
         }
         let constraint = constraint_mode
             .map(|forced| {
-                let output = prompt.renderer.grammar(&tools, &choice, &response)?;
+                let output = prompt
+                    .renderer
+                    .grammar_options(&tools, &choice, &response, &options)?;
                 let encoding = prompt
                     .tokenizer
                     .encode(output.trigger.as_str(), false)

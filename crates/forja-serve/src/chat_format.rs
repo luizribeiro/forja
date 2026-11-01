@@ -219,13 +219,13 @@ impl ChatFormat {
         now_unix_seconds: i64,
         now_utc_offset_seconds: i32,
     ) -> wasmtime::Result<Result<String, String>> {
-        self.check_input_size(messages_json, tools_json, options_json)?;
+        self.check_input_size(&[messages_json, tools_json, options_json])?;
         let options_json =
             match clock_options(options_json, now_unix_seconds, now_utc_offset_seconds) {
                 Ok(options) => options,
                 Err(error) => return Ok(Err(error)),
             };
-        self.check_input_size(messages_json, tools_json, &options_json)?;
+        self.check_input_size(&[messages_json, tools_json, &options_json])?;
         self.prepare_call()?;
         let render = self
             .render
@@ -245,13 +245,26 @@ impl ChatFormat {
         choice: &str,
         response_format: &str,
     ) -> wasmtime::Result<Result<GrammarOutput, String>> {
-        self.check_input_size(tools, choice, response_format)?;
+        self.grammar_with_options(tools, choice, response_format, "{}")
+    }
+
+    /// Builds a tool grammar with the request's opaque render controls.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn grammar_with_options(
+        &mut self,
+        tools: &str,
+        choice: &str,
+        response_format: &str,
+        options: &str,
+    ) -> wasmtime::Result<Result<GrammarOutput, String>> {
+        self.check_input_size(&[tools, choice, response_format, options])?;
         self.prepare_call()?;
         let result = self.instance.l9o_gpu_chat_format().call_grammar(
             &mut self.store,
             tools,
             choice,
             response_format,
+            options,
         )?;
         self.check_grammar(result)
     }
@@ -263,7 +276,7 @@ impl ChatFormat {
         stream: u64,
         chunk: &str,
     ) -> wasmtime::Result<Result<Vec<ChatEvent>, String>> {
-        self.check_input_size(chunk, "", "")?;
+        self.check_input_size(&[chunk])?;
         self.prepare_call()?;
         let result =
             self.instance
@@ -314,12 +327,13 @@ impl ChatFormat {
         Ok(value)
     }
 
-    fn check_input_size(&self, messages: &str, tools: &str, options: &str) -> wasmtime::Result<()> {
-        let bytes = messages
-            .len()
-            .checked_add(tools.len())
-            .and_then(|bytes| bytes.checked_add(options.len()));
-        if bytes.is_none_or(|bytes| bytes > self.limits.input_bytes) {
+    fn check_input_size(&self, inputs: &[&str]) -> wasmtime::Result<()> {
+        let bytes = inputs.iter().try_fold(0_u64, |bytes, input| {
+            bytes.checked_add(u64::try_from(input.len()).ok()?)
+        });
+        let limit = u64::try_from(self.limits.input_bytes)
+            .map_err(|_| wasmtime::Error::msg("input limit overflow"))?;
+        if bytes.is_none_or(|bytes| bytes > limit) {
             return Err(wasmtime::Error::msg(
                 "chat format input exceeds its byte limit",
             ));

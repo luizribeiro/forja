@@ -100,6 +100,20 @@ pub trait ToolFormat {
         Self::finish_render(rendered, &request_options, options)
     }
 
+    /// Builds a grammar with the opaque options used to render this request.
+    ///
+    /// # Errors
+    /// Returns an error when the request cannot be constrained.
+    fn grammar_with_options(
+        tools_json: &str,
+        choice_json: &str,
+        response_json: &str,
+        _request_options_json: &str,
+        options: &Self::Options,
+    ) -> Result<String, String> {
+        Self::grammar(tools_json, choice_json, response_json, options)
+    }
+
     /// Builds a grammar for a normalized tool request.
     ///
     /// # Errors
@@ -166,9 +180,9 @@ macro_rules! export_component {
                     <$format as ToolFormat>::render(&template, &messages, &tools, &request, &options)
                 }
 
-                fn grammar(tools: String, choice: String, response: String) -> Result<GrammarOut, String> {
+                fn grammar(tools: String, choice: String, response: String, request: String) -> Result<GrammarOut, String> {
                     let options = <$format as ToolFormat>::options(super::$data::TOOL_FORMAT_OPTIONS)?;
-                    <$format as ToolFormat>::grammar(&tools, &choice, &response, &options).map(
+                    <$format as ToolFormat>::grammar_with_options(&tools, &choice, &response, &request, &options).map(
                         |grammar| GrammarOut {
                             grammar,
                             trigger: <$format as ToolFormat>::trigger(&options).to_owned(),

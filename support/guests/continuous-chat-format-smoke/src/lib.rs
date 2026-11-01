@@ -41,6 +41,7 @@ impl Guest for Component {
         _tools_json: String,
         _tool_choice_json: String,
         _response_format_json: String,
+        _options_json: String,
     ) -> Result<GrammarOut, String> {
         Ok(GrammarOut {
             grammar: format!("start: {:?}", "bcda".repeat(64)),

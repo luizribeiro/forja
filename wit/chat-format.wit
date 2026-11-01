@@ -31,7 +31,7 @@ interface chat-format {
   /// `now_utc_offset_seconds` into the options object so an import-free guest can
   /// implement `strftime_now`.
   render: func(messages-json: string, tools-json: string, options-json: string) -> result<string, string>;
-  grammar: func(tools-json: string, tool-choice-json: string, response-format-json: string) -> result<grammar-out, string>;
+  grammar: func(tools-json: string, tool-choice-json: string, response-format-json: string, options-json: string) -> result<grammar-out, string>;
   parse: func(%stream: u64, chunk: string) -> result<list<event>, string>;
   reset: func(%stream: u64);
 }

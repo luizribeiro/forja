@@ -46,9 +46,14 @@ impl Guest for Component {
         tools_json: String,
         _tool_choice_json: String,
         _response_format_json: String,
+        options_json: String,
     ) -> Result<GrammarOut, String> {
         Ok(GrammarOut {
-            grammar: format!("grammar:{tools_json}"),
+            grammar: if options_json.contains("echo_options") {
+                options_json
+            } else {
+                format!("grammar:{tools_json}")
+            },
             trigger: "<tool_call>\n".to_owned(),
         })
     }
