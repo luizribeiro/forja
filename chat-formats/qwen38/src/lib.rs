@@ -104,8 +104,37 @@ impl ToolFormat for QwenChat {
         }
         Ok(rendered)
     }
-    fn grammar(_: &str, _: &str, _: &str, (): &()) -> Result<String, String> {
-        Err("constrained tools are unsupported".to_owned())
+    fn grammar(tools: &str, choice: &str, response: &str, (): &()) -> Result<String, String> {
+        Self::grammar_with_options(tools, choice, response, "{}", &())
+    }
+    fn grammar_with_options(
+        tools: &str,
+        choice: &str,
+        response: &str,
+        request: &str,
+        (): &(),
+    ) -> Result<String, String> {
+        let request: Value = serde_json::from_str(request).map_err(|error| error.to_string())?;
+        let parallel = match request.get("parallel_tool_calls") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(value)) => *value,
+            _ => return Err("parallel_tool_calls must be boolean".to_owned()),
+        };
+        let grammar = qwen3_coder_xml::Qwen3CoderXml::grammar(
+            tools,
+            choice,
+            response,
+            &qwen3_coder_xml::Options,
+        )?;
+        if !parallel {
+            return Ok(grammar);
+        }
+        let alternatives = grammar
+            .strip_prefix("start: ")
+            .ok_or("missing grammar start")?;
+        Ok(format!(
+            "start: call (\"\\n<tool_call>\\n\" call)*\ncall: {alternatives}"
+        ))
     }
 }
 #[cfg(target_family = "wasm")]
@@ -323,5 +352,44 @@ mod tests {
                 "rewritten:hi<tool_call>\n"
             );
         }
+    }
+    #[test]
+    fn tool_grammars_select_functions_and_parallel_policy() {
+        let tools = r#"[{"type":"function","function":{"name":"lookup","strict":true,"parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}},{"type":"function","function":{"name":"other","parameters":{"type":"object"}}}]"#;
+        for choice in [
+            "\"auto\"",
+            "\"required\"",
+            r#"{"type":"function","function":{"name":"lookup"}}"#,
+        ] {
+            let grammar = QwenChat::grammar(tools, choice, "null", &()).unwrap();
+            assert!(grammar.starts_with("start: call ("));
+            assert!(grammar.contains("<parameter=query>"));
+            if choice.starts_with('{') {
+                assert!(!grammar.contains("<function=other>"));
+            }
+            let single = QwenChat::grammar_with_options(
+                tools,
+                choice,
+                "null",
+                r#"{"parallel_tool_calls":false}"#,
+                &(),
+            )
+            .unwrap();
+            assert!(single.starts_with("start: tool_0"));
+            assert!(!single.contains("call)*"));
+        }
+        assert!(
+            QwenChat::grammar_with_options(
+                tools,
+                "\"auto\"",
+                "null",
+                r#"{"parallel_tool_calls":0}"#,
+                &()
+            )
+            .is_err()
+        );
+        assert!(
+            QwenChat::grammar(tools, r#"{"function":{"name":"missing"}}"#, "null", &()).is_err()
+        );
     }
 }

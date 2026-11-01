@@ -25,3 +25,18 @@ uv run --offline --no-project --python 3.12 \
 `FORJA_MODELS` must point to the downloaded models. `tests/fixtures/reference.json`
 records the revision, template hash and reference versions. Build the component
 with the [engine profile](../../engines/qwen38/README.md).
+
+Requests can pass these controls in `chat_template_kwargs`, for example:
+`{"enable_thinking":false,"reasoning_effort":"medium","preserve_thinking":false}`.
+Defaults are thinking enabled, effort `xhigh`, and preserved thinking history.
+Assistant history accepts `reasoning_content`; generated thinking markers remain
+in the text stream. Only text content parts are supported.
+
+Tool calls use the shared XML function/parameter format, checked against the
+pinned two-call fixture at every UTF-8 split. Auto choice permits ordinary text
+until the tool trigger. Required or named choice seeds an empty thinking block
+and the trigger; a supplied template rewrite is rendered before this suffix.
+Calls stream with distinct indices and IDs. `parallel_tool_calls=false` permits
+one call; the default permits consecutive calls. Strict schemas use the host's
+supported schema subset and argument validation. Non-text response formats and
+unsupported schema constraints are refused by the host before generation.
