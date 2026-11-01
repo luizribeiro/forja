@@ -231,6 +231,7 @@ fn load_config(load: &EngineLoadConfig, mut config: Config) -> Result<(Config, u
         }
         config.layers = layers;
     }
+    config.kv_cache = load.kv_cache;
     config.validate()?;
     if !load.variant_rule_picks.is_empty() {
         return Err(Error::loading(
@@ -241,10 +242,5 @@ fn load_config(load: &EngineLoadConfig, mut config: Config) -> Result<(Config, u
         .max_context
         .filter(|n| (1..=262_144).contains(n))
         .ok_or_else(|| Error::loading("unsupported profile context"))?;
-    if load.kv_cache != forja_sdk::KvCacheFormat::F16 {
-        return Err(Error::loading(
-            "the reference engine requires f16 KV storage",
-        ));
-    }
     Ok((config, context))
 }

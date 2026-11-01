@@ -2,7 +2,7 @@ mod batch;
 mod paged;
 use crate::{Config, numerics, quant::Affine};
 use forja_sdk::{
-    Dim, Error, Result, Tensor, Weights, bf16, f16,
+    Dim, Element, Error, KvCacheFormat, Result, Tensor, Weights, bf16, f16,
     nn::blocks::{KvCache, cached_attention, cached_attention_with},
     target::metal::Variant,
 };
@@ -47,18 +47,27 @@ impl Attention {
         Ok(output)
     }
 
-    /// Loads a full attention layer and allocates a contiguous reduced-precision cache.
+    /// Loads a full attention layer with the configured contiguous cache precision.
     ///
     /// # Errors
     /// Refuses invalid geometry, missing weights or failed allocations.
     pub fn load(weights: &Weights<'_>, config: Config, context: u32) -> Result<Self> {
         config.validate()?;
-        let cache = Cache::Eager(KvCache::new(
-            config.kv_heads,
-            context,
-            config.head_dim,
-            f16::from_f32(0.0),
-        )?);
+        let cache = match config.kv_cache {
+            KvCacheFormat::F16 => Cache::EagerF16(KvCache::new(
+                config.kv_heads,
+                context,
+                config.head_dim,
+                f16::from_f32(0.0),
+            )?),
+            KvCacheFormat::F32 => Cache::EagerF32(KvCache::new(
+                config.kv_heads,
+                context,
+                config.head_dim,
+                0.0_f32,
+            )?),
+            KvCacheFormat::Bf16 => return Err(Error::loading("unsupported cache storage")),
+        };
         Self::load_with_cache(weights, config, cache)
     }
 
@@ -110,29 +119,12 @@ impl Attention {
         let positions = Tensor::constant(&[position], &[1])?;
         let projected = self.project(input, &positions, quant)?;
         let scale = crate::numerics::inverse_sqrt_width(self.config.head_dim)?;
-        let Cache::Eager(cache) = &mut self.cache else {
-            return Err(Error::loading("paged attention requires a serving lane"));
-        };
-        let attended = match attention {
-            Some(pick) => cached_attention_with(
-                &projected.query,
-                &projected.key,
-                &projected.value,
-                cache,
-                scale,
-                &Dim::from(position),
-                &Dim::from(end),
-                pick,
-            )?,
-            None => cached_attention(
-                &projected.query,
-                &projected.key,
-                &projected.value,
-                cache,
-                scale,
-                &Dim::from(position),
-                &Dim::from(end),
-            )?,
+        let attended = match &mut self.cache {
+            Cache::EagerF16(cache) => attend(cache, &projected, scale, position, end, attention)?,
+            Cache::EagerF32(cache) => attend(cache, &projected, scale, position, end, attention)?,
+            Cache::Paged { .. } => {
+                return Err(Error::loading("paged attention requires a serving lane"));
+            }
         };
         self.output(&attended, &projected.gate, quant)
     }
@@ -189,6 +181,39 @@ impl Attention {
     }
 }
 
+fn attend<C: Element>(
+    cache: &mut KvCache<C>,
+    projected: &AttentionProjection,
+    scale: f32,
+    start: u32,
+    end: u32,
+    pick: Option<&Variant>,
+) -> Result<Tensor<f32>> {
+    let start = Dim::from(start);
+    let end = Dim::from(end);
+    match pick {
+        Some(pick) => cached_attention_with(
+            &projected.query,
+            &projected.key,
+            &projected.value,
+            cache,
+            scale,
+            &start,
+            &end,
+            pick,
+        ),
+        None => cached_attention(
+            &projected.query,
+            &projected.key,
+            &projected.value,
+            cache,
+            scale,
+            &start,
+            &end,
+        ),
+    }
+}
+
 struct AttentionProjection {
     query: Tensor<f32>,
     key: Tensor<f32>,
@@ -203,7 +228,8 @@ fn partial_rope(input: &Tensor<bf16>, positions: &Tensor<u32>, width: u32) -> Re
 }
 
 enum Cache {
-    Eager(KvCache<f16>),
+    EagerF16(KvCache<f16>),
+    EagerF32(KvCache<f32>),
     Paged {
         set: std::rc::Rc<forja_sdk::PagedCacheSet>,
         layer: u32,

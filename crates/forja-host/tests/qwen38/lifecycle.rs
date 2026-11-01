@@ -73,3 +73,31 @@ fn prompt_and_decode_refuse_ambiguous_or_split_token_spans() -> Result<(), Box<d
     );
     Ok(())
 }
+
+#[test]
+fn eager_cache_precisions_agree_at_canonical_boundaries() -> Result<(), Box<dyn Error>> {
+    let weights = Weights::open(fixture("model.safetensors"))?;
+    let mut load = verification::tiny_load();
+    load.max_context = Some(128);
+    let mut reduced = qwen38::Model::load(&weights, &load, qwen38::Config::tiny())?;
+    load.kv_cache = forja_sdk::KvCacheFormat::F32;
+    let mut reference = qwen38::Model::load(&weights, &load, qwen38::Config::tiny())?;
+    for position in 0..=64 {
+        let token = forja_sdk::Tensor::from_slice(&[position % 33], &[1])?;
+        let expected = reference
+            .decode_token(&token, position, false)?
+            .logits
+            .to_vec()?;
+        let actual = reduced
+            .decode_token(&token, position, false)?
+            .logits
+            .to_vec()?;
+        if [0, 63, 64].contains(&position) {
+            let error = golden_fixtures::normwise_relative_error(&expected, &actual)?;
+            assert!(error <= 1e-2, "position={position} error={error}");
+        }
+    }
+    load.kv_cache = forja_sdk::KvCacheFormat::Bf16;
+    assert!(qwen38::Model::load(&weights, &load, qwen38::Config::tiny()).is_err());
+    Ok(())
+}

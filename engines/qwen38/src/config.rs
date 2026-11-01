@@ -33,6 +33,8 @@ pub struct Config {
     pub conv_width: u32,
     /// Native CPU tests use portable operations.
     pub cpu: bool,
+    /// Key/value storage selected by the load configuration.
+    pub kv_cache: forja_sdk::KvCacheFormat,
 }
 impl Config {
     /// Dimensions of the pinned checkpoint.
@@ -54,6 +56,7 @@ impl Config {
             value_dim: 128,
             conv_width: 4,
             cpu: false,
+            kv_cache: forja_sdk::KvCacheFormat::F16,
         }
     }
     /// Small four-layer model retaining both attention mechanisms and grouped heads.
@@ -75,6 +78,7 @@ impl Config {
             value_dim: 16,
             conv_width: 4,
             cpu: true,
+            kv_cache: forja_sdk::KvCacheFormat::F16,
         }
     }
     /// Describes convolution history and float32 carry for every recurrent layer.
@@ -122,7 +126,10 @@ impl Config {
             self.value_dim,
             self.conv_width,
         ];
-        if dimensions.contains(&0)
+        if !matches!(
+            self.kv_cache,
+            forja_sdk::KvCacheFormat::F16 | forja_sdk::KvCacheFormat::F32
+        ) || dimensions.contains(&0)
             || self.conv_width < 2
             || self.rotary_dim > self.head_dim
             || !self.rotary_dim.is_multiple_of(2)
