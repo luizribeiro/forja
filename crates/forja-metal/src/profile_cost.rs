@@ -11,6 +11,9 @@ pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
 }
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
+    if crate::encoding::paged_validation_split(dispatch) {
+        return logical(dispatch)?.checked_add(validation(dispatch)?);
+    }
     let Some((blocks, second)) = crate::encoding::paged_attention_parts(dispatch) else {
         return logical(dispatch);
     };
@@ -34,6 +37,9 @@ pub(crate) fn internal(
         Op::State(forja_core::StateOp::DeltaRuleBlock(_))
     ) {
         return block_internal(dispatch, kernel);
+    }
+    if kernel == "paged_sdpa_validate" {
+        return validation(dispatch);
     }
     let mut cost = logical(dispatch)?;
     let input = dispatch.primitive_inputs();
@@ -121,6 +127,27 @@ pub(crate) fn internal(
         }
         _ => Some(cost),
     }
+}
+
+fn validation(dispatch: &Dispatch) -> Option<KernelCost> {
+    let Op::PagedSdpa {
+        key_length,
+        page_tokens,
+        ..
+    } = dispatch.op()
+    else {
+        return None;
+    };
+    let pages = u64::from(key_length.div_ceil(page_tokens));
+    let metadata = logical(dispatch)?.metadata_read_bytes.checked_add(4)?;
+    Some(KernelCost {
+        read_bytes: metadata,
+        metadata_read_bytes: metadata,
+        scalar_ops: pages
+            .checked_mul(4)?
+            .checked_add(u64::from(dispatch.inputs().len() > 5))?,
+        ..KernelCost::default()
+    })
 }
 
 fn block_internal(dispatch: &Dispatch, kernel: &str) -> Option<KernelCost> {

@@ -3897,6 +3897,9 @@ impl MetalBackend {
                 },
             );
             encode_dispatch_barrier(encoder);
+            if paged_validation_split(dispatch) {
+                write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
+            }
         }
         if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
             let key_scratch = self.scratch_tensor(key.layout.dtype(), &[key_length, k[2], k[3]])?;
@@ -8500,12 +8503,23 @@ fn internal_dispatch_names(dispatch: &Dispatch) -> Vec<&'static str> {
     ) {
         return delta_block_kernels(dispatch).to_vec();
     }
+    if paged_validation_split(dispatch)
+        && let Ok(main) = dispatch_kernel(dispatch)
+    {
+        return vec!["paged_sdpa_validate", main];
+    }
     if let Some((_, second)) = paged_attention_parts(dispatch)
         && let Ok(first) = dispatch_kernel(dispatch)
     {
         return vec![first, second];
     }
     internal_gather_dispatch_names(dispatch).to_vec()
+}
+
+pub(crate) fn paged_validation_split(dispatch: &Dispatch) -> bool {
+    matches!(dispatch.op(), Op::PagedSdpa { .. })
+        && paged_gqa_blocks(selected_variant(dispatch)).is_none()
+        && selected_variant(dispatch) != Some(MetalVariant::PagedSdpaDecomposed)
 }
 
 pub(crate) fn paged_attention_parts(dispatch: &Dispatch) -> Option<(u32, &'static str)> {

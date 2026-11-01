@@ -2815,6 +2815,38 @@ mod tests {
     }
 
     #[test]
+    fn paged_validation_has_independent_metadata_cost() {
+        for dtype in [forja_core::DType::F32, forja_core::DType::F16] {
+            let dispatch = paged_sdpa_dispatch_with_heads(dtype, 6, 7, 256);
+            let variant = resolve(&dispatch, "paged-sdpa.steel-256", METAL4).unwrap();
+            let dispatch =
+                dispatch.with_backend_data(forja_core::BackendDispatchData::new(variant));
+            assert!(crate::encoding::paged_validation_split(&dispatch));
+            let logical = crate::profile_cost::logical(&dispatch).unwrap();
+            let validation =
+                crate::profile_cost::internal(&dispatch, "paged_sdpa_validate", None).unwrap();
+            let main = crate::profile_cost::internal(
+                &dispatch,
+                crate::encoding::dispatch_kernel(&dispatch).unwrap(),
+                None,
+            )
+            .unwrap();
+            let total = crate::profile_cost::of(&dispatch).unwrap();
+            assert_eq!(validation.checked_add(main), Some(total));
+            assert_eq!(total.kv_bytes, logical.kv_bytes);
+            assert_eq!(
+                validation.metadata_read_bytes,
+                logical.metadata_read_bytes + 4
+            );
+            assert_eq!(
+                total.metadata_read_bytes,
+                logical.metadata_read_bytes * 2 + 4
+            );
+            assert_eq!(validation.flops, 0);
+        }
+    }
+
+    #[test]
     fn paged_attention_composite_preserves_scratch_and_counts_kv_once() {
         for name in [
             "paged-sdpa.vector-256-two-pass",
