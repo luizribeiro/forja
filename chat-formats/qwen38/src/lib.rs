@@ -392,4 +392,18 @@ mod tests {
             QwenChat::grammar(tools, r#"{"function":{"name":"missing"}}"#, "null", &()).is_err()
         );
     }
+    #[test]
+    fn embedded_template_matches_the_pinned_model_hash() {
+        use sha2::{Digest, Sha256};
+        let reference: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/reference.json")).unwrap();
+        let actual = format!("{:x}", Sha256::digest(super::template::TEMPLATE.as_bytes()));
+        assert_eq!(actual, reference["template_sha256"]);
+        assert!(
+            include_str!(
+                "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml"
+            )
+            .contains(&format!("chat-template-sha256 = \"sha256:{actual}\""))
+        );
+    }
 }

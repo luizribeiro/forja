@@ -1886,6 +1886,7 @@ dependencies = [
  "forja-chat-format",
  "qwen3-coder-xml",
  "serde_json",
+ "sha2",
  "wit-bindgen 0.62.0",
 ]
 
