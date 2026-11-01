@@ -330,3 +330,38 @@ fn pinned_chat_component_matches_transformers_render_goldens() {
         assert_eq!(rendered, fixture["rendered"], "{}", fixture["name"]);
     }
 }
+
+#[test]
+fn pinned_chat_component_renders_a_large_tool_conversation() {
+    let mut messages =
+        vec![serde_json::json!({"role":"system","content":"Deterministic conversation."})];
+    for turn in 0..12 {
+        messages.extend([
+            serde_json::json!({"role":"user","content":format!("Continue turn {turn}.")}),
+            serde_json::json!({"role":"assistant","content":" result".repeat(128),"tool_calls":[{"id":format!("call_{turn}"),"type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+            serde_json::json!({"role":"tool","content":" tool".repeat(2048),"tool_call_id":format!("call_{turn}")}),
+            serde_json::json!({"role":"assistant","content":" word".repeat(128)}),
+        ]);
+    }
+    let messages = serde_json::to_string(&messages).unwrap();
+    let options =
+        r#"{"add_generation_prompt":true,"chat_template_kwargs":{"enable_thinking":false}}"#;
+    let mut limited = ChatFormat::load(
+        test_guests::qwen38_chat_format(),
+        ChatFormatLimits {
+            fuel: 10_000_000,
+            ..ChatFormatLimits::default()
+        },
+    )
+    .unwrap();
+    let error = limited.render(&messages, "null", options).unwrap_err();
+    assert!(error.root_cause().to_string().contains("fuel"));
+    let mut format = ChatFormat::load(
+        test_guests::qwen38_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    let rendered = format.render(&messages, "null", options).unwrap().unwrap();
+    assert!(rendered.ends_with("<think>\n\n</think>\n\n"));
+    assert_eq!(rendered.matches("<tool_response>").count(), 12);
+}

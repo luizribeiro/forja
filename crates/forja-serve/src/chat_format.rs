@@ -45,7 +45,7 @@ pub struct ChatFormatLimits {
 impl Default for ChatFormatLimits {
     fn default() -> Self {
         Self {
-            fuel: 10_000_000,
+            fuel: 100_000_000,
             memory_bytes: 4 * 1024 * 1024,
             input_bytes: 1024 * 1024,
             output_bytes: 1024 * 1024,
