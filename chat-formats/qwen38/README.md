@@ -7,7 +7,9 @@ The template retains its upstream Apache-2.0 license.
 Format options must be `{}`. Thinking is enabled by default with effort `xhigh`;
 `enable_thinking=false`, `reasoning_effort=medium|low`, and
 `preserve_thinking=false` select the pinned template's alternatives. Image/video
-input is rejected. Stop tokens are 248046 and 248044.
+input is rejected. Text-only content parts, tool definitions, tool-call histories
+and consecutive tool results use the pinned template. Encoded OpenAI argument
+objects are normalized before rendering. Stop tokens are 248046 and 248044.
 
 The fixtures were recorded on CPU with Transformers 5.17.0 from the pinned model's
 original `chat_template.jinja`, using `AutoTokenizer.apply_chat_template` with

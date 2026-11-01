@@ -29,15 +29,26 @@ impl ToolFormat for QwenChat {
         ""
     }
     fn normalize_messages(messages: &mut Value, (): &()) -> Result<(), String> {
-        let messages = messages.as_array().ok_or("messages must be an array")?;
-        for message in messages {
-            if !message.get("content").is_some_and(Value::is_string)
-                || message.get("tool_calls").is_some()
-                || message.get("role").is_some_and(|role| role == "tool")
-            {
-                return Err("qwen38 currently accepts text chat without tools".to_owned());
+        let items = messages.as_array().ok_or("messages must be an array")?;
+        for message in items {
+            if let Some(content) = message.get("content") {
+                let text = content.is_string()
+                    || content.is_null()
+                    || content.as_array().is_some_and(|parts| {
+                        parts.iter().all(|part| {
+                            part.get("text").is_some_and(Value::is_string)
+                                && part.get("type").is_none_or(|kind| kind == "text")
+                                && !["image", "image_url", "video"]
+                                    .iter()
+                                    .any(|key| part.get(key).is_some())
+                        })
+                    });
+                if !text {
+                    return Err("only text content is supported".to_owned());
+                }
             }
         }
+        qwen3_coder_xml::Qwen3CoderXml::normalize_messages(messages, &qwen3_coder_xml::Options)?;
         Ok(())
     }
     fn render(
@@ -48,8 +59,8 @@ impl ToolFormat for QwenChat {
         (): &(),
     ) -> Result<String, String> {
         let tools: Value = serde_json::from_str(tools).map_err(|e| e.to_string())?;
-        if !tools.is_null() && tools != serde_json::json!([]) {
-            return Err("tools are unsupported".to_owned());
+        if !tools.is_null() && !tools.is_array() {
+            return Err("tools must be an array".to_owned());
         }
         let mut messages: Value = serde_json::from_str(messages).map_err(|e| e.to_string())?;
         Self::normalize_messages(&mut messages, &())?;
@@ -57,7 +68,11 @@ impl ToolFormat for QwenChat {
         request
             .as_object()
             .ok_or("request options must be an object")?;
-        template.render(&messages.to_string(), "null", &request.to_string())
+        template.render(
+            &messages.to_string(),
+            &tools.to_string(),
+            &request.to_string(),
+        )
     }
     fn grammar(_: &str, _: &str, _: &str, (): &()) -> Result<String, String> {
         Err("constrained tools are unsupported".to_owned())
@@ -93,11 +108,14 @@ mod tests {
     fn thinking_and_history_match_pinned_transformers_goldens() {
         let fixtures: Value =
             serde_json::from_str(include_str!("../tests/fixtures/render.json")).unwrap();
-        for fixture in fixtures.as_array().unwrap().iter().take(7) {
+        for fixture in fixtures.as_array().unwrap() {
             assert_eq!(
-                render(
+                QwenChat::render(
+                    &ChatTemplate::compile(super::template::TEMPLATE.to_owned()).unwrap(),
                     &fixture["messages"].to_string(),
-                    &fixture["options"].to_string()
+                    &fixture["tools"].to_string(),
+                    &fixture["options"].to_string(),
+                    &(),
                 )
                 .unwrap(),
                 fixture["rendered"].as_str().unwrap(),
@@ -107,7 +125,7 @@ mod tests {
         }
     }
     #[test]
-    fn refuses_tool_call_messages() {
+    fn refuses_assistant_only_history() {
         assert!(
             render(
                 r#"[{"role":"assistant","content":"","tool_calls":[]}]"#,
@@ -117,7 +135,7 @@ mod tests {
         );
     }
     #[test]
-    fn refuses_tool_role_messages() {
+    fn refuses_tool_only_history() {
         assert!(render(r#"[{"role":"tool","content":"result"}]"#, "{}").is_err());
     }
     #[test]
@@ -130,12 +148,31 @@ mod tests {
             .unwrap(),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
-        assert!(render(r#"[{"role":"user","content":[]}]"#, "{}").is_err());
+        assert!(
+            render(
+                r#"[{"role":"user","content":[{"type":"image","image":"x"}]}]"#,
+                "{}"
+            )
+            .is_err()
+        );
         assert!(render("[]", r#"{"enable_thinking":true}"#).is_err());
         assert!(QwenChat::options(r#"{"unknown":true}"#).is_err());
         assert_eq!(
             TextParser.parse("hello").unwrap(),
             [Event::TextDelta("hello".to_owned())]
         );
+    }
+    #[test]
+    fn rejects_video_and_non_object_encoded_tool_arguments() {
+        for content in [r#"[{"type":"video","video":"x"}]"#, r#"{"text":"x"}"#] {
+            assert!(
+                render(
+                    &format!("[{{\"role\":\"user\",\"content\":{content}}}]"),
+                    "{}"
+                )
+                .is_err()
+            );
+        }
+        assert!(render(r#"[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"x","arguments":"[]"}}]}]"#, "{}").is_err());
     }
 }

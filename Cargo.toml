@@ -61,6 +61,7 @@ minijinja = { version = "2.12", default-features = false, features = [
   "json",
   "macros",
   "multi_template",
+  "preserve_order",
   "serde",
 ] }
 minijinja-contrib = { version = "2.12", default-features = false, features = [

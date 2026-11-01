@@ -9,6 +9,8 @@ use chrono::{DateTime, FixedOffset, Utc};
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, State, UndefinedBehavior};
 use serde_json::Value as JsonValue;
 
+mod json;
+
 /// One incremental event emitted while parsing model output.
 #[allow(missing_docs)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,6 +231,7 @@ impl ChatTemplate {
         environment.set_undefined_behavior(UndefinedBehavior::Lenient);
         environment
             .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        environment.add_filter("tojson", json::tojson);
         environment.add_function("raise_exception", raise_exception);
         environment.add_function("strftime_now", strftime_now);
         environment.add_template_owned("chat", source)?;

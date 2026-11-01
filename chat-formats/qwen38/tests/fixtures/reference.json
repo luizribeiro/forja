@@ -4,5 +4,5 @@
   "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
   "transformers": "5.17.0",
   "tokenizers": "0.23.3",
-  "recording": "CPU AutoTokenizer.apply_chat_template(tokenize=False); decode OpenAI JSON argument strings before rendering; preserve insertion order; no model inference"
+  "recording": "CPU apply_chat_template(tokenize=False); decode argument strings; preserve insertion order; no inference"
 }

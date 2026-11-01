@@ -11,6 +11,7 @@ name = "qwen38_chat"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+qwen3-coder-xml = { path = "../qwen3-coder-xml" }
 forja-chat-format = { path = "../../crates/forja-chat-format" }
 serde_json = { workspace = true, features = ["preserve_order"] }
 
