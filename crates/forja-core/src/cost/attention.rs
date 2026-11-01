@@ -68,7 +68,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         queries.checked_mul(key_length)?
     };
     cost.flops = product(&[2, heads, pairs, width.checked_add(value_width)?])?;
-    cost.scalar_ops = product(&[heads, pairs, 5])?;
+    cost.sfu_ops = heads.checked_mul(pairs.checked_add(queries)?)?;
+    cost.scalar_ops = product(&[heads, pairs, 5])?.checked_add(heads.checked_mul(queries)?)?;
     cost.kv_bytes = product(&[
         kv_heads,
         key_length,
@@ -151,6 +152,7 @@ mod tests {
             cost.flops,
             2 * 16 * (27 + 28 + 29 + 30 + 31 + 32 + 33) * 256
         );
+        assert_eq!(cost.sfu_ops, 16 * (27 + 28 + 29 + 30 + 31 + 32 + 33 + 7));
         assert_eq!(cost.kv_bytes, 2 * 8 * 33 * 128 * 2);
     }
 

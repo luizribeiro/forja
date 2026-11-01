@@ -43,6 +43,7 @@ fn quantized_embedding_rows_include_affine_metadata() {
     assert_eq!(cost.weight_bytes, 4032);
     assert_eq!((cost.read_bytes, cost.write_bytes), (4060, 28_672));
     assert_eq!(cost.flops, 0);
+    assert_eq!(cost.scalar_ops, 2 * 7 * 1024);
 }
 
 #[test]

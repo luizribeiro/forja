@@ -92,7 +92,8 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
                 .checked_div(u64::from(*input[0].layout().shape().last()?))?
                 .checked_mul(3)?,
         )?,
-        Op::Rope { .. } => elements.checked_mul(3)?,
+        Op::Rope { .. } => elements.checked_div(2)?.checked_mul(9)?,
+        Op::QuantEmbed { .. } => elements.checked_mul(2)?,
         Op::Argmax { .. } => input[0].layout().element_count().checked_sub(elements)?,
         Op::TopK { k, normalize, .. } => input[0]
             .layout()
@@ -104,12 +105,11 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
                 0
             })?,
         Op::Sample { .. } | Op::SampleMasked { .. } => {
-            input[0].layout().element_count().checked_mul(4)?
+            input[0].layout().element_count().checked_mul(6)?
         }
         Op::Copy
         | Op::PagedCopy { .. }
         | Op::Embed
-        | Op::QuantEmbed { .. }
         | Op::Matmul
         | Op::GatherMatmul
         | Op::QuantMatmul { .. }
@@ -117,6 +117,19 @@ pub(super) fn count(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelC
         | Op::Sdpa { .. }
         | Op::PagedSdpa { .. }
         | Op::PagedSdpaAppend { .. } => cost.scalar_ops,
+    };
+    cost.sfu_ops = match dispatch.op() {
+        Op::RmsNorm { .. } => {
+            elements.checked_div(u64::from(*input[0].layout().shape().last()?))?
+        }
+        Op::Rope { .. }
+        | Op::TopK {
+            normalize: true, ..
+        } => elements,
+        Op::Sample { .. } | Op::SampleMasked { .. } => {
+            input[0].layout().element_count().checked_mul(2)?
+        }
+        _ => cost.sfu_ops,
     };
     if let Some(epilogue) = dispatch.prepared_epilogue() {
         cost.sfu_ops = cost.sfu_ops.checked_add(program_work(

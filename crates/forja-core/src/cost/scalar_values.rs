@@ -19,6 +19,10 @@ fn norm_and_rope_scalar_work_matches_hand_counts() {
         cost(Op::RmsNorm { eps: 1e-5 }, &[&input, &weights], &[&output]).scalar_ops,
         945
     );
+    assert_eq!(
+        cost(Op::RmsNorm { eps: 1e-5 }, &[&input, &weights], &[&output]).sfu_ops,
+        7
+    );
     let input = tensor(4, DType::BF16, &[7, 16, 128]);
     let positions = tensor(5, DType::U32, &[7]);
     let output = tensor(6, DType::BF16, &[7, 16, 128]);
@@ -29,7 +33,16 @@ fn norm_and_rope_scalar_work_matches_hand_counts() {
             &[&output]
         )
         .scalar_ops,
-        43_008
+        64_512
+    );
+    assert_eq!(
+        cost(
+            Op::Rope { theta: 10_000.0 },
+            &[&input, &positions],
+            &[&output]
+        )
+        .sfu_ops,
+        7 * 16 * 128
     );
 }
 
@@ -87,7 +100,8 @@ fn sampling_counts_logits_and_reads_the_mask_separately() {
         (operations[1], vec![&logits, &controls, &mask], 952),
     ] {
         let cost = cost(op, &inputs, &[&output]);
-        assert_eq!(cost.scalar_ops, 924);
+        assert_eq!(cost.scalar_ops, 1386);
+        assert_eq!(cost.sfu_ops, 462);
         assert_eq!((cost.read_bytes, cost.write_bytes), (reads, 28));
     }
 }
