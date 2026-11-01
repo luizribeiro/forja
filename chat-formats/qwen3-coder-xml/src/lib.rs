@@ -61,7 +61,8 @@ impl ToolFormat for Qwen3CoderXml {
 }
 
 const TERMINALS: &str = "STRING: /[^\\r\\n<][^\\r<]*/\nINTEGER: /-?(0|[1-9][0-9]*)/\nNUMBER: /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/\nJSON: /[^\\r<]+/\n";
-const TRIGGER: &str = "<tool_call>\n";
+/// Prefix introducing an XML function call.
+pub const TRIGGER: &str = "<tool_call>\n";
 const FUNCTION_START: &str = "<function=";
 const PARAM_START: &str = "<parameter=";
 const CALL_END: &str = "</function>\n</tool_call>";
@@ -98,6 +99,7 @@ pub struct Parser {
     buffer: String,
     activated: bool,
     done: bool,
+    multiple: bool,
     phase: ParsePhase,
 }
 
@@ -107,9 +109,19 @@ enum ParsePhase {
     Function,
     Parameter,
     Value(String),
+    BetweenCalls,
 }
 
 impl Parser {
+    /// Accepts consecutive calls separated by a newline.
+    #[must_use]
+    pub fn multiple_calls() -> Self {
+        Self {
+            multiple: true,
+            ..Self::default()
+        }
+    }
+
     /// Parses the next ordered UTF-8 chunk.
     ///
     /// # Errors
@@ -147,6 +159,13 @@ impl IncrementalParser for Parser {
         }
         loop {
             match &mut self.phase {
+                ParsePhase::BetweenCalls => {
+                    match consume_delimiter(&mut self.buffer, "\n<tool_call>\n") {
+                        Some(true) => self.phase = ParsePhase::Function,
+                        None => break,
+                        Some(false) => return Err("invalid bytes between tool calls".to_owned()),
+                    }
+                }
                 ParsePhase::Function => {
                     let Some(name) = take_tag(&mut self.buffer, FUNCTION_START)? else {
                         break;
@@ -158,6 +177,10 @@ impl IncrementalParser for Parser {
                     match consume_delimiter(&mut self.buffer, CALL_END) {
                         Some(true) => {
                             events.push(Event::CallEnd);
+                            if self.multiple {
+                                self.phase = ParsePhase::BetweenCalls;
+                                continue;
+                            }
                             self.done = true;
                             if !self.buffer.is_empty() {
                                 return Err("data follows tool call".to_owned());

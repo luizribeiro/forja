@@ -1,22 +1,17 @@
 //! Pinned text-only Qwen3.8 chat format with upstream thinking controls.
 #![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
-use forja_chat_format::{ChatTemplate, Event, IncrementalParser, ToolFormat};
+use forja_chat_format::{ChatTemplate, ToolFormat};
 use serde_json::Value;
 #[cfg(any(target_family = "wasm", test))]
 mod template;
 /// Text chat with the pinned thinking and history controls.
 pub struct QwenChat;
-/// Plain streamed assistant text.
-#[derive(Default)]
-pub struct TextParser;
-impl IncrementalParser for TextParser {
-    fn parse(&mut self, chunk: &str) -> Result<Vec<Event>, String> {
-        Ok(vec![Event::TextDelta(chunk.to_owned())])
-    }
-}
 impl ToolFormat for QwenChat {
     type Options = ();
-    type Parser = TextParser;
+    type Parser = qwen3_coder_xml::Parser;
+    fn parser((): &()) -> Self::Parser {
+        Self::Parser::multiple_calls()
+    }
     fn options(options: &str) -> Result<(), String> {
         if serde_json::from_str::<Value>(options).map_err(|e| e.to_string())?
             != serde_json::json!({})
@@ -26,7 +21,7 @@ impl ToolFormat for QwenChat {
         Ok(())
     }
     fn trigger((): &()) -> &'static str {
-        ""
+        qwen3_coder_xml::TRIGGER
     }
     fn normalize_messages(messages: &mut Value, (): &()) -> Result<(), String> {
         let items = messages.as_array().ok_or("messages must be an array")?;
@@ -94,6 +89,7 @@ forja_chat_format::export_component!(crate::QwenChat, data);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forja_chat_format::Event;
     fn render(messages: &str, options: &str) -> Result<String, String> {
         QwenChat::render(
             &ChatTemplate::compile(super::template::TEMPLATE.to_owned())
@@ -158,7 +154,7 @@ mod tests {
         assert!(render("[]", r#"{"enable_thinking":true}"#).is_err());
         assert!(QwenChat::options(r#"{"unknown":true}"#).is_err());
         assert_eq!(
-            TextParser.parse("hello").unwrap(),
+            QwenChat::parser(&()).parse("hello").unwrap(),
             [Event::TextDelta("hello".to_owned())]
         );
     }
@@ -174,5 +170,56 @@ mod tests {
             );
         }
         assert!(render(r#"[{"role":"user","content":"hi"},{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"x","arguments":"[]"}}]}]"#, "{}").is_err());
+    }
+    #[test]
+    fn parses_pinned_multiple_calls_at_every_utf8_split() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/calls.json")).unwrap();
+        let wire = fixture["wire"].as_str().unwrap();
+        let expected: Vec<Event> = fixture["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|call| {
+                let mut events = vec![Event::CallStart(call["name"].as_str().unwrap().to_owned())];
+                for (name, value) in call["arguments"].as_object().unwrap() {
+                    let raw = value.as_str().map_or_else(
+                        || {
+                            // The pinned template uses Python's spaced JSON encoding.
+                            value.to_string().replace(':', ": ").replace(',', ", ")
+                        },
+                        str::to_owned,
+                    );
+                    events.push(Event::ArgumentDelta(name.clone(), raw));
+                }
+                events.push(Event::CallEnd);
+                events
+            })
+            .collect();
+        for split in wire
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(wire.len()))
+        {
+            let mut parser = QwenChat::parser(&());
+            let mut events = parser.parse(&wire[..split]).unwrap();
+            events.extend(parser.parse(&wire[split..]).unwrap());
+            assert_eq!(events, expected, "split {split}");
+        }
+        let mut parser = QwenChat::parser(&());
+        let mut events = Vec::new();
+        for ch in wire.chars() {
+            events.extend(parser.parse(&ch.to_string()).unwrap());
+        }
+        assert_eq!(events, expected);
+        assert!(parser.parse("garbage").is_err());
+        for malformed in [
+            "<tool_call>\n<function=>\n",
+            "<tool_call>\n<bogus>",
+            "<tool_call>\n<function=x>\n</parameter>",
+        ] {
+            assert!(QwenChat::parser(&()).parse(malformed).is_err());
+        }
+        assert!(qwen3_coder_xml::Parser::default().parse(wire).is_err());
     }
 }
