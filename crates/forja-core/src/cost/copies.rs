@@ -60,3 +60,43 @@ fn paged_copy_counts_transferred_rows_in_both_directions() {
         assert_eq!(cost.flops, 0);
     }
 }
+
+#[test]
+fn private_plane_copies_count_full_state_without_arithmetic() {
+    for shape in [vec![32, 128, 128], vec![3, 7, 33]] {
+        let source = tensor(1, DType::F32, &shape);
+        let destination = tensor(2, DType::F32, &shape);
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::Copy, &[&source], &destination)
+            .unwrap();
+        let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+        let bytes = source.layout().element_count() * 4;
+        assert_eq!((cost.read_bytes, cost.write_bytes), (bytes, bytes));
+        assert_eq!((cost.flops, cost.scalar_ops, cost.sfu_ops), (0, 0, 0));
+    }
+}
+
+#[test]
+fn partial_page_cow_copy_counts_only_the_shared_tail() {
+    let pool = tensor(1, DType::F16, &[3, 64, 2048]);
+    for tokens in [1, 7, 33] {
+        let view = |page| {
+            let layout = pool
+                .layout()
+                .slice(&[
+                    crate::Slice::new(page, 1, 1).unwrap(),
+                    crate::Slice::new(0, tokens, 1).unwrap(),
+                    crate::Slice::new(0, 2048, 1).unwrap(),
+                ])
+                .unwrap();
+            Tensor::from_allocation(pool.buffer(), layout, true).unwrap()
+        };
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&view(0)], &view(1)).unwrap();
+        let cost = KernelCost::of(commands.last_dispatch().unwrap()).unwrap();
+        let bytes = u64::from(tokens) * 2048 * 2;
+        assert_eq!((cost.read_bytes, cost.write_bytes), (bytes, bytes));
+        assert_eq!(cost.metadata_read_bytes, 0);
+    }
+}
