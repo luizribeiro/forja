@@ -159,6 +159,18 @@ pub fn qwen38_chat_format() -> &'static Path {
     Path::new(env!("QWEN38_CHAT_FORMAT"))
 }
 
+/// Returns the diagnostic float-KV text engine component.
+#[must_use]
+pub fn qwen38_float_kv() -> &'static Path {
+    Path::new(env!("QWEN38_FLOAT_KV_COMPONENT"))
+}
+
+/// Returns the long-context text engine component.
+#[must_use]
+pub fn qwen38_long() -> &'static Path {
+    Path::new(env!("QWEN38_LONG_COMPONENT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};

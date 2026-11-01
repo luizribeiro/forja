@@ -2,6 +2,8 @@ use super::{Error, verification};
 use std::{env, path::PathBuf, time::Duration};
 
 type Runner = forja_host::EngineRunner<forja_metal::MetalBackend>;
+#[path = "real/capacity.rs"]
+mod capacity;
 #[path = "real/prefix.rs"]
 mod prefix;
 #[path = "real/serving.rs"]
@@ -22,6 +24,17 @@ async fn load_configured(
     layers: Option<u32>,
     context: Option<u32>,
 ) -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
+    let component = env::var_os("FORJA_QWEN38_COMPONENT")
+        .map_or_else(|| test_guests::qwen38().to_path_buf(), PathBuf::from);
+    load_profiled(replay, layers, context, component).await
+}
+
+async fn load_profiled(
+    replay: bool,
+    layers: Option<u32>,
+    context: Option<u32>,
+    component: PathBuf,
+) -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
     let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?)
         .join("Qwen3.8-27B-4bit");
     let fixtures = golden_fixtures::FixtureDirectory::open(root.join("forja-fixtures"))?;
@@ -33,8 +46,6 @@ async fn load_configured(
             fixtures.model_sha256()
         );
     }
-    let component = env::var_os("FORJA_QWEN38_COMPONENT")
-        .map_or_else(|| test_guests::qwen38().to_path_buf(), PathBuf::from);
     let profile = forja_config::read_profile(&std::fs::read(&component)?)?;
     assert_eq!(
         profile.model().weights_sha256,

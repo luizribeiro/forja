@@ -363,14 +363,27 @@ fn build_smollm2_profiles(repository: &Path, target: &Path, out: &Path) -> io::R
 fn build_qwen38_profile(repository: &Path, target: &Path, out: &Path) -> io::Result<()> {
     let engine = repository.join("engines/qwen38");
     forja_build::build_component(&engine.join("Cargo.toml"), target, &[])?;
-    let profile = engine.join("profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml");
-    let output = copy_profiled_component(
-        &target.join("wasm32-wasip2/release/qwen38.wasm"),
-        &profile,
-        out,
-        "qwen38.wasm",
-    )?;
-    emit_guest_path("QWEN38_COMPONENT", &output);
+    for (suffix, environment) in [
+        ("q4", "QWEN38_COMPONENT"),
+        ("q4-f32-kv", "QWEN38_FLOAT_KV_COMPONENT"),
+        ("q4-long", "QWEN38_LONG_COMPONENT"),
+    ] {
+        let profile = engine.join(format!(
+            "profiles/qwen38-27b-4bit.metal-apple-m3-ultra.{suffix}.toml"
+        ));
+        let filename = if suffix == "q4" {
+            "qwen38.wasm".to_owned()
+        } else {
+            format!("qwen38-{suffix}.wasm")
+        };
+        let output = copy_profiled_component(
+            &target.join("wasm32-wasip2/release/qwen38.wasm"),
+            &profile,
+            out,
+            &filename,
+        )?;
+        emit_guest_path(environment, &output);
+    }
     println!("cargo::rerun-if-changed={}", engine.display());
     Ok(())
 }
