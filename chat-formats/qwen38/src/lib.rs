@@ -1,10 +1,10 @@
-//! Pinned text-only Qwen3.8 chat format with explicit non-thinking generation.
+//! Pinned text-only Qwen3.8 chat format with upstream thinking controls.
 #![cfg_attr(not(target_family = "wasm"), forbid(unsafe_code))]
 use forja_chat_format::{ChatTemplate, Event, IncrementalParser, ToolFormat};
 use serde_json::Value;
 #[cfg(any(target_family = "wasm", test))]
 mod template;
-/// Non-thinking text chat. Tools and multimodal messages require another format.
+/// Text chat with the pinned thinking and history controls.
 pub struct QwenChat;
 /// Plain streamed assistant text.
 #[derive(Default)]
@@ -53,17 +53,10 @@ impl ToolFormat for QwenChat {
         }
         let mut messages: Value = serde_json::from_str(messages).map_err(|e| e.to_string())?;
         Self::normalize_messages(&mut messages, &())?;
-        let mut request: Value = serde_json::from_str(request).map_err(|e| e.to_string())?;
-        let options = request
-            .as_object_mut()
+        let request: Value = serde_json::from_str(request).map_err(|e| e.to_string())?;
+        request
+            .as_object()
             .ok_or("request options must be an object")?;
-        if options
-            .get("enable_thinking")
-            .is_some_and(|value| value != false)
-        {
-            return Err("only non-thinking generation is supported".to_owned());
-        }
-        options.insert("enable_thinking".to_owned(), Value::Bool(false));
         template.render(&messages.to_string(), "null", &request.to_string())
     }
     fn grammar(_: &str, _: &str, _: &str, (): &()) -> Result<String, String> {
@@ -97,6 +90,23 @@ mod tests {
         )
     }
     #[test]
+    fn thinking_and_history_match_pinned_transformers_goldens() {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/render.json")).unwrap();
+        for fixture in fixtures.as_array().unwrap().iter().take(7) {
+            assert_eq!(
+                render(
+                    &fixture["messages"].to_string(),
+                    &fixture["options"].to_string()
+                )
+                .unwrap(),
+                fixture["rendered"].as_str().unwrap(),
+                "{}",
+                fixture["name"]
+            );
+        }
+    }
+    #[test]
     fn refuses_tool_call_messages() {
         assert!(
             render(
@@ -115,7 +125,7 @@ mod tests {
         assert_eq!(
             render(
                 r#"[{"role":"user","content":"Hello"}]"#,
-                r#"{"add_generation_prompt":true}"#
+                r#"{"add_generation_prompt":true,"enable_thinking":false}"#
             )
             .unwrap(),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
