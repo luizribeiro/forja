@@ -37,6 +37,10 @@ forja run --engine qwen38-27b-4bit.metal-apple-m3-ultra.q4 --prompt 'The capital
 forja --isolated -c engines/qwen38/serve.toml --set "model.model=\"$FORJA_MODELS/Qwen3.8-27B-4bit\"" serve
 ```
 
+Use the `.q4-f32-kv` or `.q4-long` profile name in the build/run commands for
+those variants. When serving, update `model.engine`, `model.profile` and
+`model.chat_format` together to select that build.
+
 The downloader verifies upstream revision `10c35caafbb80f7dc6a7a432cdd11af10a6d4818`
 and the original Qwen tokenizer at `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
 It preserves the original shards and copies text tensor bytes unchanged into
@@ -51,7 +55,7 @@ chat with string content. Tools, images and videos are unsupported.
 
 Independent Transformers 5.17.0 CPU fixtures use the same dequantized q4 bytes,
 BF16 projection outputs, every layer tap and 32 teacher-forced token choices.
-The full WebAssembly component passes the reduced-precision end-to-end criteria:
+The default F16-KV WebAssembly component passes the reduced-precision end-to-end criteria:
 
 | Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
 | --- | ---: | ---: | ---: | ---: |
@@ -63,6 +67,23 @@ Operator differentials use normwise relative error at most `1e-5` for F32 and
 `1e-2` for BF16/quantized tensors; full-model
 checks require mean KL at most `1e-2`, top-1 agreement at least 95% for each prompt,
 and per-layer error at most `5e-2`. These are correctness results. No performance is claimed.
+
+The diagnostic F32-KV profile retains q4 weights and BF16 activations. It passes
+the same three per-prompt gates (31/32, 32/32, 32/32 choices); the arithmetic
+fixture also passes with replay enabled.
+
+Long-position operator checks cover 0/63/64, 32K, 128K and 262,143 with integer
+RoPE positions, F32/F16 KV and full-width attention. They use independent
+references and the same dtype tolerances. Structured recurrent-state checks carry
+16 key heads and 48 value heads through 262,144 tokens. Ordinary decay, slow decay
+and underflow stay within `1e-5`; near-identity log decay (`-1e-7`) reaches
+`1.94e-5` cumulative error against F64, with `1.83e-7` after the first block.
+Full-model long-text accuracy remains unqualified.
+
+Real-weight capacity checks reserve the full context under 48 GiB with replay
+off/on, count three state versions per lane, and preserve state across refusals.
+They populate 64 model tokens; the separate attention checks scan full long KV
+caches. These are correctness/capacity diagnostics, not benchmarks.
 
 Regenerate the fixtures with the pinned CPU reference environment:
 
