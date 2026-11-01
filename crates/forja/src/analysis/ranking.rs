@@ -84,8 +84,10 @@ pub(crate) fn human(report: &Value) -> String {
     {
         let _ = writeln!(
             out,
-            "  {}: bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%{}",
+            "  {}: {:.1}% GPU / {:.1}% wall; bound {:.3}–{:.3} ms; GPU efficiency {:.1}–{:.1}%{}",
             row["layer_type"].as_str().unwrap_or("?"),
+            number(&row["share_of_gpu_percent"]),
+            number(&row["share_of_step_percent"]),
             number(&row["lower_bound_seconds_range"][0]) * 1000.0,
             number(&row["lower_bound_seconds_range"][1]) * 1000.0,
             number(&row["gpu_efficiency_percent_range"][0]),
@@ -106,7 +108,7 @@ pub(crate) fn human(report: &Value) -> String {
     {
         let _ = writeln!(
             out,
-            "  {}{} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA {:.1}% {}",
+            "  {}{} | {} | {} | {:.1}% wall | recover {:.3}/{:.3} ms | BW {:.1}–{:.1}% | MMA-equivalent {:.1}% {}",
             row["name"].as_str().unwrap_or("?"),
             crate::analysis_diagnostics::marker(row),
             row["variant"]
@@ -164,10 +166,9 @@ mod tests {
             text.lines().any(|line| line.starts_with("Model bound")
                 && line.contains("[! outside calibration CI]"))
         );
-        assert!(
-            text.lines()
-                .any(|line| line.contains("test: bound") && line.contains("[! >100%]"))
-        );
+        assert!(text.lines().any(|line| line.contains("test:")
+            && line.contains("bound")
+            && line.contains("[! >100%]")));
         assert!(text.contains("site [! >100%]"));
     }
 

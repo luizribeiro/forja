@@ -96,7 +96,7 @@ pub(crate) fn report(
         "notes": ["Profile-derived diagnostic, not a model benchmark.",
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
-            "Scalar/SFU and integer throughput are uncalibrated; MMA percentages use matrix-product FLOPs only.",
+            "Scalar/SFU and integer throughput are uncalibrated; Floating-point work uses an optimistic MMA-equivalent ceiling, including scalar FMA kernels.",
             "Persistent f32 carry panels risk register spills; register residency and occupancy require device profiling.",
             "Calibration bound envelopes combine per-probe CI endpoints, not a joint 95% interval; resource flags use raw GPU intervals.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
@@ -247,6 +247,11 @@ mod tests {
                 .all(|row| row["kernel"] != "composite")
         );
         assert_eq!(report["model_benchmark"], false);
+        assert_eq!(
+            report["whole_model"]["by_layer_type"][0]["share_of_gpu_percent"],
+            80.0
+        );
+        assert_eq!(report["whole_model"]["unassigned_gpu_seconds"], 2.0);
         let mut invalid = profile;
         invalid.schema_version = 1;
         assert!(invalid.validate().is_err());

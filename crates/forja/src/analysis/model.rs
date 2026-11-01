@@ -18,6 +18,7 @@ struct Totals {
     flops: u64,
     scalar_ops: u64,
     sfu_ops: u64,
+    metadata_read_bytes: u64,
     state_read_bytes: u64,
     state_write_bytes: u64,
     scratch_read_bytes: u64,
@@ -75,6 +76,10 @@ impl Totals {
             .sfu_ops
             .checked_add(cost.sfu_ops)
             .ok_or("SFU total overflow")?;
+        self.metadata_read_bytes = self
+            .metadata_read_bytes
+            .checked_add(cost.metadata_read_bytes)
+            .ok_or("metadata total overflow")?;
         self.state_read_bytes = self
             .state_read_bytes
             .checked_add(cost.state_read_bytes)
@@ -115,10 +120,20 @@ impl Totals {
         let mut memory = [0.0_f64; 2];
         for (index, seconds) in memory.iter_mut().enumerate() {
             *seconds = if mode == "decode" {
-                self.weights[index]
+                let read = self.weights[index]
                     .checked_add(self.kv)
-                    .ok_or("decode stream overflow")? as f64
-                    / ceiling.read_bandwidth()
+                    .and_then(|bytes| bytes.checked_add(self.state_read_bytes))
+                    .and_then(|bytes| bytes.checked_add(self.scratch_read_bytes))
+                    .and_then(|bytes| bytes.checked_add(self.metadata_read_bytes))
+                    .ok_or("decode stream overflow")?;
+                let write = self
+                    .state_write_bytes
+                    .checked_add(self.scratch_write_bytes)
+                    .ok_or("decode write overflow")?;
+                (read as f64 / ceiling.read_bandwidth()).max(
+                    read.checked_add(write).ok_or("decode traffic overflow")? as f64
+                        / ceiling.copy_bandwidth(),
+                )
             } else {
                 (self.read[index] as f64 / ceiling.read_bandwidth()).max(
                     self.read[index]
@@ -180,12 +195,12 @@ impl Totals {
                 .chain(wall_efficiency.unwrap_or([0.0; 2])),
         );
         Ok(
-            json!({"bound_kind": if mode == "decode" { "matrix-weights-plus-KV-once" } else { "aggregate-prefill-roofline" },
+            json!({"bound_kind": if mode == "decode" { "matrix-weights-KV-state-scratch-metadata" } else { "aggregate-prefill-roofline" },
             "weight_bytes_range": self.weights, "kv_bytes": self.kv, "logical_read_bytes_range": self.read, "write_bytes": self.write,
-            "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
+            "metadata_read_bytes": self.metadata_read_bytes, "state_read_bytes": self.state_read_bytes, "state_write_bytes": self.state_write_bytes,
             "scratch_read_bytes": self.scratch_read_bytes, "scratch_write_bytes": self.scratch_write_bytes,
             "scalar_ops": self.scalar_ops, "sfu_ops": self.sfu_ops, "scalar_sfu_ceiling": "uncalibrated",
-            "matrix_product_flops": self.flops, "physical_dispatches": self.dispatches, "layers": self.layers, "layer_count": self.layers.len(),
+            "floating_point_ops": self.flops, "physical_dispatches": self.dispatches, "layers": self.layers, "layer_count": self.layers.len(),
             "streaming_bound_seconds_range": memory, "compute_bound_seconds": self.compute[1],
             "dispatch_count_floor_seconds": floor, "lower_bound_seconds_range": bounds, "target_seconds_range": targets,
             "observed_or_attributed_gpu_seconds": gpu, "attributed_interval_seconds": self.attributed,
@@ -246,6 +261,7 @@ pub(super) fn summaries(
             .into_iter()
             .map(|(kind, total)| {
                 let mut row = total.json(&profile.mode, total.attributed, None, target, shared)?;
+                add_shares(&mut row, &total, profile);
                 row["layer_type"] = json!(kind);
                 Ok(row)
             })
@@ -260,13 +276,21 @@ pub(super) fn summaries(
         .into_iter()
         .map(|(kind, total)| {
             let mut row = total.json(&profile.mode, total.attributed, None, target, shared)?;
+            add_shares(&mut row, &total, profile);
             row["layer_type"] = json!(kind);
             Ok(row)
         })
         .collect::<Result<Vec<Value>, Box<dyn Error>>>()?;
     Ok(
-        json!({"by_layer_type": by_layer_type, "overall": all.json(&profile.mode, profile.unprofiled.gpu_time_seconds, Some(profile.unprofiled.wall_time_seconds), target, shared)?, "phases": phases}),
+        json!({"unassigned_gpu_seconds": (profile.unprofiled.gpu_time_seconds - all.attributed).max(0.0), "attribution_excess_seconds": (all.attributed - profile.unprofiled.gpu_time_seconds).max(0.0), "by_layer_type": by_layer_type, "overall": all.json(&profile.mode, profile.unprofiled.gpu_time_seconds, Some(profile.unprofiled.wall_time_seconds), target, shared)?, "phases": phases}),
     )
+}
+
+fn add_shares(row: &mut Value, total: &Totals, profile: &Profile) {
+    row["share_of_gpu_percent"] =
+        json!(total.attributed / profile.unprofiled.gpu_time_seconds * 100.0);
+    row["share_of_step_percent"] =
+        json!(total.attributed / profile.unprofiled.wall_time_seconds * 100.0);
 }
 
 #[cfg(test)]
@@ -311,6 +335,35 @@ mod tests {
         assert_eq!(within["bound_exceeds_observed"], false);
         let outside = total.json("prefill", 0.4, None, 0.8, ceiling).unwrap();
         assert_eq!(outside["bound_exceeds_observed"], true);
+    }
+
+    #[test]
+    fn decode_bound_includes_persistent_state_scratch_and_metadata() {
+        let ceiling = Ceilings::new(100.0, 200.0, 1000.0, 0.01).unwrap();
+        let mut total = Totals::default();
+        total
+            .add(
+                KernelCost {
+                    read_bytes: 450,
+                    write_bytes: 220,
+                    weight_bytes: 80,
+                    kv_bytes: 20,
+                    state_read_bytes: 200,
+                    state_write_bytes: 200,
+                    scratch_read_bytes: 100,
+                    scratch_write_bytes: 20,
+                    metadata_read_bytes: 50,
+                    ..KernelCost::default()
+                },
+                4,
+                10.0,
+                ceiling,
+            )
+            .unwrap();
+        let row = total.json("decode", 10.0, None, 0.8, ceiling).unwrap();
+        assert_eq!(row["lower_bound_seconds_range"], json!([4.5, 4.5]));
+        assert_eq!(row["metadata_read_bytes"], 50);
+        assert_eq!(row["state_read_bytes"], 200);
     }
 
     #[test]
