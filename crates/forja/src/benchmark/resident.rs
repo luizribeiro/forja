@@ -18,7 +18,7 @@ type Loaded = (EngineRunner<forja_metal::MetalBackend>, EngineInfo, String);
 
 pub(super) struct Runners {
     retain: bool,
-    prefix_reuse: bool,
+    pub(super) prefill_step: Option<std::num::NonZeroUsize>,
     pub(super) batch_prefixes: std::collections::BTreeMap<usize, super::PagedPrefix>,
     pub(super) prefix_builds: u64,
     primed: std::collections::BTreeSet<Prime>,
@@ -33,7 +33,7 @@ impl Runners {
     pub(super) const fn new(retain: bool) -> Self {
         Self {
             retain,
-            prefix_reuse: true,
+            prefill_step: None,
             batch_prefixes: std::collections::BTreeMap::new(),
             prefix_builds: 0,
             primed: std::collections::BTreeSet::new(),
@@ -50,7 +50,7 @@ impl Runners {
     }
 
     pub(super) const fn uses_prefixes(&self) -> bool {
-        self.retain && self.prefix_reuse
+        self.retain && self.prefill_step.is_none()
     }
 
     pub(super) const fn protocol(&self) -> u32 {
@@ -122,7 +122,17 @@ impl Runners {
         let count = self.instance_loads.entry(phase).or_default();
         *count = count.checked_add(1).ok_or("instance load count overflow")?;
         let loaded = load_benchmark_runner(options, point, component).await?;
-        self.prefix_reuse &= loaded.0.supports_prefix_reuse();
+        self.prefill_step = if loaded.0.supports_prefix_reuse() {
+            None
+        } else {
+            let profile = crate::resolution::read_embedded_profile(component)?;
+            Some(
+                std::num::NonZeroUsize::new(usize::try_from(
+                    profile.workload().prefill_chunk.get(),
+                )?)
+                .ok_or("zero prefill chunk")?,
+            )
+        };
         Ok(loaded)
     }
 
@@ -254,7 +264,7 @@ mod tests {
             (runners.protocol(), runners.cache_state()),
             (2, "prefix-fork-per-worker")
         );
-        runners.prefix_reuse = false;
+        runners.prefill_step = std::num::NonZeroUsize::new(2048);
         assert!(runners.retains());
         assert!(!runners.uses_prefixes());
         assert_eq!(

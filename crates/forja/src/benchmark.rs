@@ -619,6 +619,7 @@ async fn run_metal(
         if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
             report["worker"] = serde_json::json!({"protocol":runners.protocol(),"prefix_entries":runners.prefix_entries(),"prefix_builds":runners.prefix_builds,"pid": std::process::id(), "runner_loads": runners.loads,
                 "instance_loads": runners.instance_loads, "cache_state": runners.cache_state(),
+                "prefill_step_tokens": runners.prefill_step.map(std::num::NonZeroUsize::get),
                 "configured_priming_passes": options.warmups, "priming_policy":"once-per-worker-shape; at most two decode steps", "phase_timers": runners.times.report(started.elapsed())?});
         }
         if let Some(path) = output {
@@ -1496,12 +1497,16 @@ async fn measure_record_prefill(
     prime: bool,
 ) -> Result<Sample, Box<dyn Error>> {
     let started = Instant::now();
-    if runners.retains() {
+    if runners.retains() || runners.prefill_step.is_some() {
         runner.prepare_paged_request(None, 0)?;
         prepare_benchmark_runner(runner, prompt.len())?;
     }
     let setup = started.elapsed();
-    let sample = measure_prefill(runner, prompt).await?;
+    let sample = if let Some(limit) = runners.prefill_step {
+        measure_prefill_chunks(runner, prompt, 0, limit).await?
+    } else {
+        measure_prefill(runner, prompt).await?
+    };
     if prime {
         runners.times.add(timing::Stage::Prime, started.elapsed());
     } else {
@@ -2234,16 +2239,61 @@ async fn measure_prefill_from(
     tokens: &[u32],
     start: usize,
 ) -> Result<Sample, Box<dyn Error>> {
+    let limit = std::num::NonZeroUsize::new(tokens.len()).ok_or("empty prefill")?;
+    measure_prefill_chunks(runner, tokens, start, limit).await
+}
+
+#[cfg(any(target_os = "macos", test))]
+type PromptSubmissions<'a> = Vec<(u32, &'a [u32])>;
+
+#[cfg(any(target_os = "macos", test))]
+fn prompt_submissions(
+    tokens: &[u32],
+    start: usize,
+    limit: std::num::NonZeroUsize,
+) -> Result<PromptSubmissions<'_>, Box<dyn Error>> {
+    let start = u64::try_from(start)?;
+    u32::try_from(
+        start
+            .checked_add(u64::try_from(tokens.len())?)
+            .ok_or("prefill span overflow")?,
+    )?;
+    if tokens.is_empty() {
+        return Err("empty prefill".into());
+    }
+    tokens
+        .chunks(limit.get())
+        .enumerate()
+        .map(|(index, tokens)| {
+            let offset = u64::try_from(index)?
+                .checked_mul(u64::try_from(limit.get())?)
+                .and_then(|n| n.checked_add(start))
+                .ok_or("prefill offset overflow")?;
+            Ok((u32::try_from(offset)?, tokens))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+async fn measure_prefill_chunks(
+    runner: &mut EngineRunner<forja_metal::MetalBackend>,
+    tokens: &[u32],
+    start: usize,
+    limit: std::num::NonZeroUsize,
+) -> Result<Sample, Box<dyn Error>> {
+    let submissions = prompt_submissions(tokens, start, limit)?;
     let before = runner.metrics();
     let started = Instant::now();
-    step(
-        runner,
-        tokens.to_vec(),
-        u32::try_from(start)?,
-        forja_host::BatchPhase::Prompt,
-    )
-    .await?;
-    runner.wait_for_queued_submissions().await?;
+    for (position, chunk) in submissions {
+        step(
+            runner,
+            chunk.to_vec(),
+            position,
+            forja_host::BatchPhase::Prompt,
+        )
+        .await?;
+        runner.wait_for_queued_submissions().await?;
+    }
     sample(before, runner.metrics(), started.elapsed())
 }
 
@@ -2307,15 +2357,13 @@ async fn measure_record_decode(
     if runners.uses_prefixes() {
         prefix::measure(runner, prompt, steps, options, runners, prime).await
     } else {
-        if runners.retains() {
-            runner.prepare_paged_request(None, 0)?;
-            let reserved = prompt
-                .len()
-                .checked_add(steps)
-                .and_then(|n| n.checked_add(1))
-                .ok_or("decode reservation overflow")?;
-            prepare_benchmark_runner(runner, reserved)?;
-        }
+        runner.prepare_paged_request(None, 0)?;
+        let reserved = prompt
+            .len()
+            .checked_add(steps)
+            .and_then(|n| n.checked_add(1))
+            .ok_or("decode reservation overflow")?;
+        prepare_benchmark_runner(runner, reserved)?;
         let started = Instant::now();
         let sample = measure_decode(
             runner,
@@ -3249,6 +3297,32 @@ mod tests {
     use forja_testing::temporary_directory;
 
     use super::*;
+
+    #[test]
+    fn prompt_submission_spans_cover_odd_tails_and_refuse_overflow() {
+        let limit = std::num::NonZeroUsize::new(2048).unwrap();
+        for count in [1_u32, 7, 33, 4097] {
+            let tokens = (0..count).collect::<Vec<_>>();
+            let pieces = prompt_submissions(&tokens, 64, limit).unwrap();
+            let mut position = 64;
+            for (start, values) in &pieces {
+                assert_eq!(*start, position);
+                assert!(!values.is_empty() && values.len() <= 2048);
+                position += u32::try_from(values.len()).unwrap();
+            }
+            assert_eq!(position, 64 + count);
+            assert_eq!(
+                pieces
+                    .iter()
+                    .flat_map(|(_, values)| values.iter().copied())
+                    .collect::<Vec<_>>(),
+                tokens
+            );
+            assert!(prompt_submissions(&tokens, usize::MAX, limit).is_err());
+        }
+        assert!(prompt_submissions(&[1, 7, 33], u32::MAX as usize - 1, limit).is_err());
+        assert!(prompt_submissions(&[], 0, limit).is_err());
+    }
 
     #[test]
     fn measures_empty_and_declared_bucket_parameter_counts() {
