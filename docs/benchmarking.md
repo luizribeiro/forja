@@ -396,3 +396,60 @@ SmolLM2's Forja profiles use f32-promoted weights, whereas this MLX baseline use
 native bf16: label that precision difference instead of calling it a matched
 precision comparison. The [worked example](../engines/smollm2/README.md) links the
 actual records and explains each measured optimization.
+
+## HTTP conversations
+
+`forja bench http` packages the same streaming client for either server. Supply a
+suite, server argv JSON array and frozen identity JSON; it starts and stops only
+that owned server. Use a Python environment containing the pinned Transformers
+and tokenizer packages via `FORJA_BENCH_PYTHON`.
+
+```console
+forja bench http --suite conversation.toml --url http://127.0.0.1:8080 --server server.json --identity identity.json --reps 1 --warmups 1 --raw-samples --json conversation.json
+```
+
+The identity binds model/revision, tokenizer directory, named artifact paths and
+SHA256 hashes, effective server settings and template options. Required artifacts
+are `tokenizer`, `tokenizer_config`, `weights` and `server`. Additional shards,
+components and configuration files should also be included. Optional
+`cache_metrics` names the metrics URL, pending gauge and completed counter.
+
+Each repetition starts a fresh server, performs at most one two-token
+initialization request, then runs the whole scripted conversation. Actual replies
+are appended to subsequent histories. The original tokenizer renders and checks
+every prompt against the suite's whole-command context ceiling before HTTP;
+server prompt-token counts must agree. Per-turn records retain request history,
+usage, prompt hashes, visible SSE events, TTFT, decode rate, cache hits and
+recompute observations. Decode rate is `(completion_tokens - 1)` divided by the
+interval from first visible content through DONE; SSE chunks are not tokens.
+Recompute idle waits remain outside TTFT/decode and inside total session time.
+A generated-reply hit means the reused prefix extends beyond the previous prompt;
+a recompute hit additionally requires the configured recompute metrics. Unsupported
+counters are null. Raw turns are flushed as they complete, including before a
+later failure. Turns are observations within one independent conversation.
+
+Use `--mode serving` with the concurrent serving-suite schema to drive the same
+client's concurrency, cancellation and exactness checks. Its frozen identity also
+supplies `repository`, `weights` paths and, for Forja, `resolved_config` plus the
+binary/component/profile/chat-format artifacts. Managed server output is retained
+beside each record. Greedy HTTP requests omit seed so server batching can run.
+
+Stateful native engines that cannot restore authenticated prefix state use worker
+protocol 3: weights stay resident for one block while every request creates fresh
+state. Records distinguish this from protocol 2 prefix forks and include priming,
+setup, measured and output-probe costs. Stateful prefill submissions respect the
+profile's `prefill-chunk` bound, wait for scratch reuse between chunks, and time the
+whole prompt. Decode priming follows declared numerical prompt blocks; records
+made before a change to this policy must be measured again.
+
+The MLX native adapter in `support/bench-mlx/native.py` implements this fresh-request
+worker contract with one loaded model and newly constructed caches per request.
+Its generator computes one token ahead: decode timing drains that lookahead after
+one yielded token, then measures the declared input positions. Whole-command
+context ceilings also include the extra prefill lookahead token. Classic process
+calls retain every configured full warmup; worker priming stays bounded.
+The optional HTTP server adapter applies a byte cap to the existing LRU cache
+constructor as well as the server admission limit. Its separate `--audit-log` mode
+records actual BatchGenerator request IDs and cache types. Collect admission
+proof with observation enabled, then disable observation for timing runs and
+retain the matching source/configuration identities.
