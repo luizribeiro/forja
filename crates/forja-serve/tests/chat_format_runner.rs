@@ -68,6 +68,7 @@ fn component_declares_no_imports() {
         test_guests::chat_format_smoke(),
         test_guests::qwen3_coder_chat_format(),
         test_guests::custom_chat_format(),
+        test_guests::qwen38_chat_format(),
     ] {
         let component = wasmtime::component::Component::from_file(&engine, path).unwrap();
         assert_eq!(
@@ -234,4 +235,98 @@ fn grammar_receives_bounded_opaque_request_options() {
             .grammar_with_options("[]", "null", "null", options)
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn repeated_calls_keep_the_grammar_open_until_eos() {
+    use forja_serve::guidance::GuidanceWorker;
+    let body = "<function=lookup>\n</function>\n</tool_call>";
+    let separator = "\n<tool_call>\n";
+    let vocab = [
+        (body.replace('\n', "Ċ"), 0),
+        (separator.replace('\n', "Ċ"), 1),
+        ("<eos>".to_owned(), 2),
+    ];
+    let model = tokenizers::models::bpe::BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .build()
+        .unwrap();
+    let mut tokenizer = tokenizers::Tokenizer::new(model);
+    tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    let worker = GuidanceWorker::new(&tokenizer, 3, &[2]).unwrap();
+    let mut format = ChatFormat::load(
+        test_guests::qwen38_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    let tools =
+        r#"[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]"#;
+    let grammar = format
+        .grammar(tools, "\"required\"", "null")
+        .unwrap()
+        .unwrap();
+    let session = worker.compile(grammar.grammar).await.unwrap();
+    assert_eq!(session.mask().await.unwrap().unwrap(), [1]);
+    session.commit(0).await.unwrap();
+    assert_eq!(session.mask().await.unwrap().unwrap(), [6]);
+    session.commit(1).await.unwrap();
+    assert_eq!(session.mask().await.unwrap().unwrap(), [1]);
+    session.commit(0).await.unwrap();
+    assert_eq!(session.mask().await.unwrap().unwrap(), [6]);
+    session.commit(2).await.unwrap();
+    assert!(session.mask().await.unwrap().is_none());
+    let events = format
+        .parse(
+            1,
+            &format!("{}{}{}{}", grammar.trigger, body, separator, body),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::CallEnd))
+            .count(),
+        2
+    );
+    format.reset(1).unwrap();
+    let grammar = format
+        .grammar_with_options(
+            tools,
+            "\"required\"",
+            "null",
+            r#"{"parallel_tool_calls":false}"#,
+        )
+        .unwrap()
+        .unwrap();
+    let single = worker.compile(grammar.grammar).await.unwrap();
+    assert_eq!(single.mask().await.unwrap().unwrap(), [1]);
+    single.commit(0).await.unwrap();
+    assert!(single.mask().await.unwrap().is_none());
+}
+
+#[test]
+fn pinned_chat_component_matches_transformers_render_goldens() {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../chat-formats/qwen38/tests/fixtures/render.json"
+    ))
+    .unwrap();
+    let mut format = ChatFormat::load(
+        test_guests::qwen38_chat_format(),
+        ChatFormatLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(format.info().stop_token_ids, [248_046, 248_044]);
+    for fixture in fixtures.as_array().unwrap() {
+        let options = serde_json::json!({"add_generation_prompt":fixture["options"]["add_generation_prompt"], "chat_template_kwargs": fixture["options"].as_object().unwrap().iter().filter(|(name,_)| *name != "add_generation_prompt").map(|(key,value)| (key.clone(),value.clone())).collect::<serde_json::Map<_,_>>()});
+        let rendered = format
+            .render(
+                &fixture["messages"].to_string(),
+                &fixture["tools"].to_string(),
+                &options.to_string(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rendered, fixture["rendered"], "{}", fixture["name"]);
+    }
 }

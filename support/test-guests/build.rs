@@ -71,6 +71,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?;
     let qwen_chat_format_path = out_dir.join("qwen3-coder.chat-format.wasm");
     fs::write(&qwen_chat_format_path, qwen_chat_format)?;
+    let pinned_chat_manifest = repository.join("chat-formats/qwen38/Cargo.toml");
+    forja_build::build_core_module(&pinned_chat_manifest, &qwen_chat_target_dir, &[])?;
+    let pinned_chat_format = forja_build::encode_component(&fs::read(
+        qwen_chat_target_dir.join("wasm32-unknown-unknown/release/qwen38_chat.wasm"),
+    )?)?;
+    let pinned_chat_format_path = out_dir.join("qwen38.chat-format.wasm");
+    fs::write(&pinned_chat_format_path, pinned_chat_format)?;
+    emit_guest_path("QWEN38_CHAT_FORMAT", &pinned_chat_format_path);
+    println!(
+        "cargo::rerun-if-changed={}",
+        repository.join("chat-formats/qwen38").display()
+    );
     let custom_manifest = repository.join("support/guests/custom-chat-format-smoke/Cargo.toml");
     forja_build::build_core_module(&custom_manifest, &qwen_chat_target_dir, &[])?;
     let custom_chat_format = forja_build::encode_component(&fs::read(

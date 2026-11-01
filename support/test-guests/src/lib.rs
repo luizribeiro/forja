@@ -153,6 +153,12 @@ pub fn qwen38() -> &'static Path {
     Path::new(env!("QWEN38_COMPONENT"))
 }
 
+/// Returns the pinned text chat component.
+#[must_use]
+pub fn qwen38_chat_format() -> &'static Path {
+    Path::new(env!("QWEN38_CHAT_FORMAT"))
+}
+
 #[cfg(test)]
 mod tests {
     use wasmtime::component::{Component, Linker, ResourceTable};
