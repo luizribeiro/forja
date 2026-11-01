@@ -306,6 +306,11 @@ forja profile --engine /path/engine.wasm --model /path/model --mode prefill --co
 forja analyze --profile /path/evidence/pp16k/profile.json --calibration calibration.json --json analysis.json
 ```
 
+Use `--mode prefill --step-tokens 512 --context 16384` to profile a cold paged
+serving lane with an engine-declared prompt bucket. Every step is retained. Add
+`--prefix-context N` to measure only the suffix; cache preparation is reported
+separately from the timed GPU phase.
+
 Use `--mode decode --context 8192` for a decode step with populated KV. Prefill
 records retain every chunk, so an early chunk cannot stand in for the full run.
 Omit `--calibration` to reuse or create the matching device cache. Identity/schema

@@ -282,19 +282,51 @@ async fn measure_serving_prefill_profile(
         .copied()
         .ok_or("serving prefill step has no exact batch shape")?;
     let reserved = u64::try_from(options.context)?;
-    let prefix =
-        prepare_serving_profile_prefix(runner, &tokens[..options.prefix_context], shape, reserved)
-            .await?;
+    let prefix = if options.prefix_context == 0 {
+        None
+    } else {
+        Some(
+            prepare_serving_profile_prefix(
+                runner,
+                &tokens[..options.prefix_context],
+                shape,
+                reserved,
+            )
+            .await?,
+        )
+    };
     for _ in 0..options.warmups {
-        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, false)
-            .await?;
+        measure_serving_profile_phase(
+            runner,
+            prefix.as_ref(),
+            tokens,
+            options,
+            shape,
+            reserved,
+            false,
+        )
+        .await?;
     }
-    let (baseline, cache_setup, _) =
-        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, false)
-            .await?;
-    let (profiled, _, step_profiles) =
-        measure_serving_profile_phase(runner, &prefix, tokens, options, shape, reserved, true)
-            .await?;
+    let (baseline, cache_setup, _) = measure_serving_profile_phase(
+        runner,
+        prefix.as_ref(),
+        tokens,
+        options,
+        shape,
+        reserved,
+        false,
+    )
+    .await?;
+    let (profiled, _, step_profiles) = measure_serving_profile_phase(
+        runner,
+        prefix.as_ref(),
+        tokens,
+        options,
+        shape,
+        reserved,
+        true,
+    )
+    .await?;
     Ok(TokenProfile {
         device,
         baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
@@ -337,7 +369,7 @@ async fn prepare_serving_profile_prefix(
 #[cfg(target_os = "macos")]
 async fn measure_serving_profile_phase(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
-    prefix: &PagedPrefix,
+    prefix: Option<&PagedPrefix>,
     tokens: &[u32],
     options: &Profile,
     shape: BatchShape,
@@ -346,8 +378,11 @@ async fn measure_serving_profile_phase(
 ) -> Result<(Sample, Duration, Vec<EngineStepProfile>), Box<dyn Error>> {
     runner.prepare_paged_lane(0, None, 0)?;
     let setup_started = Instant::now();
-    let fork = prefix.fork_reserved(u64::try_from(options.prefix_context)?, reserved)?;
-    runner.prepare_paged_lane(0, Some(fork), reserved)?;
+    let prefix_tokens = u64::try_from(options.prefix_context)?;
+    let fork = prefix
+        .map(|prefix| prefix.fork_reserved(prefix_tokens, reserved))
+        .transpose()?;
+    runner.prepare_paged_lane(0, fork, reserved)?;
     let cache_setup = setup_started.elapsed();
     let before = runner.metrics();
     let started = Instant::now();

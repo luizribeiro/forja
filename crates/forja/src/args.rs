@@ -1387,12 +1387,10 @@ impl ProfileArgs {
                 "--prefix-context requires prefill mode and must be less than --context",
             ));
         }
-        if self.step_tokens.is_some()
-            && (self.mode != ProfileMode::Prefill || self.prefix_context == 0)
-        {
+        if self.step_tokens.is_some() && self.mode != ProfileMode::Prefill {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::ValueValidation,
-                "--step-tokens requires a cached-prefix prefill",
+                "--step-tokens requires prefill mode",
             ));
         }
         Ok(Profile {
@@ -1743,6 +1741,32 @@ mod tests {
         };
         assert_eq!(options.mode, ProfileMode::Prefill);
         assert_eq!(options.prefix_context, 256);
+        assert_eq!(options.step_tokens, Some(128));
+    }
+
+    #[test]
+    fn parses_cold_serving_prefill_profile() {
+        let command = parse(
+            [
+                "profile",
+                "--engine",
+                "/engine.wasm",
+                "--model",
+                "/model",
+                "--context",
+                "512",
+                "--mode",
+                "prefill",
+                "--step-tokens",
+                "128",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        let Command::Profile(options) = command else {
+            panic!("expected profile command");
+        };
+        assert_eq!(options.prefix_context, 0);
         assert_eq!(options.step_tokens, Some(128));
     }
 
