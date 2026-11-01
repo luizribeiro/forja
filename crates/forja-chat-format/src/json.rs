@@ -3,6 +3,54 @@ use serde::Serialize;
 use serde_json::ser::{Formatter, PrettyFormatter};
 use std::io::{self, Write};
 
+struct PythonNumbers<F>(F);
+
+macro_rules! forward {
+    ($($method:ident $(($argument:ident: $kind:ty))?),* $(,)?) => {
+        $(fn $method<W: ?Sized + Write>(&mut self, writer: &mut W $(, $argument: $kind)?) -> io::Result<()> {
+            self.0.$method(writer $(, $argument)?)
+        })*
+    };
+}
+
+impl<F: Formatter> Formatter for PythonNumbers<F> {
+    forward!(
+        begin_array,
+        end_array,
+        begin_array_value(first: bool),
+        end_array_value,
+        begin_object,
+        end_object,
+        begin_object_key(first: bool),
+        end_object_key,
+        begin_object_value,
+        end_object_value
+    );
+
+    fn write_f32<W: ?Sized + Write>(&mut self, writer: &mut W, value: f32) -> io::Result<()> {
+        self.write_f64(writer, f64::from(value))
+    }
+    fn write_f64<W: ?Sized + Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
+        let scientific = format!("{value:e}");
+        let (digits, exponent) = scientific
+            .split_once('e')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "non-finite JSON number"))?;
+        let exponent: i32 = exponent
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if (-4..16).contains(&exponent) {
+            let fixed = value.to_string();
+            writer.write_all(fixed.as_bytes())?;
+            if !fixed.contains('.') {
+                writer.write_all(b".0")?;
+            }
+            Ok(())
+        } else {
+            write!(writer, "{digits}e{exponent:+03}")
+        }
+    }
+}
+
 struct TemplateFormatter;
 
 impl Formatter for TemplateFormatter {
@@ -38,9 +86,10 @@ pub(super) fn tojson(value: &Value, indent: Option<Value>, kwargs: Kwargs) -> Re
     kwargs.assert_all_used()?;
     let indent = match indent {
         None => None,
+        Some(value) if value.is_none() => None,
         Some(value) => match bool::try_from(value.clone()).ok() {
-            Some(true) => Some(2),
-            Some(false) => None,
+            Some(true) => Some(1),
+            Some(false) => Some(0),
             None => Some(usize::try_from(value)?),
         },
     };
@@ -55,12 +104,12 @@ pub(super) fn tojson(value: &Value, indent: Option<Value>, kwargs: Kwargs) -> Re
         let spaces = " ".repeat(indent);
         value.serialize(&mut serde_json::Serializer::with_formatter(
             &mut bytes,
-            PrettyFormatter::with_indent(spaces.as_bytes()),
+            PythonNumbers(PrettyFormatter::with_indent(spaces.as_bytes())),
         ))
     } else {
         value.serialize(&mut serde_json::Serializer::with_formatter(
             &mut bytes,
-            TemplateFormatter,
+            PythonNumbers(TemplateFormatter),
         ))
     };
     result.map_err(|error| {
@@ -104,5 +153,24 @@ mod tests {
     fn json_refuses_unbounded_indentation() {
         let template = ChatTemplate::compile("{{ data|tojson(indent=129) }}".to_owned()).unwrap();
         assert!(template.render("[]", "null", r#"{"data":{}}"#).is_err());
+    }
+    #[test]
+    fn json_matches_python_float_notation_and_indent_controls() {
+        let options = r#"{"data":[0.00001,0.0001,0.000001,1e16,1e20,-0.0,1.0,5e-324,1.7976931348623157e308]}"#;
+        let expected =
+            "[1e-05, 0.0001, 1e-06, 1e+16, 1e+20, -0.0, 1.0, 5e-324, 1.7976931348623157e+308]";
+        for filter in ["tojson", "tojson(indent=none)"] {
+            let template = ChatTemplate::compile(format!("{{{{ data|{filter} }}}}")).unwrap();
+            assert_eq!(template.render("[]", "null", options).unwrap(), expected);
+        }
+        for (indent, spaces) in [("false", ""), ("true", " "), ("2", "  ")] {
+            let template =
+                ChatTemplate::compile(format!("{{{{ data|tojson(indent={indent}) }}}}")).unwrap();
+            let pretty = format!(
+                "[\n{spaces}{}\n]",
+                expected[1..expected.len() - 1].replace(", ", &format!(",\n{spaces}"))
+            );
+            assert_eq!(template.render("[]", "null", options).unwrap(), pretty);
+        }
     }
 }

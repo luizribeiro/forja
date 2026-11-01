@@ -14,7 +14,8 @@ objects are normalized before rendering. Stop tokens are 248046 and 248044.
 The fixtures were recorded on CPU with Transformers 5.17.0 from the pinned model's
 original `chat_template.jinja`, using `AutoTokenizer.apply_chat_template` with
 `tokenize=False`. OpenAI JSON argument strings are decoded into mappings before
-rendering; insertion order is retained. Regenerate with:
+rendering; insertion order and Python floating-point spelling are retained.
+Numeric enum fixtures include threshold, subnormal and seeded finite values. Regenerate with:
 
 ```sh
 uv run --offline --no-project --python 3.12 \
