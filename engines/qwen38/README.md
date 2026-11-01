@@ -2,7 +2,9 @@
 
 Text-only inference for `mlx-community/Qwen3.8-27B-4bit`: 64 hybrid decoder layers,
 affine q4/group-64 weights, BF16 activations, F32 recurrent state and F16 KV.
-The Metal profile targets Apple M3 Ultra and limits context to 32,768 tokens.
+The Metal profiles target Apple M3 Ultra. The default limits context to 32,768
+tokens; `qwen38-27b-4bit.metal-apple-m3-ultra.q4-f32-kv` retains that budget with
+F32 KV for diagnostics. Both use q4 weights and BF16 activations.
 Prompt processing uses canonical 64-token WY blocks and a final partial block;
 decode advances recurrent state one token at a time. Single-lane SDK calls declare
 `BatchPhase::Prompt` or `BatchPhase::Decode` explicitly. Prompt submissions start

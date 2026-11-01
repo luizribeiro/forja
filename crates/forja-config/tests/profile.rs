@@ -437,3 +437,25 @@ fn qwen38_profile_declares_bounded_sparse_canonical_snapshots() {
     assert_eq!(serving.state_snapshot_bytes.unwrap().get(), 2 << 30);
     assert_eq!(serving.state_snapshot_interval.unwrap().get(), 4096);
 }
+
+#[test]
+fn qwen38_float_cache_profile_keeps_the_short_context_budget() {
+    let source = include_str!(
+        "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4-f32-kv.toml"
+    );
+    let profile: Profile = toml::from_str(source).unwrap();
+    assert_eq!(profile.workload().max_context.get(), 32_768);
+    assert_eq!(profile.workload().prefill_chunk.get(), 2048);
+    assert_eq!(
+        profile.numerics().kv_cache,
+        forja_config::KvCacheFormat::F32
+    );
+    assert_eq!(
+        profile.variants().fixed["paged-attention.prefill"],
+        "paged-sdpa.steel-bounded-256"
+    );
+    assert!(
+        toml::from_str::<Profile>(&format!("{source}\n[limits]\nlive_bytes = \"64GiB\"\n"))
+            .is_err()
+    );
+}
