@@ -59,15 +59,50 @@ impl ToolFormat for QwenChat {
         }
         let mut messages: Value = serde_json::from_str(messages).map_err(|e| e.to_string())?;
         Self::normalize_messages(&mut messages, &())?;
-        let request: Value = serde_json::from_str(request).map_err(|e| e.to_string())?;
-        request
-            .as_object()
+        let mut request: Value = serde_json::from_str(request).map_err(|e| e.to_string())?;
+        let controls = request
+            .get("chat_template_kwargs")
+            .filter(|value| !value.is_null())
+            .cloned();
+        let options = request
+            .as_object_mut()
             .ok_or("request options must be an object")?;
-        template.render(
+        if let Some(controls) = controls {
+            for (name, value) in controls
+                .as_object()
+                .ok_or("chat_template_kwargs must be an object")?
+            {
+                let valid = match name.as_str() {
+                    "enable_thinking" | "preserve_thinking" => value.is_boolean(),
+                    "reasoning_effort" => {
+                        matches!(value.as_str(), Some("xhigh" | "medium" | "low"))
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    return Err(format!("unsupported template control: {name}"));
+                }
+                options.insert(name.clone(), value.clone());
+            }
+        }
+        let rendered = template.render(
             &messages.to_string(),
             &tools.to_string(),
             &request.to_string(),
-        )
+        )?;
+        Self::finish_render(rendered, &request, &())
+    }
+    fn finish_render(mut rendered: String, request: &Value, (): &()) -> Result<String, String> {
+        if request
+            .get("tool_choice")
+            .is_some_and(|choice| choice == "required" || choice.is_object())
+        {
+            if rendered.ends_with("<think>\n") {
+                rendered.push_str("\n</think>\n\n");
+            }
+            rendered.push_str(qwen3_coder_xml::TRIGGER);
+        }
+        Ok(rendered)
     }
     fn grammar(_: &str, _: &str, _: &str, (): &()) -> Result<String, String> {
         Err("constrained tools are unsupported".to_owned())
@@ -221,5 +256,72 @@ mod tests {
             assert!(QwenChat::parser(&()).parse(malformed).is_err());
         }
         assert!(qwen3_coder_xml::Parser::default().parse(wire).is_err());
+    }
+    #[test]
+    fn nested_controls_match_flat_goldens_and_refuse_unknown_controls() {
+        let fixtures: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/render.json")).unwrap();
+        for fixture in fixtures.as_array().unwrap() {
+            let mut request = serde_json::json!({});
+            if let Some(value) = fixture["options"].get("add_generation_prompt") {
+                request["add_generation_prompt"] = value.clone();
+            }
+            let mut controls = fixture["options"].clone();
+            controls
+                .as_object_mut()
+                .unwrap()
+                .remove("add_generation_prompt");
+            request["chat_template_kwargs"] = controls;
+            assert_eq!(
+                QwenChat::render(
+                    &ChatTemplate::compile(super::template::TEMPLATE.to_owned()).unwrap(),
+                    &fixture["messages"].to_string(),
+                    &fixture["tools"].to_string(),
+                    &request.to_string(),
+                    &()
+                )
+                .unwrap(),
+                fixture["rendered"]
+            );
+        }
+        for controls in [
+            r#"{"enable_thinking":"false"}"#,
+            r#"{"reasoning_effort":"high"}"#,
+            r#"{"unknown":true}"#,
+            "[]",
+        ] {
+            assert!(
+                render(
+                    r#"[{"role":"user","content":"hi"}]"#,
+                    &format!(r#"{{"chat_template_kwargs":{controls}}}"#)
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn required_tools_seed_calls_after_thinking_and_respect_template_rewrites() {
+        for choice in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"function","function":{"name":"lookup"}}),
+        ] {
+            let request = serde_json::json!({"add_generation_prompt":true,"tool_choice":choice});
+            let rendered =
+                render(r#"[{"role":"user","content":"hi"}]"#, &request.to_string()).unwrap();
+            assert!(rendered.ends_with("<think>\n\n</think>\n\n<tool_call>\n"));
+            let rewrite =
+                ChatTemplate::compile("rewritten:{{ messages[0].content }}".to_owned()).unwrap();
+            assert_eq!(
+                QwenChat::render(
+                    &rewrite,
+                    r#"[{"role":"user","content":"hi"}]"#,
+                    "[]",
+                    &request.to_string(),
+                    &()
+                )
+                .unwrap(),
+                "rewritten:hi<tool_call>\n"
+            );
+        }
     }
 }
