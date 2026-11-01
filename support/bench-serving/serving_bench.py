@@ -78,18 +78,23 @@ def validate_identity(args: argparse.Namespace, artifacts: dict[str, Path]) -> N
 class Server:
     """Owned server process restarted for cold cases."""
 
-    def __init__(self, command: list[str], url: str):
+    def __init__(self, command: list[str], url: str, log: Path | None = None):
         self.command = command
         self.url = url
         self.process: subprocess.Popen[bytes] | None = None
         self.startup_seconds = 0.0
+        self.log = log
 
     def start(self) -> None:
         """Start the server and wait for its model endpoint."""
         started = time.perf_counter()
         self.stop()
-        self.process = subprocess.Popen(self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.monotonic() + 300
+        if self.log is None:
+            self.process = subprocess.Popen(self.command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            with self.log.open("ab") as output:
+                self.process = subprocess.Popen(self.command, stdout=output, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 2700
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(f"server exited with {self.process.returncode}")
@@ -97,7 +102,7 @@ class Server:
                 self.startup_seconds += time.perf_counter() - started
                 return
             time.sleep(0.1)
-        raise TimeoutError("server did not become ready within 300 seconds")
+        raise TimeoutError("server did not become ready within 45 minutes")
 
     def stop(self) -> None:
         """Stop only the process started by this runner."""
