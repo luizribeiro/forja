@@ -118,6 +118,25 @@ impl<B: Backend + Send + Sync + 'static> crate::EngineRunner<B> {
         .map_err(invalid_handle)
     }
 
+    /// Returns the per-sequence snapshot allocation, excluding the shared token ledger.
+    ///
+    /// # Errors
+    /// Refuses unavailable protected state or an overflowing byte extent.
+    pub fn canonical_snapshot_bytes(&self) -> Result<u64, compute::Error> {
+        let pool = self
+            .page_pool
+            .ok_or_else(|| invalid_handle("paged storage is unavailable"))?;
+        let host = self.store.data();
+        let slot = host
+            .paged_state_slot(pool)?
+            .ok_or_else(|| invalid_handle("protected state is unavailable"))?;
+        let state = host
+            .state_slots
+            .get(&slot)
+            .ok_or_else(|| invalid_handle("protected state is unavailable"))?;
+        crate::StateSnapshot::<B>::required_bytes(state.prefix_layout())
+    }
+
     /// Allocates an immutable, charged prompt ledger for canonical evaluation.
     ///
     /// # Errors

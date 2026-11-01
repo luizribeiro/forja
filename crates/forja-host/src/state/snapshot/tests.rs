@@ -97,6 +97,10 @@ fn immutable_images_preserve_all_float_payload_bits_and_charges() {
         before + image.charged_bytes()
     );
     let bytes = image.charged_bytes();
+    assert_eq!(
+        bytes,
+        StateSnapshot::<forja_cpu::CpuBackend>::required_bytes(&image.layout).unwrap()
+    );
     drop(image);
     assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
     let maximum = 966;

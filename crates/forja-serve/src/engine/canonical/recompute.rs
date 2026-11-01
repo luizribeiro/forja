@@ -214,7 +214,12 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         }
         let prompt = self.runner.canonical_context(cache.namespace, tokens);
         match prompt {
-            Ok(prompt) if prompt.charged_bytes() <= cache.allowance.bytes() => {
+            Ok(prompt)
+                if cache
+                    .snapshot_bytes
+                    .checked_add(prompt.charged_bytes())
+                    .is_some_and(|bytes| bytes <= cache.allowance.bytes()) =>
+            {
                 self.metrics.recompute_queued = self.metrics.recompute_queued.saturating_add(1);
                 self.metrics.recompute_pending = true;
                 let bound = usize::try_from(self.scheduler.active_lanes).unwrap_or(usize::MAX);

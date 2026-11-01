@@ -16,6 +16,15 @@ pub struct StateSnapshot<B: Backend> {
 }
 
 impl<B: Backend> StateSnapshot<B> {
+    pub(crate) fn required_bytes(layout: &StateLayout) -> Result<u64, compute::Error> {
+        u64::try_from(layout.planes().len())
+            .map_err(|_| quota("snapshot plane count overflow"))?
+            .checked_mul(4096)
+            .and_then(|bytes| bytes.checked_add(256))
+            .and_then(|bytes| bytes.checked_add(layout.version_bytes()))
+            .ok_or_else(|| quota("snapshot byte count overflow"))
+    }
+
     pub(crate) fn reference_charge(&self, bytes: u64) -> Result<StateCharge, compute::Error> {
         StateCharge::reserve(
             self.backend.as_ref(),
@@ -120,15 +129,7 @@ impl<B: Backend> StateSequenceHandle<B> {
         drop(journal);
         let count = usize::try_from(end).map_err(|_| quota("snapshot token count overflow"))?;
         let layout = self.storage.pool.layout();
-        let descriptors = u64::try_from(layout.planes().len())
-            .map_err(|_| quota("snapshot plane count overflow"))?
-            .checked_mul(4096)
-            .and_then(|n| n.checked_add(256))
-            .ok_or_else(|| quota("snapshot metadata overflow"))?;
-        let bytes = layout
-            .version_bytes()
-            .checked_add(descriptors)
-            .ok_or_else(|| quota("snapshot byte count overflow"))?;
+        let bytes = StateSnapshot::<B>::required_bytes(layout)?;
         if bytes
             .checked_add(prompt.charged_bytes())
             .is_none_or(|total| total > allowance.bytes())

@@ -108,10 +108,8 @@ async fn reply_recompute_respects_disabled_and_insufficient_snapshot_allowances(
         );
         assert_eq!(engine.metrics.snapshot_refusals, u64::from(allowance > 0));
         assert_eq!(engine.metrics.recompute_completed, 0);
-        assert_eq!(
-            engine.metrics.recompute_blocks,
-            if allowance == 1024 { 2 } else { 0 }
-        );
+        assert_eq!(engine.metrics.recompute_blocks, 0);
+        assert_eq!(engine.metrics.recompute_queued, 0);
         assert_eq!(evaluate(&mut engine, vec![0; 65], true).await?.2, 0);
     }
     Ok(())

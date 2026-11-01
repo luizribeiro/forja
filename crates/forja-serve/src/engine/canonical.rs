@@ -12,6 +12,7 @@ pub(super) struct CanonicalCache<B: Backend> {
     namespace: HybridPrefixNamespace,
     allowance: SnapshotAllowance,
     declared: u64,
+    snapshot_bytes: u64,
     recompute: Option<recompute::Recompute>,
     pending_recomputes: VecDeque<recompute::Recompute>,
     pub(super) store: Option<HybridPrefixStore<B>>,
@@ -67,6 +68,10 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             namespace,
             allowance,
             declared: declared.get(),
+            snapshot_bytes: self
+                .runner
+                .canonical_snapshot_bytes()
+                .map_err(cache_error)?,
             recompute: None,
             pending_recomputes: VecDeque::new(),
             store: None,
