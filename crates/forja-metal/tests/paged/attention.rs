@@ -205,3 +205,6 @@ fn metal_steel_attention_reference_agrees_at_short_boundaries() {
 
 #[path = "legacy.rs"]
 mod legacy;
+
+#[path = "bounded.rs"]
+mod bounded;

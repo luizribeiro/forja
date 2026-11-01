@@ -9080,7 +9080,11 @@ fn steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError> {
     };
     let [_, query_length, width] = shape3(query.layout())?;
     let [_, _, value_width] = shape3(value.layout())?;
-    Ok(query_length > 1 && width == value_width && matches!(width, 64 | 128 | 256))
+    Ok(
+        (query_length > 1 || (bounded_attention(dispatch) && query_length == 1))
+            && width == value_width
+            && matches!(width, 64 | 128 | 256),
+    )
 }
 
 #[cfg(test)]
@@ -9105,10 +9109,12 @@ fn paged_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendError>
         .get(3)
         .copied()
         .ok_or(BackendError::InvalidInput)?;
-    Ok((query_length > 1 || (query_length == 1 && width == 256))
-        && width == value_width
-        && matches!(width, 64 | 128 | 256)
-        && key.layout().shape().get(3) == Some(&width))
+    Ok(
+        (query_length > 1 || (query_length == 1 && (width == 256 || bounded_attention(dispatch))))
+            && width == value_width
+            && matches!(width, 64 | 128 | 256)
+            && key.layout().shape().get(3) == Some(&width),
+    )
 }
 
 #[cfg(test)]

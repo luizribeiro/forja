@@ -844,6 +844,35 @@ macro_rules! batch_invariant_variant {
     };
 }
 
+macro_rules! bounded_attention_variant {
+    ($name:literal, $operation:ident, $implementation:ident, $constraints:expr) => {
+        VariantDef {
+            implementation: MetalImplementation { kernel: MetalVariant::$implementation, bounded_attention: true },
+            ..batch_invariant_variant!($name, $operation, $implementation, $constraints,
+                &["attention requiring bounded F32 accumulation at long contexts."],
+                &["short contexts where the extra accumulator work is unnecessary."],
+                &["Merges partials after 64 contributions; F32 Steel retains an extra register tile and rescales it per key block. The vector path adds F32 partial registers and rescaling; reduced vector caches retain their existing order."])
+        }
+    };
+}
+
+const ANY_ATTENTION_ROWS: Constraint = value(
+    QUERY_LENGTH,
+    Relation::Range {
+        min: 1,
+        max: u64::MAX,
+    },
+);
+const SDPA_STEEL_BOUNDED: &[Constraint] = &[ANY_ATTENTION_ROWS, SDPA_STEEL[1], SDPA_STEEL[2]];
+const SDPA_STEEL_BOUNDED_256: &[Constraint] =
+    &[ANY_ATTENTION_ROWS, SDPA_STEEL_256[1], SDPA_STEEL_256[2]];
+const PAGED_STEEL_BOUNDED: &[Constraint] = &[
+    ANY_ATTENTION_ROWS,
+    PAGED_SDPA_STEEL[1],
+    PAGED_SDPA_STEEL[2],
+    PAGED_SDPA_STEEL[3],
+];
+
 const DELTA_BLOCK_KEYS: &[Constraint] = &[value(
     dim("key width", QUERY, Axis::Index(2)),
     Relation::Range {
@@ -1549,6 +1578,31 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         &["head-width-256 decode with one query head per threadgroup."],
         &["multi-token queries."],
         &["Uses 32 ordered reduction blocks independent of batch and grouped-query ratio."]
+    ),
+    bounded_attention_variant!("sdpa.steel-bounded", Sdpa, SdpaSteel, SDPA_STEEL_BOUNDED),
+    bounded_attention_variant!(
+        "sdpa.steel-bounded-256",
+        Sdpa,
+        SdpaSteel256,
+        SDPA_STEEL_BOUNDED_256
+    ),
+    bounded_attention_variant!(
+        "paged-sdpa.steel-bounded",
+        PagedSdpa,
+        PagedSdpaSteel,
+        PAGED_STEEL_BOUNDED
+    ),
+    bounded_attention_variant!(
+        "paged-sdpa.steel-bounded-256",
+        PagedSdpa,
+        PagedSdpaSteel256,
+        PAGED_STEEL_256
+    ),
+    bounded_attention_variant!(
+        "paged-sdpa.vector-bounded-256-two-pass",
+        PagedSdpa,
+        PagedSdpaWideTwoPass,
+        PAGED_WIDE_TWO_PASS
     ),
 ];
 
@@ -2302,6 +2356,11 @@ mod tests {
                 "paged-sdpa.steel-half-256",
                 "paged-sdpa.vector-256-two-pass",
                 "sdpa.vector-256-two-pass",
+                "sdpa.steel-bounded",
+                "sdpa.steel-bounded-256",
+                "paged-sdpa.steel-bounded",
+                "paged-sdpa.steel-bounded-256",
+                "paged-sdpa.vector-bounded-256-two-pass",
             ]
         );
     }
@@ -2750,6 +2809,31 @@ mod tests {
     }
 
     #[test]
+    fn bounded_attention_has_explicit_configuration_and_distinct_classes() {
+        for (bounded, legacy) in [
+            ("sdpa.steel-bounded", "sdpa.steel"),
+            ("sdpa.steel-bounded-256", "sdpa.steel-256"),
+            ("paged-sdpa.steel-bounded", "paged-sdpa.steel"),
+            ("paged-sdpa.steel-bounded-256", "paged-sdpa.steel-256"),
+            (
+                "paged-sdpa.vector-bounded-256-two-pass",
+                "paged-sdpa.vector-256-two-pass",
+            ),
+        ] {
+            let lookup = |name| REGISTRY.iter().find(|entry| entry.name == name).unwrap();
+            let new = lookup(bounded);
+            let old = lookup(legacy);
+            assert!(new.implementation.bounded_attention);
+            assert!(!old.implementation.bounded_attention);
+            assert_eq!(new.implementation.kernel, old.implementation.kernel);
+            assert_eq!(new.reduction_class, Some(bounded));
+            assert_ne!(new.reduction_class, old.reduction_class);
+            assert_eq!(new.guarantees, old.guarantees);
+            assert!(new.batch_invariant);
+        }
+    }
+
+    #[test]
     fn catalog_order_matches_registry_order() {
         let markdown = markdown("Test GPU");
         let json = json("Test GPU");
@@ -3134,6 +3218,31 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn every_variant_has_an_encoder_accepted_fixture() {
         let fixtures = vec![
+            (
+                "sdpa.steel-bounded",
+                sdpa_dispatch(DType::F32, 6, 1, 33, 64, 64),
+                "steel_attention_64",
+            ),
+            (
+                "sdpa.steel-bounded-256",
+                sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256),
+                "steel_attention_256",
+            ),
+            (
+                "paged-sdpa.steel-bounded",
+                paged_sdpa_dispatch(DType::F32, 1, 128),
+                "paged_steel_attention_128",
+            ),
+            (
+                "paged-sdpa.steel-bounded-256",
+                paged_sdpa_dispatch(DType::F32, 1, 256),
+                "paged_steel_attention_256",
+            ),
+            (
+                "paged-sdpa.vector-bounded-256-two-pass",
+                paged_sdpa_dispatch_with_heads(DType::F32, 6, 1, 256),
+                "paged_sdpa_2pass_1_independent_256",
+            ),
             (
                 "delta-rule-block.wy64-mma-v16",
                 state_dispatch(forja_core::StateOp::DeltaRuleBlock),
