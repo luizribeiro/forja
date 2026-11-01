@@ -88,6 +88,8 @@ pub(crate) struct Submission {
 pub(crate) struct Timing {
     pub(crate) wall_time_seconds: f64,
     pub(crate) gpu_time_seconds: f64,
+    #[serde(default, rename = "cache_setup_wall_time_seconds")]
+    pub(crate) cache_setup: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -98,6 +100,10 @@ pub(crate) struct Profile {
     pub(crate) inputs: Value,
     pub(crate) mode: String,
     pub(crate) tokens: u64,
+    #[serde(default)]
+    pub(crate) cached_prefix_tokens: u64,
+    #[serde(default)]
+    pub(crate) measured_tokens: Option<u64>,
     pub(crate) unprofiled: Timing,
     pub(crate) submissions: Vec<Submission>,
 }
@@ -111,6 +117,16 @@ pub(crate) fn positive(value: f64) -> Result<f64, Box<dyn Error>> {
 }
 
 impl Profile {
+    pub(crate) fn measured_count(&self) -> Option<u64> {
+        if self.mode == "decode" {
+            Some(1)
+        } else {
+            self.tokens
+                .checked_sub(self.cached_prefix_tokens)
+                .filter(|count| *count > 0)
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
         if self.schema_version != 2
             || self.tokens == 0
@@ -118,6 +134,16 @@ impl Profile {
             || self.submissions.is_empty()
         {
             return Err("unsupported or empty profile; rerun forja profile --json".into());
+        }
+        let measured = self
+            .measured_count()
+            .ok_or("invalid measured token range")?;
+        if self.measured_tokens.is_some_and(|count| count != measured)
+            || (self.mode == "decode" && self.cached_prefix_tokens != 0)
+            || !self.unprofiled.cache_setup.is_finite()
+            || self.unprofiled.cache_setup < 0.0
+        {
+            return Err("invalid profile workload or cache preparation timing".into());
         }
         positive(self.unprofiled.wall_time_seconds)?;
         positive(self.unprofiled.gpu_time_seconds)?;

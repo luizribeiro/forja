@@ -413,7 +413,7 @@ fn report(
         "mode": mode_name(options.mode),
         "tokens": options.context,
         "cached_prefix_tokens": options.prefix_context,
-        "measured_tokens": options.context - options.prefix_context,
+        "measured_tokens": match options.mode { ProfileMode::Decode => 1, ProfileMode::Prefill => options.context - options.prefix_context },
         "serving_step_tokens": options.step_tokens,
         "streaming_read_gigabytes_per_second": peak,
         "streaming_copy_gigabytes_per_second": device.streaming_copy_gigabytes_per_second,

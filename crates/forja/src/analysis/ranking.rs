@@ -73,9 +73,10 @@ pub(super) fn aggregate(rows: &[Value], field: &str) -> Result<Vec<Value>, Box<d
 pub(crate) fn human(report: &Value) -> String {
     use std::fmt::Write;
     let mut out = format!(
-        "{}: {} tokens — profile diagnostic (not a model benchmark)\n",
+        "{}: context {}, {} measured tokens — profile diagnostic (not a model benchmark)\n",
         report["mode"].as_str().unwrap_or("unknown"),
-        report["tokens"]
+        report["tokens"],
+        report["measured_tokens"]
     );
     let number = |value: &Value| value.as_f64().unwrap_or(0.0);
     let overall = &report["whole_model"]["overall"];
@@ -145,17 +146,7 @@ pub(crate) fn human(report: &Value) -> String {
         );
         let _ = writeln!(out, "    screen: {}", row["alternatives"]);
     }
-    for row in report["by_kernel"].as_array().into_iter().flatten() {
-        for risk in row["register_spill_risks"].as_array().into_iter().flatten() {
-            let _ = writeln!(
-                out,
-                "Register risk: {} / {}: {} f32 accumulator values/thread (source estimate; spills unmeasured)",
-                row["kernel"].as_str().unwrap_or("?"),
-                row["variant"].as_str().unwrap_or("?"),
-                risk["private_f32_accumulator_values_per_thread"]
-            );
-        }
-    }
+    out.push_str(&register_risks(report));
     for row in report["unmeasured_kernels"]
         .as_array()
         .into_iter()
@@ -170,6 +161,23 @@ pub(crate) fn human(report: &Value) -> String {
         );
     }
     out.push_str("\nFull JSON contains every dispatch, kernel, phase and layer type. Traffic is logical; expert reuse is a range. Scalar/SFU throughput is uncalibrated. Screen alternatives before adopting them.\n");
+    out
+}
+
+fn register_risks(report: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for row in report["by_kernel"].as_array().into_iter().flatten() {
+        for risk in row["register_spill_risks"].as_array().into_iter().flatten() {
+            let _ = writeln!(
+                out,
+                "Register risk: {} / {}: {} f32 accumulator values/thread (source estimate; spills unmeasured)",
+                row["kernel"].as_str().unwrap_or("?"),
+                row["variant"].as_str().unwrap_or("?"),
+                risk["private_f32_accumulator_values_per_thread"]
+            );
+        }
+    }
     out
 }
 

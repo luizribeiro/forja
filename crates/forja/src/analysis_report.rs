@@ -89,13 +89,15 @@ pub(crate) fn report(
     sort(&mut kernels);
     Ok(
         json!({"schema_version": 1, "kind": "roofline-analysis", "model_benchmark": false,
-        "mode": profile.mode, "tokens": profile.tokens, "device_identity": profile.device_identity,
+        "mode": profile.mode, "tokens": profile.tokens, "measured_tokens": profile.measured_count().ok_or("invalid measured token range")?, "cached_prefix_tokens": profile.cached_prefix_tokens, "device_identity": profile.device_identity,
         "inputs": profile.inputs, "profile_provenance": profile.provenance, "calibration": calibration,
-        "unprofiled": {"wall_seconds": profile.unprofiled.wall_time_seconds, "gpu_seconds": profile.unprofiled.gpu_time_seconds},
+        "unprofiled": {"wall_seconds": profile.unprofiled.wall_time_seconds, "gpu_seconds": profile.unprofiled.gpu_time_seconds, "cache_setup_wall_seconds": profile.unprofiled.cache_setup},
         "profiled_gpu_seconds": profiled_gpu, "timestamp_perturbation_ratio": profiled_gpu / profile.unprofiled.gpu_time_seconds,
         "attribution_scale": scale, "target_utilization": target,
         "notes": ["Profile-derived diagnostic, not a model benchmark.",
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
+            "Host snapshot capture/materialization transfers are outside GPU kernel work; prefix preparation is separate from the measured step.",
+            "Sampling scalar/SFU counts describe the logical stochastic path; greedy/conditional branches may execute less work.",
             "Traffic is logical, not a hardware DRAM counter; expert reuse is an interval unless proven by the command graph.",
             "Scalar/SFU and integer throughput are uncalibrated; Floating-point work uses an optimistic MMA-equivalent ceiling, including scalar FMA kernels.",
             "Persistent f32 carry panels risk register spills; register residency and occupancy require device profiling.",
@@ -204,6 +206,21 @@ mod tests {
                 < f64::EPSILON
         );
         assert!(ranking::human(&report).contains("Unmeasured: block/layer-0/dispatch-0 / read-a"));
+    }
+
+    #[test]
+    fn suffix_tokens_and_host_copy_preparation_remain_explicit() {
+        let (mut profile, calibration) = fixture();
+        profile.cached_prefix_tokens = 7;
+        profile.measured_tokens = Some(26);
+        profile.unprofiled.cache_setup = 0.25;
+        profile.validate().unwrap();
+        let row = report(&profile, &calibration, 0.8).unwrap();
+        assert_eq!(row["measured_tokens"], 26);
+        assert_eq!(row["cached_prefix_tokens"], 7);
+        assert_eq!(row["unprofiled"]["cache_setup_wall_seconds"], 0.25);
+        profile.measured_tokens = Some(33);
+        assert!(profile.validate().is_err());
     }
 
     #[test]
