@@ -123,9 +123,10 @@ def worker_policy(row, enabled=True):
     if not policies <= {"fresh-request", "cold-process", "prefix-fork-per-worker"}:
         raise ValueError("unknown worker cache-state policy")
     protocols = {adapter.get("worker_protocol", 1) for adapter in adapters}
-    if len(protocols) != 1 or not protocols <= {1, 2}:
+    if len(protocols) != 1 or not protocols <= {1, 2, 3}:
         raise ValueError("worker protocols must match")
-    if (protocols == {2}) != (policies == {"prefix-fork-per-worker"}):
+    if ((protocols == {2}) != ("prefix-fork-per-worker" in policies)
+            or protocols == {2} and len(policies) != 1):
         raise ValueError("worker protocol does not match cache-state policy")
     native = all(len(adapter["command"]) > 1 and adapter["command"][1] == "bench"
                  and {"/provenance/binary_sha256", "/inputs/0/engine_sha256"}
@@ -146,12 +147,12 @@ def measurement_protocol(row, enabled, warmups):
     protocol = adapters[0].get("worker_protocol", 1) if resident else None
     return {"execution": "resident-block-workers" if resident else "process-per-leg",
             "worker_protocol": protocol, "configured_priming_passes": warmups,
-            "priming": "once-per-worker-shape; two decode steps" if protocol == 2 else priming.pop()}
+            "priming": "once-per-worker-shape; two decode steps" if protocol in {2, 3} else priming.pop()}
 
 
 def bind_measurement_protocol(row, enabled, warmups):
     """New protocols cannot borrow history from a different effective runtime mode."""
-    modern = any(adapter.get("worker_protocol") == 2 or "--priming" in adapter["command"]
+    modern = any(adapter.get("worker_protocol") in {2, 3} or "--priming" in adapter["command"]
                  for adapter in [row["baseline"], row["candidate"]])
     if not modern or not row.get("history_identity"):
         return row

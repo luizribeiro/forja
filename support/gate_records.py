@@ -1,6 +1,7 @@
 """Frozen per-leg records shared only within one gate invocation."""
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 import time
@@ -95,6 +96,8 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                     or record["worker"].get("cache_state") != "prefix-fork-per-worker"
                     or not record["worker"].get("phase_timers")):
                 raise ValueError("prefix worker cache/timing proof is missing")
+        if workers and record["worker"].get("protocol") == 3:
+            verify_fresh_worker(record["worker"], warmups)
         for pointer, expected in adapter.get("expected_provenance", {}).items():
             if value_at(record, pointer) != expected:
                 raise ValueError(f"measurement provenance mismatch: {pointer}")
@@ -126,3 +129,15 @@ def command_sampler(row: dict, directory: Path, guard: list[str], warmups: int,
                                    if result.get("output_digest")],
                 "record_file": str(output), "record_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
     return sample
+
+
+def verify_fresh_worker(worker, warmups):
+    """A fresh-request worker must expose its actual priming and phase costs."""
+    timers = worker.get("phase_timers")
+    if (worker.get("cache_state") != "fresh-request"
+            or worker.get("configured_priming_passes") != warmups
+            or worker.get("priming_policy") != "once-per-worker-shape; at most two decode steps"
+            or not isinstance(timers, dict) or not timers
+            or any(not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+                   for value in timers.values())):
+        raise ValueError("fresh worker cache/timing proof is missing")

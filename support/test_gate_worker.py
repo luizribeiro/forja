@@ -23,9 +23,10 @@ for line in sys.stdin:
     return [sys.executable, str(script)]
 
 
-def test_two_sides_keep_distinct_processes_across_many_requests(tmp_path):
-    command = fake_worker(tmp_path)
-    workers = [Worker(command, None, tmp_path / f"side-{side}.log", timeout=2) for side in "AB"]
+@pytest.mark.parametrize("protocol", [1, 3])
+def test_two_sides_keep_distinct_processes_across_many_requests(tmp_path, protocol):
+    command = fake_worker(tmp_path, protocol=protocol)
+    workers = [Worker(command, None, tmp_path / f"side-{side}.log", timeout=2, protocol=protocol) for side in "AB"]
     try:
         assert workers[0].ready["pid"] != workers[1].ready["pid"]
         for index, side in enumerate("ABBABAAB"):
