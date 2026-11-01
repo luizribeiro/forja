@@ -1484,7 +1484,7 @@ where
             Ok(tokenizer) => tokenizer,
             Err(error) => return Err(error),
         };
-        let skip_special_tokens = constraint.as_ref().is_none_or(|plan| plan.forced);
+        let skip_special_tokens = constraint.is_none();
         let mut decoder = tokenizer.decode_stream(skip_special_tokens);
         let mut boundary = BoundaryState::new(&params.stops, constraint.as_ref());
         let mut text = String::new();

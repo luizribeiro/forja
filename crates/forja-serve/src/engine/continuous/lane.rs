@@ -20,10 +20,10 @@ struct DecodeRequest {
 struct Detokenizer(mpsc::Sender<DecodeRequest>);
 
 impl Detokenizer {
-    fn spawn(tokenizer: tokenizers::Tokenizer) -> Self {
+    fn spawn(tokenizer: tokenizers::Tokenizer, skip_special_tokens: bool) -> Self {
         let (sender, mut receiver) = mpsc::channel::<DecodeRequest>(1);
         tokio::spawn(async move {
-            let mut decoder = tokenizer.decode_stream(true);
+            let mut decoder = tokenizer.decode_stream(skip_special_tokens);
             while let Some(request) = receiver.recv().await {
                 drop(
                     request.reply.send(
@@ -98,7 +98,7 @@ impl BatchLane {
             sampling,
             control: request.control,
             boundary: BoundaryState::new(&request.params.stops, None),
-            decoder: Detokenizer::spawn(tokenizer),
+            decoder: Detokenizer::spawn(tokenizer, constraint.is_none()),
             ledger: PrefixLedger::new(request.tokens),
             params: request.params,
             request_params: request.request_params,
@@ -255,5 +255,51 @@ impl BatchLane {
 
     pub(super) fn take_ledger(&mut self) -> PrefixLedger {
         std::mem::take(&mut self.ledger)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn constrained_lanes_preserve_special_token_delimiters() {
+        let vocab = [
+            ("a".to_owned(), 0),
+            ("<close>".to_owned(), 1),
+            ("<eos>".to_owned(), 2),
+        ];
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        tokenizer.add_special_tokens(&[tokenizers::AddedToken::from("<close>", true)]);
+        let worker = crate::guidance::GuidanceWorker::new(&tokenizer, 3, &[2]).unwrap();
+        for constrained in [false, true] {
+            let constraint = if constrained {
+                let guidance = worker.compile(r#"start: "a""#.to_owned()).await.unwrap();
+                let allow = guidance.mask().await.unwrap().unwrap();
+                Some(BatchConstraint {
+                    guidance,
+                    allow,
+                    parser: None,
+                })
+            } else {
+                None
+            };
+            let lane = BatchLane::new(
+                crate::engine::continuous::prefill::tests::request(),
+                0,
+                0,
+                0,
+                SamplingParams::default(),
+                tokenizer.clone(),
+                constraint,
+            );
+            let piece = lane.decoder.step(1).await.unwrap();
+            assert_eq!(piece.as_deref(), constrained.then_some("<close>"));
+        }
     }
 }
