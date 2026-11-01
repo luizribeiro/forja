@@ -1,4 +1,6 @@
 //! Independent projection and hybrid architecture coverage.
+#[path = "qwen38/long_positions.rs"]
+mod long_positions;
 #[path = "qwen38/numerics.rs"]
 mod numerics;
 #[path = "qwen38/weights.rs"]
