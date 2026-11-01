@@ -1,13 +1,16 @@
 use std::{error::Error, fs, path::PathBuf, process::Command};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 #[derive(Args, Debug, PartialEq, Serialize)]
 pub(crate) struct Options {
-    /// Conversation suite with the model, turns and context ceiling.
+    /// Shared HTTP workload type.
+    #[arg(long, value_enum, default_value_t = Mode::Conversation)]
+    mode: Mode,
+    /// Suite with the model and workload inputs.
     #[arg(long)]
     suite: PathBuf,
     /// URL of the server owned by this benchmark.
@@ -22,7 +25,7 @@ pub(crate) struct Options {
     /// New JSON benchmark record path.
     #[arg(long)]
     json: PathBuf,
-    /// Number of independent whole conversations.
+    /// Number of independent whole workload repetitions.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     reps: u32,
     /// Enable one two-token initialization request per fresh server.
@@ -33,7 +36,18 @@ pub(crate) struct Options {
     raw_samples: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum Mode {
+    Conversation,
+    Serving,
+}
+
 const SOURCES: &[(&str, &str)] = &[
+    (
+        "http_serving.py",
+        include_str!("../../../support/bench-serving/http_serving.py"),
+    ),
     (
         "http_entry.py",
         include_str!("../../../support/bench-serving/http_entry.py"),

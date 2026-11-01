@@ -12,6 +12,7 @@ import http_client
 import multi_turn
 import provenance
 import serving_bench
+import http_serving
 
 
 def write(path, value):
@@ -25,6 +26,8 @@ def run(options):
     if output.exists():
         raise ValueError('refusing to overwrite a benchmark record')
     identity = conversation_identity.load(options['identity'])
+    if options.get('mode') == 'serving':
+        return http_serving.run(options, identity)
     suite, suite_hash = multi_turn.load_suite(Path(options['suite']))
     check = conversation_identity.TokenCheck(identity)
     command = json.loads(Path(options['server']).read_text())
@@ -84,7 +87,7 @@ def run(options):
         'prompt_cache_reused': all(row['cache_hit'] for run in runs for row in run[1:]),
         'notes': ['Each repetition is a fresh whole conversation; turns are not independent trials.',
             'Actual assistant messages are appended to history. CPU rendering verifies tokens before HTTP.',
-            'TTFT/ITL refer to visible SSE content events. Decode rate uses server completion_tokens minus one over first-to-last content event; token grouping is not inferred.',
+            'TTFT/ITL refer to visible SSE content events. Decode rate uses server completion_tokens minus one over first content event to DONE; token grouping is not inferred.',
             'Idle recompute waits and startup are outside TTFT/decode windows and retained in whole-session wall time.',
             'A null reply_recompute_hits field means the server has no corresponding recompute metric.'],
         'turns': conversation_session.reports(runs)}
