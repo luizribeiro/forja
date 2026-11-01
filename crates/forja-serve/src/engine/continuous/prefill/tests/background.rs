@@ -272,3 +272,30 @@ async fn pending_reply_fifo_supersedes_only_its_oldest_entry_at_the_lane_bound()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn published_reply_boundary_short_circuits_without_another_canonical_block()
+-> Result<(), TestError> {
+    let mut engine = configured().await?;
+    let ledger = PrefixLedger::new(vec![0; 63]);
+    let control = GenerationControl::new(Duration::from_secs(2));
+    for completed in 1..=2 {
+        engine.queue_canonical_recompute(&ledger, 63, &[1, 2], &control, true);
+        finish_recompute(&mut engine).await;
+        assert_eq!(engine.metrics.recompute_completed, completed);
+        assert_eq!(engine.metrics.recompute_blocks, 1);
+        assert_eq!(
+            engine
+                .canonical_cache
+                .as_ref()
+                .unwrap()
+                .store
+                .as_ref()
+                .unwrap()
+                .usage()?
+                .entries,
+            1
+        );
+    }
+    Ok(())
+}
