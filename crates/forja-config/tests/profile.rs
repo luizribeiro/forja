@@ -459,3 +459,26 @@ fn qwen38_float_cache_profile_keeps_the_short_context_budget() {
             .is_err()
     );
 }
+
+#[test]
+fn qwen38_long_profile_bounds_prompt_scratch_without_raising_host_quotas() {
+    let source = include_str!(
+        "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4-long.toml"
+    );
+    let profile: Profile = toml::from_str(source).unwrap();
+    assert_eq!(profile.workload().max_context.get(), 262_144);
+    assert_eq!(profile.workload().prefill_chunk.get(), 2048);
+    assert_eq!(profile.serving().unwrap().prompt_token_budget.get(), 2048);
+    assert_eq!(
+        profile.numerics().kv_cache,
+        forja_config::KvCacheFormat::F16
+    );
+    assert_eq!(
+        forja_core::automatic_live_bytes(384 << 30, 512 << 30).unwrap(),
+        48 << 30
+    );
+    assert!(
+        toml::from_str::<Profile>(&format!("{source}\n[limits]\nlive_bytes = \"64GiB\"\n"))
+            .is_err()
+    );
+}

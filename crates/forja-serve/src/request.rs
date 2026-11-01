@@ -1355,4 +1355,38 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn long_context_envelopes_accept_only_lower_host_limits() {
+        for lower in [1, 32_768, 131_072, 262_144] {
+            assert_eq!(
+                serving_context_ceiling(
+                    262_144,
+                    262_144,
+                    Choice::Fixed(std::num::NonZeroU32::new(lower).unwrap())
+                )
+                .unwrap(),
+                lower
+            );
+        }
+        assert_eq!(
+            serving_context_ceiling(262_144, 262_144, Choice::Auto).unwrap(),
+            262_144
+        );
+        assert!(
+            serving_context_ceiling(
+                262_144,
+                262_144,
+                Choice::Fixed(std::num::NonZeroU32::new(262_145).unwrap())
+            )
+            .is_err()
+        );
+        assert!(
+            serving_context_ceiling(
+                262_144,
+                32_768,
+                Choice::Fixed(std::num::NonZeroU32::new(131_072).unwrap())
+            )
+            .is_err()
+        );
+    }
 }

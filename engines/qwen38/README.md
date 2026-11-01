@@ -19,6 +19,13 @@ work recomputes its canonical blocks for exact next-turn token matches. Arriving
 requests preempt between blocks; cancellation discards unfinished recompute.
 The next turn replays any remaining partial block.
 
+The `qwen38-27b-4bit.metal-apple-m3-ultra.q4-long` profile declares 262,144 tokens
+with F16 KV. The operator may lower `serving.max_context`. Prompt scratch remains
+bounded by 2,048 tokens. The automatic live quota remains 48 GiB; admission counts
+weights, KV backing, state versions, tables, graphs and retained scratch. Long
+requests can reduce concurrency or be refused. Profile capacity is not an
+accuracy or performance claim.
+
 ## Use
 
 Run from the repository root inside `nix develop`:
