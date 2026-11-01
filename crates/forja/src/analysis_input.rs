@@ -36,7 +36,7 @@ pub(crate) struct Scope {
 }
 
 #[derive(Deserialize)]
-struct CostValue(#[serde(with = "Cost")] KernelCost);
+pub(crate) struct CostValue(#[serde(with = "Cost")] pub(crate) KernelCost);
 
 fn optional_cost<'de, D: serde::Deserializer<'de>>(
     deserializer: D,

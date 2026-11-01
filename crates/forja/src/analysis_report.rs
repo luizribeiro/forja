@@ -101,7 +101,7 @@ pub(crate) fn report(
             "Calibration bound envelopes combine per-probe CI endpoints, not a joint 95% interval; resource flags use raw GPU intervals.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
         "whole_model": model::summaries(profile, calibration, scale, target)?,
-        "by_kernel": ranking::aggregate(&kernels, "kernel"), "ranked_call_sites": ranking::aggregate(&dispatches, "site_group"),
+        "by_kernel": ranking::aggregate(&kernels, "kernel")?, "ranked_call_sites": ranking::aggregate(&dispatches, "site_group")?,
         "unmeasured_kernels": unmeasured, "dispatches": dispatches, "kernels": kernels }),
     )
 }
@@ -252,6 +252,14 @@ mod tests {
             80.0
         );
         assert_eq!(report["whole_model"]["unassigned_gpu_seconds"], 2.0);
+        let read_bytes: u64 = report["by_kernel"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["cost"]["read_bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(read_bytes, 200);
+
         let mut invalid = profile;
         invalid.schema_version = 1;
         assert!(invalid.validate().is_err());

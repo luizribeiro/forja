@@ -1,5 +1,8 @@
+use crate::analysis_input::CostValue;
+use forja_core::KernelCost;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
 
 const SUMS: &[&str] = &[
     "profiled_gpu_seconds",
@@ -10,15 +13,25 @@ const SUMS: &[&str] = &[
     "recoverable_at_target_seconds",
 ];
 
-pub(super) fn aggregate(rows: &[Value], field: &str) -> Vec<Value> {
+pub(super) fn aggregate(rows: &[Value], field: &str) -> Result<Vec<Value>, Box<dyn Error>> {
     let mut groups = BTreeMap::<String, Vec<&Value>>::new();
     for row in rows {
         let key = format!("{} | {} | {}", row[field], row["variant"], row["kernel"]);
         groups.entry(key).or_default().push(row);
     }
     let mut result = groups.into_values().map(|rows| {
+        let mut cost = KernelCost::default();
+        let mut dispatches = 0_u64;
+        for row in &rows {
+            if let Some(value) = row.get("cost") {
+                cost = cost.checked_add(serde_json::from_value::<CostValue>(value.clone())?.0).ok_or("group cost overflow")?;
+            }
+            dispatches = dispatches.checked_add(row["physical_dispatches"].as_u64().unwrap_or(1)).ok_or("dispatch count overflow")?;
+        }
         let first = rows[0];
         let mut group = json!({"name": first[field], "kernel": first["kernel"], "variant": first["variant"], "bound": first["bound"], "instances": rows.len()});
+        group["cost"] = cost.json();
+        group["physical_dispatches"] = json!(dispatches);
         for &key in SUMS {
             group[key] = json!(rows.iter().filter_map(|row| row[key].as_f64()).sum::<f64>());
         }
@@ -45,10 +58,10 @@ pub(super) fn aggregate(rows: &[Value], field: &str) -> Vec<Value> {
             }
         }
         group["over_100_percent"] = json!(group["over_100_percent"].as_bool().unwrap_or(false) || crate::analysis_diagnostics::over_100([group["share_of_step_percent"].as_f64().unwrap_or(0.0), group["percent_of_compute_ceiling"].as_f64().unwrap_or(0.0), group["percent_of_memory_ceiling_range"][1].as_f64().unwrap_or(0.0)]));
-        group
-    }).collect::<Vec<_>>();
+        Ok(group)
+    }).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     super::sort(&mut result);
-    result
+    Ok(result)
 }
 
 pub(crate) fn human(report: &Value) -> String {
@@ -149,7 +162,7 @@ mod tests {
     #[test]
     fn aggregate_markers_include_summed_shares_and_memory_percentages() {
         let row = json!({"site_group":"a", "variant":"current", "kernel":"k", "profiled_gpu_seconds":1.0, "share_of_step_percent":70.0, "percent_of_streaming_read_ceiling_range":[50.0,50.0], "percent_of_streaming_copy_ceiling_range":[70.0,70.0], "percent_of_memory_ceiling_range":[70.0,70.0]});
-        let result = aggregate(&[row.clone(), row], "site_group");
+        let result = aggregate(&[row.clone(), row], "site_group").unwrap();
         assert_eq!(result[0]["share_of_step_percent"], 140.0);
         assert_eq!(
             result[0]["percent_of_memory_ceiling_range"],
@@ -178,7 +191,7 @@ mod tests {
             json!({"site_group":"a", "variant":"current", "kernel":"k", "alternatives":["one", "two"], "recoverable_seconds": 1.0}),
             json!({"site_group":"a", "variant":"current", "kernel":"k", "alternatives":["two"], "recoverable_seconds": 2.0}),
         ];
-        let result = aggregate(&rows, "site_group");
+        let result = aggregate(&rows, "site_group").unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["recoverable_seconds"], 3.0);
         assert_eq!(result[0]["alternatives"], json!(["two"]));
