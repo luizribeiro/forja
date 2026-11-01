@@ -104,6 +104,8 @@ pub struct CompletionParams {
     pub echo: Option<bool>,
     /// Unsupported prompt suffix.
     pub suffix: Option<String>,
+    /// Opaque template controls interpreted by the selected chat-format guest.
+    pub chat_template_kwargs: Option<serde_json::Map<String, Value>>,
     /// Optional tool definitions.
     pub tools: Option<Vec<Tool>>,
     /// Optional tool selection.
@@ -222,12 +224,23 @@ pub(crate) fn validate_chat_input(
     }) {
         return too_large("message bytes exceed the configured ceiling");
     }
+    let option_bytes = match request
+        .params
+        .chat_template_kwargs
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+    {
+        Ok(bytes) => bytes.map_or(0, |bytes| bytes.len()),
+        Err(_) => return invalid("cannot encode chat template options"),
+    };
     validate_text(
         checked_text_bytes(
             request
                 .messages
                 .iter()
-                .filter_map(|message| message.content.as_ref().map(String::len)),
+                .filter_map(|message| message.content.as_ref().map(String::len))
+                .chain(std::iter::once(option_bytes)),
         )?,
         config,
     )?;
@@ -461,7 +474,8 @@ fn reject_unsupported(params: &CompletionParams, chat: bool) -> Result<(), Valid
             && (params.tools.is_some()
                 || params.tool_choice.is_some()
                 || params.parallel_tool_calls.is_some()
-                || params.response_format.is_some()));
+                || params.response_format.is_some()
+                || params.chat_template_kwargs.is_some()));
     if unsupported {
         invalid("request contains an unsupported non-default field")
     } else {

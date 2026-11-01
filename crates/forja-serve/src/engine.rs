@@ -2517,6 +2517,7 @@ where
         .map_err(|error| GenerationError::new(format!("cannot encode response format: {error}")))?;
     let options = serde_json::to_string(&serde_json::json!({
         "add_generation_prompt": true,
+        "chat_template_kwargs": request.params.chat_template_kwargs.as_ref(),
         "tool_choice": request.params.tool_choice.as_ref(),
         "parallel_tool_calls": request.params.parallel_tool_calls,
         "response_format": request.params.response_format.as_ref(),
@@ -2945,6 +2946,68 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    struct OptionsRenderer(Arc<StdMutex<Option<serde_json::Value>>>);
+
+    impl PromptRenderer for OptionsRenderer {
+        fn render_prompt(
+            &mut self,
+            _: &str,
+            _: &str,
+            options: &str,
+        ) -> Result<String, GenerationError> {
+            *self.0.lock().unwrap() = Some(serde_json::from_str(options).unwrap());
+            Ok("a".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_template_options_reach_the_guest_within_the_text_ceiling() {
+        let seen = Arc::new(StdMutex::new(None));
+        let tokenizer = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges([("a".to_owned(), 0)], Vec::new())
+            .build()
+            .unwrap();
+        let prompt = Arc::new(StdMutex::new(PromptArtifacts {
+            tokenizer: Tokenizer::new(tokenizer),
+            renderer: OptionsRenderer(Arc::clone(&seen)),
+        }));
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"test", "messages":[{"role":"user","content":"a"}],
+            "max_tokens":1, "chat_template_kwargs":{"style":"terse"}
+        }))
+        .unwrap();
+        let info = crate::ChatInfo {
+            stop_token_ids: Vec::new(),
+            sampling: crate::SamplingDefaults::default(),
+        };
+        let control = GenerationControl::new(Duration::from_secs(1));
+        let mut config = HostConfig::default();
+        let result = prepare_chat_prompt(
+            &request,
+            &config,
+            &info,
+            16,
+            1,
+            Arc::clone(&prompt),
+            &control,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.0, [0]);
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["chat_template_kwargs"]["style"],
+            "terse"
+        );
+        *seen.lock().unwrap() = None;
+        config.request.max_text_bytes = forja_config::ByteSize::new(1);
+        assert!(
+            prepare_chat_prompt(&request, &config, &info, 16, 1, prompt, &control)
+                .await
+                .is_err()
+        );
+        assert!(seen.lock().unwrap().is_none());
     }
 
     #[tokio::test]
