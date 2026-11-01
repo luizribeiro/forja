@@ -84,6 +84,18 @@ pub(crate) struct Submission {
     pub(crate) timeline: Vec<Dispatch>,
 }
 
+impl Submission {
+    pub(crate) fn attribution_seconds(&self) -> Result<f64, Box<dyn Error>> {
+        let precise = positive(
+            self.timeline
+                .iter()
+                .map(|row| row.gpu_time_seconds + row.gap_before_seconds)
+                .sum(),
+        )?;
+        positive(self.gpu_time_seconds.max(precise))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Timing {
     pub(crate) wall_time_seconds: f64,

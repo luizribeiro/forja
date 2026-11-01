@@ -329,7 +329,9 @@ promising change with a full model `forja bench` record before adopting it.
 
 Interpret these as diagnostics. Precise timestamps perturb execution; the report
 shows that ratio and scales attribution to an unprofiled GPU control. Per-kernel
-perturbation remains unknown. Step shares use unprofiled wall time; host overhead
+perturbation remains unknown. Command-start sampling may overlap subsequent work,
+so attribution uses the larger command-counter or precise span per submission.
+Both time bases are retained; GPU attribution stays within the unprofiled control. Step shares use unprofiled wall time; host overhead
 is therefore visible as unassigned time. Traffic counts logical operands, not
 hardware DRAM transactions. Routed expert reuse produces a footprint interval;
 proven unique routes tighten it. Padding/tile FLOPs are separate from logical

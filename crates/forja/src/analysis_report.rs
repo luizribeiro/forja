@@ -17,14 +17,12 @@ pub(crate) fn report(
     calibration: &Value,
     target: f64,
 ) -> Result<Value, Box<dyn Error>> {
-    let profiled_gpu = positive(
-        profile
-            .submissions
-            .iter()
-            .map(|submission| submission.gpu_time_seconds)
-            .sum(),
-    )?;
-    let scale = positive(profile.unprofiled.gpu_time_seconds / profiled_gpu)?;
+    let ProfiledTimes {
+        command: profiled_gpu,
+        precise: precise_gpu,
+        basis,
+    } = profiled_times(profile)?;
+    let scale = positive(profile.unprofiled.gpu_time_seconds / basis)?;
     let mut dispatches = Vec::new();
     let mut kernels = Vec::new();
     let mut unmeasured = Vec::new();
@@ -92,9 +90,12 @@ pub(crate) fn report(
         "mode": profile.mode, "tokens": profile.tokens, "measured_tokens": profile.measured_count().ok_or("invalid measured token range")?, "cached_prefix_tokens": profile.cached_prefix_tokens, "device_identity": profile.device_identity,
         "inputs": profile.inputs, "profile_provenance": profile.provenance, "calibration": calibration,
         "unprofiled": {"wall_seconds": profile.unprofiled.wall_time_seconds, "gpu_seconds": profile.unprofiled.gpu_time_seconds, "cache_setup_wall_seconds": profile.unprofiled.cache_setup},
-        "profiled_gpu_seconds": profiled_gpu, "timestamp_perturbation_ratio": profiled_gpu / profile.unprofiled.gpu_time_seconds,
+        "profiled_gpu_seconds": profiled_gpu, "precise_interval_gpu_seconds": precise_gpu, "attribution_basis_gpu_seconds": basis,
+        "attribution_time_basis": "per-submission maximum of command-counter interval and precise spans",
+        "precise_timestamp_perturbation_ratio": precise_gpu / profile.unprofiled.gpu_time_seconds, "timestamp_perturbation_ratio": profiled_gpu / profile.unprofiled.gpu_time_seconds,
         "attribution_scale": scale, "target_utilization": target,
         "notes": ["Profile-derived diagnostic, not a model benchmark.",
+            "Command start timestamps may follow the first precise interval; attribution uses the larger per-submission span and retains unprofiled GPU control.",
             "Attribution scales precise intervals plus preceding gaps to unprofiled GPU time; per-kernel perturbation is unquantified.",
             "Host snapshot capture/materialization transfers are outside GPU kernel work; prefix preparation is separate from the measured step.",
             "Sampling scalar/SFU counts describe the logical stochastic path; greedy/conditional branches may execute less work.",
@@ -107,6 +108,42 @@ pub(crate) fn report(
         "by_kernel": ranking::aggregate(&kernels, "kernel")?, "ranked_call_sites": ranking::aggregate(&dispatches, "site_group")?,
         "unmeasured_kernels": unmeasured, "dispatches": dispatches, "kernels": kernels }),
     )
+}
+
+struct ProfiledTimes {
+    command: f64,
+    precise: f64,
+    basis: f64,
+}
+
+fn profiled_times(profile: &Profile) -> Result<ProfiledTimes, Box<dyn Error>> {
+    let profiled_gpu = positive(
+        profile
+            .submissions
+            .iter()
+            .map(|submission| submission.gpu_time_seconds)
+            .sum(),
+    )?;
+    let basis = positive(
+        profile
+            .submissions
+            .iter()
+            .map(crate::analysis_input::Submission::attribution_seconds)
+            .sum::<Result<f64, _>>()?,
+    )?;
+    let precise_gpu = positive(
+        profile
+            .submissions
+            .iter()
+            .flat_map(|submission| &submission.timeline)
+            .map(|row| row.gpu_time_seconds + row.gap_before_seconds)
+            .sum(),
+    )?;
+    Ok(ProfiledTimes {
+        command: profiled_gpu,
+        precise: precise_gpu,
+        basis,
+    })
 }
 
 pub(super) fn sort(rows: &mut [Value]) {
@@ -206,6 +243,33 @@ mod tests {
                 < f64::EPSILON
         );
         assert!(ranking::human(&report).contains("Unmeasured: block/layer-0/dispatch-0 / read-a"));
+    }
+
+    #[test]
+    fn precise_spans_exceeding_command_intervals_do_not_overassign_control() {
+        let (mut profile, calibration) = fixture();
+        for submission in &mut profile.submissions {
+            submission.gpu_time_seconds = 5.0;
+        }
+        let row = report(&profile, &calibration, 0.8).unwrap();
+        assert_eq!(row["profiled_gpu_seconds"], 10.0);
+        assert_eq!(row["precise_interval_gpu_seconds"], 16.0);
+        assert_eq!(row["attribution_scale"], 0.625);
+        assert_eq!(
+            row["whole_model"]["by_layer_type"][0]["share_of_gpu_percent"],
+            100.0
+        );
+        assert_eq!(row["whole_model"]["attribution_excess_seconds"], 0.0);
+        let phases = row["whole_model"]["phases"].as_array().unwrap();
+        assert_eq!(
+            phases
+                .iter()
+                .map(|phase| phase["observed_or_attributed_gpu_seconds"]
+                    .as_f64()
+                    .unwrap())
+                .sum::<f64>(),
+            10.0
+        );
     }
 
     #[test]

@@ -252,7 +252,7 @@ pub(super) fn summaries(
         }
         let mut summary = phase.json(
             &profile.mode,
-            submission.gpu_time_seconds * scale,
+            submission.attribution_seconds()? * scale,
             None,
             target,
             shared,
