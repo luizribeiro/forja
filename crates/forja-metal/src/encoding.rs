@@ -8417,6 +8417,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulRouteGemv
                     | MetalVariant::GatherQuantMatmulVector8
                     | MetalVariant::QuantMatmulVector8
+                    | MetalVariant::QuantMatmulVector8TwoGroups
                     | MetalVariant::QuantMatmulVector16
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
@@ -8765,6 +8766,7 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
         Some(
             MetalVariant::QuantMatmulGemvN2
             | MetalVariant::QuantMatmulVector8
+            | MetalVariant::QuantMatmulVector8TwoGroups
             | MetalVariant::QuantMatmulVector16,
         ) => Ok("quantized_gemv_n2"),
         Some(MetalVariant::QuantMatmulQ8FastGemv) => Ok("quantized_gemv_q8_fast"),
@@ -9255,6 +9257,7 @@ pub(super) fn variant_supported(
         | MetalVariant::SdpaDecomposed
         | MetalVariant::TopKPartials
         | MetalVariant::QuantMatmulVector8
+        | MetalVariant::QuantMatmulVector8TwoGroups
         | MetalVariant::QuantMatmulVector16 => true,
         MetalVariant::GatherQuantMatmulWeightedBroad => dispatch.primitive_inputs().len() == 6,
         MetalVariant::MatmulGemv => matmul_rows(dispatch)? == 1,
@@ -9719,7 +9722,11 @@ fn quantized_constants(
 
 fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
     let words = match selected_variant(dispatch) {
-        Some(MetalVariant::QuantMatmulVector8 | MetalVariant::GatherQuantMatmulVector8) => 2,
+        Some(
+            MetalVariant::QuantMatmulVector8
+            | MetalVariant::QuantMatmulVector8TwoGroups
+            | MetalVariant::GatherQuantMatmulVector8,
+        ) => 2,
         Some(MetalVariant::QuantMatmulVector16) => 4,
         _ => return [0, 2, 0],
     };
@@ -9731,7 +9738,11 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
                 .checked_mul(layout.dtype().byte_size())
                 .is_some_and(|bytes| bytes.is_multiple_of(16))
     });
-    let groups = if matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) {
+    let groups = if matches!(dispatch.op(), Op::GatherQuantMatmul { .. })
+        || matches!(
+            selected_variant(dispatch),
+            Some(MetalVariant::QuantMatmulVector8TwoGroups)
+        ) {
         2
     } else {
         4
@@ -13460,7 +13471,11 @@ mod tests {
         let backend = MetalBackend::new().unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for bits in [4, 8] {
-                for variant in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+                for variant in [
+                    "quant-matmul.vector8",
+                    "quant-matmul.vector8-2g",
+                    "quant-matmul.vector16",
+                ] {
                     assert_quant_epilogue(&backend, variant, dtype, bits, 7, 768, 33, true);
                 }
                 assert_gather_quant_epilogue(

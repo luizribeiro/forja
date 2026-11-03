@@ -31,6 +31,7 @@ pub(crate) enum MetalVariant {
     QuantMatmulGemv,
     QuantMatmulGemvN2,
     QuantMatmulVector8,
+    QuantMatmulVector8TwoGroups,
     QuantMatmulVector16,
     QuantMatmulQ8FastGemv,
     QuantMatmulQ8FastGemvN2,
@@ -991,6 +992,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         &[
             "Uses a fixed lane partition for every batch row; strided views use guarded scalar loads."
         ]
+    ),
+    batch_invariant_variant!(@class "quant-matmul.vector8";
+        "quant-matmul.vector8-2g",
+        QuantMatmul,
+        QuantMatmulVector8TwoGroups,
+        QUANT_VECTOR,
+        &["contiguous decode weights with narrower output groups."],
+        &["wide batches where more groups amortize input loads."],
+        &["Uses two SIMD groups per threadgroup with the vector8 reduction order."]
     ),
     batch_invariant_variant!(
         "quant-matmul.vector16",
@@ -2298,6 +2308,7 @@ mod tests {
                 "quant-matmul.gemv",
                 "quant-matmul.gemv-n2",
                 "quant-matmul.vector8",
+                "quant-matmul.vector8-2g",
                 "quant-matmul.vector16",
                 "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
@@ -3007,7 +3018,11 @@ mod tests {
     fn vector_gemv_refuses_prefill_rows() {
         let decode = quant_dispatch(DType::F32, 8, 768, true);
         let prefill = quant_dispatch(DType::F32, 9, 768, false);
-        for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+        for name in [
+            "quant-matmul.vector8",
+            "quant-matmul.vector8-2g",
+            "quant-matmul.vector16",
+        ] {
             assert!(resolve(&decode, name, METAL4).is_ok());
             assert_quant_tail_refusals(&decode, name, (32, 32));
             assert!(matches!(
@@ -3483,6 +3498,11 @@ mod tests {
                 "quantized_gemv_n2",
             ),
             (
+                "quant-matmul.vector8-2g",
+                quant_dispatch_with_bits(DType::F32, 1, 768, false, 4),
+                "quantized_gemv_n2",
+            ),
+            (
                 "quant-matmul.vector16",
                 quant_dispatch_with_bits(DType::F32, 1, 768, false, 4),
                 "quantized_gemv_n2",
@@ -3740,7 +3760,11 @@ mod tests {
         for (name, dispatch, kernel) in fixtures {
             assert_variant_kernel(name, dispatch, kernel);
         }
-        for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+        for name in [
+            "quant-matmul.vector8",
+            "quant-matmul.vector8-2g",
+            "quant-matmul.vector16",
+        ] {
             assert_variant_kernel(
                 name,
                 quant_dispatch(DType::F32, 1, 768, false),

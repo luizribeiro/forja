@@ -75,7 +75,11 @@ fn vector_load_gemv_matches_cpu_and_keeps_batch_bits() {
     let candidate = MetalBackend::new().unwrap();
     for inner in [64, 768, 2048, 4096] {
         for bits in [4, 8] {
-            for name in ["quant-matmul.vector8", "quant-matmul.vector16"] {
+            for name in [
+                "quant-matmul.vector8",
+                "quant-matmul.vector8-2g",
+                "quant-matmul.vector16",
+            ] {
                 let mut first = None;
                 for rows in [1, 2, 4, 7, 8] {
                     let mut values = DeterministicValues::new(0x510e_527f_ade6_82d1);
