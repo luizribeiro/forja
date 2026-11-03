@@ -22,7 +22,7 @@ struct DeltaProjection {
     key: Tensor<f32>,
     value: Tensor<bf16>,
     beta: Tensor<bf16>,
-    a: Tensor<f32>,
+    a: Tensor<bf16>,
 }
 
 impl DeltaNet {
@@ -167,7 +167,7 @@ impl DeltaNet {
         let y = if prefill {
             let bias = self.dt_bias.broadcast_as(&gate_shape)?;
             let log_a = self.log_a.broadcast_as(&gate_shape)?;
-            let log_decay = numerics::log_decay(&a, &bias, &log_a)?;
+            let log_decay = numerics::log_decay(&a.to_dtype::<f32>()?, &bias, &log_a)?;
             self.carry
                 .delta(
                     [
@@ -215,7 +215,7 @@ impl DeltaNet {
             tokens,
         )?;
         let ab = self.ab.forward(input, pick)?;
-        let a = gate_panel(&ab, 0, c.value_heads, gate_shape)?.to_dtype::<f32>()?;
+        let a = gate_panel(&ab, 0, c.value_heads, gate_shape)?;
         let beta =
             numerics::sigmoid_bf16(&gate_panel(&ab, c.value_heads, c.value_heads, gate_shape)?)?;
         Ok(DeltaProjection {

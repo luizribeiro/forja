@@ -1,4 +1,4 @@
-use forja_sdk::{Result, Tensor};
+use forja_sdk::{FloatElement, Result, Tensor};
 
 #[forja_sdk::kernel(map)]
 pub(crate) fn softplus(
@@ -35,18 +35,20 @@ pub(crate) fn log_decay(
 ) -> Result<Tensor<f32>> {
     log_coefficient(&softplus(a, bias)?, log_a)
 }
-pub(crate) fn decay(
-    a: &Tensor<f32>,
+pub(crate) fn decay<A: FloatElement>(
+    a: &Tensor<A>,
     bias: &Tensor<f32>,
     log_a: &Tensor<f32>,
 ) -> Result<Tensor<f32>> {
-    decode_coefficient(a, bias, log_a)
+    let output = Tensor::<f32>::zeros(a.shape())?;
+    decode_coefficient_into(a, bias, log_a, &output)?;
+    Ok(output)
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::{decode_coefficient, softplus};
-    use forja_sdk::{NativeDevice, Tensor, set_native_device};
+    use super::{decay, softplus};
+    use forja_sdk::{NativeDevice, Tensor, bf16, set_native_device};
 
     #[forja_sdk::kernel(map)]
     fn staged_coefficient(
@@ -72,7 +74,8 @@ mod tests {
                 f32::NAN,
                 f32::INFINITY,
                 f32::NEG_INFINITY,
-            ],
+            ]
+            .map(bf16::from_f32),
             &[11],
         )
         .unwrap();
@@ -86,8 +89,12 @@ mod tests {
             &[11],
         )
         .unwrap();
-        let staged = staged_coefficient(&softplus(&a, &bias).unwrap(), &log_a).unwrap();
-        let fused = decode_coefficient(&a, &bias, &log_a).unwrap();
+        let staged = staged_coefficient(
+            &softplus(&a.to_dtype::<f32>().unwrap(), &bias).unwrap(),
+            &log_a,
+        )
+        .unwrap();
+        let fused = decay(&a, &bias, &log_a).unwrap();
         for (actual, expected) in fused.to_vec().unwrap().iter().zip(staged.to_vec().unwrap()) {
             if expected.is_nan() {
                 assert!(actual.is_nan());
