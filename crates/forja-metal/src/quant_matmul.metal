@@ -1636,7 +1636,7 @@ struct alignas(16) QuantizedGemmRead16 {
     uchar bytes[16];
 };
 
-template <typename T, uint tile_stride>
+template <typename T, uint tile_stride, uint block_inner>
 void load_quantized_gemm_input_tile(
     device const uchar *input,
     constant QuantMatmulParams &params,
@@ -1646,7 +1646,6 @@ void load_quantized_gemm_input_tile(
     uint thread_index,
     uint thread_count) {
     constexpr uint block_rows = 32;
-    constexpr uint block_inner = 32;
     constexpr uint elements_per_thread = block_rows * block_inner / 128;
     constexpr uint vector_elements = 16 / sizeof(T);
     constexpr uint reads_per_thread = elements_per_thread / vector_elements;
@@ -1688,7 +1687,7 @@ void load_quantized_gemm_input_tile(
     }
 }
 
-template <typename T>
+template <typename T, uint block_inner>
 void quantized_gemm_tiled_impl(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -1706,7 +1705,6 @@ void quantized_gemm_tiled_impl(
     threadgroup T *weight_tile) {
     constexpr uint block_rows = 32;
     constexpr uint block_columns = 32;
-    constexpr uint block_inner = 32;
     constexpr uint tile_stride = block_inner + 16 / sizeof(T);
     BlockMMA<
         T, block_rows, block_columns, block_inner, 2, 2,
@@ -1714,7 +1712,7 @@ void quantized_gemm_tiled_impl(
     uint row_origin = tile.y * block_rows;
     uint column_origin = tile.x * block_columns;
     for (uint inner_origin = 0; inner_origin < params.inner; inner_origin += block_inner) {
-        load_quantized_gemm_input_tile<T, tile_stride>(
+        load_quantized_gemm_input_tile<T, tile_stride, block_inner>(
             input, params, row_origin, inner_origin,
             input_tile, thread_index, thread_count);
         load_transposed_quantized_weight_tile<
@@ -1752,7 +1750,7 @@ void quantized_gemm_tiled_impl(
     }
 }
 
-#define quantized_gemm_tiled_kernel(name, type)                                    \
+#define quantized_gemm_tiled_kernel(name, type, block_inner)                       \
 kernel void name(                                                                  \
     device const uchar *input [[buffer(0)]],                                        \
     device const uchar *packed [[buffer(1)]],                                       \
@@ -1766,16 +1764,19 @@ kernel void name(                                                               
     ushort simdgroup [[simdgroup_index_in_threadgroup]],                            \
     ushort lane [[thread_index_in_simdgroup]],                                      \
     uint3 tile [[threadgroup_position_in_grid]]) {                                  \
-    constexpr uint tile_stride = 32 + 16 / sizeof(type);                            \
+    constexpr uint tile_stride = block_inner + 16 / sizeof(type);                   \
     threadgroup type input_tile[32 * tile_stride];                                  \
     threadgroup type weight_tile[32 * tile_stride];                                 \
-    quantized_gemm_tiled_impl<type>(                                                \
+    quantized_gemm_tiled_impl<type, block_inner>(                                   \
         input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,       \
         thread_index,                                                               \
         threadgroup_size.x * threadgroup_size.y * threadgroup_size.z,               \
         simdgroup, lane, tile, input_tile, weight_tile);                            \
 }
 
-quantized_gemm_tiled_kernel(quantized_gemm_tiled_f32, float)
-quantized_gemm_tiled_kernel(quantized_gemm_tiled_f16, half)
-quantized_gemm_tiled_kernel(quantized_gemm_tiled_bf16, bfloat)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_f32, float, 32)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_f16, half, 32)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_bf16, bfloat, 32)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f32, float, 64)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f16, half, 64)
+quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_bf16, bfloat, 64)

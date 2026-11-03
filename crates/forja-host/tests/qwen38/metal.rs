@@ -41,22 +41,24 @@ fn metal_tiled_projection_padding_preserves_independent_row_bits() -> Result<(),
         64,
         96,
     )?;
-    let pick = Variant::new("quant-matmul.tiled")?;
-    for rows in [1, 2, 4, 7, 8, 16, 33] {
-        let values = (0..rows * 64)
-            .map(|i| bf16::from_f64(f64::from(i % 33) / 32.0 - 0.5))
-            .collect::<Vec<_>>();
-        let input = Tensor::from_slice(&values, &[rows, 64])?;
-        let actual = projection.forward(&input, Some(&pick))?.to_vec()?;
-        let mut singles = Vec::new();
-        for row in 0..rows {
-            singles.extend(
-                projection
-                    .forward(&input.narrow(0, row, 1)?, Some(&pick))?
-                    .to_vec()?,
-            );
+    for name in ["quant-matmul.tiled", "quant-matmul.tiled-k64"] {
+        let pick = Variant::new(name)?;
+        for rows in [1, 2, 4, 7, 8, 16, 33] {
+            let values = (0..rows * 64)
+                .map(|i| bf16::from_f64(f64::from(i % 33) / 32.0 - 0.5))
+                .collect::<Vec<_>>();
+            let input = Tensor::from_slice(&values, &[rows, 64])?;
+            let actual = projection.forward(&input, Some(&pick))?.to_vec()?;
+            let mut singles = Vec::new();
+            for row in 0..rows {
+                singles.extend(
+                    projection
+                        .forward(&input.narrow(0, row, 1)?, Some(&pick))?
+                        .to_vec()?,
+                );
+            }
+            assert_eq!(actual, singles, "{name} rows={rows}");
         }
-        assert_eq!(actual, singles);
     }
     Ok(())
 }

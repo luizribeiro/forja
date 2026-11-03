@@ -37,6 +37,7 @@ pub(crate) enum MetalVariant {
     QuantMatmulQ8FastGemvN2,
     QuantMatmulSmallM,
     QuantMatmulTiled,
+    QuantMatmulTiledK64,
     GatherQuantMatmulPortable,
     GatherQuantMatmulRouteGemv,
     GatherQuantMatmulVector8,
@@ -1057,6 +1058,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         &["contiguous batches of at least 16 rows."],
         &["small or strided batches."],
         &["One algorithm supports f32, f16, and bf16 activations."]
+    ),
+    batch_invariant_variant!(
+        "quant-matmul.tiled-k64",
+        QuantMatmul,
+        QuantMatmulTiledK64,
+        TILED,
+        &["contiguous batches with enough reduction work to amortize 64-wide blocks."],
+        &["small or strided batches."],
+        &["Uses 64-wide reduction blocks with f32, f16, or bf16 activations."]
     ),
     batch_invariant_variant!(
         "gather-quant-matmul.portable",
@@ -2120,7 +2130,7 @@ impl MetalVariant {
             GatherQuantMatmulGrouped, GatherQuantMatmulGrouped32x32,
             GatherQuantMatmulGrouped32x32Blocked, GatherQuantMatmulGroupedPair32x32Blocked,
             MatmulSteel32x64x16_1x2, MatmulSteel64x32x32_2x2, MatmulSteel64x64x16_1x2,
-            MatmulSteel64x64x16_2x2, QuantMatmulTiled,
+            MatmulSteel64x64x16_2x2, QuantMatmulTiled, QuantMatmulTiledK64,
         };
         let tile = match self {
             MatmulSteel64x64x16_2x2 | MatmulSteel64x64x16_1x2 => [64, 64, 16],
@@ -2133,6 +2143,7 @@ impl MetalVariant {
             | GatherQuantMatmulGrouped32x32
             | GatherQuantMatmulGrouped32x32Blocked
             | GatherQuantMatmulGroupedPair32x32Blocked => [32, 32, 32],
+            QuantMatmulTiledK64 => [32, 32, 64],
             _ => [0; 3],
         };
         let attention_tiles: &'static [(u32, [u32; 2])] = match self {
@@ -2315,6 +2326,7 @@ mod tests {
                 "quant-matmul.q8-fast-gemv-n2",
                 "quant-matmul.small-m",
                 "quant-matmul.tiled",
+                "quant-matmul.tiled-k64",
                 "gather-quant-matmul.portable",
                 "gather-quant-matmul.route-gemv",
                 "gather-quant-matmul.vector8",
@@ -3531,6 +3543,11 @@ mod tests {
                 "quant-matmul.tiled",
                 quant_dispatch(DType::BF16, 16, 64, false),
                 "quantized_gemm_tiled_bf16",
+            ),
+            (
+                "quant-matmul.tiled-k64",
+                quant_dispatch(DType::BF16, 16, 64, false),
+                "quantized_gemm_tiled_k64_bf16",
             ),
             (
                 "gather-quant-matmul.portable",

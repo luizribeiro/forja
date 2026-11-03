@@ -102,6 +102,67 @@ fn vector_load_gemv_matches_cpu_and_keeps_batch_bits() {
     }
 }
 
+#[test]
+fn tiled_k64_matches_cpu_at_odd_edges_and_reduction_tail() {
+    let reference = CpuBackend::new();
+    let candidate = MetalBackend::new().unwrap();
+    for rows in [17, 33] {
+        for columns in [33, 65] {
+            for bits in [4, 8] {
+                for dtype in [DType::F32, DType::F16, DType::BF16] {
+                    assert_pinned_tiled_k64(&reference, &candidate, rows, columns, bits, dtype);
+                }
+            }
+        }
+    }
+}
+
+fn assert_pinned_tiled_k64(
+    reference: &CpuBackend,
+    candidate: &MetalBackend,
+    rows: u32,
+    columns: u32,
+    bits: u8,
+    dtype: DType,
+) {
+    let inner = 96;
+    let group_size = 32;
+    let specs = [
+        TensorSpec::contiguous(dtype, &[rows, inner]),
+        TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
+        TensorSpec::contiguous(DType::BF16, &[columns, inner / group_size]),
+    ];
+    let mut values = DeterministicValues::new(0x510e_527f_ade6_82d1);
+    let bytes = specs
+        .iter()
+        .map(|spec| generated_tensor_bytes(spec, &mut values).unwrap())
+        .collect::<Vec<_>>();
+    let reference_inputs = allocate_inputs(reference, &specs, &bytes);
+    let candidate_inputs = allocate_inputs(candidate, &specs, &bytes);
+    let reference_output = reference.alloc(dtype, &[rows, columns]).unwrap();
+    let candidate_output = candidate.alloc(dtype, &[rows, columns]).unwrap();
+    let op = Op::QuantMatmul { bits, group_size };
+    submit_quant(reference, op, &reference_inputs, &reference_output, None);
+    let inputs = candidate_inputs.iter().collect::<Vec<_>>();
+    let variant = candidate
+        .validate_variant_for_op(op, &inputs, &[&candidate_output], "quant-matmul.tiled-k64")
+        .unwrap();
+    submit_quant(
+        candidate,
+        op,
+        &candidate_inputs,
+        &candidate_output,
+        Some(BackendDispatchData::new(variant)),
+    );
+    assert_outputs_agree(
+        dtype,
+        &reference.read(&reference_output).unwrap(),
+        &candidate.read(&candidate_output).unwrap(),
+    )
+    .unwrap();
+}
+
 fn assert_pinned_decode_batch(
     reference: &CpuBackend,
     candidate: &MetalBackend,

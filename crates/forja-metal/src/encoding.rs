@@ -4507,7 +4507,10 @@ impl MetalBackend {
             "quantized_gemv_q8_fast" => (8, 1, 64),
             "quantized_gemm_tiled_f32"
             | "quantized_gemm_tiled_f16"
-            | "quantized_gemm_tiled_bf16" => (32, 32, 128),
+            | "quantized_gemm_tiled_bf16"
+            | "quantized_gemm_tiled_k64_f32"
+            | "quantized_gemm_tiled_k64_f16"
+            | "quantized_gemm_tiled_k64_bf16" => (32, 32, 128),
             _ => (8, 8, 256),
         };
         dispatch_threadgroups(
@@ -8413,6 +8416,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::QuantMatmulQ8FastGemvN2
                     | MetalVariant::QuantMatmulSmallM
                     | MetalVariant::QuantMatmulTiled
+                    | MetalVariant::QuantMatmulTiledK64
                     | MetalVariant::GatherQuantMatmulPortable
                     | MetalVariant::GatherQuantMatmulRouteGemv
                     | MetalVariant::GatherQuantMatmulVector8
@@ -8778,6 +8782,12 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
             DType::F32 => Ok("quantized_gemm_tiled_f32"),
             DType::F16 => Ok("quantized_gemm_tiled_f16"),
             DType::BF16 => Ok("quantized_gemm_tiled_bf16"),
+            DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
+        },
+        Some(MetalVariant::QuantMatmulTiledK64) => match input.layout().dtype() {
+            DType::F32 => Ok("quantized_gemm_tiled_k64_f32"),
+            DType::F16 => Ok("quantized_gemm_tiled_k64_f16"),
+            DType::BF16 => Ok("quantized_gemm_tiled_k64_bf16"),
             DType::I32 | DType::U32 => Err(BackendError::InvalidInput),
         },
         _ => Err(BackendError::InvalidInput),
@@ -9275,7 +9285,7 @@ pub(super) fn variant_supported(
             "quantized_gemv_q8_fast" | "quantized_gemv_q8_fast_n2"
         ),
         MetalVariant::QuantMatmulSmallM => rows()? > 1,
-        MetalVariant::QuantMatmulTiled => {
+        MetalVariant::QuantMatmulTiled | MetalVariant::QuantMatmulTiledK64 => {
             quant_matmul_kernel(dispatch)?.starts_with("quantized_gemm_tiled_")
         }
         MetalVariant::GatherQuantMatmulGrouped
@@ -12494,6 +12504,9 @@ mod tests {
             "quantized_gemm_tiled_f32",
             "quantized_gemm_tiled_f16",
             "quantized_gemm_tiled_bf16",
+            "quantized_gemm_tiled_k64_f32",
+            "quantized_gemm_tiled_k64_f16",
+            "quantized_gemm_tiled_k64_bf16",
         ] {
             for words in [
                 quant_epilogue_specialization(7, 511),
@@ -13541,30 +13554,14 @@ mod tests {
     #[test]
     fn metal_quant_tiled_epilogues_cover_formats_dtypes_and_edge_tiles() {
         let backend = MetalBackend::new().unwrap();
-        for dtype in [DType::F32, DType::F16, DType::BF16] {
-            for bits in [4, 8] {
-                assert_quant_epilogue(
-                    &backend,
-                    "quant-matmul.tiled",
-                    dtype,
-                    bits,
-                    33,
-                    128,
-                    33,
-                    false,
-                );
+        for variant in ["quant-matmul.tiled", "quant-matmul.tiled-k64"] {
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                for bits in [4, 8] {
+                    assert_quant_epilogue(&backend, variant, dtype, bits, 33, 128, 33, false);
+                }
             }
+            assert_quant_epilogue(&backend, variant, DType::BF16, 8, 16, 1024, 128, true);
         }
-        assert_quant_epilogue(
-            &backend,
-            "quant-matmul.tiled",
-            DType::BF16,
-            8,
-            16,
-            1024,
-            128,
-            true,
-        );
     }
 
     #[test]
