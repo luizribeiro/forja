@@ -48,7 +48,7 @@ def run(options):
                 client.reset_connection()
                 process = {'pid': server.process.pid, 'ready_epoch': time.time()}
                 prime_started = time.time()
-                for _ in range(min(1, options['warmups'])):
+                for _ in range(options['warmups']):
                     sample = client.chat([{'role': 'user', 'content': 'Benchmark initialization.'}],
                                          2, identity.get('chat_template_kwargs', {}))
                     if sample['error']:
@@ -79,8 +79,8 @@ def run(options):
                        'packages': versions, **provenance.machine(), 'os_build': platform.version()},
         'measurement_mode': {'sampling': 'fixed', 'execution': 'process-per-leg',
             'cache_state': 'fresh-server-per-conversation', 'unit': 'whole-conversation',
-            'reps': options['reps'], 'warmups': min(1, options['warmups']),
-            'priming': 'one two-token request per fresh server'},
+            'reps': options['reps'], 'warmups': options['warmups'],
+            'priming': 'configured two-token requests per fresh server'},
         'processes': processes, 'started_epoch': started, 'finished_epoch': time.time(),
         'server_startup_seconds': server.startup_seconds, 'sampled_peak_rss_bytes': sampled_rss,
         'sampled_rss_is_high_water_mark': False, 'gpu_time_seconds': None,

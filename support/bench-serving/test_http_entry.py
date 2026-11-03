@@ -32,7 +32,8 @@ def test_http_runner_preserves_sessions_and_cleans_up_on_failure(monkeypatch, tm
     assert events == ['start', 'stop']
 
 
-def test_successful_conversations_record_provenance_and_turns(monkeypatch, tmp_path):
+@pytest.mark.parametrize('warmups', [0, 1, 3])
+def test_successful_conversations_record_provenance_and_turns(monkeypatch, tmp_path, warmups):
     suite = Path(__file__).resolve().parents[2] / 'bench/suites/multi-turn.toml'
     command = tmp_path / 'command.json'
     command.write_text('["fake-server"]')
@@ -63,17 +64,17 @@ def test_successful_conversations_record_provenance_and_turns(monkeypatch, tmp_p
     monkeypatch.setattr(http_entry.conversation_session, 'reports', lambda runs: [{'runs': len(runs)}])
     record = http_entry.run({'json': str(tmp_path/'record.json'), 'identity': 'identity',
         'suite': str(suite), 'server': str(command), 'url': 'http://127.0.0.1:1',
-        'reps': 2, 'warmups': 1, 'provenance': {'commit': 'frozen'}})
+        'reps': 2, 'warmups': warmups, 'provenance': {'commit': 'frozen'}})
     assert record['schema_version'] == 1 and record['kind'] == 'http-conversation-benchmark'
     assert record['measurement_mode']['unit'] == 'whole-conversation'
-    assert record['measurement_mode']['reps'] == 2 and record['measurement_mode']['warmups'] == 1
+    assert record['measurement_mode']['reps'] == 2 and record['measurement_mode']['warmups'] == warmups
     assert record['turns'] == [{'runs': 2}] and record['prompt_cache_reused']
     assert record['provenance']['commit'] == 'frozen'
     assert record['provenance']['machine'] == 'test-machine'
     assert record['server_command'] == ['fake-server'] and len(record['server_command_sha256']) == 64
     assert len(record['processes']) == 2 and record['sampled_peak_rss_bytes'] == 33
     assert len(record['notes']) == 5 and 'Actual assistant messages' in record['notes'][1]
-    assert calls == ['start', 'prime', 'stop', 'start', 'prime', 'stop', 'stop']
+    assert calls == (['start'] + ['prime'] * warmups + ['stop']) * 2 + ['stop']
 
 
 @pytest.mark.parametrize('field', ['id', 'revision'])

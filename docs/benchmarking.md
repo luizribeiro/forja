@@ -414,8 +414,8 @@ are `tokenizer`, `tokenizer_config`, `weights` and `server`. Additional shards,
 components and configuration files should also be included. Optional
 `cache_metrics` names the metrics URL, pending gauge and completed counter.
 
-Each repetition starts a fresh server, performs at most one two-token
-initialization request, then runs the whole scripted conversation. Actual replies
+Each repetition starts a fresh server, performs `--warmups` two-token
+initialization requests (default one), then runs the whole scripted conversation. Actual replies
 are appended to subsequent histories. The original tokenizer renders and checks
 every prompt against the suite's whole-command context ceiling before HTTP;
 server prompt-token counts must agree. Per-turn records retain request history,

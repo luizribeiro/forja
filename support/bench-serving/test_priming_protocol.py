@@ -1,8 +1,10 @@
 """Exercise the bounded HTTP protocol through the complete benchmark runner."""
 import priming
+import pytest
 
 
-def test_bounded_http_keeps_measured_cases_and_restarts_cold_server(monkeypatch, tmp_path):
+@pytest.mark.parametrize("warmups", [0, 1, 3])
+def test_bounded_http_keeps_measured_cases_and_restarts_cold_server(monkeypatch, tmp_path, warmups):
     import argparse
     import time
     import serving_bench
@@ -11,7 +13,7 @@ def test_bounded_http_keeps_measured_cases_and_restarts_cold_server(monkeypatch,
             "output_tokens": 128, "concurrency": 1, "sampling": "greedy", "cold": True}
     warm = cold | {"name": "warm", "route": "chat", "cold": False, "warm_prefix_tokens": 2048}
     settings = {"model": "model", "revision": "rev", "seed": 0,
-                "connection_policy": "reuse", "warmups": 3, "repetitions": 1}
+                "connection_policy": "reuse", "warmups": warmups, "repetitions": 1}
     calls, starts = [], []
 
     class Server:
@@ -55,11 +57,13 @@ def test_bounded_http_keeps_measured_cases_and_restarts_cold_server(monkeypatch,
                               priming="bounded", implementation="forja", repository=tmp_path,
                               forja_repository=tmp_path, weights=[], resolved_config=None, metrics_url=None)
     record = serving_bench.run(args)
-    assert [case["output_tokens"] for case in calls] == [2, 128, 1, 2, 128]
+    assert [case["output_tokens"] for case in calls] == [2] * warmups + [128, 1] + [2] * warmups + [128]
     assert [result["case"] for result in record["results"]] == [cold, warm]
-    assert starts == [0, 1]
+    assert starts == ([0] + list(range(1, warmups)) + [warmups] if warmups else [0, 0])
     assert record["results"][0]["server_metrics"]["gpu_seconds"] is None
     assert record["results"][1]["server_metrics"]["gpu_seconds"] == 0.0
-    assert record["priming"]["paths"][0]["cached_tokens"] == 0
-    assert record["priming"]["paths"][0]["fresh_server_before_measurement"]
+    assert len(record["priming"]["paths"]) == 2 * warmups
+    for prime in record["priming"]["paths"][:warmups]:
+        assert prime["cached_tokens"] == 0
+        assert prime["fresh_server_before_measurement"]
     assert record["phase_timers"]["measured_seconds"] > 0

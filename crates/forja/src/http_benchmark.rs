@@ -28,8 +28,8 @@ pub(crate) struct Options {
     /// Number of independent whole workload repetitions.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     reps: u32,
-    /// Enable one two-token initialization request per fresh server.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=1))]
+    /// Number of bounded initialization rounds per fresh workload.
+    #[arg(long, default_value_t = 1)]
     warmups: u32,
     /// Retain individual requests and measurement windows.
     #[arg(long)]
@@ -139,6 +139,8 @@ mod tests {
             [
                 "bench",
                 "http",
+                "--warmups",
+                "3",
                 "--suite",
                 "suite.toml",
                 "--url",
@@ -153,7 +155,10 @@ mod tests {
             .map(str::to_owned),
         )
         .unwrap();
-        assert!(matches!(command, crate::args::Command::BenchHttp(_)));
+        let crate::args::Command::BenchHttp(options) = command else {
+            panic!("expected HTTP benchmark command");
+        };
+        assert_eq!(options.warmups, 3);
         assert!(
             crate::args::parse(
                 [

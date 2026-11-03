@@ -270,7 +270,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 if bounded and sample["error"] is not None:
                     raise ValueError("warm-prefix preparation failed")
                 timers["prefix_preparation_seconds"] += time.perf_counter() - preparation_started
-            if bounded and settings["warmups"]:
+            for initialization in range(settings["warmups"] if bounded else 0):
+                if initialization and case.get("cold"):
+                    server.start()
+                    client.reset_connection()
                 prime = priming.case(client, case)
                 primes.append(prime)
                 timers["priming_seconds"] += prime.get("seconds", 0.0)
