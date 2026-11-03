@@ -5,6 +5,7 @@ constant uint reduction_chunk_width [[function_constant(17)]];
 constant uint sample_fast_topk [[function_constant(18)]];
 constant uint sample_fast_max_chunks [[function_constant(19)]];
 constant uint sample_has_mask [[function_constant(20)]];
+constant uint rms_contiguous [[function_constant(21)]];
 
 kernel void hold(device uchar *buffer [[buffer(0)]], uint index [[thread_position_in_grid]]) {
     if (index == 0) {
@@ -75,8 +76,10 @@ void rms_norm_body(
     uint first = lane;
     uint step = looped ? group_width : params.width;
     for (uint column = first; column < params.width; column += step) {
-        float value = load_float(
-            input, physical_index(input_layout, row * params.width + column), input0_dtype);
+        uint linear = row * params.width + column;
+        ulong index = rms_contiguous ? input_layout.offset + linear
+                                     : physical_index(input_layout, linear);
+        float value = load_float(input, index, input0_dtype);
         sum += value * value;
     }
     sum = simd_sum(sum);
@@ -97,10 +100,15 @@ void rms_norm_body(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint column = lane; column < params.width; column += group_width) {
         uint linear = row * params.width + column;
-        float value = load_float(input, physical_index(input_layout, linear), input0_dtype);
-        float scale = load_float(weight, physical_index(weight_layout, column), input1_dtype);
-        store_float(output, physical_index(output_layout, linear), output_dtype,
-                    value * inverse_rms * scale);
+        ulong input_index = rms_contiguous ? input_layout.offset + linear
+                                           : physical_index(input_layout, linear);
+        ulong weight_index = rms_contiguous ? weight_layout.offset + column
+                                            : physical_index(weight_layout, column);
+        ulong output_index = rms_contiguous ? output_layout.offset + linear
+                                            : physical_index(output_layout, linear);
+        float value = load_float(input, input_index, input0_dtype);
+        float scale = load_float(weight, weight_index, input1_dtype);
+        store_float(output, output_index, output_dtype, value * inverse_rms * scale);
     }
 }
 

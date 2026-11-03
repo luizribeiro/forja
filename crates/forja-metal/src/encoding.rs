@@ -7631,6 +7631,14 @@ impl MetalBackend {
             (0, dtype_code(input.layout().dtype())),
             (1, dtype_code(weight.layout().dtype())),
             (2, dtype_code(output.layout().dtype())),
+            (
+                21,
+                u32::from(
+                    input.layout().is_contiguous()
+                        && weight.layout().is_contiguous()
+                        && output.layout().is_contiguous(),
+                ),
+            ),
         ];
         let pipeline =
             self.row_pipeline("rms_norm_single", "rms_norm_looped", width, &constants)?;
@@ -15469,6 +15477,24 @@ mod tests {
                 )
                 .unwrap();
             }
+            assert_backends_agree(
+                &reference,
+                &candidate,
+                Op::RmsNorm { eps: 1e-6 },
+                &[
+                    TensorSpec::sliced(
+                        dtype,
+                        &[8, 4097],
+                        &[
+                            Slice::new(1, 7, 1).unwrap(),
+                            Slice::new(0, 4097, 1).unwrap(),
+                        ],
+                    ),
+                    TensorSpec::contiguous(dtype, &[4097]),
+                ],
+                &TensorSpec::contiguous(dtype, &[7, 4097]),
+            )
+            .unwrap();
             assert_backends_agree(
                 &reference,
                 &candidate,
