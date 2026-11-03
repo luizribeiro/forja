@@ -13,12 +13,12 @@ tar -C "$repository" -cf - \
   support/guests support/test-guests wit \
   | tar -C "$scratch/source" -xf -
 
-cargo build --release --locked -p test-guests \
+CARGO_TARGET_DIR="$scratch/target-a" cargo build --release --locked -p test-guests \
   --manifest-path "$repository/Cargo.toml" --target-dir "$scratch/target-a"
 
 cargo_home=${CARGO_HOME:-${HOME}/.cargo}
 ln -s "$cargo_home" "$scratch/cargo-home"
-CARGO_HOME="$scratch/cargo-home" cargo build --release --locked -p test-guests \
+CARGO_HOME="$scratch/cargo-home" CARGO_TARGET_DIR="$scratch/target-b" cargo build --release --locked -p test-guests \
   --manifest-path "$scratch/source/Cargo.toml" --target-dir "$scratch/target-b"
 
 out_a=$(find "$scratch/target-a/release/build" -type d -path '*/test-guests-*/out')
