@@ -59,9 +59,9 @@ The default F16-KV WebAssembly component passes the reduced-precision end-to-end
 
 | Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
 | --- | ---: | ---: | ---: | ---: |
-| Hello | 1 | 31/32 | 0.0008287 | 0.01589 |
-| What is 2 + 2? | 8 | 32/32 | 0.0001693 | 0.01518 |
-| The capital of France is | 5 | 32/32 | 0.00008628 | 0.01190 |
+| Hello | 1 | 31/32 | 0.0007686 | 0.01589 |
+| What is 2 + 2? | 8 | 32/32 | 0.0002466 | 0.01518 |
+| The capital of France is | 5 | 32/32 | 0.0001519 | 0.01190 |
 
 Operator differentials use normwise relative error at most `1e-5` for F32 and
 `1e-2` for BF16/quantized tensors; full-model

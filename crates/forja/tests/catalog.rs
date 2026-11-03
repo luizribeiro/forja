@@ -85,7 +85,11 @@ fn metal_qwen38_decode_profiles_share_the_one_row_reduction_class() {
     let variants = catalog["variants"].as_array().unwrap();
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engines/qwen38/profiles");
-    for suffix in ["q4", "q4-f32-kv", "q4-long"] {
+    for (suffix, decode_class) in [
+        ("q4", "quant-matmul.vector8"),
+        ("q4-f32-kv", "quant-matmul.row-gemv"),
+        ("q4-long", "quant-matmul.vector8"),
+    ] {
         let path = root.join(format!(
             "qwen38-27b-4bit.metal-apple-m3-ultra.{suffix}.toml"
         ));
@@ -98,7 +102,7 @@ fn metal_qwen38_decode_profiles_share_the_one_row_reduction_class() {
                 .iter()
                 .find(|variant| variant["name"].as_str() == Some(fixed[site].as_str()))
                 .unwrap();
-            assert_eq!(variant["reduction_class"], "quant-matmul.row-gemv");
+            assert_eq!(variant["reduction_class"], decode_class);
             assert_eq!(variant["batch_invariant"], true);
         }
     }
