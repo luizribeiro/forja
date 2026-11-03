@@ -8,8 +8,7 @@ pub struct DeltaNet {
     config: Config,
     qkv: Affine,
     z: Affine,
-    a: Affine,
-    b: Affine,
+    ab: Affine,
     out: Affine,
     convolution: Tensor<bf16>,
     norm: Tensor<bf16>,
@@ -62,13 +61,8 @@ impl DeltaNet {
             config,
             qkv: Affine::load(&weights.scoped("in_proj_qkv"), config.hidden, channels)?,
             z: Affine::load(&weights.scoped("in_proj_z"), config.hidden, values)?,
-            a: Affine::load(
-                &weights.scoped("in_proj_a"),
-                config.hidden,
-                config.value_heads,
-            )?,
-            b: Affine::load(
-                &weights.scoped("in_proj_b"),
+            ab: Affine::load_pair(
+                [&weights.scoped("in_proj_a"), &weights.scoped("in_proj_b")],
                 config.hidden,
                 config.value_heads,
             )?,
@@ -220,12 +214,10 @@ impl DeltaNet {
             [value_rows, c.value_dim],
             tokens,
         )?;
-        let beta = numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(gate_shape)?;
-        let a = self
-            .a
-            .forward(input, pick)?
-            .reshape(gate_shape)?
-            .to_dtype::<f32>()?;
+        let ab = self.ab.forward(input, pick)?;
+        let a = gate_panel(&ab, 0, c.value_heads, gate_shape)?.to_dtype::<f32>()?;
+        let beta =
+            numerics::sigmoid_bf16(&gate_panel(&ab, c.value_heads, c.value_heads, gate_shape)?)?;
         Ok(DeltaProjection {
             query,
             key,
@@ -275,9 +267,18 @@ fn projected_panel(
     }
 }
 
+fn gate_panel(mixed: &Tensor<bf16>, start: u32, width: u32, shape: &[u32]) -> Result<Tensor<bf16>> {
+    let panel = mixed.narrow(1, start, width)?;
+    if shape.len() == 1 {
+        panel.reshape(&[width])
+    } else {
+        Ok(panel)
+    }
+}
+
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::projected_panel;
+    use super::{gate_panel, projected_panel};
     use forja_sdk::{NativeDevice, Tensor, bf16, set_native_device};
 
     #[test]
@@ -308,6 +309,37 @@ mod tests {
                 assert_eq!(actual.to_vec().unwrap(), changed[4..12]);
             } else {
                 assert_eq!(actual.to_vec().unwrap(), copied.to_vec().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn gate_panel_preserves_batch_one_rank() {
+        set_native_device(NativeDevice::Cpu);
+        let mixed = Tensor::from_slice(&vec![bf16::from_f64(1.0); 96], &[1, 96]).unwrap();
+        assert_eq!(gate_panel(&mixed, 48, 48, &[48]).unwrap().shape(), &[48]);
+        assert_eq!(
+            gate_panel(&mixed, 48, 48, &[1, 48]).unwrap().shape(),
+            &[1, 48]
+        );
+    }
+
+    #[test]
+    fn gate_panels_match_reference_values_across_token_counts() {
+        set_native_device(NativeDevice::Cpu);
+        for tokens in [1, 3, 33] {
+            let values = (0..tokens * 96)
+                .map(|index| bf16::from_f64(f64::from(index % 251)))
+                .collect::<Vec<_>>();
+            let mixed = Tensor::from_slice(&values, &[tokens, 96]).unwrap();
+            for start in [0, 48] {
+                let actual = gate_panel(&mixed, start, 48, &[tokens, 48]).unwrap();
+                let expected = values
+                    .chunks_exact(96)
+                    .flat_map(|row| row[start as usize..start as usize + 48].iter().copied())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.shape(), &[tokens, 48]);
+                assert_eq!(actual.to_vec().unwrap(), expected);
             }
         }
     }
