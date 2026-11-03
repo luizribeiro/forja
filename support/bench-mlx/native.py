@@ -13,6 +13,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bench_stats import stats  # noqa: E402
+from bench_priming import FRESH_WORKER_POLICY  # noqa: E402
 from native_runtime import Runtime, engine_hash  # noqa: E402
 
 
@@ -87,7 +88,7 @@ def measure(runtime, args, identity, source):
     if args.worker:
         record['worker']={'protocol':3,'pid':os.getpid(),'runner_loads':1,'instance_loads':{'single':1},
             'cache_state':'fresh-request','configured_priming_passes':args.warmups,
-            'priming_policy':'once-per-worker-shape; at most two decode steps','cache_builds':runtime.cache_builds,
+            'priming_policy':FRESH_WORKER_POLICY,'cache_builds':runtime.cache_builds,
             'phase_timers':phases}
     return record
 

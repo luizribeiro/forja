@@ -8,6 +8,7 @@ import time
 import tomllib
 from bench_cache import digest
 from bench_cache_run import metric, value_at
+from bench_priming import FRESH_WORKER_POLICY
 
 def save(path: Path, value):
     temporary = path.with_suffix(".tmp")
@@ -136,7 +137,7 @@ def verify_fresh_worker(worker, warmups):
     timers = worker.get("phase_timers")
     if (worker.get("cache_state") != "fresh-request"
             or worker.get("configured_priming_passes") != warmups
-            or worker.get("priming_policy") != "once-per-worker-shape; at most two decode steps"
+            or worker.get("priming_policy") != FRESH_WORKER_POLICY
             or not isinstance(timers, dict) or not timers
             or any(not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
                    for value in timers.values())):
