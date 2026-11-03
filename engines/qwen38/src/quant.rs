@@ -35,7 +35,9 @@ impl Affine {
                 let [rows, width]: [u32; 2] = input.shape().try_into().map_err(|_| {
                     forja_sdk::Error::loading("projection requires row-major input")
                 })?;
-                if pick.name() == "quant-matmul.tiled" && (1..TILED_MIN_ROWS).contains(&rows) {
+                if matches!(pick.name(), "quant-matmul.tiled" | "quant-matmul.tiled-k64")
+                    && (1..TILED_MIN_ROWS).contains(&rows)
+                {
                     let padded = Tensor::zeros(&[TILED_MIN_ROWS, width])?;
                     input.copy_into(&mut padded.narrow(0, 0, rows)?)?;
                     padded

@@ -96,7 +96,12 @@ fn metal_qwen38_decode_profiles_share_the_one_row_reduction_class() {
         let profile: forja_config::Profile =
             toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let fixed = &profile.variants().fixed;
-        assert_eq!(fixed["quant"], "quant-matmul.tiled");
+        let prefill_variant = if suffix == "q4-f32-kv" {
+            "quant-matmul.tiled"
+        } else {
+            "quant-matmul.tiled-k64"
+        };
+        assert_eq!(fixed["quant"], prefill_variant);
         for site in ["quant-decode", "quant-decode-batch"] {
             let variant = variants
                 .iter()
