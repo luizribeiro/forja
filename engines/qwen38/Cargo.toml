@@ -21,6 +21,9 @@ metal-variants = ["forja-sdk/metal-variants"]
 [dependencies]
 forja-sdk = { path = "../../crates/forja-sdk" }
 
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+forja-sdk = { path = "../../crates/forja-sdk", features = ["native"] }
+
 [lints.rust]
 missing_docs = "warn"
 

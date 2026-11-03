@@ -206,23 +206,20 @@ impl DeltaNet {
         let key_rows = rows(tokens, c.key_heads)?;
         let value_rows = rows(tokens, c.value_heads)?;
         let keys = c.key_heads * c.key_dim;
-        let query = mixed
-            .narrow(1, 0, keys)?
-            .contiguous()?
-            .reshape(&[key_rows, c.key_dim])?
-            .to_dtype::<f32>()?;
-        let key = mixed
-            .narrow(1, keys, keys)?
-            .contiguous()?
-            .reshape(&[key_rows, c.key_dim])?
-            .to_dtype::<f32>()?;
+        let query =
+            projected_panel(mixed, 0, keys, [key_rows, c.key_dim], tokens)?.to_dtype::<f32>()?;
+        let key =
+            projected_panel(mixed, keys, keys, [key_rows, c.key_dim], tokens)?.to_dtype::<f32>()?;
         let scale = numerics::inverse_sqrt_width(c.key_dim)?;
         let query = numerics::l2(&query, scale)?;
         let key = numerics::l2(&key, 1.0)?;
-        let value = mixed
-            .narrow(1, 2 * keys, c.value_heads * c.value_dim)?
-            .contiguous()?
-            .reshape(&[value_rows, c.value_dim])?;
+        let value = projected_panel(
+            mixed,
+            2 * keys,
+            c.value_heads * c.value_dim,
+            [value_rows, c.value_dim],
+            tokens,
+        )?;
         let beta = numerics::sigmoid_bf16(&self.b.forward(input, pick)?)?.reshape(gate_shape)?;
         let a = self
             .a
@@ -261,4 +258,57 @@ fn rows(tokens: u32, heads: u32) -> Result<u32> {
         .checked_mul(u64::from(heads))
         .and_then(|count| u32::try_from(count).ok())
         .ok_or_else(|| forja_sdk::Error::loading("delta panel row count overflow"))
+}
+
+fn projected_panel(
+    mixed: &Tensor<bf16>,
+    start: u32,
+    width: u32,
+    shape: [u32; 2],
+    tokens: u32,
+) -> Result<Tensor<bf16>> {
+    let panel = mixed.narrow(1, start, width)?;
+    if tokens == 1 {
+        panel.reshape(&shape)
+    } else {
+        panel.contiguous()?.reshape(&shape)
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::projected_panel;
+    use forja_sdk::{NativeDevice, Tensor, bf16, set_native_device};
+
+    #[test]
+    fn projected_panel_uses_a_single_row_view_and_copies_multirow_panels() {
+        set_native_device(NativeDevice::Cpu);
+        for tokens in [1, 3] {
+            let values = (0..tokens * 12)
+                .map(|index| bf16::from_f64(f64::from(index)))
+                .collect::<Vec<_>>();
+            let mixed = Tensor::from_slice(&values, &[tokens, 12]).unwrap();
+            let shape = [tokens * 2, 4];
+            let actual = projected_panel(&mixed, 4, 8, shape, tokens).unwrap();
+            let copied = mixed
+                .narrow(1, 4, 8)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+                .reshape(&shape)
+                .unwrap();
+            assert_eq!(actual.shape(), shape);
+            assert_eq!(actual.to_vec().unwrap(), copied.to_vec().unwrap());
+
+            let changed = (0..tokens * 12)
+                .map(|index| bf16::from_f64(f64::from(index + 100)))
+                .collect::<Vec<_>>();
+            mixed.write(&changed).unwrap();
+            if tokens == 1 {
+                assert_eq!(actual.to_vec().unwrap(), changed[4..12]);
+            } else {
+                assert_eq!(actual.to_vec().unwrap(), copied.to_vec().unwrap());
+            }
+        }
+    }
 }
