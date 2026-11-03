@@ -44,11 +44,12 @@ impl Model {
         let mut sites = vec![
             "quant",
             "quant-decode",
-            "quant-decode-batch",
             "attention",
             "sample",
             "delta-prefill",
         ];
+        #[cfg(target_family = "wasm")]
+        sites.push("quant-decode-batch");
         if pool.is_some() {
             sites.extend(["paged-attention.prefill", "paged-attention.decode"]);
         }

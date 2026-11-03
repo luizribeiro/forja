@@ -5,7 +5,6 @@ pub(super) fn tiny_load() -> forja_sdk::EngineLoadConfig {
     load.fixed_variant_picks = [
         ("quant", "quant-matmul.portable"),
         ("quant-decode", "quant-matmul.portable"),
-        ("quant-decode-batch", "quant-matmul.portable"),
         ("attention", "sdpa.decomposed"),
         ("sample", "sample.parallel"),
         ("delta-prefill", "delta-rule-block.wy64-fixed"),
