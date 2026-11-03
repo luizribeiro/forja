@@ -18,6 +18,9 @@ pub struct Model {
     norm: Tensor<bf16>,
     layers: Vec<DecoderLayer>,
     quant: Option<Variant>,
+    quant_decode: Option<Variant>,
+    #[cfg(target_family = "wasm")]
+    quant_decode_batch: Option<Variant>,
     attention: Option<Variant>,
     delta: Option<Variant>,
     pub(crate) sample: Option<Variant>,
@@ -38,7 +41,14 @@ impl Model {
         pool: Option<forja_sdk::PagedPool<'_>>,
     ) -> Result<Self> {
         let (config, context) = load_config(load, config)?;
-        let mut sites = vec!["quant", "attention", "sample", "delta-prefill"];
+        let mut sites = vec![
+            "quant",
+            "quant-decode",
+            "quant-decode-batch",
+            "attention",
+            "sample",
+            "delta-prefill",
+        ];
         if pool.is_some() {
             sites.extend(["paged-attention.prefill", "paged-attention.decode"]);
         }
@@ -80,6 +90,15 @@ impl Model {
             quant: picks
                 .as_ref()
                 .map(|picks| picks.at("quant", 0))
+                .transpose()?,
+            quant_decode: picks
+                .as_ref()
+                .map(|picks| picks.at("quant-decode", 0))
+                .transpose()?,
+            #[cfg(target_family = "wasm")]
+            quant_decode_batch: picks
+                .as_ref()
+                .map(|picks| picks.at("quant-decode-batch", 0))
                 .transpose()?,
             attention: picks
                 .as_ref()
@@ -169,6 +188,11 @@ impl Model {
             Vec::new()
         };
         let mut last = None;
+        let quant = if prefill {
+            self.quant.as_ref()
+        } else {
+            self.quant_decode.as_ref()
+        };
         let block = if prefill {
             crate::PREFILL_BLOCK_TOKENS
         } else {
@@ -185,17 +209,12 @@ impl Model {
                     layer.prefill(
                         &hidden,
                         start + row,
-                        self.quant.as_ref(),
+                        quant,
                         self.attention.as_ref(),
                         self.delta.as_ref(),
                     )?
                 } else {
-                    layer.forward(
-                        &hidden,
-                        start + row,
-                        self.quant.as_ref(),
-                        self.attention.as_ref(),
-                    )?
+                    layer.forward(&hidden, start + row, quant, self.attention.as_ref())?
                 };
                 if taps && index + 1 < layers {
                     hidden.copy_into(&mut captured[index].narrow(0, row, rows)?)?;
@@ -212,7 +231,7 @@ impl Model {
         Ok(StepOutput {
             logits: self
                 .output
-                .forward(&hidden, self.quant.as_ref())?
+                .forward(&hidden, quant)?
                 .to_dtype::<f32>()?
                 .reshape(&[self.config.vocab])?,
             taps: captured

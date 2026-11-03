@@ -29,22 +29,19 @@ impl Model {
                 .copy_into(&mut positions.narrow(0, row, 1)?)?;
         }
         let lanes = (0..batch).collect::<Vec<_>>();
+        let quant = if batch == 1 {
+            self.quant_decode.as_ref()
+        } else {
+            self.quant_decode_batch.as_ref()
+        };
         forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.embedding.embed(tokens)?;
         for layer in &mut self.layers {
-            hidden = layer.decode_rows(
-                &hidden,
-                &positions,
-                starts,
-                &lanes,
-                self.quant.as_ref(),
-                &paged.decode,
-            )?;
+            hidden =
+                layer.decode_rows(&hidden, &positions, starts, &lanes, quant, &paged.decode)?;
         }
         forja_sdk::profile_scope("output", "global", None)?;
         hidden = hidden.rms_norm(&self.norm, 1.0e-6)?;
-        self.output
-            .forward(&hidden, self.quant.as_ref())?
-            .to_dtype::<f32>()
+        self.output.forward(&hidden, quant)?.to_dtype::<f32>()
     }
 }

@@ -97,6 +97,11 @@ impl Model {
         } else {
             &paged.decode
         };
+        let quant = if prefill {
+            self.quant.as_ref()
+        } else {
+            self.quant_decode.as_ref()
+        };
         let mut captured = Vec::new();
         forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.embedding.embed(tokens)?;
@@ -107,7 +112,7 @@ impl Model {
                 lane,
                 start,
                 phase,
-                [self.quant.as_ref(), Some(attention), self.delta.as_ref()],
+                [quant, Some(attention), self.delta.as_ref()],
             )?;
             if taps && index + 1 < layers {
                 captured.push(hidden.to_dtype::<f32>()?);
@@ -121,7 +126,7 @@ impl Model {
         Ok(StepOutput {
             logits: self
                 .output
-                .forward(&hidden.narrow(0, rows - 1, 1)?, self.quant.as_ref())?
+                .forward(&hidden.narrow(0, rows - 1, 1)?, quant)?
                 .to_dtype::<f32>()?
                 .reshape(&[self.config.vocab])?,
             taps: captured,

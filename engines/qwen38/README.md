@@ -55,13 +55,8 @@ chat with string content. Tools, images and videos are unsupported.
 
 Independent Transformers 5.17.0 CPU fixtures use the same dequantized q4 bytes,
 BF16 projection outputs, every layer tap and 32 teacher-forced token choices.
-The default F16-KV WebAssembly component passes the reduced-precision end-to-end criteria:
-
-| Prompt | Prompt tokens | Matching choices | Mean KL | Maximum layer relative error |
-| --- | ---: | ---: | ---: | ---: |
-| Hello | 1 | 31/32 | 0.0008287 | 0.01589 |
-| What is 2 + 2? | 8 | 32/32 | 0.0001693 | 0.01518 |
-| The capital of France is | 5 | 32/32 | 0.00008628 | 0.01190 |
+The default F16-KV WebAssembly component passes the reduced-precision end-to-end
+criteria on three prompts: “Hello”, “What is 2 + 2?” and “The capital of France is”.
 
 Operator differentials use normwise relative error at most `1e-5` for F32 and
 `1e-2` for BF16/quantized tensors; full-model
@@ -69,8 +64,7 @@ checks require mean KL at most `1e-2`, top-1 agreement at least 95% for each pro
 and per-layer error at most `5e-2`. These are correctness results. No performance is claimed.
 
 The diagnostic F32-KV profile retains q4 weights and BF16 activations. It passes
-the same three per-prompt gates (31/32, 32/32, 32/32 choices); the arithmetic
-fixture also passes with replay enabled.
+the same per-prompt gates; the arithmetic fixture also passes with replay enabled.
 
 Long-position operator checks cover 0/63/64, 32K, 128K and 262,143 with integer
 RoPE positions, F32/F16 KV and full-width attention. They use independent
@@ -93,8 +87,9 @@ uv run --no-project --python 3.12 --with-requirements support/golden/qwen38-requ
 
 ## Porting notes
 
-Quantized projections use one tiled reduction class. Inputs shorter than 16 rows
-are zero-padded and cropped so every decode bucket uses the same row reduction.
+Prompt projections use the tiled reduction class; inputs shorter than 16 rows
+are zero-padded and cropped. Decode projections use the row-GEMV reduction
+class in every serving bucket, with independent rows for batches of 2, 4 and 8.
 
 Decay uses GPU float32 `exp_rounded`/`ln_1p` with a softplus threshold of 20,
 matching the reference operation order without scalar readbacks. The block

@@ -78,3 +78,28 @@ fn metal_qwen3_coder_reduction_classes_match_the_registry() {
         qwen3_coder_reduction_classes::SERVING_REDUCTION_CLASSES.len()
     );
 }
+
+#[test]
+fn metal_qwen38_decode_profiles_share_the_one_row_reduction_class() {
+    let catalog: serde_json::Value = serde_json::from_str(&catalog(&["--json"])).unwrap();
+    let variants = catalog["variants"].as_array().unwrap();
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engines/qwen38/profiles");
+    for suffix in ["q4", "q4-f32-kv", "q4-long"] {
+        let path = root.join(format!(
+            "qwen38-27b-4bit.metal-apple-m3-ultra.{suffix}.toml"
+        ));
+        let profile: forja_config::Profile =
+            toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let fixed = &profile.variants().fixed;
+        assert_eq!(fixed["quant"], "quant-matmul.tiled");
+        for site in ["quant-decode", "quant-decode-batch"] {
+            let variant = variants
+                .iter()
+                .find(|variant| variant["name"].as_str() == Some(fixed[site].as_str()))
+                .unwrap();
+            assert_eq!(variant["reduction_class"], "quant-matmul.row-gemv");
+            assert_eq!(variant["batch_invariant"], true);
+        }
+    }
+}
