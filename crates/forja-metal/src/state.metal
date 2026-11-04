@@ -27,25 +27,19 @@ bool authenticate_state(
     return valid;
 }
 
-kernel void state_delta_rule(
-    device const uchar *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
-    device const uchar *value [[buffer(2)]], device const uchar *decay [[buffer(3)]],
-    device const uchar *beta [[buffer(4)]], device const float *previous [[buffer(5)]],
-    device const uint2 *table [[buffer(6)]], device const uint *generations [[buffer(7)]],
-    device const uint *activity [[buffer(8)]], device uchar *output [[buffer(9)]],
-    device float *next [[buffer(10)]], constant TensorLayout *layouts [[buffer(11)]],
-    constant StateParams &params [[buffer(12)]], device atomic_uint *error_flag [[buffer(13)]],
-    uint3 group [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
+void state_delta_rule_compute(
+    device const uchar *query, device const uchar *key,
+    device const uchar *value, device const uchar *decay,
+    device const uchar *beta, device const float *previous,
+    device const uint2 *table, device const uint *generations,
+    device const uint *activity, device uchar *output,
+    device float *next, constant TensorLayout *layouts,
+    constant StateParams &params, device atomic_uint *error_flag,
+    uint3 group, uint simd_group,
+    uint lane) {
     uint head = group.y;
     uint column = group.x * 4 + simd_group;
-    if (column >= params.values) { return; }
     uint out_index = head * params.values + column;
-    if (activity[0] == 0) {
-        if (lane == 0) { store_float(output, physical_index(layouts[6],out_index),output_dtype,0.0f); }
-        return;
-    }
-    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
     uint q_head = head / (params.heads / params.q_heads);
     uint per_thread = (params.keys + 31) / 32;
     float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
@@ -77,6 +71,31 @@ kernel void state_delta_rule(
     if (lane == 0) { store_float(output,physical_index(layouts[6],out_index),output_dtype,result); }
 }
 
+kernel void state_delta_rule(
+    device const uchar *query [[buffer(0)]], device const uchar *key [[buffer(1)]],
+    device const uchar *value [[buffer(2)]], device const uchar *decay [[buffer(3)]],
+    device const uchar *beta [[buffer(4)]], device const float *previous [[buffer(5)]],
+    device const uint2 *table [[buffer(6)]], device const uint *generations [[buffer(7)]],
+    device const uint *activity [[buffer(8)]], device uchar *output [[buffer(9)]],
+    device float *next [[buffer(10)]], constant TensorLayout *layouts [[buffer(11)]],
+    constant StateParams &params [[buffer(12)]], device atomic_uint *error_flag [[buffer(13)]],
+    uint3 group [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    uint head = group.y;
+    uint column = group.x * 4 + simd_group;
+    if (column >= params.values) { return; }
+    uint out_index = head * params.values + column;
+    if (activity[0] == 0) {
+        if (lane == 0) { store_float(output, physical_index(layouts[6],out_index),output_dtype,0.0f); }
+        return;
+    }
+    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
+    state_delta_rule_compute(query, key, value, decay, beta, previous, table, generations,
+        activity, output, next, layouts, params, error_flag, group, simd_group, lane);
+}
+
+
+
 struct ConvStateParams {
     StateAuth access;
     uint tokens;
@@ -94,21 +113,15 @@ float causal_state_value(device const uchar *input, device const uchar *history,
     return load_float(input,physical_index(layouts[0],uint((row-history_rows)*params.channels+channel)),input0_dtype);
 }
 
-kernel void state_causal_conv(
-    device const uchar *input [[buffer(0)]], device const uchar *weight [[buffer(1)]],
-    device const uchar *history [[buffer(2)]], device const uint2 *table [[buffer(3)]],
-    device const uint *generations [[buffer(4)]], device const uint *activity [[buffer(5)]],
-    device uchar *output [[buffer(6)]], device uchar *next [[buffer(7)]],
-    constant TensorLayout *layouts [[buffer(8)]], constant ConvStateParams &params [[buffer(9)]],
-    device atomic_uint *error_flag [[buffer(10)]], uint index [[thread_position_in_grid]]) {
+void state_causal_conv_compute(
+    device const uchar *input, device const uchar *weight,
+    device const uchar *history, device const uint2 *table,
+    device const uint *generations, device const uint *activity,
+    device uchar *output, device uchar *next,
+    constant TensorLayout *layouts, constant ConvStateParams &params,
+    device atomic_uint *error_flag, uint index) {
     uint outputs = layouts[3].element_count;
     uint states = layouts[4].element_count;
-    if (index >= max(outputs,states)) { return; }
-    if (activity[0] == 0) {
-        if (index < outputs) { store_float(output,physical_index(layouts[3],index),output_dtype,0.0f); }
-        return;
-    }
-    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
     uint channel = index % params.channels;
     if (index < outputs) {
         ulong row = index / params.channels;
@@ -124,4 +137,23 @@ kernel void state_causal_conv(
         store_float(next,physical_index(layouts[4],index),input0_dtype,
             causal_state_value(input,history,layouts,row,channel,params));
     }
+}
+
+kernel void state_causal_conv(
+    device const uchar *input [[buffer(0)]], device const uchar *weight [[buffer(1)]],
+    device const uchar *history [[buffer(2)]], device const uint2 *table [[buffer(3)]],
+    device const uint *generations [[buffer(4)]], device const uint *activity [[buffer(5)]],
+    device uchar *output [[buffer(6)]], device uchar *next [[buffer(7)]],
+    constant TensorLayout *layouts [[buffer(8)]], constant ConvStateParams &params [[buffer(9)]],
+    device atomic_uint *error_flag [[buffer(10)]], uint index [[thread_position_in_grid]]) {
+    uint outputs = layouts[3].element_count;
+    uint states = layouts[4].element_count;
+    if (index >= max(outputs,states)) { return; }
+    if (activity[0] == 0) {
+        if (index < outputs) { store_float(output,physical_index(layouts[3],index),output_dtype,0.0f); }
+        return;
+    }
+    if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
+    state_causal_conv_compute(input, weight, history, table, generations, activity, output,
+        next, layouts, params, error_flag, index);
 }
