@@ -3,6 +3,8 @@ mod prefix;
 #[cfg(target_os = "macos")]
 mod profile_batch;
 #[cfg(target_os = "macos")]
+mod profile_prefix;
+#[cfg(target_os = "macos")]
 mod resident;
 #[cfg(target_os = "macos")]
 mod timing;
@@ -290,15 +292,7 @@ async fn measure_serving_prefill_profile(
     let prefix = if options.prefix_context == 0 {
         None
     } else {
-        Some(
-            prepare_serving_profile_prefix(
-                runner,
-                &tokens[..options.prefix_context],
-                shape,
-                reserved,
-            )
-            .await?,
-        )
+        Some(profile_prefix::Prefix::prepare(runner, tokens, options, shape, reserved).await?)
     };
     for _ in 0..options.warmups {
         measure_serving_profile_phase(
@@ -344,37 +338,9 @@ async fn measure_serving_prefill_profile(
 }
 
 #[cfg(target_os = "macos")]
-async fn prepare_serving_profile_prefix(
-    runner: &mut EngineRunner<forja_metal::MetalBackend>,
-    tokens: &[u32],
-    shape: BatchShape,
-    reserved: u64,
-) -> Result<PagedPrefix, Box<dyn Error>> {
-    runner.prepare_paged_lane(0, None, 0)?;
-    runner.prepare_paged_lane(0, None, reserved)?;
-    let step_tokens = usize::try_from(shape.tokens)?;
-    for (index, chunk) in tokens.chunks(step_tokens).enumerate() {
-        run_serving_profile_step(
-            runner,
-            shape,
-            chunk,
-            index
-                .checked_mul(step_tokens)
-                .ok_or("prefix offset overflowed")?,
-        )
-        .await?;
-    }
-    let prefix = runner
-        .paged_prefix()?
-        .ok_or("serving prefill did not produce a paged prefix")?;
-    runner.prepare_paged_lane(0, None, 0)?;
-    Ok(prefix)
-}
-
-#[cfg(target_os = "macos")]
 async fn measure_serving_profile_phase(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
-    prefix: Option<&PagedPrefix>,
+    prefix: Option<&profile_prefix::Prefix>,
     tokens: &[u32],
     options: &Profile,
     shape: BatchShape,
@@ -384,10 +350,11 @@ async fn measure_serving_profile_phase(
     runner.prepare_paged_lane(0, None, 0)?;
     let setup_started = Instant::now();
     let prefix_tokens = u64::try_from(options.prefix_context)?;
-    let fork = prefix
-        .map(|prefix| prefix.fork_reserved(prefix_tokens, reserved))
-        .transpose()?;
-    runner.prepare_paged_lane(0, fork, reserved)?;
+    if let Some(prefix) = prefix {
+        prefix.restore(runner, prefix_tokens, reserved)?;
+    } else {
+        runner.prepare_paged_lane(0, None, reserved)?;
+    }
     let cache_setup = setup_started.elapsed();
     let before = runner.metrics();
     let started = Instant::now();
