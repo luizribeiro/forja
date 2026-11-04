@@ -6,7 +6,9 @@ macro_rules! shared_rows {
         fn $name() {
             let backend = MetalBackend::new().unwrap();
             for (inner, columns) in [(5120, 17408), (17408, 5120), (4096, 4097)] {
-                assert_shared_rows(&backend, DType::$dtype, $bits, inner, columns);
+                for parameters in [DType::F16, DType::BF16] {
+                    assert_shared_rows(&backend, DType::$dtype, $bits, inner, columns, parameters);
+                }
             }
         }
     };
@@ -18,13 +20,20 @@ shared_rows!(shared_q8_f16_preserves_single_row_bits, F16, 8);
 shared_rows!(shared_q4_bf16_preserves_single_row_bits, BF16, 4);
 shared_rows!(shared_q8_bf16_preserves_single_row_bits, BF16, 8);
 
-fn assert_shared_rows(backend: &MetalBackend, dtype: DType, bits: u8, inner: u32, columns: u32) {
+fn assert_shared_rows(
+    backend: &MetalBackend,
+    dtype: DType,
+    bits: u8,
+    inner: u32,
+    columns: u32,
+    parameters: DType,
+) {
     for rows in [1, 2, 4, 7, 8] {
         let mut specs = [
             TensorSpec::contiguous(dtype, &[rows, inner]),
             TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
-            TensorSpec::contiguous(DType::BF16, &[columns, inner / 64]),
-            TensorSpec::contiguous(DType::BF16, &[columns, inner / 64]),
+            TensorSpec::contiguous(parameters, &[columns, inner / 64]),
+            TensorSpec::contiguous(parameters, &[columns, inner / 64]),
         ];
         if rows == 7 {
             for spec in &mut specs {
