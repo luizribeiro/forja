@@ -14,6 +14,11 @@ pub(super) struct Recompute {
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
+    pub(in crate::engine) fn canonical_recompute_running(&self) -> bool {
+        self.canonical_cache
+            .as_ref()
+            .is_some_and(|cache| cache.recompute.is_some())
+    }
     pub(in crate::engine) async fn advance_canonical_recompute(&mut self) -> bool {
         let job = self.canonical_cache.as_mut().and_then(|cache| {
             cache

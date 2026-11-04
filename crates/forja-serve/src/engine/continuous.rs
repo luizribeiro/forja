@@ -23,6 +23,27 @@ mod prefill;
 // Allow response delivery and follow-up admission before an indivisible background block.
 const BACKGROUND_QUIET_PERIOD: Duration = Duration::from_millis(10);
 
+enum IdleWake {
+    Command(Box<ServiceCommand>),
+    Recompute,
+    Closed,
+}
+
+async fn idle_work(
+    receiver: &mut mpsc::Receiver<ServiceCommand>,
+    running: bool,
+    pending: bool,
+) -> IdleWake {
+    if running {
+        return IdleWake::Recompute;
+    }
+    tokio::select! {
+        biased;
+        command = receiver.recv() => command.map_or(IdleWake::Closed, |command| IdleWake::Command(Box::new(command))),
+        () = tokio::time::sleep(BACKGROUND_QUIET_PERIOD), if pending => IdleWake::Recompute,
+    }
+}
+
 enum CompletionSink {
     Complete(oneshot::Sender<Result<Completion, GenerationError>>),
     Stream {
@@ -431,13 +452,18 @@ where
                     Ok(command) => pending.push_back(RequestEnvelope::from_command(command)),
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        tokio::select! {
-                            biased;
-                            command = receiver.recv() => {
-                                let Some(command) = command else { return; };
-                                pending.push_back(RequestEnvelope::from_command(command));
+                        match idle_work(
+                            &mut receiver,
+                            self.canonical_recompute_running(),
+                            self.metrics.recompute_pending,
+                        )
+                        .await
+                        {
+                            IdleWake::Command(command) => {
+                                pending.push_back(RequestEnvelope::from_command(*command));
                             }
-                            () = tokio::time::sleep(BACKGROUND_QUIET_PERIOD), if self.metrics.recompute_pending => {
+                            IdleWake::Closed => return,
+                            IdleWake::Recompute => {
                                 self.advance_canonical_recompute().await;
                                 self.refresh_shared_metrics(&shared_metrics);
                                 tokio::task::yield_now().await;

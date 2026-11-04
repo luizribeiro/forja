@@ -20,6 +20,35 @@ async fn finish_recompute(engine: &mut Engine) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn multi_block_recompute_pays_one_quiet_window() -> Result<(), TestError> {
+    use crate::engine::continuous::{BACKGROUND_QUIET_PERIOD, IdleWake, idle_work};
+    let mut engine = configured().await?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.queue_canonical_recompute(
+        &PrefixLedger::new(vec![0; 65]),
+        65,
+        &[0; 127],
+        &control,
+        true,
+    );
+    let (_sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let before = tokio::time::Instant::now();
+    while engine.metrics.recompute_pending {
+        assert!(matches!(
+            idle_work(&mut receiver, engine.canonical_recompute_running(), true).await,
+            IdleWake::Recompute
+        ));
+        engine.advance_canonical_recompute().await;
+    }
+    assert_eq!(
+        tokio::time::Instant::now() - before,
+        BACKGROUND_QUIET_PERIOD
+    );
+    assert_eq!(engine.metrics.recompute_blocks, 3);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn follow_up_during_idle_grace_preempts_before_background_work() -> Result<(), TestError> {
     use crate::{ServingMetrics, http::ServiceCommand};
     use std::sync::{Arc, Mutex};
