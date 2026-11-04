@@ -1578,6 +1578,18 @@ fn element_offsets(layout: &Layout) -> impl Iterator<Item = u64> + '_ {
 }
 
 fn gather(source: &[u8], layout: &Layout) -> Result<Vec<u8>, BackendError> {
+    if layout.element_count() == 0 {
+        return Ok(Vec::new());
+    }
+    if layout.is_contiguous() {
+        let span = layout.byte_span();
+        let start = usize::try_from(span.start).map_err(|_| BackendError::InvalidInput)?;
+        let end = usize::try_from(span.end).map_err(|_| BackendError::InvalidInput)?;
+        return source
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or(BackendError::InvalidInput);
+    }
     let width =
         usize::try_from(layout.dtype().byte_size()).map_err(|_| BackendError::InvalidInput)?;
     let mut result = Vec::with_capacity(logical_byte_len(layout)?);
@@ -2058,3 +2070,50 @@ pub(crate) fn refused_read_canary_bytes(backend: &MetalBackend, tensor: &Tensor)
 #[cfg(test)]
 #[path = "../tests/gather_quant_matmul.rs"]
 mod gather_quant_tests;
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_reads_preserve_raw_bits_offsets_and_bounds() {
+        for dtype in [DType::F32, DType::F16, DType::BF16, DType::U32, DType::I32] {
+            for shape in [vec![1], vec![7, 33], vec![4097], vec![48, 128, 128]] {
+                for offset in [0_u64, 7] {
+                    let count = shape.iter().map(|&n| u64::from(n)).product::<u64>();
+                    let start = usize::try_from(offset * dtype.byte_size()).unwrap();
+                    let end = start + usize::try_from(count * dtype.byte_size()).unwrap();
+                    let source = (0..=u8::MAX).cycle().take(end + 16).collect::<Vec<_>>();
+                    let layout = Layout::contiguous(
+                        dtype,
+                        offset,
+                        shape.clone(),
+                        u64::try_from(source.len()).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(gather(&source, &layout).unwrap(), source[start..end]);
+                    assert_eq!(
+                        gather(&source[..end - 1], &layout),
+                        Err(BackendError::InvalidInput)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn readback_keeps_strided_and_empty_view_semantics() {
+        let source = (0..64).collect::<Vec<u8>>();
+        let layout = Layout::new(DType::F32, 1, vec![7], vec![2], 64).unwrap();
+        let expected = (0..7)
+            .flat_map(|i| source[(1 + i * 2) * 4..(2 + i * 2) * 4].to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(gather(&source, &layout).unwrap(), expected);
+        assert_eq!(
+            gather(&source[..55], &layout),
+            Err(BackendError::InvalidInput)
+        );
+        let empty = Layout::contiguous(DType::BF16, 7, vec![0], 14).unwrap();
+        assert_eq!(gather(&[], &empty).unwrap(), [] as [u8; 0]);
+    }
+}
