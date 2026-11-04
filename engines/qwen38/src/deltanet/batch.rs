@@ -20,6 +20,11 @@ impl DeltaNet {
         {
             return Err(Error::loading("invalid recurrent lane rows"));
         }
+        let state_picks = if batch > 1 {
+            self.state_picks.each_ref().map(Option::as_ref)
+        } else {
+            [None, None]
+        };
         let projected = self.qkv.forward(input, pick)?;
         let convolved = Tensor::zeros(projected.shape())?;
         for (row, &lane) in lanes.iter().enumerate() {
@@ -29,7 +34,7 @@ impl DeltaNet {
                 &projected.narrow(0, row, 1)?,
                 &self.convolution,
                 &mut convolved.narrow(0, row, 1)?,
-                self.state_picks[1].as_ref(),
+                state_picks[1],
             )?;
         }
         let mixed = numerics::silu_bf16(&convolved)?;
@@ -59,7 +64,7 @@ impl DeltaNet {
                 &decay.narrow(0, row, 1)?.reshape(&[c.value_heads])?,
                 &beta.narrow(0, row, 1)?.reshape(&[c.value_heads])?,
                 &mut head_rows(&y, row, c.value_heads)?,
-                self.state_picks[0].as_ref(),
+                state_picks[0],
             )?;
         }
         self.finish_rows(&y, input, pick)
