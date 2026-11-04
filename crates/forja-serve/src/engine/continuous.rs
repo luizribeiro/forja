@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex as StdMutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use forja_core::Backend;
@@ -19,6 +19,9 @@ use crate::{
 mod batch;
 mod lane;
 mod prefill;
+
+// Allow response delivery and follow-up admission before an indivisible background block.
+const BACKGROUND_QUIET_PERIOD: Duration = Duration::from_millis(10);
 
 enum CompletionSink {
     Complete(oneshot::Sender<Result<Completion, GenerationError>>),
@@ -428,15 +431,19 @@ where
                     Ok(command) => pending.push_back(RequestEnvelope::from_command(command)),
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        if self.advance_canonical_recompute().await {
-                            self.refresh_shared_metrics(&shared_metrics);
-                            tokio::task::yield_now().await;
-                            continue;
+                        tokio::select! {
+                            biased;
+                            command = receiver.recv() => {
+                                let Some(command) = command else { return; };
+                                pending.push_back(RequestEnvelope::from_command(command));
+                            }
+                            () = tokio::time::sleep(BACKGROUND_QUIET_PERIOD), if self.metrics.recompute_pending => {
+                                self.advance_canonical_recompute().await;
+                                self.refresh_shared_metrics(&shared_metrics);
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
                         }
-                        let Some(command) = receiver.recv().await else {
-                            return;
-                        };
-                        pending.push_back(RequestEnvelope::from_command(command));
                     }
                 }
             }

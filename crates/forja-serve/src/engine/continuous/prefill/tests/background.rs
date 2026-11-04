@@ -19,6 +19,37 @@ async fn finish_recompute(engine: &mut Engine) {
     assert!(!engine.metrics.recompute_pending);
 }
 
+#[tokio::test(start_paused = true)]
+async fn follow_up_during_idle_grace_preempts_before_background_work() -> Result<(), TestError> {
+    use crate::{ServingMetrics, http::ServiceCommand};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, oneshot};
+    let mut engine = configured().await?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    engine.queue_canonical_recompute(
+        &PrefixLedger::new(vec![0; 65]),
+        65,
+        &[0; 127],
+        &control,
+        true,
+    );
+    let metrics = Arc::new(Mutex::new(ServingMetrics::default()));
+    let (sender, receiver) = mpsc::channel(8);
+    let worker = tokio::spawn(engine.run_continuous(receiver, metrics.clone()));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(5)).await;
+    let (reply, quiesced) = oneshot::channel();
+    sender.send(ServiceCommand::Quiesce { reply }).await?;
+    quiesced.await??;
+    let observed = metrics.lock().unwrap().clone();
+    assert_eq!(observed.recompute_blocks, 0);
+    assert_eq!(observed.recompute_preempted, 1);
+    assert!(!observed.recompute_pending);
+    drop(sender);
+    worker.await?;
+    Ok(())
+}
+
 async fn evaluate(
     engine: &mut Engine,
     tokens: Vec<u32>,

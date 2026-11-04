@@ -22,6 +22,7 @@ tracing.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 forja-cpu = { path = "../forja-cpu" }
 test-guests = { path = "../../support/test-guests" }
 tracing-subscriber.workspace = true
