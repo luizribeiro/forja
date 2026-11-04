@@ -86,9 +86,22 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
                 "gpu_seconds": submission.gpu_time().ok_or("GPU timing unavailable")?.as_secs_f64()}));
         }
     }
+    let resources = commands
+        .last_dispatch()
+        .map(|dispatch| backend.kernel_resources(dispatch))
+        .transpose()?
+        .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
         "variant": options.variant, "serial": options.serial, "copies": options.copies.get(), "resident_operand_bytes": bytes,
         "dispatches_per_sample": options.dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
+        "pipeline_resources": resources.map(|resources| serde_json::json!({
+            "kernel": resources.kernel, "execution_width": resources.execution_width,
+            "maximum_threadgroup_threads": resources.maximum_threads,
+            "static_threadgroup_bytes": resources.static_threadgroup_bytes,
+            "observed_registers_per_thread": null, "observed_occupancy": null,
+            "basis": "compiled pipeline limits; not measured occupancy or register allocation"
+        })),
+        "rates": cost.map(|cost| diagnostic_rates(cost, options.dispatches, &samples)).transpose()?,
         "warmups": options.warmups, "samples": samples, "provenance": {
             "commit": crate::provenance::commit(), "dirty": crate::provenance::dirty(),
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
@@ -100,6 +113,26 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         options.variant, options.reps
     );
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[allow(clippy::cast_precision_loss)]
+fn diagnostic_rates(
+    cost: forja_core::KernelCost,
+    dispatches: std::num::NonZeroU32,
+    samples: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let bytes = cost
+        .read_bytes
+        .checked_add(cost.write_bytes)
+        .ok_or("cost overflow")?;
+    samples.iter().map(|sample| {
+        let seconds = sample["gpu_seconds"].as_f64().filter(|seconds| seconds.is_finite() && *seconds > 0.0).ok_or("invalid GPU duration")? / f64::from(dispatches.get());
+        Ok(serde_json::json!({"gpu_seconds_per_dispatch": seconds,
+            "logical_gigabytes_per_second": bytes as f64 / seconds / 1e9,
+            "logical_teraflops_per_second": cost.flops as f64 / seconds / 1e12,
+            "basis": "logical operation work and operands, not measured DRAM transactions or instruction throughput"}))
+    }).collect()
 }
 
 #[cfg(target_os = "macos")]
@@ -163,12 +196,46 @@ fn diagnostic_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_rates_check_costs_and_normalize_dispatches() {
+        let count = std::num::NonZeroU32::new(4).unwrap();
+        let cost = forja_core::KernelCost {
+            read_bytes: 8,
+            write_bytes: 8,
+            flops: 100,
+            ..Default::default()
+        };
+        let rates =
+            diagnostic_rates(cost, count, &[serde_json::json!({"gpu_seconds": 1.0})]).unwrap();
+        assert_eq!(rates[0]["gpu_seconds_per_dispatch"], 0.25);
+        assert_eq!(rates[0]["logical_gigabytes_per_second"], 64.0 / 1e9);
+        for sample in [
+            serde_json::json!({}),
+            serde_json::json!({"gpu_seconds": 0.0}),
+            serde_json::json!({"gpu_seconds": -1.0}),
+        ] {
+            assert!(diagnostic_rates(cost, count, &[sample]).is_err());
+        }
+        let overflow = forja_core::KernelCost {
+            read_bytes: u64::MAX,
+            write_bytes: 1,
+            ..Default::default()
+        };
+        assert!(diagnostic_rates(overflow, count, &[]).is_err());
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_kernel_diagnostics_execute_explicit_variants() {
         let root = std::env::temp_dir().join(format!("forja-kernel-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
         for (variant, shape) in [
+            (
+                "quant-matmul.vector8-shared",
+                serde_json::json!({"operation":{"kind":"quant-matmul","bits":4,"group_size":64},
+                    "inputs":[{"dtype":"bf16","shape":[4,64]}, {"dtype":"u32","shape":[33,8]},
+                    {"dtype":"f16","shape":[33,1]}, {"dtype":"f16","shape":[33,1]}],
+                    "outputs":[{"dtype":"bf16","shape":[4,33]}]}),
+            ),
             (
                 "gather-quant-matmul.vector8",
                 serde_json::json!({
@@ -284,5 +351,16 @@ mod tests {
         options.dispatches = std::num::NonZeroU32::new(2).unwrap();
         assert!(run(&options, &forja_config::DevConfig::default()).is_err());
         assert_eq!(record["samples"].as_array().unwrap().len(), 1);
+        assert_eq!(record["rates"].as_array().unwrap().len(), 1);
+        if variant == "quant-matmul.vector8-shared" {
+            assert_eq!(record["pipeline_resources"]["execution_width"], 32);
+            assert!(
+                record["pipeline_resources"]["maximum_threadgroup_threads"]
+                    .as_u64()
+                    .unwrap()
+                    >= 128
+            );
+            assert!(record["pipeline_resources"]["observed_occupancy"].is_null());
+        }
     }
 }

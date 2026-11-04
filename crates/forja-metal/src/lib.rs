@@ -44,6 +44,8 @@ pub use bandwidth::MemoryBandwidth;
 #[cfg(target_os = "macos")]
 pub use calibration::CalibrationSample;
 #[cfg(target_os = "macos")]
+pub use encoding::resources::KernelResources;
+#[cfg(target_os = "macos")]
 pub use encoding::{MetalProgramHandle, ProfileTimestampGranularity};
 #[cfg(target_os = "macos")]
 pub use storage::{MetalBackend, MetalGraphReplay, ProgramCompileBudget};

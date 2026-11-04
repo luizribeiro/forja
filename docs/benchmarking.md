@@ -288,6 +288,10 @@ start at zero. Paged attention accepts explicit noncontiguous page tables and
 generation arrays. Core operation/catalog constraints and allocation quotas apply.
 Records say `kernel-diagnostic` and `model_benchmark:false`; use them for screens,
 never as model benchmarks or accepted model baselines.
+Rates count logical operands and FLOPs rather than hardware transactions or
+instruction throughput. Quantized matrix diagnostics also report compiled
+execution width, threadgroup limits and static threadgroup storage; these limits
+do not measure occupancy, register allocation or spills.
 
 ## Choose the next optimization
 

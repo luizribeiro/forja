@@ -1,3 +1,4 @@
+pub(super) mod resources;
 mod state;
 #[cfg(test)]
 mod state_cache_tests;
@@ -4496,25 +4497,14 @@ impl MetalBackend {
         let scales = self.encoder_tensor(scales)?;
         let biases = self.encoder_tensor(biases)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        let (params, [rows, inner, columns]) = Self::quant_matmul_params(
+        let (params, [rows, _, columns]) = Self::quant_matmul_params(
             [&input, &packed, &scales, &biases, &output],
             bits,
             group_size,
         )?;
         let params = arguments.write(&params)?;
         let kernel = quant_matmul_kernel(dispatch)?;
-        let constants = [
-            (0, dtype_code(input.layout.dtype())),
-            (1, dtype_code(scales.layout.dtype())),
-            (2, dtype_code(output.layout.dtype())),
-            (12, u32::from(bits)),
-            (13, group_size),
-            (222, qmv_vector_config(dispatch)[0]),
-            (223, qmv_vector_config(dispatch)[1]),
-            (224, qmv_vector_config(dispatch)[2]),
-            (225, qmv_vector_config(dispatch)[3]),
-            (15, quant_epilogue_specialization(columns, inner)),
-        ];
+        let constants = resources::quant_constants(dispatch)?;
         let mut pipelines = self
             .pipelines
             .lock()
