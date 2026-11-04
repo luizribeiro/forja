@@ -16,6 +16,7 @@ pub struct DeltaNet {
     log_a: Tensor<f32>,
     dt_bias: Tensor<f32>,
     carry: Carry,
+    state_picks: [Option<Variant>; 2],
 }
 struct DeltaProjection {
     query: Tensor<f32>,
@@ -85,8 +86,13 @@ impl DeltaNet {
                 .tensor::<bf16>("dt_bias", &[config.value_heads])?
                 .to_dtype()?,
             carry,
+            state_picks: [None, None],
         })
     }
+    pub(crate) fn select_state_picks(&mut self, picks: [Option<Variant>; 2]) {
+        self.state_picks = picks;
+    }
+
     pub(crate) fn select_lane(&mut self, lane: u32) -> Result<()> {
         self.carry.select_lane(lane)
     }

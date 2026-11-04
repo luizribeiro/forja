@@ -74,6 +74,7 @@ impl Carry {
         input: &Tensor<T>,
         weights: &Tensor<T>,
         output: &mut Tensor<T>,
+        pick: Option<&Variant>,
     ) -> Result<()> {
         let Self::Slotted {
             cache,
@@ -85,7 +86,7 @@ impl Carry {
         };
         cache
             .state_at(*lane, planes[0])?
-            .causal_convolution_into(input, weights, output)
+            .causal_convolution_into_with(input, weights, output, pick)
     }
 
     pub(super) fn delta_into<T: FloatElement>(
@@ -95,6 +96,7 @@ impl Carry {
         decay: &Tensor<f32>,
         beta: &Tensor<T>,
         output: &mut Tensor<T>,
+        pick: Option<&Variant>,
     ) -> Result<()> {
         let Self::Slotted {
             cache,
@@ -106,7 +108,7 @@ impl Carry {
         };
         cache
             .state_at(*lane, planes[1])?
-            .delta_rule_into(qk[0], qk[1], value, decay, beta, output)
+            .delta_rule_into_with(qk, value, decay, beta, output, pick)
     }
 
     pub(super) fn delta<T: FloatElement>(

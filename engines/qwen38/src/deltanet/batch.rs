@@ -29,6 +29,7 @@ impl DeltaNet {
                 &projected.narrow(0, row, 1)?,
                 &self.convolution,
                 &mut convolved.narrow(0, row, 1)?,
+                self.state_picks[1].as_ref(),
             )?;
         }
         let mixed = numerics::silu_bf16(&convolved)?;
@@ -58,6 +59,7 @@ impl DeltaNet {
                 &decay.narrow(0, row, 1)?.reshape(&[c.value_heads])?,
                 &beta.narrow(0, row, 1)?.reshape(&[c.value_heads])?,
                 &mut head_rows(&y, row, c.value_heads)?,
+                self.state_picks[0].as_ref(),
             )?;
         }
         self.finish_rows(&y, input, pick)

@@ -4,6 +4,12 @@ use forja_sdk::{Dim, Error, PagedCacheSet, Result, Tensor, Weights, bf16, target
 use std::rc::Rc;
 
 impl DecoderLayer {
+    pub(crate) fn select_state_picks(&mut self, picks: [Option<Variant>; 2]) {
+        if let Mixer::Recurrent(layer) = &mut self.mixer {
+            layer.select_state_picks(picks);
+        }
+    }
+
     /// Loads a decoder with its attention pair or protected recurrent plane pair.
     ///
     /// # Errors

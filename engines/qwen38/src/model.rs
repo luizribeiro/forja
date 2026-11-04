@@ -54,11 +54,33 @@ impl Model {
             sites.extend(["paged-attention.prefill", "paged-attention.decode"]);
         }
 
+        let state_sites = ["delta-decode", "conv-decode"]
+            .into_iter()
+            .filter(|site| {
+                load.fixed_variant_picks
+                    .iter()
+                    .any(|pick| pick.site == *site)
+                    || load
+                        .variant_rule_picks
+                        .iter()
+                        .any(|pick| pick.site == *site)
+            })
+            .collect::<Vec<_>>();
+        sites.extend(&state_sites);
         let picks = if config.cpu {
             None
         } else {
             Some(EngineSelections::new(load, &[], &sites, context)?)
         };
+        let state_picks = ["delta-decode", "conv-decode"].map(|site| {
+            picks
+                .as_ref()
+                .filter(|_| state_sites.contains(&site))
+                .map(|picks| picks.at(site, 0))
+                .transpose()
+        });
+        let [delta_state, conv_state] = state_picks;
+        let state_picks = [delta_state?, conv_state?];
         let paged = pool
             .map(|pool| paged::PagedModel::new(pool, config, context, picks.as_ref()))
             .transpose()?;
@@ -75,7 +97,7 @@ impl Model {
             layers: (0..config.layers)
                 .map(|index| {
                     let weights = model.scoped(format!("layers.{index}"));
-                    if let Some(paged) = &paged {
+                    let mut layer = if let Some(paged) = &paged {
                         DecoderLayer::load_paged(
                             &weights,
                             config,
@@ -85,7 +107,9 @@ impl Model {
                         )
                     } else {
                         DecoderLayer::load(&weights, config, index, context)
-                    }
+                    }?;
+                    layer.select_state_picks(state_picks.clone());
+                    Ok(layer)
                 })
                 .collect::<Result<_>>()?,
             quant: picks
