@@ -48,12 +48,32 @@ fn assert_shared_rows(
     parameters: DType,
     variant_name: &str,
 ) {
+    assert_shared_group(
+        backend,
+        dtype,
+        (bits, 64),
+        (inner, columns),
+        parameters,
+        variant_name,
+    );
+}
+
+fn assert_shared_group(
+    backend: &MetalBackend,
+    dtype: DType,
+    quantization: (u8, u32),
+    shape: (u32, u32),
+    parameters: DType,
+    variant_name: &str,
+) {
+    let (bits, group_size) = quantization;
+    let (inner, columns) = shape;
     for rows in [1, 2, 4, 7, 8] {
         let mut specs = [
             TensorSpec::contiguous(dtype, &[rows, inner]),
             TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
-            TensorSpec::contiguous(parameters, &[columns, inner / 64]),
-            TensorSpec::contiguous(parameters, &[columns, inner / 64]),
+            TensorSpec::contiguous(parameters, &[columns, inner / group_size]),
+            TensorSpec::contiguous(parameters, &[columns, inner / group_size]),
         ];
         if rows == 7 {
             for spec in &mut specs {
@@ -75,10 +95,7 @@ fn assert_shared_rows(
             .collect::<Vec<_>>();
         let inputs = allocate_inputs(backend, &specs, &bytes);
         let output = backend.alloc(dtype, &[rows, columns]).unwrap();
-        let op = Op::QuantMatmul {
-            bits,
-            group_size: 64,
-        };
+        let op = Op::QuantMatmul { bits, group_size };
         let variant = backend
             .validate_variant_for_op(
                 op,
@@ -174,3 +191,30 @@ shared_rows!(
     8,
     "quant-matmul.vector8-shared-n4"
 );
+
+macro_rules! shared_quant_group {
+    ($name:ident, $group:literal) => {
+        #[test]
+        fn $name() {
+            let backend = MetalBackend::new().unwrap();
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                for bits in [4, 8] {
+                    for shape in shared_shapes("quant-matmul.vector8-shared-n4") {
+                        for parameters in [DType::F16, DType::BF16] {
+                            assert_shared_group(
+                                &backend,
+                                dtype,
+                                (bits, $group),
+                                shape,
+                                parameters,
+                                "quant-matmul.vector8-shared-n4",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+shared_quant_group!(shared_wide_group32_preserves_bits, 32);
+shared_quant_group!(shared_wide_group128_preserves_bits, 128);
