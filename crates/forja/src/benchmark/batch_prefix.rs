@@ -165,6 +165,8 @@ mod tests {
                     }
                     expected = Some(actual);
                 }
+                super::super::prepare_benchmark_runner(&mut runner, 36)?;
+                super::super::prepare_benchmark_runner(&mut runner, 36)?;
                 Ok::<_, Box<dyn Error>>(())
             })
     }

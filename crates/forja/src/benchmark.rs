@@ -2643,6 +2643,9 @@ fn prepare_benchmark_runner(
     reserved_tokens: usize,
 ) -> Result<(), Box<dyn Error>> {
     runner
+        .prepare_paged_request(None, 0)
+        .map_err(|error| format!("paged benchmark release failed: {error:?}"))?;
+    runner
         .prepare_paged_request(None, u64::try_from(reserved_tokens)?)
         .map_err(|error| format!("paged benchmark admission failed: {error:?}"))?;
     Ok(())
