@@ -1,3 +1,4 @@
+mod batch_prefix;
 #[cfg(target_os = "macos")]
 mod prefix;
 #[cfg(target_os = "macos")]
@@ -1875,49 +1876,15 @@ async fn prepare_batch_prefix(
     serving: &forja_host::ServingInfo,
     tokens: Vec<u32>,
     reserved_tokens: u64,
-) -> Result<PagedPrefix, Box<dyn Error>> {
-    let shape = serving
-        .batch_shapes
-        .iter()
-        .filter(|shape| {
-            shape.phase == BatchPhase::Prompt
-                && shape.bucket == 1
-                && shape.selection == BatchSelection::Combined
-                && shape.tokens <= 512
-        })
-        .max_by_key(|shape| shape.tokens)
-        .copied()
-        .ok_or("batch benchmark has no bounded prompt shape")?;
-    runner.prepare_paged_lane(0, None, 0)?;
-    runner.prepare_paged_lane(0, None, reserved_tokens)?;
-    for (chunk, start) in tokens
-        .chunks(usize::try_from(shape.tokens)?)
-        .zip((0..).step_by(usize::try_from(shape.tokens)?))
-    {
-        let output = runner
-            .batch_step(EngineBatch {
-                shape,
-                lanes: vec![Some(EngineBatchLane {
-                    slot: 0,
-                    tokens: Some(chunk.to_vec()),
-                    start_pos: u32::try_from(start)?,
-                    sampling: SamplingParams::default(),
-                })],
-            })
-            .await?
-            .map_err(|error| format!("batch benchmark prefix failed: {error:?}"))?;
-        runner.read(&output.tokens).await?;
-    }
-    runner
-        .paged_prefix()?
-        .ok_or_else(|| "batch benchmark did not produce a paged prefix".into())
+) -> Result<batch_prefix::Prefix, Box<dyn Error>> {
+    batch_prefix::Prefix::prepare(runner, serving, tokens, reserved_tokens).await
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 async fn measure_batch_repetition(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
-    prefixes: &[PagedPrefix],
+    prefixes: &[batch_prefix::Prefix],
     contexts: &[u32],
     feedback: &[u32],
     bucket: u32,
@@ -1933,10 +1900,14 @@ async fn measure_batch_repetition(
         let prefix_tokens = contexts[lane]
             .checked_sub(1)
             .ok_or("batch benchmark context is empty")?;
-        let prefix =
-            prefixes[lane % prefixes.len()].fork_reserved(u64::from(prefix_tokens), reserved)?;
-        runner.prepare_paged_lane(u32::try_from(lane)?, None, 0)?;
-        runner.prepare_paged_lane(u32::try_from(lane)?, Some(prefix), reserved)?;
+        prefixes[lane % prefixes.len()]
+            .restore(
+                runner,
+                u32::try_from(lane)?,
+                u64::from(prefix_tokens),
+                reserved,
+            )
+            .await?;
     }
     let mut lane_tokens = run_batch_decode_step(
         runner,

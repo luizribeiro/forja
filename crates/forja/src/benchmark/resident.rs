@@ -19,7 +19,7 @@ type Loaded = (EngineRunner<forja_metal::MetalBackend>, EngineInfo, String);
 pub(super) struct Runners {
     retain: bool,
     pub(super) prefill_step: Option<std::num::NonZeroUsize>,
-    pub(super) batch_prefixes: std::collections::BTreeMap<usize, super::PagedPrefix>,
+    pub(super) batch_prefixes: std::collections::BTreeMap<usize, super::batch_prefix::Prefix>,
     pub(super) prefix_builds: u64,
     primed: std::collections::BTreeSet<Prime>,
     loaded: std::collections::BTreeMap<Phase, Loaded>,
