@@ -126,7 +126,11 @@ impl BatchLane {
     ) -> Result<Option<FinishReason>, GenerationError> {
         self.token_ids.push(token);
         if self.consumed == 0 {
-            observe(&mut metrics.ttft, self.started.elapsed());
+            observe_phase(
+                &mut metrics.ttft,
+                &mut metrics.first_token_time_ns,
+                self.started.elapsed(),
+            );
             if self.cached_tokens == 0 {
                 observe(&mut metrics.uncached_ttft, self.started.elapsed());
             }

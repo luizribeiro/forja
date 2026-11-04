@@ -183,6 +183,7 @@ where
             ));
         }
         let prefix = hit.map(|hit| hit.sequence);
+        let binding_started = std::time::Instant::now();
         loop {
             #[cfg(test)]
             let refuse_bind = self
@@ -245,6 +246,9 @@ where
                 Err(error) => return Err((request, batch_admission_error(&error))),
             }
         }
+        self.metrics.prefix_bind_time_ns = self.metrics.prefix_bind_time_ns.saturating_add(
+            u64::try_from(binding_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
         let Ok(cached) = u32::try_from(cached) else {
             return Err((
                 request,
@@ -394,7 +398,11 @@ where
             prefill.request.prefix_reuse,
             &prefill.request.control,
         )?;
-        observe(&mut self.metrics.suffix_prefill_time, started.elapsed());
+        observe_phase(
+            &mut self.metrics.suffix_prefill_time,
+            &mut self.metrics.suffix_prefill_time_ns,
+            started.elapsed(),
+        );
         Ok(prefill.consumed == prefill.request.tokens.len())
     }
 

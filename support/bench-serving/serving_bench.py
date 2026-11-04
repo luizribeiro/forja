@@ -145,7 +145,7 @@ def ready(base_url: str) -> bool:
 
 
 def scrape_metrics(url: str | None) -> dict[str, float] | None:
-    """Read unlabeled Prometheus samples from an optional endpoint."""
+    """Read aggregate samples and declared decode-bucket counters."""
     if url is None:
         return None
     parsed = urlsplit(url)
@@ -160,9 +160,11 @@ def scrape_metrics(url: str | None) -> dict[str, float] | None:
         connection.close()
     samples = {}
     for line in body.splitlines():
-        if not line or line.startswith("#") or "{" in line:
+        if not line or line.startswith("#"):
             continue
         name, separator, value = line.partition(" ")
+        if "{" in name and not name.startswith('forja_decode_batches_total{bucket="'):
+            continue
         if separator:
             samples[name] = float(value)
     return samples
@@ -178,17 +180,34 @@ def metric_report(
         for name in ("pool_bytes", "table_bytes", "graph_bytes", "scratch_bytes")
     }
     phases = {
-        name: None for name in ("scheduler_seconds", "queue_seconds", "parser_mask_seconds", "sse_seconds")
+        name: None for name in ("scheduler_seconds", "queue_seconds", "parser_mask_seconds", "sse_seconds",
+                               "prefix_bind_seconds", "suffix_prefill_seconds", "first_token_seconds",
+                               "first_decode_submit_seconds")
     }
     graphs = {"prepared": None, "preparation_seconds": None}
     report = {"gpu_seconds": None, "graphs": graphs, "memory": memory, "host_phases": phases}
     if before is None or after is None:
         return report
+    report["execution"] = {
+        "live_graphs": after.get("forja_engine_live_graphs"),
+        "replay_requests": None,
+        "decode_batches": {
+            name: int(max(0, after[name] - before.get(name, 0)))
+            for name in after if name.startswith('forja_decode_batches_total{bucket="')
+        },
+    }
+    metric = "forja_engine_graph_replays_total"
+    if metric in before and metric in after:
+        report["execution"]["replay_requests"] = int(max(0, after[metric] - before[metric]))
     for name in memory:
         metric = f"forja_{name}"
         if metric in after:
             memory[name] = int(after[metric])
     counters = {
+        "prefix_bind_seconds": "forja_prefix_bind_nanoseconds_total",
+        "suffix_prefill_seconds": "forja_suffix_prefill_nanoseconds_total",
+        "first_token_seconds": "forja_first_token_nanoseconds_total",
+        "first_decode_submit_seconds": "forja_first_decode_submit_nanoseconds_total",
         "scheduler_seconds": "forja_scheduler_nanoseconds_total",
         "queue_seconds": "forja_queue_nanoseconds_total",
         "parser_mask_seconds": "forja_parser_mask_nanoseconds_total",

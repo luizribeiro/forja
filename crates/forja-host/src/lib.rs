@@ -547,6 +547,8 @@ pub struct EngineMetrics {
     pub live_graphs: usize,
     /// Command graphs successfully prepared since the runner was created.
     pub prepared_graphs: u64,
+    /// Replay requests admitted after graph and binding validation.
+    pub graph_replays: u64,
     /// Wall time spent successfully preparing command graphs.
     pub graph_preparation_time: Duration,
     /// Wall time spent validating dispatches for successfully prepared graphs.
@@ -3942,6 +3944,7 @@ pub struct Host<B: Backend> {
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
     prepared_graphs: AtomicU64,
+    graph_replays: AtomicU64,
     graph_preparation_time_ns: AtomicU64,
     graph_validation_time_ns: AtomicU64,
     graph_arena_bytes: u64,
@@ -3986,6 +3989,7 @@ impl<B: Backend + 'static> Host<B> {
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
             prepared_graphs: AtomicU64::new(0),
+            graph_replays: AtomicU64::new(0),
             graph_preparation_time_ns: AtomicU64::new(0),
             graph_validation_time_ns: AtomicU64::new(0),
             graph_arena_bytes: 0,
@@ -5287,6 +5291,7 @@ impl<B: Backend + 'static> Host<B> {
             live_bytes: self.live_bytes.load(Ordering::Acquire),
             live_graphs: self.live_graphs.load(Ordering::Acquire),
             prepared_graphs: self.prepared_graphs.load(Ordering::Acquire),
+            graph_replays: self.graph_replays.load(Ordering::Acquire),
             graph_preparation_time: Duration::from_nanos(
                 self.graph_preparation_time_ns.load(Ordering::Acquire),
             ),
@@ -6780,6 +6785,9 @@ impl<B: Backend + 'static> Host<B> {
         paged: Vec<PagedUse>,
         flight: Option<ReplayFlight>,
     ) -> SubmitRequest<B> {
+        if matches!(&work, SubmissionWork::Replay { .. }) {
+            self.graph_replays.fetch_add(1, Ordering::AcqRel);
+        }
         SubmitRequest {
             backend: Arc::clone(&self.backend),
             snapshot: None,
@@ -15904,6 +15912,7 @@ mod tests {
             .run()
             .await
             .unwrap();
+        assert_eq!(host.engine_metrics().graph_replays, 1);
         assert_eq!(
             host.backend.read(&output_tensor).unwrap(),
             f32_bytes(&[1.0, 2.0, 3.0, 0.0])
@@ -17723,6 +17732,7 @@ mod tests {
                 live_bytes: 0,
                 live_graphs: 0,
                 prepared_graphs: 0,
+                graph_replays: 0,
                 graph_preparation_time: Duration::ZERO,
                 graph_validation_time: Duration::ZERO,
                 submissions: 2,

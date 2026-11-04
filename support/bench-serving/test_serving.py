@@ -185,6 +185,18 @@ def test_runner_scrapes_resource_gauges_and_counter_deltas() -> None:
         thread.join()
 
 
+def test_runner_reports_serving_phase_and_bucket_deltas() -> None:
+    before = {"forja_suffix_prefill_nanoseconds_total": 1_000_000_000,
+              "forja_engine_graph_replays_total": 5}
+    after = {"forja_suffix_prefill_nanoseconds_total": 3_000_000_000,
+             "forja_engine_graph_replays_total": 17, "forja_engine_live_graphs": 13,
+             'forja_decode_batches_total{bucket="4"}': 11}
+    report = serving_bench.metric_report(before, after)
+    assert report["host_phases"]["suffix_prefill_seconds"] == 2.0
+    assert report["execution"]["replay_requests"] == 12
+    assert report["execution"]["decode_batches"] == {'forja_decode_batches_total{bucket="4"}': 11}
+
+
 def test_exactness_report_compares_concurrent_output_fingerprints() -> None:
     base = {
         "name": "exact",

@@ -1,8 +1,16 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::{fmt::Write as _, time::Duration};
 /// Serializable aggregate measurements with log2-microsecond latency buckets.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ServingMetrics {
+    pub(crate) decode_batches: BTreeMap<u32, u64>,
+    pub(crate) prefix_bind_time_ns: u64,
+    pub(crate) suffix_prefill_time_ns: u64,
+    pub(crate) first_token_time_ns: u64,
+    pub(crate) first_decode_submit_time_ns: u64,
+    pub(crate) graph_replays: u64,
+    pub(crate) live_graphs: usize,
     pub(crate) requests: u64,
     pub(crate) hits: u64,
     pub(crate) misses: u64,
@@ -46,6 +54,7 @@ impl ServingMetrics {
         let mut output = String::new();
         gauge(&mut output, "forja_live", live);
         gauge(&mut output, "forja_ready", ready);
+        self.execution_prometheus(&mut output);
         counter(&mut output, "forja_prefix_requests_total", self.requests);
         counter(&mut output, "forja_prefix_hits_total", self.hits);
         counter(&mut output, "forja_prefix_misses_total", self.misses);
@@ -137,6 +146,33 @@ impl ServingMetrics {
         gauge_u64(&mut output, "forja_graph_bytes", self.graph_bytes);
         gauge_u64(&mut output, "forja_scratch_bytes", self.scratch_bytes);
         output
+    }
+
+    fn execution_prometheus(&self, output: &mut String) {
+        output.push_str("# TYPE forja_decode_batches_total counter\n");
+        for (bucket, count) in &self.decode_batches {
+            let _ = writeln!(
+                output,
+                "forja_decode_batches_total{{bucket=\"{bucket}\"}} {count}"
+            );
+        }
+        for (name, count) in [
+            ("prefix_bind_nanoseconds", self.prefix_bind_time_ns),
+            ("suffix_prefill_nanoseconds", self.suffix_prefill_time_ns),
+            ("first_token_nanoseconds", self.first_token_time_ns),
+            (
+                "first_decode_submit_nanoseconds",
+                self.first_decode_submit_time_ns,
+            ),
+            ("engine_graph_replays", self.graph_replays),
+        ] {
+            counter(output, &format!("forja_{name}_total"), count);
+        }
+        gauge_u64(
+            output,
+            "forja_engine_live_graphs",
+            u64::try_from(self.live_graphs).unwrap_or(u64::MAX),
+        );
     }
 }
 
@@ -247,6 +283,8 @@ mod tests {
             hits: 3,
             gpu_time_ns: 11,
             prepared_graphs: 13,
+            graph_replays: 23,
+            decode_batches: BTreeMap::from([(4, 7)]),
             graph_preparation_time_ns: 17,
             ..ServingMetrics::default()
         };
@@ -266,6 +304,8 @@ mod tests {
         assert!(text.contains("forja_queue_seconds_count 0\n"));
         assert!(text.contains("forja_engine_gpu_time_nanoseconds 11\n"));
         assert!(text.contains("forja_engine_prepared_graphs_total 13\n"));
+        assert!(text.contains("forja_engine_graph_replays_total 23\n"));
+        assert!(text.contains("forja_decode_batches_total{bucket=\"4\"} 7\n"));
         assert!(text.contains("forja_engine_graph_preparation_nanoseconds_total 17\n"));
         assert!(!text.contains("request_id"));
         assert!(!text.contains("path="));

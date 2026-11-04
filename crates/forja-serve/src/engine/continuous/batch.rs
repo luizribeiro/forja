@@ -380,6 +380,8 @@ where
             .map_err(|error| {
                 GenerationError::unavailable(format!("decode batch failed: {error:?}"))
             })?;
+        let batches = self.metrics.decode_batches.entry(shape.bucket).or_default();
+        *batches = batches.saturating_add(1);
         Ok(Some(PendingBatch {
             output,
             lanes: lanes
@@ -897,20 +899,9 @@ where
         if let Some(barrier) = &self.batch_test_barrier {
             barrier.pause_prefill_once().await;
         }
-        let (submitted_slots, submission) = {
-            let ordinary = active
-                .iter()
-                .chain(completed.iter().map(|(_, lane)| lane))
-                .filter(|lane| !lane.is_constrained())
-                .collect::<Vec<_>>();
-            let slots = ordinary.iter().map(|lane| lane.slot).collect::<Vec<_>>();
-            let submission = if queued.is_none() {
-                self.submit_batch(policy, &ordinary, &[]).await
-            } else {
-                Ok(None)
-            };
-            (slots, submission)
-        };
+        let (submitted_slots, submission) = self
+            .submit_prefill_successor(active, &completed, queued.is_some(), policy)
+            .await;
         match submission {
             Ok(batch) => {
                 if batch.is_some() {
@@ -964,6 +955,37 @@ where
                 }
             }
         }
+    }
+
+    async fn submit_prefill_successor(
+        &mut self,
+        active: &[BatchLane],
+        completed: &[(RequestId, BatchLane)],
+        already_queued: bool,
+        policy: &SchedulerPolicy,
+    ) -> (Vec<u32>, Result<Option<PendingBatch>, GenerationError>) {
+        let submit_started = std::time::Instant::now();
+        let (submitted_slots, submission) = {
+            let ordinary = active
+                .iter()
+                .chain(completed.iter().map(|(_, lane)| lane))
+                .filter(|lane| !lane.is_constrained())
+                .collect::<Vec<_>>();
+            let slots = ordinary.iter().map(|lane| lane.slot).collect::<Vec<_>>();
+            let submission = if already_queued {
+                Ok(None)
+            } else {
+                self.submit_batch(policy, &ordinary, &[]).await
+            };
+            (slots, submission)
+        };
+        if !already_queued && !completed.is_empty() {
+            self.metrics.first_decode_submit_time_ns =
+                self.metrics.first_decode_submit_time_ns.saturating_add(
+                    u64::try_from(submit_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+        }
+        (submitted_slots, submission)
     }
 
     fn reservations_fit(&self, reservations: impl IntoIterator<Item = u64>) -> bool {

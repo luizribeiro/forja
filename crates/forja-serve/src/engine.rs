@@ -1123,6 +1123,8 @@ where
         let execution = self.runner.metrics();
         self.metrics.gpu_time_ns = u64::try_from(execution.gpu_time.as_nanos()).unwrap_or(u64::MAX);
         self.metrics.prepared_graphs = execution.prepared_graphs;
+        self.metrics.graph_replays = execution.graph_replays;
+        self.metrics.live_graphs = execution.live_graphs;
         self.metrics.graph_preparation_time_ns =
             u64::try_from(execution.graph_preparation_time.as_nanos()).unwrap_or(u64::MAX);
         self.metrics.live_bytes = execution.live_bytes;
@@ -1299,7 +1301,11 @@ where
         let match_started = Instant::now();
         let (cached_len, paged) = self.prepare_prefix(&tokens, prompt_tokens, params.max_tokens)?;
         self.metrics.requests = self.metrics.requests.saturating_add(1);
-        observe(&mut self.metrics.match_time, match_started.elapsed());
+        observe_phase(
+            &mut self.metrics.match_time,
+            &mut self.metrics.prefix_bind_time_ns,
+            match_started.elapsed(),
+        );
         if cached_len == 0 {
             self.metrics.misses = self.metrics.misses.saturating_add(1);
         } else {
@@ -1315,8 +1321,9 @@ where
         let first = self
             .prefill_pieces(&tokens, start_pos, sampling, control)
             .await?;
-        observe(
+        observe_phase(
             &mut self.metrics.suffix_prefill_time,
+            &mut self.metrics.suffix_prefill_time_ns,
             prefill_started.elapsed(),
         );
         Ok(PrefilledPrompt {
@@ -1510,7 +1517,11 @@ where
                 token_ids.push(token);
                 if consumed == 0 {
                     let ttft = started.elapsed();
-                    observe(&mut self.metrics.ttft, ttft);
+                    observe_phase(
+                        &mut self.metrics.ttft,
+                        &mut self.metrics.first_token_time_ns,
+                        ttft,
+                    );
                     if cached_tokens == 0 {
                         observe(&mut self.metrics.uncached_ttft, ttft);
                     }
