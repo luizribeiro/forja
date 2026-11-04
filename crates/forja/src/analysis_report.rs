@@ -87,7 +87,7 @@ pub(crate) fn report(
     sort(&mut kernels);
     Ok(
         json!({"schema_version": 1, "kind": "roofline-analysis", "model_benchmark": false,
-        "mode": profile.mode, "tokens": profile.tokens, "measured_tokens": profile.measured_count().ok_or("invalid measured token range")?, "cached_prefix_tokens": profile.cached_prefix_tokens, "device_identity": profile.device_identity,
+        "mode": profile.mode, "tokens": profile.tokens, "batch_size": profile.batch_size.unwrap_or(1), "measured_tokens": profile.measured_count().ok_or("invalid measured token range")?, "cached_prefix_tokens": profile.cached_prefix_tokens, "device_identity": profile.device_identity,
         "inputs": profile.inputs, "profile_provenance": profile.provenance, "calibration": calibration,
         "unprofiled": {"wall_seconds": profile.unprofiled.wall_time_seconds, "gpu_seconds": profile.unprofiled.gpu_time_seconds, "cache_setup_wall_seconds": profile.unprofiled.cache_setup},
         "profiled_gpu_seconds": profiled_gpu, "precise_interval_gpu_seconds": precise_gpu, "attribution_basis_gpu_seconds": basis,
@@ -285,6 +285,23 @@ mod tests {
         assert_eq!(row["cached_prefix_tokens"], 7);
         assert_eq!(row["unprofiled"]["cache_setup_wall_seconds"], 0.25);
         profile.measured_tokens = Some(33);
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn decode_cost_normalization_counts_every_lane() {
+        let (mut profile, calibration) = fixture();
+        profile.mode = "decode".into();
+        profile.batch_size = Some(4);
+        profile.measured_tokens = Some(4);
+        profile.validate().unwrap();
+        assert_eq!(
+            report(&profile, &calibration, 0.8).unwrap()["measured_tokens"],
+            4
+        );
+        profile.measured_tokens = Some(1);
+        assert!(profile.validate().is_err());
+        profile.mode = "prefill".into();
         assert!(profile.validate().is_err());
     }
 

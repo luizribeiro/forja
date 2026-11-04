@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod prefix;
 #[cfg(target_os = "macos")]
+mod profile_batch;
+#[cfg(target_os = "macos")]
 mod resident;
 #[cfg(target_os = "macos")]
 mod timing;
@@ -228,6 +230,9 @@ pub(crate) async fn measure_token_profile(
             seed: options.sampling.seed,
         },
     };
+    if options.batch_size > 1 {
+        return profile_batch::measure(&mut runner, &info, &tokens, options, device).await;
+    }
     if let Some(step_tokens) = options.step_tokens {
         return measure_serving_prefill_profile(
             &mut runner,

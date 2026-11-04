@@ -113,6 +113,8 @@ pub(crate) struct Profile {
     pub(crate) mode: String,
     pub(crate) tokens: u64,
     #[serde(default)]
+    pub(crate) batch_size: Option<u32>,
+    #[serde(default)]
     pub(crate) cached_prefix_tokens: u64,
     #[serde(default)]
     pub(crate) measured_tokens: Option<u64>,
@@ -131,7 +133,7 @@ pub(crate) fn positive(value: f64) -> Result<f64, Box<dyn Error>> {
 impl Profile {
     pub(crate) fn measured_count(&self) -> Option<u64> {
         if self.mode == "decode" {
-            Some(1)
+            Some(u64::from(self.batch_size.unwrap_or(1))).filter(|count| *count > 0)
         } else {
             self.tokens
                 .checked_sub(self.cached_prefix_tokens)
@@ -142,6 +144,7 @@ impl Profile {
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
         if self.schema_version != 2
             || self.tokens == 0
+            || (self.mode == "prefill" && self.batch_size.is_some_and(|size| size != 1))
             || !matches!(self.mode.as_str(), "prefill" | "decode")
             || self.submissions.is_empty()
         {

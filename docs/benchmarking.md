@@ -311,7 +311,9 @@ serving lane with an engine-declared prompt bucket. Every step is retained. Add
 `--prefix-context N` to measure only the suffix; cache preparation is reported
 separately from the timed GPU phase.
 
-Use `--mode decode --context 8192` for a decode step with populated KV. Context
+Use `--mode decode --context 8192` for a decode step with populated KV.
+Add `--batch-size 4` to profile a declared paged decode bucket with private state
+and populated KV per lane; the report counts all measured lane tokens. Context
 priming follows the engine-declared numerical prompt blocks. Prefill
 records retain every chunk, so an early chunk cannot stand in for the full run.
 Omit `--calibration` to reuse or create the matching device cache. Identity/schema

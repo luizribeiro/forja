@@ -193,6 +193,7 @@ pub(crate) struct Profile {
     pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) context: usize,
+    pub(crate) batch_size: u32,
     pub(crate) prefix_context: usize,
     pub(crate) step_tokens: Option<usize>,
     pub(crate) mode: ProfileMode,
@@ -217,6 +218,9 @@ struct ProfileArgs {
     /// Context length or prefill token count to profile.
     #[arg(long, value_parser = parse_profile_context)]
     context: u32,
+    /// Number of paged decode lanes to profile together.
+    #[arg(long, default_value_t = 1, value_parser = parse_positive)]
+    batch_size: u32,
     /// Tokens to populate before measuring a suffix prefill.
     #[arg(long, default_value_t = 0)]
     prefix_context: u32,
@@ -1413,7 +1417,14 @@ impl ProfileArgs {
                 "--step-tokens requires prefill mode",
             ));
         }
+        if self.batch_size > 1 && self.mode != ProfileMode::Decode {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "--batch-size greater than one requires decode mode",
+            ));
+        }
         Ok(Profile {
+            batch_size: self.batch_size,
             engine,
             model_dir,
             context: usize::try_from(self.context).map_err(|error| {
@@ -1717,6 +1728,8 @@ mod tests {
                 "/model",
                 "--context",
                 "512",
+                "--batch-size",
+                "4",
                 "--json",
             ]
             .map(str::to_owned),
@@ -1727,6 +1740,7 @@ mod tests {
         };
         assert_eq!(options.engine, PathBuf::from("/engine.wasm"));
         assert_eq!(options.context, 512);
+        assert_eq!(options.batch_size, 4);
         assert_eq!(options.prefix_context, 0);
         assert_eq!(options.step_tokens, None);
         assert_eq!(options.mode, ProfileMode::Decode);
@@ -1760,8 +1774,32 @@ mod tests {
             panic!("expected profile command");
         };
         assert_eq!(options.mode, ProfileMode::Prefill);
+        assert_eq!(options.batch_size, 1);
         assert_eq!(options.prefix_context, 256);
         assert_eq!(options.step_tokens, Some(128));
+    }
+
+    #[test]
+    fn refuses_batched_prefill_profile() {
+        assert!(
+            parse(
+                [
+                    "profile",
+                    "--engine",
+                    "/engine.wasm",
+                    "--model",
+                    "/model",
+                    "--context",
+                    "512",
+                    "--mode",
+                    "prefill",
+                    "--batch-size",
+                    "4",
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]
