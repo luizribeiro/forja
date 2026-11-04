@@ -32,6 +32,7 @@ pub(crate) enum MetalVariant {
     QuantMatmulGemvN2,
     QuantMatmulVector8,
     QuantMatmulVector8TwoGroups,
+    QuantMatmulVector8Shared,
     QuantMatmulVector16,
     QuantMatmulQ8FastGemv,
     QuantMatmulQ8FastGemvN2,
@@ -1002,6 +1003,15 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         &["contiguous decode weights with narrower output groups."],
         &["wide batches where more groups amortize input loads."],
         &["Uses two SIMD groups per threadgroup with the vector8 reduction order."]
+    ),
+    batch_invariant_variant!(@class "quant-matmul.vector8";
+        "quant-matmul.vector8-shared",
+        QuantMatmul,
+        QuantMatmulVector8Shared,
+        QUANT_VECTOR,
+        &["two through eight rows sharing one packed weight matrix."],
+        &["large batches that benefit from tiled multiplication."],
+        &["Loads each packed weight tile once for all rows with the vector8 lane partition and reduction."]
     ),
     batch_invariant_variant!(
         "quant-matmul.vector16",
@@ -2320,6 +2330,7 @@ mod tests {
                 "quant-matmul.gemv-n2",
                 "quant-matmul.vector8",
                 "quant-matmul.vector8-2g",
+                "quant-matmul.vector8-shared",
                 "quant-matmul.vector16",
                 "quant-matmul.row-gemv",
                 "quant-matmul.q8-fast-gemv",
@@ -3033,6 +3044,7 @@ mod tests {
         for name in [
             "quant-matmul.vector8",
             "quant-matmul.vector8-2g",
+            "quant-matmul.vector8-shared",
             "quant-matmul.vector16",
         ] {
             assert!(resolve(&decode, name, METAL4).is_ok());
@@ -3515,6 +3527,11 @@ mod tests {
                 "quantized_gemv_n2",
             ),
             (
+                "quant-matmul.vector8-shared",
+                quant_dispatch_with_bits(DType::F32, 4, 768, false, 4),
+                "quantized_gemv_shared",
+            ),
+            (
                 "quant-matmul.vector16",
                 quant_dispatch_with_bits(DType::F32, 1, 768, false, 4),
                 "quantized_gemv_n2",
@@ -3799,6 +3816,26 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(crate::encoding::dispatch_kernel(&selected).unwrap(), kernel);
+    }
+
+    #[test]
+    fn shared_quant_rows_match_validation_and_encoder_limits() {
+        for rows in [1, 2, 4, 7, 8, 9] {
+            let dispatch = quant_dispatch_with_bits(DType::F32, rows, 768, false, 4);
+            let accepted = rows <= 8;
+            assert_eq!(
+                resolve(&dispatch, "quant-matmul.vector8-shared", METAL4).is_ok(),
+                accepted
+            );
+            assert_eq!(
+                crate::encoding::variant_supported(
+                    &dispatch,
+                    MetalVariant::QuantMatmulVector8Shared
+                )
+                .unwrap(),
+                accepted
+            );
+        }
     }
 
     #[test]

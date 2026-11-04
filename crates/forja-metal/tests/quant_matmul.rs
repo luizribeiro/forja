@@ -1,5 +1,8 @@
 //! Differential coverage for affine-quantized matrix multiplication.
 
+#[path = "quant_matmul/shared.rs"]
+mod shared;
+
 use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, Slice, Submission, ViewOp};
 use forja_cpu::CpuBackend;
 use forja_metal::MetalBackend;

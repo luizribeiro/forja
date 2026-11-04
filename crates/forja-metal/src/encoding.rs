@@ -3421,9 +3421,15 @@ impl MetalBackend {
                 error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "gather-matmul"));
                 buffers
             }
-            Op::QuantMatmul { bits, group_size } => self.encode_quant_matmul(
-                encoder, table, dispatch, bits, group_size, bindings, arguments,
-            )?,
+            Op::QuantMatmul { bits, group_size } => {
+                let (buffers, flag) = self.encode_quant_matmul(
+                    encoder, table, dispatch, bits, group_size, bindings, arguments,
+                )?;
+                if let Some(flag) = flag {
+                    error_flags.push(EncodedErrorFlag::new(flag, dispatch_index, "quant-matmul"));
+                }
+                buffers
+            }
             Op::GatherQuantMatmul { bits, group_size } => {
                 let (buffers, flag) = if dispatch.primitive_inputs().len() == 6 {
                     self.encode_gather_quant_weighted_sum(
@@ -4438,7 +4444,7 @@ impl MetalBackend {
         group_size: u32,
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
-    ) -> Result<Vec<BufferBinding>, BackendError> {
+    ) -> Result<(Vec<BufferBinding>, Option<BufferBinding>), BackendError> {
         let [input, packed, scales, biases] = dispatch.primitive_inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -4463,6 +4469,7 @@ impl MetalBackend {
             (222, qmv_vector_config(dispatch)[0]),
             (223, qmv_vector_config(dispatch)[1]),
             (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
             (15, quant_epilogue_specialization(columns, inner)),
         ];
         let mut pipelines = self
@@ -4492,9 +4499,19 @@ impl MetalBackend {
         if let Some(layouts) = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)? {
             temporaries.push(layouts);
         }
+        // Supported bucket constants compile out the error branch and retain static encoding.
+        let error_flag = if unsupported_shared_bucket(dispatch) {
+            let flag = grouped_error_flag(arguments)?;
+            bindings.bind(table, 6, &flag);
+            temporaries.push(flag.clone());
+            Some(flag)
+        } else {
+            None
+        };
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64), // Vectors use n2.
+            "quantized_gemv_shared" => (qmv_vector_config(dispatch)[1] * 2, rows, 128),
             "quantized_gemv_n2" => {
                 let groups = qmv_vector_config(dispatch)[1];
                 (
@@ -4528,7 +4545,7 @@ impl MetalBackend {
                 depth: 1,
             },
         );
-        Ok(temporaries)
+        Ok((temporaries, error_flag))
     }
 
     fn quant_matmul_params(
@@ -4655,6 +4672,7 @@ impl MetalBackend {
             (222, qmv_vector_config(dispatch)[0]),
             (223, qmv_vector_config(dispatch)[1]),
             (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
         let mut pipelines = self
@@ -4746,6 +4764,7 @@ impl MetalBackend {
             (222, qmv_vector_config(dispatch)[0]),
             (223, qmv_vector_config(dispatch)[1]),
             (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
         let pipeline = self
@@ -4919,6 +4938,7 @@ impl MetalBackend {
             (222, qmv_vector_config(dispatch)[0]),
             (223, qmv_vector_config(dispatch)[1]),
             (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
         let epilogue = dispatch
@@ -5043,6 +5063,7 @@ impl MetalBackend {
         self.encode_grouped_quantized_gemm(
             encoder,
             table,
+            dispatch,
             [input, packed, scales, biases, &sorted, &blocks, output],
             &params,
             shape,
@@ -5125,9 +5146,10 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(config.0)),
             (13, config.1),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
         ];
         let pipeline = self
             .pipelines
@@ -5262,6 +5284,7 @@ impl MetalBackend {
         self.encode_grouped_quantized_gemm(
             encoder,
             table,
+            dispatch,
             [
                 input,
                 gate_packed,
@@ -5284,6 +5307,7 @@ impl MetalBackend {
         self.encode_grouped_quantized_gemm(
             encoder,
             table,
+            dispatch,
             [
                 input, up_packed, up_scales, up_biases, &sorted, &blocks, &up,
             ],
@@ -5459,6 +5483,7 @@ impl MetalBackend {
         &self,
         encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
         table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+        dispatch: &Dispatch,
         tensors: [&EncoderTensor; 7],
         params: &BufferBinding,
         shape: [u32; 3],
@@ -5476,9 +5501,10 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
             (12, u32::from(config.0)),
             (13, config.1),
-            (222, 0),
-            (223, 2),
-            (224, 0),
+            (222, qmv_vector_config(dispatch)[0]),
+            (223, qmv_vector_config(dispatch)[1]),
+            (224, qmv_vector_config(dispatch)[2]),
+            (225, qmv_vector_config(dispatch)[3]),
             (16, block_rows),
         ];
         let mut pipelines = self
@@ -7898,6 +7924,9 @@ impl MetalBackend {
             }
             Op::QuantMatmul { .. } => {
                 arguments.write(144)?;
+                if unsupported_shared_bucket(dispatch) {
+                    arguments.write(8)?;
+                }
                 Self::size_epilogue_arguments(dispatch, arguments)?;
             }
             Op::GatherQuantMatmul { .. } => {
@@ -8422,6 +8451,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::GatherQuantMatmulVector8
                     | MetalVariant::QuantMatmulVector8
                     | MetalVariant::QuantMatmulVector8TwoGroups
+                    | MetalVariant::QuantMatmulVector8Shared
                     | MetalVariant::QuantMatmulVector16
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
@@ -8767,6 +8797,7 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
     };
     match selected_variant(dispatch) {
         Some(MetalVariant::QuantMatmulGemv) => Ok("quantized_gemv"),
+        Some(MetalVariant::QuantMatmulVector8Shared) => Ok("quantized_gemv_shared"),
         Some(
             MetalVariant::QuantMatmulGemvN2
             | MetalVariant::QuantMatmulVector8
@@ -9277,9 +9308,9 @@ pub(super) fn variant_supported(
         | MetalVariant::MatmulSteel64x64x16_1x2
         | MetalVariant::MatmulSteel64x32x32_2x2
         | MetalVariant::MatmulSteel32x64x16_1x2 => matmul_rows(dispatch)? > 1,
-        MetalVariant::QuantMatmulGemv | MetalVariant::QuantMatmulGemvN2 => {
-            (1..=8).contains(&rows()?)
-        }
+        MetalVariant::QuantMatmulGemv
+        | MetalVariant::QuantMatmulGemvN2
+        | MetalVariant::QuantMatmulVector8Shared => (1..=8).contains(&rows()?),
         MetalVariant::QuantMatmulQ8FastGemv | MetalVariant::QuantMatmulQ8FastGemvN2 => matches!(
             quant_matmul_kernel(dispatch)?,
             "quantized_gemv_q8_fast" | "quantized_gemv_q8_fast_n2"
@@ -9716,7 +9747,7 @@ fn quantized_constants(
     scales: &Tensor,
     output: &Tensor,
     config: (u8, u32),
-    geometry: [u32; 3],
+    geometry: [u32; 4],
 ) -> Vec<(u32, u32)> {
     vec![
         (0, dtype_code(input.layout().dtype())),
@@ -9727,18 +9758,30 @@ fn quantized_constants(
         (222, geometry[0]),
         (223, geometry[1]),
         (224, geometry[2]),
+        (225, geometry[3]),
     ]
 }
 
-fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
+#[cfg(test)]
+thread_local! {
+    static FORCED_QMV_ROWS: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+fn unsupported_shared_bucket(dispatch: &Dispatch) -> bool {
+    selected_variant(dispatch) == Some(MetalVariant::QuantMatmulVector8Shared)
+        && !matches!(qmv_vector_config(dispatch)[3], 1 | 2 | 4 | 8)
+}
+
+fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 4] {
     let words = match selected_variant(dispatch) {
         Some(
             MetalVariant::QuantMatmulVector8
             | MetalVariant::QuantMatmulVector8TwoGroups
+            | MetalVariant::QuantMatmulVector8Shared
             | MetalVariant::GatherQuantMatmulVector8,
         ) => 2,
         Some(MetalVariant::QuantMatmulVector16) => 4,
-        _ => return [0, 2, 0],
+        _ => return [0, 2, 0, 1],
     };
     let contiguous = dispatch.primitive_inputs().iter().all(|tensor| {
         let layout = tensor.layout();
@@ -9757,7 +9800,17 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 3] {
     } else {
         4
     };
-    [words, groups, u32::from(contiguous)]
+    let rows = if matches!(
+        selected_variant(dispatch),
+        Some(MetalVariant::QuantMatmulVector8Shared)
+    ) {
+        dispatch.primitive_inputs()[0].layout().shape()[0].next_power_of_two()
+    } else {
+        1
+    };
+    #[cfg(test)]
+    let rows = FORCED_QMV_ROWS.with(|forced| forced.get().unwrap_or(rows));
+    [words, groups, u32::from(contiguous), rows]
 }
 
 fn quant_epilogue_specialization(columns: u32, inner: u32) -> u32 {
@@ -10555,6 +10608,43 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn metal_shared_quant_unsupported_bucket_reports_error_without_writing() {
+        for bucket in [0, 3, 16] {
+            let backend = MetalBackend::new().unwrap();
+            let input = backend.alloc(DType::F32, &[1, 64]).unwrap();
+            let packed = backend.alloc(DType::U32, &[7, 8]).unwrap();
+            let scales = backend.alloc(DType::F16, &[7, 1]).unwrap();
+            let biases = backend.alloc(DType::F16, &[7, 1]).unwrap();
+            let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+            let canary = 17_f32.to_le_bytes().repeat(7);
+            backend.write(&output, &canary).unwrap();
+            let inputs = [&input, &packed, &scales, &biases];
+            let op = Op::QuantMatmul {
+                bits: 4,
+                group_size: 64,
+            };
+            let variant = backend
+                .validate_variant_for_op(op, &inputs, &[&output], "quant-matmul.vector8-shared")
+                .unwrap();
+            let mut commands = CommandList::new();
+            commands.dispatch(op, &inputs, &output).unwrap();
+            assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+            FORCED_QMV_ROWS.set(Some(bucket));
+            let submission = backend.submit(commands);
+            FORCED_QMV_ROWS.set(None);
+            assert!(matches!(submission.unwrap().wait(),
+                Err(BackendError::DeviceErrorFlag {
+                    dispatch: 0, operation: "quant-matmul", flag: 2, value, ..
+                }) if value == bucket
+            ));
+            assert_eq!(
+                crate::storage::refused_read_canary_bytes(&backend, &output),
+                canary
+            );
+        }
+    }
 
     fn assert_paged_integer_probe(
         probe: crate::calibration::Probe,

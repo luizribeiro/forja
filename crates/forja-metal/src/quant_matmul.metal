@@ -10,6 +10,7 @@ constant uint grouped_tile_rows [[function_constant(16)]];
 constant uint qmv_vector_words [[function_constant(222)]];
 constant uint qmv_vector_groups [[function_constant(223)]];
 constant uint qmv_vector_contiguous [[function_constant(224)]];
+constant uint qmv_batch_rows [[function_constant(225)]];
 
 struct QuantEmbedParams {
     uint vocab;
@@ -102,6 +103,104 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
     return float4(*reinterpret_cast<device const bfloat4 *>(buffer + index * 2));
 }
 
+template <uint output_count, uint words_per_thread, uint bits, uint batch_rows>
+void quantized_vector_batch_sums(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    ulong input_base,
+    ulong packed_base,
+    ulong scale_base,
+    ulong bias_base,
+    ulong input_stride,
+    ulong input_row_stride,
+    uint rows,
+    ulong packed_row_stride,
+    ulong packed_word_stride,
+    ulong scale_row_stride,
+    ulong scale_group_stride,
+    ulong bias_row_stride,
+    ulong bias_group_stride,
+    uint inner,
+    uint columns,
+    uint first_column,
+    ushort lane,
+    thread float (&sums)[batch_rows][output_count]) {
+    constexpr uint values_per_word = 32 / bits;
+    constexpr uint values_per_thread = values_per_word * words_per_thread;
+    if (first_column >= columns) return;
+    uint scale_bytes = input1_dtype == 0 ? 4 : 2;
+    device const uchar *weight_base = packed + (packed_base + ulong(first_column) * packed_row_stride) * 4;
+    device const uchar *scale_rows = scales + (scale_base + ulong(first_column) * scale_row_stride) * scale_bytes;
+    device const uchar *bias_rows = biases + (bias_base + ulong(first_column) * bias_row_stride) * scale_bytes;
+    for (ulong block = 0; block < inner; block += values_per_thread * 32) {
+        ulong first = block + uint(lane) * values_per_thread;
+        if (first >= inner) continue;
+        uint4 tile_words[output_count];
+        float tile_scale[output_count];
+        float tile_bias[output_count];
+        #pragma unroll
+        for (uint item = 0; item < output_count; ++item) {
+            if (first_column + item >= columns) continue;
+            ulong index = ulong(first / values_per_word) * packed_word_stride;
+            device const uchar *row = weight_base + ulong(item) * packed_row_stride * 4;
+            uint4 words = uint4(0u);
+            if (qmv_vector_contiguous != 0 || (packed_word_stride == 1 && ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0)) {
+                if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
+                else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
+            } else {
+                for (uint i = 0; i < words_per_thread; ++i) words[i] = load_uint(row, index + ulong(i) * packed_word_stride);
+            }
+            ulong group = first / quant_group_size;
+            tile_scale[item] = load_float(scale_rows, ulong(item) * scale_row_stride + group * scale_group_stride, input1_dtype);
+            tile_bias[item] = load_float(bias_rows, ulong(item) * bias_row_stride + group * bias_group_stride, input1_dtype);
+            tile_words[item] = words;
+        }
+        #pragma unroll
+        for (uint batch = 0; batch < batch_rows; ++batch) {
+            if (batch >= rows) continue;
+            float activations[values_per_thread];
+            float input_sum = 0.0f;
+            #pragma unroll
+            for (uint element = 0; element < values_per_thread; element += 4) {
+                ulong index = input_base + ulong(batch) * input_row_stride + ulong(first + element) * input_stride;
+                float4 values;
+                if (qmv_vector_contiguous != 0 || (input_stride == 1 && (index & 3) == 0)) {
+                    values = load_float4_contiguous(input, index, input0_dtype);
+                } else {
+                    for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * input_stride, input0_dtype);
+                }
+                input_sum += dot(values, float4(1.0f));
+                if constexpr (bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
+                for (uint i = 0; i < 4; ++i) activations[element + i] = values[i];
+            }
+            #pragma unroll
+            for (uint item = 0; item < output_count; ++item) {
+                if (first_column + item >= columns) continue;
+                float value = 0.0f;
+                #pragma unroll
+                for (uint word = 0; word < words_per_thread; ++word) {
+                    if constexpr (bits == 4) {
+                        ushort2 halves = as_type<ushort2>(tile_words[item][word]);
+                        for (uint part = 0; part < 2; ++part) {
+                            uint i = word * 8 + part * 4;
+                            value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]),
+                            float4(halves[part] & 15u, halves[part] & 240u, halves[part] & 3840u, halves[part] & 61440u));
+                        }
+                    } else {
+                        uint i = word * 4;
+                        value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]), float4(as_type<uchar4>(tile_words[item][word])));
+                    }
+                }
+                sums[batch][item] += tile_scale[item] * value + tile_bias[item] * input_sum;
+            }
+        }
+    }
+    for (uint batch = 0; batch < batch_rows; ++batch)
+    for (uint item = 0; item < output_count; ++item) sums[batch][item] = simd_sum(sums[batch][item]);
+}
+
 template <uint output_count, uint words_per_thread, uint bits>
 void quantized_vector_sums(
     device const uchar *input,
@@ -124,64 +223,12 @@ void quantized_vector_sums(
     uint first_column,
     ushort lane,
     thread float (&sums)[output_count]) {
-    constexpr uint values_per_word = 32 / bits;
-    constexpr uint values_per_thread = values_per_word * words_per_thread;
-    if (first_column >= columns) return;
-    uint scale_bytes = input1_dtype == 0 ? 4 : 2;
-    device const uchar *weight_base = packed + (packed_base + ulong(first_column) * packed_row_stride) * 4;
-    device const uchar *scale_rows = scales + (scale_base + ulong(first_column) * scale_row_stride) * scale_bytes;
-    device const uchar *bias_rows = biases + (bias_base + ulong(first_column) * bias_row_stride) * scale_bytes;
-    for (ulong block = 0; block < inner; block += values_per_thread * 32) {
-        ulong first = block + uint(lane) * values_per_thread;
-        if (first >= inner) continue;
-        float activations[values_per_thread];
-        float input_sum = 0.0f;
-        #pragma unroll
-        for (uint element = 0; element < values_per_thread; element += 4) {
-            ulong index = input_base + ulong(first + element) * input_stride;
-            float4 values;
-            if (qmv_vector_contiguous != 0 || (input_stride == 1 && (index & 3) == 0)) {
-                values = load_float4_contiguous(input, index, input0_dtype);
-            } else {
-                for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * input_stride, input0_dtype);
-            }
-            input_sum += dot(values, float4(1.0f));
-            if constexpr (bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
-            for (uint i = 0; i < 4; ++i) activations[element + i] = values[i];
-        }
-        #pragma unroll
-        for (uint item = 0; item < output_count; ++item) {
-            if (first_column + item >= columns) continue;
-            ulong index = ulong(first / values_per_word) * packed_word_stride;
-            device const uchar *row = weight_base + ulong(item) * packed_row_stride * 4;
-            uint4 words = uint4(0u);
-            if (qmv_vector_contiguous != 0 || (packed_word_stride == 1 && ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0)) {
-                if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
-                else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
-            } else {
-                for (uint i = 0; i < words_per_thread; ++i) words[i] = load_uint(row, index + ulong(i) * packed_word_stride);
-            }
-            float value = 0.0f;
-        #pragma unroll
-            for (uint word = 0; word < words_per_thread; ++word) {
-                if constexpr (bits == 4) {
-                    ushort2 halves = as_type<ushort2>(words[word]);
-                    for (uint part = 0; part < 2; ++part) {
-                        uint i = word * 8 + part * 4;
-                        value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]),
-                            float4(halves[part] & 15u, halves[part] & 240u, halves[part] & 3840u, halves[part] & 61440u));
-                    }
-                } else {
-                    uint i = word * 4;
-                    value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]), float4(as_type<uchar4>(words[word])));
-                }
-            }
-            ulong group = first / quant_group_size;
-            sums[item] += load_float(scale_rows, ulong(item) * scale_row_stride + group * scale_group_stride, input1_dtype) * value
-                + load_float(bias_rows, ulong(item) * bias_row_stride + group * bias_group_stride, input1_dtype) * input_sum;
-        }
-    }
-    for (uint item = 0; item < output_count; ++item) sums[item] = simd_sum(sums[item]);
+    float batch[1][output_count] = {0.0f};
+    quantized_vector_batch_sums<output_count, words_per_thread, bits, 1>(
+        input, packed, scales, biases, input_base, packed_base, scale_base, bias_base,
+        input_stride, 0, 1, packed_row_stride, packed_word_stride, scale_row_stride,
+        scale_group_stride, bias_row_stride, bias_group_stride, inner, columns, first_column, lane, batch);
+    for (uint item = 0; item < output_count; ++item) sums[item] = batch[0][item];
 }
 
 template <uint output_count>
@@ -507,6 +554,70 @@ kernel void quantized_gemv_n2(
                     value);
             }
         }
+    }
+}
+
+template <uint batch_rows>
+void quantized_gemv_shared_body(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    device uchar *output,
+    constant QuantMatmulParams &params,
+    FORJA_EPILOGUE_PARAMETERS
+    ushort simdgroup,
+    ushort lane,
+    uint2 tile) {
+    uint first_column = tile.x * (qmv_vector_groups * 2) + uint(simdgroup) * 2;
+    float sums[batch_rows][2] = {0.0f};
+    if (quant_bits == 4) {
+        quantized_vector_batch_sums<2, 2, 4, batch_rows>(
+            input, packed, scales, biases, params.input_offset, params.packed_offset,
+            params.scale_offset, params.bias_offset, params.input_inner_stride,
+            params.input_row_stride, params.rows, params.packed_row_stride,
+            params.packed_word_stride, params.scale_row_stride, params.scale_group_stride,
+            params.bias_row_stride, params.bias_group_stride, params.inner, params.columns,
+            first_column, lane, sums);
+    } else {
+        quantized_vector_batch_sums<2, 2, 8, batch_rows>(
+            input, packed, scales, biases, params.input_offset, params.packed_offset,
+            params.scale_offset, params.bias_offset, params.input_inner_stride,
+            params.input_row_stride, params.rows, params.packed_row_stride,
+            params.packed_word_stride, params.scale_row_stride, params.scale_group_stride,
+            params.bias_row_stride, params.bias_group_stride, params.inner, params.columns,
+            first_column, lane, sums);
+    }
+    if (lane == 0) {
+        for (uint row = 0; row < params.rows; ++row) {
+            for (uint item = 0; item < 2; ++item) {
+                uint column = first_column + item;
+                if (column < params.columns) {
+                    float value = forja_epilogue(sums[row][item], 0.0f, 0u, row, column,
+                        1u, params.rows, params.columns, FORJA_EPILOGUE_VALUES);
+                    store_float(output, params.output_offset + ulong(row) * params.output_row_stride
+                        + ulong(column) * params.output_column_stride, output_dtype, value);
+                }
+            }
+        }
+    }
+}
+
+kernel void quantized_gemv_shared(
+    device const uchar *input [[buffer(0)]], device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]], device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]], constant QuantMatmulParams &params [[buffer(5)]],
+    device atomic_uint *error_flag [[buffer(6)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]], uint2 tile [[threadgroup_position_in_grid]]) {
+    if (qmv_batch_rows == 1) quantized_gemv_shared_body<1>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
+    else if (qmv_batch_rows == 2) quantized_gemv_shared_body<2>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
+    else if (qmv_batch_rows == 4) quantized_gemv_shared_body<4>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
+    else if (qmv_batch_rows == 8) quantized_gemv_shared_body<8>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
+    else {
+        atomic_store_explicit(error_flag, 2u, memory_order_relaxed);
+        atomic_store_explicit(error_flag + 1, qmv_batch_rows, memory_order_relaxed);
     }
 }
 
