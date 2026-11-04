@@ -557,7 +557,7 @@ kernel void quantized_gemv_n2(
     }
 }
 
-template <uint batch_rows>
+template <uint batch_rows, uint output_count>
 void quantized_gemv_shared_body(
     device const uchar *input,
     device const uchar *packed,
@@ -569,10 +569,10 @@ void quantized_gemv_shared_body(
     ushort simdgroup,
     ushort lane,
     uint2 tile) {
-    uint first_column = tile.x * (qmv_vector_groups * 2) + uint(simdgroup) * 2;
-    float sums[batch_rows][2] = {0.0f};
+    uint first_column = tile.x * (qmv_vector_groups * output_count) + uint(simdgroup) * output_count;
+    float sums[batch_rows][output_count] = {0.0f};
     if (quant_bits == 4) {
-        quantized_vector_batch_sums<2, 2, 4, batch_rows>(
+        quantized_vector_batch_sums<output_count, 2, 4, batch_rows>(
             input, packed, scales, biases, params.input_offset, params.packed_offset,
             params.scale_offset, params.bias_offset, params.input_inner_stride,
             params.input_row_stride, params.rows, params.packed_row_stride,
@@ -580,7 +580,7 @@ void quantized_gemv_shared_body(
             params.bias_row_stride, params.bias_group_stride, params.inner, params.columns,
             first_column, lane, sums);
     } else {
-        quantized_vector_batch_sums<2, 2, 8, batch_rows>(
+        quantized_vector_batch_sums<output_count, 2, 8, batch_rows>(
             input, packed, scales, biases, params.input_offset, params.packed_offset,
             params.scale_offset, params.bias_offset, params.input_inner_stride,
             params.input_row_stride, params.rows, params.packed_row_stride,
@@ -590,7 +590,7 @@ void quantized_gemv_shared_body(
     }
     if (lane == 0) {
         for (uint row = 0; row < params.rows; ++row) {
-            for (uint item = 0; item < 2; ++item) {
+            for (uint item = 0; item < output_count; ++item) {
                 uint column = first_column + item;
                 if (column < params.columns) {
                     float value = forja_epilogue(sums[row][item], 0.0f, 0u, row, column,
@@ -603,23 +603,29 @@ void quantized_gemv_shared_body(
     }
 }
 
-kernel void quantized_gemv_shared(
-    device const uchar *input [[buffer(0)]], device const uchar *packed [[buffer(1)]],
-    device const uchar *scales [[buffer(2)]], device const uchar *biases [[buffer(3)]],
-    device uchar *output [[buffer(4)]], constant QuantMatmulParams &params [[buffer(5)]],
-    device atomic_uint *error_flag [[buffer(6)]],
-    FORJA_EPILOGUE_ARGUMENTS
-    ushort simdgroup [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]], uint2 tile [[threadgroup_position_in_grid]]) {
-    if (qmv_batch_rows == 1) quantized_gemv_shared_body<1>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
-    else if (qmv_batch_rows == 2) quantized_gemv_shared_body<2>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
-    else if (qmv_batch_rows == 4) quantized_gemv_shared_body<4>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
-    else if (qmv_batch_rows == 8) quantized_gemv_shared_body<8>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile);
-    else {
-        atomic_store_explicit(error_flag, 2u, memory_order_relaxed);
-        atomic_store_explicit(error_flag + 1, qmv_batch_rows, memory_order_relaxed);
-    }
+#define SHARED_QUANT_KERNEL(NAME, COLUMNS) \
+kernel void NAME( \
+    device const uchar *input [[buffer(0)]], device const uchar *packed [[buffer(1)]], \
+    device const uchar *scales [[buffer(2)]], device const uchar *biases [[buffer(3)]], \
+    device uchar *output [[buffer(4)]], constant QuantMatmulParams &params [[buffer(5)]], \
+    device atomic_uint *error_flag [[buffer(6)]], \
+    FORJA_EPILOGUE_ARGUMENTS \
+    ushort simdgroup [[simdgroup_index_in_threadgroup]], \
+    ushort lane [[thread_index_in_simdgroup]], uint2 tile [[threadgroup_position_in_grid]]) { \
+    if (qmv_batch_rows == 1) quantized_gemv_shared_body<1, COLUMNS>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile); \
+    else if (qmv_batch_rows == 2) quantized_gemv_shared_body<2, COLUMNS>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile); \
+    else if (qmv_batch_rows == 4) quantized_gemv_shared_body<4, COLUMNS>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile); \
+    else if (qmv_batch_rows == 8) quantized_gemv_shared_body<8, COLUMNS>(input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES, simdgroup, lane, tile); \
+    else { \
+        atomic_store_explicit(error_flag, 2u, memory_order_relaxed); \
+        atomic_store_explicit(error_flag + 1, qmv_batch_rows, memory_order_relaxed); \
+    } \
 }
+
+SHARED_QUANT_KERNEL(quantized_gemv_shared, 2)
+SHARED_QUANT_KERNEL(quantized_gemv_shared_n4, 4)
+
+#undef SHARED_QUANT_KERNEL
 
 template <uint output_count>
 void quantized_gemv_q8_fast_body(

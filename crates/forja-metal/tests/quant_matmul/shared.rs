@@ -2,12 +2,23 @@ use super::*;
 
 macro_rules! shared_rows {
     ($name:ident, $dtype:ident, $bits:literal) => {
+        shared_rows!($name, $dtype, $bits, "quant-matmul.vector8-shared");
+    };
+    ($name:ident, $dtype:ident, $bits:literal, $variant:literal) => {
         #[test]
         fn $name() {
             let backend = MetalBackend::new().unwrap();
-            for (inner, columns) in [(5120, 17408), (17408, 5120), (4096, 4097)] {
+            for (inner, columns) in shared_shapes($variant) {
                 for parameters in [DType::F16, DType::BF16] {
-                    assert_shared_rows(&backend, DType::$dtype, $bits, inner, columns, parameters);
+                    assert_shared_rows(
+                        &backend,
+                        DType::$dtype,
+                        $bits,
+                        inner,
+                        columns,
+                        parameters,
+                        $variant,
+                    );
                 }
             }
         }
@@ -20,6 +31,14 @@ shared_rows!(shared_q8_f16_preserves_single_row_bits, F16, 8);
 shared_rows!(shared_q4_bf16_preserves_single_row_bits, BF16, 4);
 shared_rows!(shared_q8_bf16_preserves_single_row_bits, BF16, 8);
 
+fn shared_shapes(variant_name: &str) -> Vec<(u32, u32)> {
+    let mut shapes = vec![(5120, 17408), (17408, 5120), (4096, 4097)];
+    if variant_name == "quant-matmul.vector8-shared-n4" {
+        shapes.extend([(768, 4098), (768, 4099), (1536, 4099)]);
+    }
+    shapes
+}
+
 fn assert_shared_rows(
     backend: &MetalBackend,
     dtype: DType,
@@ -27,6 +46,7 @@ fn assert_shared_rows(
     inner: u32,
     columns: u32,
     parameters: DType,
+    variant_name: &str,
 ) {
     for rows in [1, 2, 4, 7, 8] {
         let mut specs = [
@@ -64,7 +84,7 @@ fn assert_shared_rows(
                 op,
                 &inputs.iter().collect::<Vec<_>>(),
                 &[&output],
-                "quant-matmul.vector8-shared",
+                variant_name,
             )
             .unwrap();
         submit_quant(
@@ -112,3 +132,45 @@ fn assert_shared_rows(
         );
     }
 }
+
+shared_rows!(
+    vector8_shared_n4_q4_f32_preserves_bits,
+    F32,
+    4,
+    "quant-matmul.vector8-shared-n4"
+);
+
+shared_rows!(
+    vector8_shared_n4_q8_f32_preserves_bits,
+    F32,
+    8,
+    "quant-matmul.vector8-shared-n4"
+);
+
+shared_rows!(
+    vector8_shared_n4_q4_f16_preserves_bits,
+    F16,
+    4,
+    "quant-matmul.vector8-shared-n4"
+);
+
+shared_rows!(
+    vector8_shared_n4_q8_f16_preserves_bits,
+    F16,
+    8,
+    "quant-matmul.vector8-shared-n4"
+);
+
+shared_rows!(
+    vector8_shared_n4_q4_bf16_preserves_bits,
+    BF16,
+    4,
+    "quant-matmul.vector8-shared-n4"
+);
+
+shared_rows!(
+    vector8_shared_n4_q8_bf16_preserves_bits,
+    BF16,
+    8,
+    "quant-matmul.vector8-shared-n4"
+);
