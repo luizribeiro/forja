@@ -1,9 +1,10 @@
 use forja_core::{StateOp, Tensor};
 
 use super::{
-    ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, MTL4ArgumentTable,
-    MTLComputePipelineState, MTLSize, MetalBackend, Op, ProtocolObject, dispatch_threadgroups,
-    dtype_code, encode_layout, error_state, set_argument_table, set_pipeline,
+    ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, EncoderTensor,
+    MTL4ArgumentTable, MTLComputePipelineState, MTLSize, MetalBackend, Op, ProtocolObject,
+    Retained, dispatch_threadgroups, dtype_code, encode_layout, error_state, set_argument_table,
+    set_pipeline,
 };
 
 mod block;
@@ -48,46 +49,17 @@ impl MetalBackend {
             );
         }
         let input = dispatch.inputs();
-        let ordinary = input.len() - 3;
         let (kernel, geometry, groups) = state_geometry(operation, input, dispatch.outputs())?;
         let tensors = input
             .iter()
             .chain(dispatch.outputs())
             .map(|t| self.encoder_tensor(t))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut layout_bytes = Vec::new();
-        for tensor in tensors[..ordinary].iter().chain(&tensors[input.len()..]) {
-            layout_bytes.extend(encode_layout(&tensor.layout)?);
-        }
+        let (layout_bytes, parameter_bytes) = state_arguments(dispatch, &tensors, geometry)?;
         let layouts = arguments.write(&layout_bytes)?;
-        let access = operation.access();
-        let params: Vec<_> = [
-            access.source(),
-            access.destination(),
-            input[input.len() - 2].layout().shape()[0],
-            u32::from(access.is_active()),
-        ]
-        .into_iter()
-        .chain(geometry)
-        .flat_map(u32::to_ne_bytes)
-        .collect();
-        let params = arguments.write(&params)?;
+        let params = arguments.write(&parameter_bytes)?;
         let flag = arguments.write(&error_state())?;
-        let constants: Vec<_> = [0, 1, 3, 4, 5]
-            .into_iter()
-            .enumerate()
-            .take(ordinary)
-            .map(|(i, slot)| (slot, dtype_code(input[i].layout().dtype())))
-            .chain([(2, dtype_code(dispatch.output().layout().dtype()))])
-            .collect();
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
-        if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
-            return Err(BackendError::UnsupportedOperation);
-        }
+        let pipeline = self.state_pipeline(kernel, dispatch)?;
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in tensors.iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -107,6 +79,59 @@ impl MetalBackend {
         );
         Ok((vec![layouts, params, flag.clone()], flag))
     }
+    fn state_pipeline(
+        &self,
+        kernel: &str,
+        dispatch: &Dispatch,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let input = dispatch.inputs();
+        let constants = [0, 1, 3, 4, 5]
+            .into_iter()
+            .enumerate()
+            .take(input.len() - 3)
+            .map(|(i, slot)| (slot, dtype_code(input[i].layout().dtype())))
+            .chain([(2, dtype_code(dispatch.output().layout().dtype()))])
+            .collect::<Vec<_>>();
+        let pipeline = self
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(kernel, &constants)?;
+        if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
+            return Err(BackendError::UnsupportedOperation);
+        }
+        Ok(pipeline)
+    }
+}
+
+fn state_arguments(
+    dispatch: &Dispatch,
+    tensors: &[EncoderTensor],
+    geometry: [u32; 4],
+) -> Result<(Vec<u8>, Vec<u8>), BackendError> {
+    let Op::State(operation) = dispatch.op() else {
+        return Err(BackendError::InvalidInput);
+    };
+    let input = dispatch.inputs();
+    let mut layouts = Vec::new();
+    for tensor in tensors[..input.len() - 3]
+        .iter()
+        .chain(&tensors[input.len()..])
+    {
+        layouts.extend(encode_layout(&tensor.layout)?);
+    }
+    let access = operation.access();
+    let params = [
+        access.source(),
+        access.destination(),
+        input[input.len() - 2].layout().shape()[0],
+        u32::from(access.is_active()),
+    ]
+    .into_iter()
+    .chain(geometry)
+    .flat_map(u32::to_ne_bytes)
+    .collect();
+    Ok((layouts, params))
 }
 
 fn state_geometry(

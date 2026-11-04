@@ -1,8 +1,7 @@
 use super::{
     ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, MTL4ArgumentTable,
-    MTLComputePipelineState, MTLSize, MetalBackend, Op, ProtocolObject, Tensor,
-    dispatch_threadgroups, dtype_code, encode_layout, error_state, set_argument_table,
-    set_pipeline, state_geometry,
+    MTLSize, MetalBackend, Op, ProtocolObject, Tensor, dispatch_threadgroups, error_state,
+    set_argument_table, set_pipeline, state_arguments, state_geometry,
 };
 use crate::variants::MetalVariant;
 
@@ -80,7 +79,6 @@ impl MetalBackend {
                 return Err(BackendError::InvalidInput);
             };
             let input = dispatch.inputs();
-            let ordinary = input.len() - 3;
             let (_, geometry, _) = state_geometry(operation, input, dispatch.outputs())?;
             let tensors = input
                 .iter()
@@ -91,41 +89,12 @@ impl MetalBackend {
                 pointers.extend(tensor.buffer.address.to_ne_bytes());
             }
             pointers.resize(pointers.len() + (11 - tensors.len()) * 8, 0);
-            for tensor in tensors[..ordinary].iter().chain(&tensors[input.len()..]) {
-                layouts.extend(encode_layout(&tensor.layout)?);
-            }
-            layouts.resize(
-                layouts.len() + (8 - ordinary - dispatch.outputs().len()) * 112,
-                0,
-            );
-            let access = operation.access();
-            for value in [
-                access.source(),
-                access.destination(),
-                input[input.len() - 2].layout().shape()[0],
-                u32::from(access.is_active()),
-            ]
-            .into_iter()
-            .chain(geometry)
-            {
-                params.extend(value.to_ne_bytes());
-            }
+            let (layout, parameter) = state_arguments(dispatch, &tensors, geometry)?;
+            layouts.extend(&layout);
+            layouts.resize(layouts.len() + 8 * 112 - layout.len(), 0);
+            params.extend(parameter);
         }
-        let constants = [0, 1, 3, 4, 5]
-            .into_iter()
-            .enumerate()
-            .take(first.inputs().len() - 3)
-            .map(|(i, slot)| (slot, dtype_code(first.inputs()[i].layout().dtype())))
-            .chain([(2, dtype_code(first.output().layout().dtype()))])
-            .collect::<Vec<_>>();
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
-        if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
-            return Err(BackendError::UnsupportedOperation);
-        }
+        let pipeline = self.state_pipeline(kernel, first)?;
         let buffers = [pointers, layouts, params, error_state().to_vec()]
             .iter()
             .map(|bytes| arguments.write(bytes))
