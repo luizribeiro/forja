@@ -1,5 +1,5 @@
 use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, StateOp, Submission};
-use forja_testing::{DeterministicValues, TensorSpec, generated_tensor_bytes, state_test_metadata};
+use forja_testing::{DeterministicValues, TensorSpec, generated_tensor_bytes};
 
 #[derive(Clone, Copy, Debug)]
 enum Geometry {
@@ -57,12 +57,7 @@ fn compare(
     corrupt: bool,
 ) {
     let delta = matches!(geometry, Geometry::Delta(_));
-    let (access, specs) = specifications(geometry, dtype);
-    let op = Op::State(if delta {
-        StateOp::DeltaRule(access)
-    } else {
-        StateOp::CausalDepthwiseConv(access)
-    });
+    let specs = specifications(geometry, dtype);
     let name = if delta {
         "delta-rule.simd-lanes"
     } else {
@@ -71,7 +66,12 @@ fn compare(
     let mut batch = CommandList::new();
     let mut results = Vec::new();
     for lane in 0..lanes {
-        let inputs = lane_inputs(backend, &specs, lane, corrupt);
+        let (access, inputs) = lane_inputs(backend, &specs, lane, corrupt);
+        let op = Op::State(if delta {
+            StateOp::DeltaRule(access)
+        } else {
+            StateOp::CausalDepthwiseConv(access)
+        });
         let output = backend
             .alloc(dtype, inputs[if delta { 2 } else { 0 }].layout().shape())
             .unwrap();
@@ -146,9 +146,8 @@ fn compare(
     }
 }
 
-fn specifications(geometry: Geometry, dtype: DType) -> (forja_core::StateAccess, Vec<TensorSpec>) {
-    let (access, metadata) = state_test_metadata().unwrap();
-    let mut specs = match geometry {
+fn specifications(geometry: Geometry, dtype: DType) -> Vec<TensorSpec> {
+    match geometry {
         Geometry::Delta([heads, q_heads, keys, values]) => vec![
             TensorSpec::permuted(DType::F32, &[keys, q_heads], &[1, 0]),
             TensorSpec::permuted(DType::F32, &[keys, q_heads], &[1, 0]),
@@ -162,9 +161,7 @@ fn specifications(geometry: Geometry, dtype: DType) -> (forja_core::StateAccess,
             TensorSpec::permuted(dtype, &[channels, taps], &[1, 0]),
             TensorSpec::contiguous(dtype, &[taps - 1, channels]),
         ],
-    };
-    specs.extend(metadata);
-    (access, specs)
+    }
 }
 
 fn lane_inputs(
@@ -172,7 +169,10 @@ fn lane_inputs(
     specs: &[TensorSpec],
     lane: usize,
     corrupt: bool,
-) -> Vec<forja_core::Tensor> {
+) -> (forja_core::StateAccess, Vec<forja_core::Tensor>) {
+    let (access, metadata) = lane_metadata(lane);
+    let mut specs = specs.to_vec();
+    specs.extend(metadata);
     let mut values = DeterministicValues::new(0x6a09_e667 + u64::try_from(lane).unwrap());
     let inputs = specs
         .iter()
@@ -196,8 +196,57 @@ fn lane_inputs(
     }
     if lane == 2 && corrupt {
         backend
-            .write(&inputs[ordinary + 1], &0_u32.to_le_bytes().repeat(3))
+            .write(
+                &inputs[ordinary + 1],
+                &0_u32.to_le_bytes().repeat(
+                    usize::try_from(inputs[ordinary + 1].layout().element_count()).unwrap(),
+                ),
+            )
             .unwrap();
     }
-    inputs
+    (access, inputs)
+}
+
+fn lane_metadata(lane: usize) -> (forja_core::StateAccess, [TensorSpec; 3]) {
+    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+    let pool = StatePool::new(
+        StateLayout::new(vec![StatePlane::new(DType::F32, vec![1]).unwrap()]).unwrap(),
+        8,
+        4096,
+    )
+    .unwrap();
+    let mut leases = (0..=lane)
+        .map(|_| pool.reserve().unwrap())
+        .collect::<Vec<_>>();
+    let sequence = leases.last_mut().unwrap();
+    let transaction = sequence.begin(1).unwrap();
+    let slot = sequence.bind(&transaction).unwrap();
+    let table = slot.table();
+    let access = StateAccess::from_slot(&slot).unwrap();
+    assert_eq!(usize::try_from(access.source()).unwrap() / 3, lane);
+    (
+        access,
+        [
+            TensorSpec::initialized(
+                DType::U32,
+                &[2, 2],
+                table
+                    .entries()
+                    .iter()
+                    .flat_map(|entry| [entry.page(), entry.generation()])
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+            TensorSpec::initialized(
+                DType::U32,
+                &[24],
+                table
+                    .generations()
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            ),
+            TensorSpec::initialized(DType::U32, &[1], 1_u32.to_le_bytes().to_vec()),
+        ],
+    )
 }
