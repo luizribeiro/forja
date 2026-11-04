@@ -36,7 +36,7 @@ paged-cache = true
 [variants.fixed]
 quant = "quant-matmul.tiled-k64"
 quant-decode = "quant-matmul.vector8-2g"
-quant-decode-batch = "quant-matmul.vector8-shared"
+quant-decode-batch = "quant-matmul.vector8-shared-n4"
 delta-decode = "delta-rule.simd-lanes"
 conv-decode = "causal-depthwise-conv.direct-lanes"
 attention = "sdpa.vector-256-two-pass"
