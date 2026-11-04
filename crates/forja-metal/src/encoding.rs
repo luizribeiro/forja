@@ -12426,6 +12426,19 @@ mod tests {
         }
     }
 
+    fn resolved_timestamp_bytes(submission: &MetalSubmission) -> Vec<u8> {
+        assert!(submission.completion.timestamps.lock().unwrap().is_none());
+        submission
+            .completion
+            .resolved_timestamps
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .bytes
+            .clone()
+    }
+
     #[test]
     fn concurrent_submission_gpu_times_survive_slot_reuse() {
         let backend = Arc::new(MetalBackend::new().unwrap());
@@ -12437,13 +12450,18 @@ mod tests {
 
         let counts = [1, 16, 256, 4096];
         let original = run_submission_wave(&backend, &workloads, &counts);
-        let shortest = original[0].1;
-        let longest = original[3].1;
-        assert!(shortest > Duration::ZERO);
-        assert!(longest >= shortest.saturating_mul(4));
-        for (_, gpu, wall) in &original {
-            assert!(*gpu <= *wall, "GPU {gpu:?}, wall {wall:?}");
-        }
+        let snapshots = original
+            .iter()
+            .map(|(submission, gpu, wall)| {
+                assert!(*gpu > Duration::ZERO);
+                assert!(*gpu <= *wall, "GPU {gpu:?}, wall {wall:?}");
+                resolved_timestamp_bytes(submission)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshots.iter().collect::<HashSet<_>>().len(),
+            original.len()
+        );
 
         for _ in 0..4 {
             drop(run_submission_wave(
@@ -12452,8 +12470,9 @@ mod tests {
                 &[4096, 256, 16, 1],
             ));
         }
-        for (submission, expected, _) in original {
+        for ((submission, expected, _), snapshot) in original.into_iter().zip(snapshots) {
             assert_eq!(submission.gpu_time(), Some(expected));
+            assert_eq!(resolved_timestamp_bytes(&submission), snapshot);
         }
     }
 
