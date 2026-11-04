@@ -1,13 +1,23 @@
 use forja_core::{Backend, BackendDispatchData, CommandList, DType, Op, StateOp, Submission};
 use forja_testing::{DeterministicValues, TensorSpec, generated_tensor_bytes, state_test_metadata};
 
+#[derive(Clone, Copy, Debug)]
+enum Geometry {
+    Delta([u32; 4]),
+    Conv([u32; 3]),
+}
+
 #[test]
 fn metal_authenticated_state_lanes_match_singles_with_inactive_rows() {
     let backend = forja_metal::MetalBackend::new().unwrap();
-    for delta in [false, true] {
+    for geometry in [
+        Geometry::Delta([48, 16, 128, 128]),
+        Geometry::Conv([1, 10240, 4]),
+        Geometry::Conv([1, 4097, 4]),
+    ] {
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for lanes in [1, 2, 4, 7, 8] {
-                compare(&backend, delta, dtype, lanes, false);
+                compare(&backend, geometry, dtype, lanes, false);
             }
         }
     }
@@ -16,19 +26,38 @@ fn metal_authenticated_state_lanes_match_singles_with_inactive_rows() {
 #[test]
 fn metal_authenticated_lane_batch_refuses_stale_generation() {
     let backend = forja_metal::MetalBackend::new().unwrap();
-    for delta in [false, true] {
-        compare(&backend, delta, DType::BF16, 4, true);
+    for geometry in [
+        Geometry::Delta([48, 16, 128, 128]),
+        Geometry::Conv([1, 4097, 4]),
+    ] {
+        compare(&backend, geometry, DType::BF16, 4, true);
+    }
+}
+
+#[test]
+fn metal_lane_batches_preserve_odd_keys_values_and_history_tails() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for geometry in [
+        Geometry::Delta([6, 2, 7, 33]),
+        Geometry::Delta([6, 2, 33, 7]),
+        Geometry::Delta([1, 1, 1, 1]),
+        Geometry::Conv([7, 33, 4]),
+    ] {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            compare(&backend, geometry, dtype, 4, false);
+        }
     }
 }
 
 fn compare(
     backend: &forja_metal::MetalBackend,
-    delta: bool,
+    geometry: Geometry,
     dtype: DType,
     lanes: usize,
     corrupt: bool,
 ) {
-    let (access, specs) = specifications(delta, dtype);
+    let delta = matches!(geometry, Geometry::Delta(_));
+    let (access, specs) = specifications(geometry, dtype);
     let op = Op::State(if delta {
         StateOp::DeltaRule(access)
     } else {
@@ -44,13 +73,11 @@ fn compare(
     for lane in 0..lanes {
         let inputs = lane_inputs(backend, &specs, lane, corrupt);
         let output = backend
-            .alloc(dtype, if delta { &[48, 128] } else { &[1, 4097] })
+            .alloc(dtype, inputs[if delta { 2 } else { 0 }].layout().shape())
             .unwrap();
+        let previous = &inputs[inputs.len() - 4];
         let state = backend
-            .alloc(
-                if delta { DType::F32 } else { dtype },
-                if delta { &[48, 128, 128] } else { &[3, 4097] },
-            )
+            .alloc(previous.layout().dtype(), previous.layout().shape())
             .unwrap();
         let single_output = backend.alloc(dtype, output.layout().shape()).unwrap();
         let single_state = backend
@@ -119,23 +146,22 @@ fn compare(
     }
 }
 
-fn specifications(delta: bool, dtype: DType) -> (forja_core::StateAccess, Vec<TensorSpec>) {
+fn specifications(geometry: Geometry, dtype: DType) -> (forja_core::StateAccess, Vec<TensorSpec>) {
     let (access, metadata) = state_test_metadata().unwrap();
-    let mut specs = if delta {
-        vec![
-            TensorSpec::permuted(DType::F32, &[128, 16], &[1, 0]),
-            TensorSpec::permuted(DType::F32, &[128, 16], &[1, 0]),
-            TensorSpec::contiguous(dtype, &[48, 128]),
-            TensorSpec::contiguous(DType::F32, &[48]),
-            TensorSpec::contiguous(dtype, &[48]),
-            TensorSpec::contiguous(DType::F32, &[48, 128, 128]),
-        ]
-    } else {
-        vec![
-            TensorSpec::contiguous(dtype, &[1, 4097]),
-            TensorSpec::permuted(dtype, &[4097, 4], &[1, 0]),
-            TensorSpec::contiguous(dtype, &[3, 4097]),
-        ]
+    let mut specs = match geometry {
+        Geometry::Delta([heads, q_heads, keys, values]) => vec![
+            TensorSpec::permuted(DType::F32, &[keys, q_heads], &[1, 0]),
+            TensorSpec::permuted(DType::F32, &[keys, q_heads], &[1, 0]),
+            TensorSpec::contiguous(dtype, &[heads, values]),
+            TensorSpec::contiguous(DType::F32, &[heads]),
+            TensorSpec::contiguous(dtype, &[heads]),
+            TensorSpec::contiguous(DType::F32, &[heads, keys, values]),
+        ],
+        Geometry::Conv([tokens, channels, taps]) => vec![
+            TensorSpec::contiguous(dtype, &[tokens, channels]),
+            TensorSpec::permuted(dtype, &[channels, taps], &[1, 0]),
+            TensorSpec::contiguous(dtype, &[taps - 1, channels]),
+        ],
     };
     specs.extend(metadata);
     (access, specs)
