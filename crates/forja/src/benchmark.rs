@@ -426,6 +426,40 @@ fn merge_step_profiles(
     for profile in profiles.drain(..) {
         merged.wall_time = merged.wall_time.saturating_add(profile.wall_time);
         merged.guest_time = merged.guest_time.saturating_add(profile.guest_time);
+        for (destination, source) in [
+            (&mut merged.imports.alloc, profile.imports.alloc),
+            (&mut merged.imports.view_slice, profile.imports.view_slice),
+            (
+                &mut merged.imports.view_reshape,
+                profile.imports.view_reshape,
+            ),
+            (
+                &mut merged.imports.view_permute,
+                profile.imports.view_permute,
+            ),
+            (
+                &mut merged.imports.view_broadcast,
+                profile.imports.view_broadcast,
+            ),
+            (&mut merged.imports.write, profile.imports.write),
+            (&mut merged.imports.dispatch, profile.imports.dispatch),
+            (&mut merged.imports.submit, profile.imports.submit),
+            (&mut merged.imports.read, profile.imports.read),
+            (
+                &mut merged.imports.command_list,
+                profile.imports.command_list,
+            ),
+            (
+                &mut merged.imports.resource_drop,
+                profile.imports.resource_drop,
+            ),
+            (&mut merged.allocations, profile.allocations),
+            (&mut merged.releases, profile.releases),
+            (&mut merged.output_read, profile.output_read),
+        ] {
+            destination.count = destination.count.saturating_add(source.count);
+            destination.time = destination.time.saturating_add(source.time);
+        }
         merged.submissions.extend(profile.submissions);
     }
     Ok(merged)
@@ -3344,11 +3378,17 @@ mod tests {
         let profiles = [2_u64, 3].map(|milliseconds| EngineStepProfile {
             wall_time: Duration::from_millis(milliseconds),
             guest_time: Duration::from_millis(milliseconds - 1),
+            output_read: ImportProfile {
+                count: milliseconds,
+                time: Duration::from_millis(milliseconds),
+            },
             ..EngineStepProfile::default()
         });
         let merged = merge_step_profiles(profiles.into()).unwrap();
         assert_eq!(merged.wall_time, Duration::from_millis(5));
         assert_eq!(merged.guest_time, Duration::from_millis(3));
+        assert_eq!(merged.output_read.count, 5);
+        assert_eq!(merged.output_read.time, Duration::from_millis(5));
     }
 
     #[cfg(target_os = "macos")]

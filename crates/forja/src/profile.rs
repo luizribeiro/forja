@@ -427,6 +427,7 @@ fn report(
             "cache_setup_wall_time_seconds": measurement.cache_setup_wall.as_secs_f64(),
         },
         "whole_run": whole_run,
+        "host_step": record::host_step(&measurement.step),
         "profiled": {
             "wall_time_seconds": measurement.step.wall_time.as_secs_f64(),
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),

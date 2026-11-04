@@ -45,7 +45,16 @@ pub(super) fn submissions(
             queries = queries.max(dispatch.inputs[0].shape[1]);
         }
         Ok(json!({"index": index, "phase": {"mode": super::mode_name(mode), "context": context, "query_tokens": queries},
-            "gpu_time_seconds": submission.gpu_time.as_secs_f64(), "timeline": timeline(&submission.per_dispatch)? }))
+            "gpu_time_seconds": submission.gpu_time.as_secs_f64(),
+            "host_phases": {
+                "validation_seconds": submission.validation.as_secs_f64(),
+                "encoding_seconds": submission.encoding.as_secs_f64(),
+                "metadata_seconds": submission.metadata_buffers.time.as_secs_f64(),
+                "metadata_writes": submission.metadata_buffers.count,
+                "residency_seconds": submission.residency.as_secs_f64(),
+                "commit_seconds": submission.commit.as_secs_f64(),
+                "explicit_wait_seconds": submission.wait.as_secs_f64(),
+            }, "timeline": timeline(&submission.per_dispatch)? }))
     }).collect()
 }
 
@@ -74,4 +83,34 @@ fn register_pressure(dispatch: &DispatchProfile, kernel: &str) -> Value {
         "spill_risk": "private arrays may spill; confirm with compiler/device profiling",
         "spill_observed": null, "register_ceiling": "uncalibrated"
     }))
+}
+
+pub(super) fn host_step(step: &forja_host::EngineStepProfile) -> Value {
+    let imports = &step.imports;
+    let calls = [
+        ("alloc", imports.alloc),
+        ("slice", imports.view_slice),
+        ("reshape", imports.view_reshape),
+        ("permute", imports.view_permute),
+        ("broadcast", imports.view_broadcast),
+        ("write", imports.write),
+        ("dispatch", imports.dispatch),
+        ("submit", imports.submit),
+        ("read", imports.read),
+        ("command_list", imports.command_list),
+        ("resource_drop", imports.resource_drop),
+        ("backend_allocations", step.allocations),
+        ("backend_releases", step.releases),
+        ("output_read", step.output_read),
+    ]
+    .map(|(name, profile)| {
+        (
+            name,
+            json!({"calls": profile.count, "seconds": profile.time.as_secs_f64()}),
+        )
+    })
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    json!({"wall_seconds": step.wall_time.as_secs_f64(), "guest_seconds": step.guest_time.as_secs_f64(), "calls": calls,
+        "scopes": "import and backend intervals are nested; GPU and host waits overlap"})
 }
