@@ -57,11 +57,25 @@ impl PagedState<'_> {
         weights: &Tensor<T>,
         output: &mut Tensor<T>,
     ) -> Result<()> {
+        self.causal_convolution_into_with(input, weights, output, None)
+    }
+
+    /// Records the update using an explicit optional Metal selection.
+    ///
+    /// # Errors
+    /// Refuses invalid shapes, aliases, selections or a host-denied update.
+    pub fn causal_convolution_into_with<T: FloatElement>(
+        &self,
+        input: &Tensor<T>,
+        weights: &Tensor<T>,
+        output: &mut Tensor<T>,
+        pick: Option<&crate::target::metal::Variant>,
+    ) -> Result<()> {
         self.record_into(
             Update::Convolution,
             &[input.handle(), weights.handle()],
             output,
-            "",
+            pick.map_or("", crate::target::metal::Variant::name),
         )
     }
 
@@ -78,6 +92,23 @@ impl PagedState<'_> {
         beta: &Tensor<T>,
         output: &mut Tensor<T>,
     ) -> Result<()> {
+        self.delta_rule_into_with([q, k], v, decay, beta, output, None)
+    }
+
+    /// Records the update using an explicit optional Metal selection.
+    ///
+    /// # Errors
+    /// Refuses invalid shapes, aliases, selections or a host-denied update.
+    pub fn delta_rule_into_with<T: FloatElement>(
+        &self,
+        qk: [&Tensor<f32>; 2],
+        v: &Tensor<T>,
+        decay: &Tensor<f32>,
+        beta: &Tensor<T>,
+        output: &mut Tensor<T>,
+        pick: Option<&crate::target::metal::Variant>,
+    ) -> Result<()> {
+        let [q, k] = qk;
         self.record_into(
             Update::Recurrent,
             &[
@@ -88,7 +119,7 @@ impl PagedState<'_> {
                 beta.handle(),
             ],
             output,
-            "",
+            pick.map_or("", crate::target::metal::Variant::name),
         )
     }
 

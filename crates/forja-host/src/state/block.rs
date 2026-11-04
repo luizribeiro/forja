@@ -59,19 +59,7 @@ impl<B: Backend + 'static> StateCommands<B> {
             output,
             Some(&scratch.tensor),
         )?;
-        #[cfg(target_os = "macos")]
-        if let Some(backend) = (&*self.storage.backend as &dyn std::any::Any)
-            .downcast_ref::<forja_metal::MetalBackend>()
-        {
-            let name = variant
-                .ok_or_else(|| invalid_handle("delta block requires an explicit Metal variant"))?;
-            let selected = backend
-                .validate_variant(&dispatch, name)
-                .map_err(|error| crate::variant_error(&error))?;
-            dispatch.set_backend_data(forja_core::BackendDispatchData::new(selected));
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = variant;
+        self.select_variant(&mut dispatch, variant)?;
         self.record_update(plane, dispatch)?;
         if !self
             .scratch

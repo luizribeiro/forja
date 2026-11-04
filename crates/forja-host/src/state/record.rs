@@ -357,6 +357,51 @@ impl<B: Backend> StateCommands<B> {
         self.record_update(plane, dispatch)
     }
 
+    pub(crate) fn update_variant(
+        &mut self,
+        plane: usize,
+        operation: fn(StateAccess) -> StateOp,
+        inputs: &[&Tensor],
+        output: &Tensor,
+        variant: &str,
+    ) -> Result<(), compute::Error>
+    where
+        B: 'static,
+    {
+        let mut dispatch =
+            self.prepare_update(plane, operation(self.access), inputs, output, None)?;
+        self.select_variant(&mut dispatch, (!variant.is_empty()).then_some(variant))?;
+        self.record_update(plane, dispatch)
+    }
+
+    pub(super) fn select_variant(
+        &self,
+        dispatch: &mut forja_core::Dispatch,
+        name: Option<&str>,
+    ) -> Result<(), compute::Error>
+    where
+        B: 'static,
+    {
+        #[cfg(target_os = "macos")]
+        if let Some(backend) = (&*self.storage.backend as &dyn std::any::Any)
+            .downcast_ref::<forja_metal::MetalBackend>()
+        {
+            if let Some(name) = name {
+                let selected = backend
+                    .validate_variant(dispatch, name)
+                    .map_err(|error| crate::variant_error(&error))?;
+                dispatch.set_backend_data(forja_core::BackendDispatchData::new(selected));
+            } else if matches!(dispatch.op(), Op::State(StateOp::DeltaRuleBlock(_))) {
+                return Err(invalid_handle(
+                    "delta block requires an explicit Metal variant",
+                ));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (dispatch, name);
+        Ok(())
+    }
+
     pub(super) fn prepare_update(
         &self,
         plane: usize,

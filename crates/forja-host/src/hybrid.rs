@@ -853,15 +853,23 @@ fn record_state_operation<B: Backend + 'static>(
     algorithm: &str,
 ) -> Result<(), compute::Error> {
     match (operation, tensors) {
-        (paged_storage::StateOperation::CausalConvolution, [input, weights])
-            if algorithm.is_empty() =>
-        {
-            body.causal_convolution(plane, input, weights, output)?;
+        (paged_storage::StateOperation::CausalConvolution, [_, _]) => {
+            body.update_variant(
+                plane,
+                forja_core::StateOp::CausalDepthwiseConv,
+                tensors,
+                output,
+                algorithm,
+            )?;
         }
-        (paged_storage::StateOperation::DeltaRule, [q, k, v, decay, beta])
-            if algorithm.is_empty() =>
-        {
-            body.delta_rule(plane, [q, k, v, decay, beta], output)?;
+        (paged_storage::StateOperation::DeltaRule, [_, _, _, _, _]) => {
+            body.update_variant(
+                plane,
+                forja_core::StateOp::DeltaRule,
+                tensors,
+                output,
+                algorithm,
+            )?;
         }
         (paged_storage::StateOperation::DeltaRuleBlock, [q, k, v, decay, beta]) => {
             body.delta_rule_block(plane, [q, k, v, decay, beta], output, Some(algorithm))?;
