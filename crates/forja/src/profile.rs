@@ -282,7 +282,9 @@ fn print_markdown(
 
 fn print_profile_shape(options: &Profile) {
     println!("- Tokens: {}", options.context);
-    println!("- Batch size: {}", options.batch_size);
+    if options.batch_size > 1 {
+        println!("- Batch size: {}", options.batch_size);
+    }
     if options.prefix_context > 0 {
         println!("- Cached prefix: {}", options.prefix_context);
         println!(

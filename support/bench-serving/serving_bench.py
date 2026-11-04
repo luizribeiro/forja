@@ -17,6 +17,8 @@ import provenance
 import priming
 import suite
 
+DECODE_BATCHES_METRIC = "forja_decode_batches_total"
+
 
 def arguments() -> argparse.Namespace:
     """Parse serving runner options."""
@@ -163,7 +165,7 @@ def scrape_metrics(url: str | None) -> dict[str, float] | None:
         if not line or line.startswith("#"):
             continue
         name, separator, value = line.partition(" ")
-        if "{" in name and not name.startswith('forja_decode_batches_total{bucket="'):
+        if "{" in name and not name.startswith(f'{DECODE_BATCHES_METRIC}{{bucket="'):
             continue
         if separator:
             samples[name] = float(value)
@@ -192,8 +194,8 @@ def metric_report(
         "live_graphs": after.get("forja_engine_live_graphs"),
         "replay_requests": None,
         "decode_batches": {
-            name: int(max(0, after[name] - before.get(name, 0)))
-            for name in after if name.startswith('forja_decode_batches_total{bucket="')
+            name.removeprefix(f'{DECODE_BATCHES_METRIC}{{bucket="').removesuffix('"}'): int(max(0, after[name] - before.get(name, 0)))
+            for name in after if name.startswith(f'{DECODE_BATCHES_METRIC}{{bucket="') and name.endswith('"}')
         },
     }
     metric = "forja_engine_graph_replays_total"

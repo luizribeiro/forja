@@ -194,7 +194,7 @@ def test_runner_reports_serving_phase_and_bucket_deltas() -> None:
     report = serving_bench.metric_report(before, after)
     assert report["host_phases"]["suffix_prefill_seconds"] == 2.0
     assert report["execution"]["replay_requests"] == 12
-    assert report["execution"]["decode_batches"] == {'forja_decode_batches_total{bucket="4"}': 11}
+    assert report["execution"]["decode_batches"] == {"4": 11}
 
 
 def test_exactness_report_compares_concurrent_output_fingerprints() -> None:
