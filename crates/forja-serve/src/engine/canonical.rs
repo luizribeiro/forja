@@ -13,8 +13,8 @@ pub(super) struct CanonicalCache<B: Backend> {
     allowance: SnapshotAllowance,
     declared: u64,
     snapshot_bytes: u64,
-    recompute: Option<recompute::Recompute>,
-    pending_recomputes: VecDeque<recompute::Recompute>,
+    recompute: Option<recompute::Recompute<B>>,
+    pending_recomputes: VecDeque<recompute::Recompute<B>>,
     pub(super) store: Option<HybridPrefixStore<B>>,
 }
 

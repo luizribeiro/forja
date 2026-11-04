@@ -3,14 +3,16 @@ use crate::prefix::PrefixLedger;
 use forja_core::Backend;
 use forja_host::bindings::l9o::gpu::compute::Error as ComputeError;
 use forja_host::{
-    BatchPhase, BatchSelection, CanonicalPrompt, EngineBatch, EngineBatchLane, SamplingParams,
+    BatchPhase, BatchSelection, CanonicalPrompt, EngineBatch, EngineBatchLane, HybridPrefix,
+    SamplingParams,
 };
 use std::sync::Arc;
 
-pub(super) struct Recompute {
+pub(super) struct Recompute<B: Backend> {
     prompt: Arc<CanonicalPrompt>,
     control: GenerationControl,
     position: Option<u32>,
+    resume: Option<Arc<HybridPrefix<B>>>,
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
@@ -64,7 +66,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         true
     }
 
-    async fn recompute_one_block(&mut self, job: &mut Recompute) -> Result<bool, ComputeError> {
+    async fn recompute_one_block(&mut self, job: &mut Recompute<B>) -> Result<bool, ComputeError> {
         let cache = self
             .canonical_cache
             .as_ref()
@@ -78,7 +80,10 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .map_err(|_| ComputeError::Quota("context length overflow".into()))?;
         let target = length / block * block;
         if job.position.is_none() {
-            let hit = store.lookup(cache.namespace, job.prompt.tokens())?;
+            let hit = job
+                .resume
+                .take()
+                .or(store.lookup(cache.namespace, job.prompt.tokens())?);
             if hit
                 .as_ref()
                 .is_some_and(|hit| u32::try_from(hit.tokens().len()) == Ok(target))
@@ -152,6 +157,79 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         Ok(false)
     }
 
+    pub(in crate::engine) fn pause_canonical_recompute(&mut self) -> Result<(), GenerationError> {
+        let Some(mut job) = self
+            .canonical_cache
+            .as_mut()
+            .and_then(|cache| cache.recompute.take())
+        else {
+            return Ok(());
+        };
+        let complete = self.canonical_cache.as_ref().is_some_and(|cache| {
+            let block = cache.namespace.block().get() as usize;
+            job.position.map(|position| position as usize)
+                == Some(job.prompt.tokens().len() / block * block)
+        });
+        let checkpoint = if job.control.is_cancelled() {
+            Ok(None)
+        } else {
+            self.checkpoint_recompute(&job, complete)
+        };
+        let released = self.release_recompute(&job);
+        job.position = None;
+        match checkpoint {
+            Ok(_) if job.control.is_cancelled() => {
+                self.metrics.recompute_cancelled =
+                    self.metrics.recompute_cancelled.saturating_add(1);
+            }
+            Ok(_) if complete => {
+                self.metrics.recompute_completed =
+                    self.metrics.recompute_completed.saturating_add(1);
+            }
+            Ok(Some(resume)) => {
+                job.resume = Some(resume);
+                if let Some(cache) = &mut self.canonical_cache {
+                    cache.pending_recomputes.push_front(job);
+                    self.metrics.recompute_pending = true;
+                }
+                self.metrics.recompute_preempted =
+                    self.metrics.recompute_preempted.saturating_add(1);
+            }
+            Ok(None) => {
+                self.metrics.recompute_cancelled =
+                    self.metrics.recompute_cancelled.saturating_add(1);
+            }
+            Err(error) => {
+                self.metrics.recompute_failed = self.metrics.recompute_failed.saturating_add(1);
+                self.metrics.snapshot_refusals = self.metrics.snapshot_refusals.saturating_add(1);
+                tracing::warn!(%error, "cannot checkpoint background canonical state");
+            }
+        }
+        released
+    }
+
+    fn checkpoint_recompute(
+        &self,
+        job: &Recompute<B>,
+        complete: bool,
+    ) -> Result<Option<Arc<HybridPrefix<B>>>, ComputeError> {
+        let cache = self
+            .canonical_cache
+            .as_ref()
+            .ok_or_else(|| ComputeError::InvalidHandle("canonical cache unavailable".into()))?;
+        let store = cache
+            .store
+            .as_ref()
+            .ok_or_else(|| ComputeError::InvalidHandle("canonical store unavailable".into()))?;
+        let image = self.runner.capture_canonical_prefix(0, cache.allowance)?;
+        if complete {
+            store.publish(image, &job.control.cancellation.cancelled)?;
+            Ok(None)
+        } else {
+            Ok(Some(image))
+        }
+    }
+
     pub(in crate::engine) fn stop_canonical_recompute(&mut self) -> Result<(), GenerationError> {
         let Some(cache) = &mut self.canonical_cache else {
             return Ok(());
@@ -174,7 +252,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         result
     }
 
-    fn release_recompute(&mut self, job: &Recompute) -> Result<(), GenerationError> {
+    fn release_recompute(&mut self, job: &Recompute<B>) -> Result<(), GenerationError> {
         self.metrics.recompute_pending = self
             .canonical_cache
             .as_ref()
@@ -243,6 +321,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                     prompt,
                     control: control.clone(),
                     position: None,
+                    resume: None,
                 });
             }
             Ok(_) | Err(_) => {

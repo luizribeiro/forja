@@ -235,7 +235,10 @@ async fn assert_preemption(quiesce_only: bool) -> Result<(), TestError> {
     }
     let observed = metrics.lock().unwrap().clone();
     assert_eq!(observed.recompute_blocks, 1);
-    assert_eq!(observed.recompute_preempted, 1);
+    assert_eq!(
+        observed.recompute_preempted,
+        if quiesce_only { 1 } else { 2 }
+    );
     assert_eq!(observed.recompute_completed, 0);
     assert!(!observed.recompute_pending);
     drop(sender);
@@ -389,6 +392,117 @@ async fn pending_reply_fifo_trims_to_a_shrunken_lane_bound() -> Result<(), TestE
                 .is_some(),
             token == 3
         );
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn light_foreground_traffic_resumes_completed_blocks_with_cold_bits() -> Result<(), TestError>
+{
+    use crate::engine::continuous::{BACKGROUND_QUIET_PERIOD, IdleWake, idle_work};
+    let mut engine = configured().await?;
+    let control = GenerationControl::new(Duration::from_secs(2));
+    let conversation = (0..192).map(|i| i % 4).collect::<Vec<_>>();
+    engine.queue_canonical_recompute(
+        &PrefixLedger::new(conversation[..65].to_vec()),
+        65,
+        &conversation[65..],
+        &control,
+        true,
+    );
+    let (_sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    for completed in 1..=3 {
+        let before = tokio::time::Instant::now();
+        assert!(matches!(
+            idle_work(&mut receiver, engine.canonical_recompute_running(), true).await,
+            IdleWake::Recompute
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            BACKGROUND_QUIET_PERIOD
+        );
+        engine.advance_canonical_recompute().await;
+        assert_eq!(engine.metrics.recompute_blocks, completed);
+        engine.pause_canonical_recompute()?;
+        evaluate(&mut engine, vec![3; 7], false).await?;
+        assert_eq!(engine.metrics.recompute_pending, completed < 3);
+        let store = engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap();
+        assert_eq!(store.usage()?.entries, usize::from(completed == 3));
+        let namespace = store.namespace();
+        for boundary in [65, 129] {
+            assert!(
+                store
+                    .lookup(namespace, &conversation[..boundary])?
+                    .is_none()
+            );
+        }
+    }
+    finish_recompute(&mut engine).await;
+    assert_eq!(engine.metrics.recompute_blocks, 3);
+    assert_eq!(engine.metrics.recompute_completed, 1);
+    let mut next = conversation;
+    next.push(2);
+    let hit = evaluate(&mut engine, next.clone(), true).await?;
+    let cold = evaluate(&mut configured().await?, next, false).await?;
+    assert_eq!((hit.0, hit.1), (cold.0, cold.1));
+    assert_eq!(hit.2, 192);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn paused_recompute_releases_private_snapshot_bytes_on_completion_and_cancel()
+-> Result<(), TestError> {
+    for cancelled in [false, true] {
+        let mut engine = configured().await?;
+        let before = engine.memory_usage().live_bytes;
+        let control = GenerationControl::new(Duration::from_secs(2));
+        engine.queue_canonical_recompute(
+            &PrefixLedger::new(vec![0; 65]),
+            65,
+            &[1; 127],
+            &control,
+            true,
+        );
+        for completed in 1..=2 {
+            assert!(engine.advance_canonical_recompute().await);
+            assert_eq!(engine.metrics.recompute_blocks, completed);
+            engine.pause_canonical_recompute()?;
+            assert!(engine.memory_usage().live_bytes > before);
+            assert_eq!(
+                engine
+                    .canonical_cache
+                    .as_ref()
+                    .unwrap()
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .usage()?
+                    .entries,
+                0
+            );
+        }
+        if cancelled {
+            control.cancel();
+        }
+        finish_recompute(&mut engine).await;
+        assert_eq!(engine.metrics.recompute_cancelled, u64::from(cancelled));
+        assert_eq!(engine.metrics.recompute_completed, u64::from(!cancelled));
+        let store = engine
+            .canonical_cache
+            .as_ref()
+            .unwrap()
+            .store
+            .as_ref()
+            .unwrap();
+        assert_eq!(store.usage()?.entries, usize::from(!cancelled));
+        assert_eq!(store.evict_lru()?, !cancelled);
+        assert_eq!(engine.memory_usage().live_bytes, before);
     }
     Ok(())
 }

@@ -575,7 +575,7 @@ async fn short_prompts_bypass_canonical_admission_without_ledger_charges() -> Re
 }
 
 #[tokio::test]
-async fn foreground_admission_drops_the_queued_reply_ledger() -> Result<(), TestError> {
+async fn foreground_admission_preserves_the_queued_reply_ledger() -> Result<(), TestError> {
     let mut engine = engine()
         .await?
         .with_profile_prefixes(&canonical_profile()?)?;
@@ -588,8 +588,8 @@ async fn foreground_admission_drops_the_queued_reply_ledger() -> Result<(), Test
         .begin_batch_prefill(input, 0)
         .await
         .map_err(|(_, error)| error)?;
-    assert!(!engine.metrics.recompute_pending);
-    assert_eq!(engine.metrics.recompute_preempted, 1);
+    assert!(engine.metrics.recompute_pending);
+    assert_eq!(engine.metrics.recompute_preempted, 0);
     assert_eq!(engine.metrics.recompute_blocks, 0);
     Ok(())
 }

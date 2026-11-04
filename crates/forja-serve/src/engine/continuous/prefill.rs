@@ -75,7 +75,7 @@ where
         request: PreparedRequest,
         slot: u32,
     ) -> Result<PendingPrefill, (PreparedRequest, GenerationError)> {
-        if let Err(error) = self.stop_canonical_recompute() {
+        if let Err(error) = self.pause_canonical_recompute() {
             return Err((request, error));
         }
         let sampling = match sampling_seed(request.params.seed, request.params.temperature).await {

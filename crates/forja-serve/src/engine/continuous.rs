@@ -476,7 +476,15 @@ where
             while let Ok(command) = receiver.try_recv() {
                 pending.push_back(RequestEnvelope::from_command(command));
             }
-            if let Err(error) = self.stop_canonical_recompute() {
+            let pause = if matches!(
+                pending.front(),
+                Some(RequestEnvelope::Quiesce { .. } | RequestEnvelope::UpdatePolicy { .. })
+            ) {
+                self.stop_canonical_recompute()
+            } else {
+                self.pause_canonical_recompute()
+            };
+            if let Err(error) = pause {
                 tracing::warn!(%error, "cannot release background canonical state");
             }
             self.refresh_shared_metrics(&shared_metrics);
