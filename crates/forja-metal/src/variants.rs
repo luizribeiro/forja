@@ -15,10 +15,12 @@ use crate::matmul::{MatrixLayout, classify};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
     DeltaRule,
+    DeltaRuleLanes,
     DeltaBlockWy64,
     DeltaBlockWy64Mma16,
     DeltaBlockWy64Mma32,
     CausalDepthwiseConv,
+    CausalDepthwiseConvLanes,
     MatmulPortable,
     MatmulGemv,
     MatmulGemvTransposed,
@@ -1523,6 +1525,13 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
             "Fixed SIMD reductions and f32 out-of-place state; authentication precedes all state access."
         ]
     ),
+    batch_invariant_variant!(@class "delta-rule.simd";
+        "delta-rule.simd-lanes", DeltaRule, DeltaRuleLanes,
+        &[value(dim("key width", QUERY, Axis::Index(1)), Relation::Range { min: 1, max: crate::geometry::DELTA_RULE_MAX_KEYS })],
+        &["adjacent independent lanes with matching geometry and scalar types."],
+        &["dependent updates or differing lane shapes."],
+        &["Coalesces at most eight authenticated lane updates; isolated or conflicting updates retain the same per-lane arithmetic."]
+    ),
     batch_invariant_variant!(
         "delta-rule-block.wy64-fixed",
         DeltaRuleBlock,
@@ -1554,6 +1563,12 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         &["causal depthwise convolution with retained raw input history."],
         &["convolution without state."],
         &["Accumulates taps in ascending order and authenticates the private output version."]
+    ),
+    batch_invariant_variant!(@class "causal-depthwise-conv.direct";
+        "causal-depthwise-conv.direct-lanes", CausalDepthwiseConv, CausalDepthwiseConvLanes, &[],
+        &["adjacent independent history updates with matching geometry and scalar types."],
+        &["dependent updates or differing lane shapes."],
+        &["Coalesces at most eight authenticated lanes with ascending tap order; isolated or conflicting updates retain separate dispatches."]
     ),
     batch_invariant_variant!(
         "sdpa.steel-256",
@@ -2386,10 +2401,12 @@ mod tests {
                 "sample.portable",
                 "sample.parallel",
                 "delta-rule.simd",
+                "delta-rule.simd-lanes",
                 "delta-rule-block.wy64-fixed",
                 "delta-rule-block.wy64-mma-v16",
                 "delta-rule-block.wy64-mma-v32",
                 "causal-depthwise-conv.direct",
+                "causal-depthwise-conv.direct-lanes",
                 "sdpa.steel-256",
                 "sdpa.steel-half-256",
                 "paged-sdpa.steel-256",
@@ -3450,6 +3467,16 @@ mod tests {
                 "sdpa.vector-256-two-pass",
                 sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256),
                 "mlx_sdpa_vector_2pass_256",
+            ),
+            (
+                "delta-rule.simd-lanes",
+                state_dispatch(forja_core::StateOp::DeltaRule),
+                "state_delta_rule_lanes",
+            ),
+            (
+                "causal-depthwise-conv.direct-lanes",
+                state_dispatch(forja_core::StateOp::CausalDepthwiseConv),
+                "state_causal_conv_lanes",
             ),
             (
                 "delta-rule.simd",

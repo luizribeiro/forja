@@ -94,7 +94,31 @@ kernel void state_delta_rule(
         activity, output, next, layouts, params, error_flag, group, simd_group, lane);
 }
 
-
+kernel void state_delta_rule_lanes(
+    constant ulong *pointers [[buffer(0)]], constant TensorLayout *all_layouts [[buffer(1)]],
+    constant StateParams *all_params [[buffer(2)]], device atomic_uint *error_flag [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constant ulong *p = pointers + group.z * 11;
+    constant TensorLayout *layouts = all_layouts + group.z * 8;
+    constant StateParams &params = all_params[group.z];
+    uint column = group.x * 4 + simd_group;
+    if (column >= params.values) return;
+    device uchar *output = reinterpret_cast<device uchar *>(p[9]);
+    device const uint *activity = reinterpret_cast<device const uint *>(p[8]);
+    if (activity[0] == 0) {
+        if (lane == 0) store_float(output, physical_index(layouts[6], group.y * params.values + column), output_dtype, 0.0f);
+        return;
+    }
+    device const uint2 *table = reinterpret_cast<device const uint2 *>(p[6]);
+    device const uint *generations = reinterpret_cast<device const uint *>(p[7]);
+    if (!authenticate_state(table, generations, params.access, error_flag)) return;
+    state_delta_rule_compute(reinterpret_cast<device const uchar *>(p[0]),
+        reinterpret_cast<device const uchar *>(p[1]), reinterpret_cast<device const uchar *>(p[2]),
+        reinterpret_cast<device const uchar *>(p[3]), reinterpret_cast<device const uchar *>(p[4]),
+        reinterpret_cast<device const float *>(p[5]), table, generations, activity, output,
+        reinterpret_cast<device float *>(p[10]), layouts, params, error_flag, group, simd_group, lane);
+}
 
 struct ConvStateParams {
     StateAuth access;
@@ -156,4 +180,29 @@ kernel void state_causal_conv(
     if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
     state_causal_conv_compute(input, weight, history, table, generations, activity, output,
         next, layouts, params, error_flag, index);
+}
+
+kernel void state_causal_conv_lanes(
+    constant ulong *pointers [[buffer(0)]], constant TensorLayout *all_layouts [[buffer(1)]],
+    constant ConvStateParams *all_params [[buffer(2)]], device atomic_uint *error_flag [[buffer(3)]],
+    uint3 position [[thread_position_in_grid]]) {
+    constant ulong *p = pointers + position.z * 11;
+    constant TensorLayout *layouts = all_layouts + position.z * 8;
+    constant ConvStateParams &params = all_params[position.z];
+    uint index = position.x;
+    uint outputs = layouts[3].element_count;
+    if (index >= max(outputs, layouts[4].element_count)) return;
+    device uchar *output = reinterpret_cast<device uchar *>(p[6]);
+    device const uint *activity = reinterpret_cast<device const uint *>(p[5]);
+    if (activity[0] == 0) {
+        if (index < outputs) store_float(output, physical_index(layouts[3], index), output_dtype, 0.0f);
+        return;
+    }
+    device const uint2 *table = reinterpret_cast<device const uint2 *>(p[3]);
+    device const uint *generations = reinterpret_cast<device const uint *>(p[4]);
+    if (!authenticate_state(table, generations, params.access, error_flag)) return;
+    state_causal_conv_compute(reinterpret_cast<device const uchar *>(p[0]),
+        reinterpret_cast<device const uchar *>(p[1]), reinterpret_cast<device const uchar *>(p[2]),
+        table, generations, activity, output, reinterpret_cast<device uchar *>(p[7]),
+        layouts, params, error_flag, index);
 }

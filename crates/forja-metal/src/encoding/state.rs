@@ -7,6 +7,8 @@ use super::{
 };
 
 mod block;
+mod lanes;
+pub(super) use lanes::{fold_profiles, lane_group, lane_variant};
 #[cfg(test)]
 mod block_tests;
 
@@ -34,6 +36,15 @@ impl MetalBackend {
                 arguments,
                 timestamps,
                 internal_timestamp,
+            );
+        }
+        if lane_variant(dispatch) {
+            return self.encode_state_lanes(
+                encoder,
+                table,
+                std::slice::from_ref(dispatch),
+                bindings,
+                arguments,
             );
         }
         let input = dispatch.inputs();

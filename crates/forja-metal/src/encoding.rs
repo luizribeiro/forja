@@ -1963,6 +1963,7 @@ impl Completion {
 
     fn dispatch_times(&self, metadata: &[DispatchProfile]) -> Option<Vec<DispatchProfile>> {
         let timestamps = self.resolved_timestamps.get()?.as_ref()?;
+        let mut previous_end = 2;
         metadata
             .iter()
             .enumerate()
@@ -1970,7 +1971,18 @@ impl Completion {
                 let origin = 2;
                 let start = 2 + index * 2;
                 let end = start + 1;
-                let previous = if index == 0 { start } else { start - 1 };
+                if metadata.physical_dispatches == 0 {
+                    let position = timestamps.elapsed_pairs(&[(origin, previous_end)])?[0];
+                    return Some(DispatchProfile {
+                        gpu_start: position,
+                        gpu_end: position,
+                        gap_before: Duration::ZERO,
+                        gpu_time: Duration::ZERO,
+                        ..metadata.clone()
+                    });
+                }
+                let previous = if index == 0 { start } else { previous_end };
+                previous_end = end;
                 let [gpu_start, gpu_end, gap_before, gpu_time] = timestamps
                     .elapsed_pairs(&[
                         (origin, start),
@@ -3003,7 +3015,7 @@ impl MetalBackend {
         }
         timestamps.write_command(&command_buffer, 1)?;
         command_buffer.endCommandBuffer();
-        let dispatch_profiles = if PROFILE {
+        let mut dispatch_profiles = if PROFILE {
             let mut facts = crate::route_facts::RouteFacts::default();
             dispatches
                 .iter()
@@ -3020,6 +3032,9 @@ impl MetalBackend {
         } else {
             Vec::new()
         };
+        if PROFILE {
+            state::fold_profiles(&dispatches, &mut dispatch_profiles)?;
+        }
         let commit_started = PROFILE.then(Instant::now);
         let mut submission = self.commit(
             &command_buffer,
@@ -3079,19 +3094,47 @@ impl MetalBackend {
             .ok_or(BackendError::ExecutionFailed)?;
         let mut internal_profiles = Vec::new();
         let mut physical_counts = Vec::new();
+        let mut consumed = 0;
+        let mut previous_dispatch: Option<usize> = None;
         for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
-            if index > 0 {
+            if index < consumed {
+                continue;
+            }
+            if let Some(previous) = previous_dispatch {
                 write_dispatch_timestamp(
                     &encoder,
                     timestamps,
                     timestamp_granularity,
-                    1 + index * 2,
+                    3 + previous * 2,
                 )?;
             }
-            if barrier {
+            previous_dispatch = Some(index);
+            let lanes = state::lane_group(&plan.dispatches[index..]);
+            if barrier
+                || plan.barriers[index..index + lanes]
+                    .iter()
+                    .any(|&value| value)
+            {
                 encode_dispatch_barrier(&encoder);
             }
             write_dispatch_timestamp(&encoder, timestamps, timestamp_granularity, 2 + index * 2)?;
+            if lanes > 1 {
+                let (buffers, flag) = self.encode_state_lanes(
+                    &encoder,
+                    table,
+                    &plan.dispatches[index..index + lanes],
+                    &mut bindings,
+                    arguments,
+                )?;
+                temporaries.extend(buffers);
+                error_flags.push(EncodedErrorFlag::new(flag, index, "state-lanes"));
+                consumed = index + lanes;
+                if timestamps.is_some() {
+                    physical_counts.push(1);
+                    physical_counts.extend(std::iter::repeat_n(0, lanes - 1));
+                }
+                continue;
+            }
             if timestamps.is_some() {
                 internal_profiles.extend(internal_dispatch_profiles(
                     dispatch,
@@ -3143,12 +3186,12 @@ impl MetalBackend {
                 physical_counts.push(physical_dispatch_count(&recorder.finish())?);
             }
         }
-        if !plan.dispatches.is_empty() {
+        if let Some(previous) = previous_dispatch {
             write_dispatch_timestamp(
                 &encoder,
                 timestamps,
                 timestamp_granularity,
-                1 + plan.dispatches.len() * 2,
+                3 + previous * 2,
             )?;
         }
         encoder.endEncoding();
@@ -7812,14 +7855,27 @@ impl MetalBackend {
         if let Some(plan) = plan {
             arguments.offset = plan.argument_offset;
         }
+        let mut consumed = 0;
         for (index, dispatch) in dispatches.iter().enumerate() {
+            if index < consumed {
+                continue;
+            }
             if plan
                 .and_then(|plan| plan.dispatches.get(index))
                 .is_some_and(Option::is_some)
             {
                 continue;
             }
-            self.size_dispatch_arguments(dispatch, &mut arguments)?;
+            let lanes = state::lane_group(&dispatches[index..]);
+            if lanes > 1 || state::lane_variant(dispatch) {
+                arguments.write(lanes * 11 * 8)?;
+                arguments.write(lanes * 8 * 112)?;
+                arguments.write(lanes * 8 * size_of::<u32>())?;
+                arguments.write(2 * size_of::<u32>())?;
+                consumed = index + lanes;
+            } else {
+                self.size_dispatch_arguments(dispatch, &mut arguments)?;
+            }
         }
         Ok(arguments.offset.max(1))
     }
@@ -8690,6 +8746,7 @@ fn internal_dispatch_profiles(
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError> {
     Ok(match dispatch.op() {
         Op::Program(_) => match dispatch
@@ -8714,9 +8771,27 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::State(forja_core::StateOp::DeltaRule(_)) => "state_delta_rule",
+        Op::State(forja_core::StateOp::DeltaRule(_)) => {
+            if matches!(
+                selected_variant(dispatch),
+                Some(MetalVariant::DeltaRuleLanes)
+            ) {
+                "state_delta_rule_lanes"
+            } else {
+                "state_delta_rule"
+            }
+        }
         Op::State(forja_core::StateOp::DeltaRuleBlock(_)) => "state_delta_rule_block",
-        Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => "state_causal_conv",
+        Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => {
+            if matches!(
+                selected_variant(dispatch),
+                Some(MetalVariant::CausalDepthwiseConvLanes)
+            ) {
+                "state_causal_conv_lanes"
+            } else {
+                "state_causal_conv"
+            }
+        }
         Op::PagedCopy { .. } => "paged_copy",
         Op::RmsNorm { .. } => "rms_norm",
         Op::Argmax { chunk_width } => {
@@ -9266,6 +9341,7 @@ fn paged_half_steel_sdpa_supported(dispatch: &Dispatch) -> Result<bool, BackendE
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn variant_supported(
     dispatch: &Dispatch,
     variant: MetalVariant,
@@ -9284,6 +9360,8 @@ pub(super) fn variant_supported(
         }
         MetalVariant::PagedSdpaWideTwoPass
         | MetalVariant::DeltaRule
+        | MetalVariant::DeltaRuleLanes
+        | MetalVariant::CausalDepthwiseConvLanes
         | MetalVariant::DeltaBlockWy64
         | MetalVariant::DeltaBlockWy64Mma16
         | MetalVariant::DeltaBlockWy64Mma32
@@ -10495,7 +10573,9 @@ fn nan_preserving_kernel(name: &str) -> bool {
     matches!(
         name,
         "state_causal_conv"
+            | "state_causal_conv_lanes"
             | "state_delta_rule"
+            | "state_delta_rule_lanes"
             | "softmax_single"
             | "softmax_looped"
             | "argmax_partials"
