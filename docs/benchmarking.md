@@ -294,6 +294,12 @@ operand set holds its own chain; `--serial` also serializes the sets through the
 shared first output. These are diagnostic tensor dependencies, using fixed test
 authentication metadata, rather than engine state transactions. Records include
 the chain length, total dispatch count and all resident destination bytes.
+`--advance-position` visits consecutive token positions on each paged attention
+operand set before moving to the next set, incrementing key lengths too. Its
+dispatch count must be a multiple of the operand-set count. With append-and-attend
+variants, this measures successive appends to the same pages. Allocate space for
+every row. `operand_order` records `consecutive` for this flag and `cyclic`
+otherwise. This flag nulls `cost_per_dispatch` and `rates`.
 
 Rates count logical operands and FLOPs rather than hardware transactions or
 instruction throughput. Quantized matrix diagnostics also report compiled

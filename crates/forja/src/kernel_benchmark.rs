@@ -17,7 +17,7 @@ pub(crate) struct Options {
     /// Number of measured submissions.
     #[arg(long, default_value = "5")]
     pub(crate) reps: std::num::NonZeroU32,
-    /// Independent operand sets, visited cyclically within each submission.
+    /// Independent operand sets, visited cyclically unless advancing positions.
     #[arg(long, default_value = "1")]
     pub(crate) copies: std::num::NonZeroU32,
     /// Dispatches per measured submission, amortizing command-buffer latency.
@@ -26,6 +26,9 @@ pub(crate) struct Options {
     /// Chain this many single-token state updates through distinct outputs.
     #[arg(long, default_value = "1")]
     pub(crate) state_steps: std::num::NonZeroU32,
+    /// Advance paged attention by one position on each visit to an operand set.
+    #[arg(long)]
+    pub(crate) advance_position: bool,
     /// Reuse the first output to serialize dispatches through write dependencies.
     #[arg(long)]
     pub(crate) serial: bool,
@@ -79,9 +82,13 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         return Err("kernel diagnostic exceeds live-byte quota".into());
     }
     let commands = diagnostic_commands(&backend, &shape, options)?;
-    let cost = commands
-        .last_dispatch()
-        .and_then(forja_core::KernelCost::of);
+    let cost = if options.advance_position {
+        None
+    } else {
+        commands
+            .last_dispatch()
+            .and_then(forja_core::KernelCost::of)
+    };
     let mut samples = Vec::new();
     let count = options
         .warmups
@@ -102,7 +109,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .transpose()?
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
-        "variant": options.variant, "serial": options.serial, "copies": options.copies.get(), "resident_operand_bytes": bytes,
+        "variant": options.variant, "serial": options.serial, "advance_position": options.advance_position, "operand_order": if options.advance_position {"consecutive"} else {"cyclic"}, "copies": options.copies.get(), "resident_operand_bytes": bytes,
         "state_steps": options.state_steps.get(), "dispatches_per_sample": dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({
             "kernel": resources.kernel, "execution_width": resources.execution_width,
@@ -162,6 +169,11 @@ fn diagnostic_commands(
     let chained_input = (options.state_steps.get() > 1)
         .then(|| chain_state_input(shape.operation, &shape.inputs))
         .transpose()?;
+    let group = if options.advance_position {
+        consecutive_rows(options.dispatches, options.copies)?
+    } else {
+        options.copies
+    };
     let operands = (0..options.copies.get())
         .map(|_| {
             Ok((
@@ -175,7 +187,13 @@ fn diagnostic_commands(
     let epilogue = shape.prepare_epilogue()?;
     let mut commands = CommandList::new();
     for index in 0..options.dispatches.get() {
-        let (inputs, outputs) = &operands[usize::try_from(index % options.copies.get())?];
+        let (operand, position) = diagnostic_visit(index, group, options.advance_position);
+        let (inputs, outputs) = &operands[usize::try_from(operand)?];
+        let operation = if options.advance_position {
+            advance_attention(shape.operation, position)?
+        } else {
+            shape.operation
+        };
         for step in 0..usize::try_from(options.state_steps.get())? {
             let inputs = inputs
                 .iter()
@@ -199,20 +217,16 @@ fn diagnostic_commands(
                     }
                 })
                 .collect::<Vec<_>>();
-            let variant = backend.validate_variant_for_op(
-                shape.operation,
-                &inputs,
-                &outputs,
-                &options.variant,
-            )?;
+            let variant =
+                backend.validate_variant_for_op(operation, &inputs, &outputs, &options.variant)?;
             if let Some(epilogue) = &epilogue {
-                commands.dispatch_epilogue(shape.operation, &inputs, outputs[0], epilogue, &[])?;
+                commands.dispatch_epilogue(operation, &inputs, outputs[0], epilogue, &[])?;
                 if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
                     return Err("missing diagnostic dispatch".into());
                 }
             } else {
                 commands.dispatch_many_with_backend_data(
-                    shape.operation,
+                    operation,
                     &inputs,
                     &outputs,
                     BackendDispatchData::new(variant),
@@ -252,6 +266,65 @@ fn validate_diagnostic_options(shape: &Shape, options: &Options) -> Result<(), B
         return Err("state steps require one convolution token".into());
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn consecutive_rows(
+    dispatches: std::num::NonZeroU32,
+    copies: std::num::NonZeroU32,
+) -> Result<std::num::NonZeroU32, Box<dyn Error>> {
+    if !dispatches.get().is_multiple_of(copies.get()) {
+        return Err("successive positions require an equal row count per operand set".into());
+    }
+    std::num::NonZeroU32::new(dispatches.get() / copies.get())
+        .ok_or_else(|| "successive positions require at least one row per operand set".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn diagnostic_visit(index: u32, group: std::num::NonZeroU32, consecutive: bool) -> (u32, u32) {
+    if consecutive {
+        (index / group.get(), index % group.get())
+    } else {
+        (index % group.get(), 0)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn advance_attention(
+    operation: forja_core::Op,
+    offset: u32,
+) -> Result<forja_core::Op, Box<dyn Error>> {
+    use forja_core::Op;
+    let add = |value: u32| {
+        value
+            .checked_add(offset)
+            .ok_or("attention position overflow")
+    };
+    Ok(match operation {
+        Op::PagedSdpaAppend {
+            scale,
+            q_start,
+            page_tokens,
+        } => Op::PagedSdpaAppend {
+            scale,
+            q_start: add(q_start)?,
+            page_tokens,
+        },
+        Op::PagedSdpa {
+            scale,
+            causal,
+            q_start,
+            key_length,
+            page_tokens,
+        } => Op::PagedSdpa {
+            scale,
+            causal,
+            q_start: add(q_start)?,
+            key_length: add(key_length)?,
+            page_tokens,
+        },
+        _ => return Err("position advancement requires paged attention".into()),
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -325,6 +398,63 @@ mod tests {
         assert_eq!(effective_dispatches(&options).unwrap().get(), 3);
         options.dispatches = std::num::NonZeroU32::MAX;
         assert!(effective_dispatches(&options).is_err());
+    }
+
+    #[test]
+    fn attention_rows_stay_consecutive_on_each_operand_set() {
+        let count = |n| std::num::NonZeroU32::new(n).unwrap();
+        let rows = consecutive_rows(count(6), count(2)).unwrap();
+        assert_eq!(
+            (0..6)
+                .map(|i| diagnostic_visit(i, rows, true))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|i| diagnostic_visit(i, count(2), false))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 0), (0, 0), (1, 0)]
+        );
+        assert!(consecutive_rows(count(7), count(2)).is_err());
+        assert!(consecutive_rows(count(1), count(2)).is_err());
+    }
+
+    #[test]
+    fn attention_rows_advance_both_position_and_key_length() {
+        use forja_core::Op;
+        let attention = Op::PagedSdpa {
+            scale: 0.5,
+            causal: true,
+            q_start: 4095,
+            key_length: 4096,
+            page_tokens: 32,
+        };
+        assert_eq!(
+            advance_attention(attention, 2).unwrap(),
+            Op::PagedSdpa {
+                scale: 0.5,
+                causal: true,
+                q_start: 4097,
+                key_length: 4098,
+                page_tokens: 32
+            }
+        );
+        let append = Op::PagedSdpaAppend {
+            scale: 0.5,
+            q_start: 4095,
+            page_tokens: 32,
+        };
+        assert_eq!(
+            advance_attention(append, 2).unwrap(),
+            Op::PagedSdpaAppend {
+                scale: 0.5,
+                q_start: 4097,
+                page_tokens: 32
+            }
+        );
+        assert!(advance_attention(attention, u32::MAX).is_err());
+        assert!(advance_attention(Op::Matmul, 0).is_err());
     }
 
     #[test]
@@ -477,6 +607,7 @@ mod tests {
             reps: std::num::NonZeroU32::new(1).unwrap(),
             warmups: 0,
             serial: false,
+            advance_position: false,
             copies: std::num::NonZeroU32::new(1).unwrap(),
             dispatches: std::num::NonZeroU32::new(1).unwrap(),
             state_steps: std::num::NonZeroU32::new(3).unwrap(),
@@ -518,6 +649,7 @@ mod tests {
             reps: std::num::NonZeroU32::new(1).unwrap(),
             warmups: 0,
             serial: true,
+            advance_position: false,
             state_steps: std::num::NonZeroU32::new(1).unwrap(),
             copies: std::num::NonZeroU32::new(3).unwrap(),
             dispatches: std::num::NonZeroU32::new(7).unwrap(),
@@ -552,6 +684,16 @@ mod tests {
                     >= 128
             );
             assert!(record["pipeline_resources"]["observed_occupancy"].is_null());
+        }
+        if matches!(spec.operation, forja_core::Op::PagedSdpa { .. }) {
+            options.advance_position = true;
+            options.dispatches = options.copies;
+            run(&options, &forja_config::DevConfig::default()).unwrap();
+            let advanced: serde_json::Value =
+                serde_json::from_slice(&fs::read(&options.json).unwrap()).unwrap();
+            assert_eq!(advanced["operand_order"], "consecutive");
+            assert!(advanced["cost_per_dispatch"].is_null());
+            assert!(advanced["rates"].is_null());
         }
     }
 }
