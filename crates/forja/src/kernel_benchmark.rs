@@ -158,32 +158,7 @@ fn diagnostic_commands(
             .map(|spec| spec.allocate(backend))
             .collect::<Result<Vec<_>, _>>()
     };
-    validate_operand_visits(options.dispatches, options.copies)?;
-    if options.state_steps.get() > 1
-        && !matches!(
-            shape.operation,
-            forja_core::Op::State(
-                forja_core::StateOp::DeltaRule(_) | forja_core::StateOp::CausalDepthwiseConv(_)
-            )
-        )
-    {
-        return Err("state steps require single-token state operations".into());
-    }
-    if options.state_steps.get() > 1
-        && matches!(
-            shape.operation,
-            forja_core::Op::State(forja_core::StateOp::CausalDepthwiseConv(_))
-        )
-        && shape
-            .inputs
-            .first()
-            .ok_or("missing convolution tokens")?
-            .dimensions()
-            .first()
-            != Some(&1)
-    {
-        return Err("state steps require one convolution token".into());
-    }
+    validate_diagnostic_options(shape, options)?;
     let chained_input = (options.state_steps.get() > 1)
         .then(|| chain_state_input(shape.operation, &shape.inputs))
         .transpose()?;
@@ -246,6 +221,37 @@ fn diagnostic_commands(
         }
     }
     Ok(commands)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_diagnostic_options(shape: &Shape, options: &Options) -> Result<(), Box<dyn Error>> {
+    validate_operand_visits(options.dispatches, options.copies)?;
+    if options.state_steps.get() > 1
+        && !matches!(
+            shape.operation,
+            forja_core::Op::State(
+                forja_core::StateOp::DeltaRule(_) | forja_core::StateOp::CausalDepthwiseConv(_)
+            )
+        )
+    {
+        return Err("state steps require single-token state operations".into());
+    }
+    if options.state_steps.get() > 1
+        && matches!(
+            shape.operation,
+            forja_core::Op::State(forja_core::StateOp::CausalDepthwiseConv(_))
+        )
+        && shape
+            .inputs
+            .first()
+            .ok_or("missing convolution tokens")?
+            .dimensions()
+            .first()
+            != Some(&1)
+    {
+        return Err("state steps require one convolution token".into());
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", test))]
