@@ -1918,3 +1918,89 @@ quantized_gemm_tiled_kernel(quantized_gemm_tiled_bf16, bfloat, 32)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f32, float, 64)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f16, half, 64)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_bf16, bfloat, 64)
+
+template <uint output_count>
+void quantized_gemv_staged_sums(
+    device const uchar *input, device const uchar *packed,
+    device const uchar *scales, device const uchar *biases,
+    constant QuantMatmulParams &params,
+    threadgroup half4 *weights, threadgroup float2 *affine,
+    uint first_column, ushort lane, ushort row,
+    thread float (&sums)[output_count]) {
+    constexpr uint values_per_word = 8;
+    constexpr uint values_per_thread = values_per_word * 2;
+    constexpr uint pieces = values_per_thread / 4;
+    for (ulong block = 0; block < params.inner; block += values_per_thread * 32) {
+        ulong first = block + uint(lane) * values_per_thread;
+        if (first < params.inner) {
+            #pragma unroll
+            for (uint item = 0; item < output_count; ++item) {
+                uint column = first_column + item;
+                if (column >= params.columns || item % qmv_batch_rows != row) continue;
+                ulong base = params.packed_offset + ulong(column) * params.packed_row_stride;
+                ulong index = (first / values_per_word) * params.packed_word_stride;
+                uint4 words = load_quantized_words<2>(packed + base * 4, index,
+                    params.packed_word_stride, ((base + index) & 1) == 0);
+                ulong group = first / quant_group_size;
+                float scale = load_float(scales, params.scale_offset + ulong(column) * params.scale_row_stride
+                    + group * params.scale_group_stride, input1_dtype);
+                float bias = load_float(biases, params.bias_offset + ulong(column) * params.bias_row_stride
+                    + group * params.bias_group_stride, input1_dtype);
+                affine[item * 32 + lane] = float2(scale, bias);
+                #pragma unroll
+                for (uint piece = 0; piece < pieces; ++piece) {
+                    weights[(item * pieces + piece) * 32 + lane] =
+                        half4(unpack_quantized_piece<4>(words[piece / (values_per_word / 4)], piece % (values_per_word / 4)));
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (first < params.inner) {
+            float activations[values_per_thread];
+            float input_sum = load_quantized_activations<4, values_per_thread>(input,
+                params.input_offset + ulong(row) * params.input_row_stride + first * params.input_inner_stride,
+                params.input_inner_stride, activations);
+            #pragma unroll
+            for (uint item = 0; item < output_count; ++item) {
+                if (first_column + item >= params.columns) continue;
+                float value = 0.0f;
+                #pragma unroll
+                for (uint piece = 0; piece < pieces; ++piece) {
+                    uint i = piece * 4;
+                    value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]),
+                        float4(weights[(item * pieces + piece) * 32 + lane]));
+                }
+                float2 parameters = affine[item * 32 + lane];
+                sums[item] += parameters.x * value + parameters.y * input_sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint item = 0; item < output_count; ++item) sums[item] = simd_sum(sums[item]);
+}
+
+kernel void quantized_gemv_staged(
+    device const uchar *input [[buffer(0)]], device const uchar *packed [[buffer(1)]],
+    device const uchar *scales [[buffer(2)]], device const uchar *biases [[buffer(3)]],
+    device uchar *output [[buffer(4)]], constant QuantMatmulParams &params [[buffer(5)]],
+    FORJA_EPILOGUE_ARGUMENTS
+    ushort row [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]) {
+    // Every Q4 mask is an exactly representable four-bit integer times a power of two.
+    threadgroup half4 weights[4 * 4 * 32];
+    threadgroup float2 affine[4 * 32];
+    float sums[4] = {0.0f};
+    uint first_column = tile.x * 4;
+    quantized_gemv_staged_sums<4>(input, packed, scales, biases, params, weights, affine,
+        first_column, lane, row, sums);
+    if (lane == 0) {
+        for (uint item = 0; item < 4; ++item) {
+            uint column = first_column + item;
+            if (column >= params.columns) continue;
+            float value = forja_epilogue(sums[item], 0.0f, 0u, row, column,
+                1u, params.rows, params.columns, FORJA_EPILOGUE_VALUES);
+            store_float(output, params.output_offset + ulong(row) * params.output_row_stride
+                + ulong(column) * params.output_column_stride, output_dtype, value);
+        }
+    }
+}

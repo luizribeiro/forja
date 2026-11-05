@@ -4544,6 +4544,7 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let (column_tile, row_tile, threads) = match kernel {
             "quantized_gemv" => (if bits == 8 { 16 } else { 8 }, 1, 64), // Vectors use n2.
+            "quantized_gemv_staged" => staged_quant_geometry(rows)?,
             kernel if kernel.starts_with("quantized_gemv_shared") => (
                 qmv_vector_config(dispatch)[1]
                     * shared_quant_columns(dispatch).ok_or(BackendError::InvalidInput)?,
@@ -8504,6 +8505,7 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
                     | MetalVariant::QuantMatmulVector8TwoGroups
                     | MetalVariant::QuantMatmulVector8Shared
                     | MetalVariant::QuantMatmulVector8SharedN4
+                    | MetalVariant::QuantMatmulVector8Staged
                     | MetalVariant::QuantMatmulVector16
                     | MetalVariant::GatherQuantMatmulGroupedSmallM
                     | MetalVariant::GatherQuantMatmulGroupedPairSmallM
@@ -8871,6 +8873,11 @@ fn quant_matmul_kernel(dispatch: &Dispatch) -> Result<&'static str, BackendError
         Some(MetalVariant::QuantMatmulVector8Shared) => Ok("quantized_gemv_shared"),
 
         Some(MetalVariant::QuantMatmulVector8SharedN4) => Ok("quantized_gemv_shared_n4"),
+        Some(MetalVariant::QuantMatmulVector8Staged) => Ok(if staged_quant_weights(dispatch) {
+            "quantized_gemv_staged"
+        } else {
+            "quantized_gemv_shared_n4"
+        }),
 
         Some(
             MetalVariant::QuantMatmulGemvN2
@@ -9388,7 +9395,8 @@ pub(super) fn variant_supported(
         MetalVariant::QuantMatmulGemv
         | MetalVariant::QuantMatmulGemvN2
         | MetalVariant::QuantMatmulVector8Shared
-        | MetalVariant::QuantMatmulVector8SharedN4 => (1..=8).contains(&rows()?),
+        | MetalVariant::QuantMatmulVector8SharedN4
+        | MetalVariant::QuantMatmulVector8Staged => (1..=8).contains(&rows()?),
         MetalVariant::QuantMatmulQ8FastGemv | MetalVariant::QuantMatmulQ8FastGemvN2 => matches!(
             quant_matmul_kernel(dispatch)?,
             "quantized_gemv_q8_fast" | "quantized_gemv_q8_fast_n2"
@@ -9848,13 +9856,32 @@ thread_local! {
 fn shared_quant_columns(dispatch: &Dispatch) -> Option<u32> {
     match selected_variant(dispatch) {
         Some(MetalVariant::QuantMatmulVector8Shared) => Some(2),
-        Some(MetalVariant::QuantMatmulVector8SharedN4) => Some(4),
+        Some(MetalVariant::QuantMatmulVector8SharedN4 | MetalVariant::QuantMatmulVector8Staged) => {
+            Some(4)
+        }
         _ => None,
     }
 }
 
+fn staged_quant_geometry(rows: u32) -> Result<(u32, u32, usize), BackendError> {
+    let threads = u64::from(rows)
+        .checked_mul(32)
+        .ok_or(BackendError::InvalidInput)?;
+    Ok((
+        4,
+        rows,
+        usize::try_from(threads).map_err(|_| BackendError::InvalidInput)?,
+    ))
+}
+
+fn staged_quant_weights(dispatch: &Dispatch) -> bool {
+    selected_variant(dispatch) == Some(MetalVariant::QuantMatmulVector8Staged)
+        && matches!(dispatch.op(), Op::QuantMatmul { bits: 4, .. })
+}
+
 fn unsupported_shared_bucket(dispatch: &Dispatch) -> bool {
     shared_quant_columns(dispatch).is_some()
+        && !staged_quant_weights(dispatch)
         && !matches!(qmv_vector_config(dispatch)[3], 1 | 2 | 4 | 8)
 }
 
@@ -9865,6 +9892,7 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 4] {
             | MetalVariant::QuantMatmulVector8TwoGroups
             | MetalVariant::QuantMatmulVector8Shared
             | MetalVariant::QuantMatmulVector8SharedN4
+            | MetalVariant::QuantMatmulVector8Staged
             | MetalVariant::GatherQuantMatmulVector8,
         ) => 2,
         Some(MetalVariant::QuantMatmulVector16) => 4,
@@ -9888,7 +9916,12 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 4] {
         4
     };
     let rows = if shared_quant_columns(dispatch).is_some() {
-        dispatch.primitive_inputs()[0].layout().shape()[0].next_power_of_two()
+        let rows = dispatch.primitive_inputs()[0].layout().shape()[0];
+        if staged_quant_weights(dispatch) {
+            rows
+        } else {
+            rows.next_power_of_two()
+        }
     } else {
         1
     };
@@ -10697,14 +10730,17 @@ mod tests {
 
     #[test]
     fn metal_shared_quant_unsupported_bucket_reports_error_without_writing() {
-        for variant_name in [
-            "quant-matmul.vector8-shared",
-            "quant-matmul.vector8-shared-n4",
+        for (variant_name, bits) in [
+            ("quant-matmul.vector8-shared", 4),
+            ("quant-matmul.vector8-shared-n4", 4),
+            ("quant-matmul.vector8-staged", 8),
         ] {
             for bucket in [0, 3, 16] {
                 let backend = MetalBackend::new().unwrap();
                 let input = backend.alloc(DType::F32, &[1, 64]).unwrap();
-                let packed = backend.alloc(DType::U32, &[7, 8]).unwrap();
+                let packed = backend
+                    .alloc(DType::U32, &[7, u32::from(bits) * 2])
+                    .unwrap();
                 let scales = backend.alloc(DType::F16, &[7, 1]).unwrap();
                 let biases = backend.alloc(DType::F16, &[7, 1]).unwrap();
                 let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
@@ -10712,7 +10748,7 @@ mod tests {
                 backend.write(&output, &canary).unwrap();
                 let inputs = [&input, &packed, &scales, &biases];
                 let op = Op::QuantMatmul {
-                    bits: 4,
+                    bits,
                     group_size: 64,
                 };
                 let variant = backend

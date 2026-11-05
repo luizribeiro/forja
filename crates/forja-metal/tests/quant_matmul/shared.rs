@@ -33,8 +33,14 @@ shared_rows!(shared_q8_bf16_preserves_single_row_bits, BF16, 8);
 
 fn shared_shapes(variant_name: &str) -> Vec<(u32, u32)> {
     let mut shapes = vec![(5120, 17408), (17408, 5120), (4096, 4097)];
-    if variant_name == "quant-matmul.vector8-shared-n4" {
+    if matches!(
+        variant_name,
+        "quant-matmul.vector8-shared-n4" | "quant-matmul.vector8-staged"
+    ) {
         shapes.extend([(768, 4098), (768, 4099), (1536, 4099)]);
+    }
+    if variant_name == "quant-matmul.vector8-staged" {
+        shapes.extend([(64, 1), (128, 7), (768, 33)]);
     }
     shapes
 }
@@ -73,9 +79,12 @@ fn assert_shared_group(
         (2, false),
         (3, false),
         (4, false),
+        (5, false),
+        (6, false),
         (7, true),
         (8, false),
         (3, true),
+        (4, true),
     ] {
         let mut specs = [
             TensorSpec::contiguous(dtype, &[rows, inner]),
@@ -201,13 +210,16 @@ shared_rows!(
 );
 
 macro_rules! shared_quant_group {
-    ($name:ident, $group:literal) => {
+    ($name:ident, $group:literal, $variant:literal) => {
         #[test]
         fn $name() {
             let backend = MetalBackend::new().unwrap();
             for dtype in [DType::F32, DType::F16, DType::BF16] {
                 for bits in [4, 8] {
-                    for shape in shared_shapes("quant-matmul.vector8-shared-n4") {
+                    for shape in shared_shapes($variant) {
+                        if !shape.0.is_multiple_of($group) {
+                            continue;
+                        }
                         for parameters in [DType::F16, DType::BF16] {
                             assert_shared_group(
                                 &backend,
@@ -215,7 +227,7 @@ macro_rules! shared_quant_group {
                                 (bits, $group),
                                 shape,
                                 parameters,
-                                "quant-matmul.vector8-shared-n4",
+                                $variant,
                             );
                         }
                     }
@@ -224,5 +236,28 @@ macro_rules! shared_quant_group {
         }
     };
 }
-shared_quant_group!(shared_wide_group32_preserves_bits, 32);
-shared_quant_group!(shared_wide_group128_preserves_bits, 128);
+shared_quant_group!(
+    shared_wide_group32_preserves_bits,
+    32,
+    "quant-matmul.vector8-shared-n4"
+);
+shared_quant_group!(
+    shared_wide_group128_preserves_bits,
+    128,
+    "quant-matmul.vector8-shared-n4"
+);
+shared_quant_group!(
+    staged_group32_preserves_bits,
+    32,
+    "quant-matmul.vector8-staged"
+);
+shared_quant_group!(
+    staged_group64_preserves_bits,
+    64,
+    "quant-matmul.vector8-staged"
+);
+shared_quant_group!(
+    staged_group128_preserves_bits,
+    128,
+    "quant-matmul.vector8-staged"
+);
