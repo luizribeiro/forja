@@ -4,6 +4,9 @@ use forja_core::Backend;
 mod shape;
 use shape::{Shape, TensorShape};
 
+#[cfg(any(target_os = "macos", test))]
+const STATE_OUTPUT_INDEX: usize = 1;
+
 #[derive(Debug, PartialEq, clap::Args)]
 pub(crate) struct Options {
     /// Catalog variant to execute, without automatic algorithm selection.
@@ -20,6 +23,9 @@ pub(crate) struct Options {
     /// Dispatches per measured submission, amortizing command-buffer latency.
     #[arg(long, default_value = "1")]
     pub(crate) dispatches: std::num::NonZeroU32,
+    /// Chain this many single-token state updates through distinct outputs.
+    #[arg(long, default_value = "1")]
+    pub(crate) state_steps: std::num::NonZeroU32,
     /// Reuse the first output to serialize dispatches through write dependencies.
     #[arg(long)]
     pub(crate) serial: bool,
@@ -53,15 +59,19 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         config.backend.metal.pool_capacity,
         &config.limits,
     )?;
-    let bytes = shape
-        .inputs
-        .iter()
-        .chain(&shape.outputs)
-        .try_fold(0_u64, |total, tensor| {
+    let dispatches = effective_dispatches(options)?;
+    let sum_bytes = |specs: &[TensorShape]| {
+        specs.iter().try_fold(0_u64, |total, tensor| {
             total
                 .checked_add(tensor.layout()?.1)
                 .ok_or_else(|| Box::<dyn Error>::from("allocation size overflow"))
-        })?;
+        })
+    };
+    let inputs = sum_bytes(&shape.inputs)?;
+    let bytes = sum_bytes(&shape.outputs)?
+        .checked_mul(u64::from(options.state_steps.get()))
+        .and_then(|outputs| outputs.checked_add(inputs))
+        .ok_or("operand size overflow")?;
     let bytes = bytes
         .checked_mul(u64::from(options.copies.get()))
         .ok_or("operand-set size overflow")?;
@@ -93,7 +103,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
         "variant": options.variant, "serial": options.serial, "copies": options.copies.get(), "resident_operand_bytes": bytes,
-        "dispatches_per_sample": options.dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
+        "state_steps": options.state_steps.get(), "dispatches_per_sample": dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({
             "kernel": resources.kernel, "execution_width": resources.execution_width,
             "maximum_threadgroup_threads": resources.maximum_threads,
@@ -101,7 +111,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
             "observed_registers_per_thread": null, "observed_occupancy": null,
             "basis": "compiled pipeline limits; not measured occupancy or register allocation"
         })),
-        "rates": cost.map(|cost| diagnostic_rates(cost, options.dispatches, &samples)).transpose()?,
+        "rates": cost.map(|cost| diagnostic_rates(cost, dispatches, &samples)).transpose()?,
         "warmups": options.warmups, "samples": samples, "provenance": {
             "commit": crate::provenance::commit(), "dirty": crate::provenance::dirty(),
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
@@ -148,54 +158,169 @@ fn diagnostic_commands(
             .map(|spec| spec.allocate(backend))
             .collect::<Result<Vec<_>, _>>()
     };
-    if options.dispatches.get() < options.copies.get() {
-        return Err("dispatches must visit every operand set".into());
+    validate_operand_visits(options.dispatches, options.copies)?;
+    if options.state_steps.get() > 1
+        && !matches!(
+            shape.operation,
+            forja_core::Op::State(
+                forja_core::StateOp::DeltaRule(_) | forja_core::StateOp::CausalDepthwiseConv(_)
+            )
+        )
+    {
+        return Err("state steps require single-token state operations".into());
     }
+    if options.state_steps.get() > 1
+        && matches!(
+            shape.operation,
+            forja_core::Op::State(forja_core::StateOp::CausalDepthwiseConv(_))
+        )
+        && shape
+            .inputs
+            .first()
+            .ok_or("missing convolution tokens")?
+            .dimensions()
+            .first()
+            != Some(&1)
+    {
+        return Err("state steps require one convolution token".into());
+    }
+    let chained_input = (options.state_steps.get() > 1)
+        .then(|| chain_state_input(shape.operation, &shape.inputs))
+        .transpose()?;
     let operands = (0..options.copies.get())
-        .map(|_| Ok((allocate(&shape.inputs)?, allocate(&shape.outputs)?)))
+        .map(|_| {
+            Ok((
+                allocate(&shape.inputs)?,
+                (0..options.state_steps.get())
+                    .map(|_| allocate(&shape.outputs))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     let epilogue = shape.prepare_epilogue()?;
     let mut commands = CommandList::new();
     for index in 0..options.dispatches.get() {
         let (inputs, outputs) = &operands[usize::try_from(index % options.copies.get())?];
-        let inputs = inputs.iter().collect::<Vec<_>>();
-        let outputs = outputs
-            .iter()
-            .enumerate()
-            .map(|(index, output)| {
-                if options.serial && index == 0 {
-                    &operands[0].1[0]
-                } else {
-                    output
-                }
-            })
-            .collect::<Vec<_>>();
-        let variant = backend.validate_variant_for_op(
-            shape.operation,
-            &inputs,
-            &outputs,
-            &options.variant,
-        )?;
-        if let Some(epilogue) = &epilogue {
-            commands.dispatch_epilogue(shape.operation, &inputs, outputs[0], epilogue, &[])?;
-            if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
-                return Err("missing diagnostic dispatch".into());
-            }
-        } else {
-            commands.dispatch_many_with_backend_data(
+        for step in 0..usize::try_from(options.state_steps.get())? {
+            let inputs = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, tensor)| {
+                    if step > 0 && Some(index) == chained_input {
+                        &outputs[step - 1][STATE_OUTPUT_INDEX]
+                    } else {
+                        tensor
+                    }
+                })
+                .collect::<Vec<_>>();
+            let outputs = outputs[step]
+                .iter()
+                .enumerate()
+                .map(|(index, output)| {
+                    if options.serial && index == 0 {
+                        &operands[0].1[0][0]
+                    } else {
+                        output
+                    }
+                })
+                .collect::<Vec<_>>();
+            let variant = backend.validate_variant_for_op(
                 shape.operation,
                 &inputs,
                 &outputs,
-                BackendDispatchData::new(variant),
+                &options.variant,
             )?;
+            if let Some(epilogue) = &epilogue {
+                commands.dispatch_epilogue(shape.operation, &inputs, outputs[0], epilogue, &[])?;
+                if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
+                    return Err("missing diagnostic dispatch".into());
+                }
+            } else {
+                commands.dispatch_many_with_backend_data(
+                    shape.operation,
+                    &inputs,
+                    &outputs,
+                    BackendDispatchData::new(variant),
+                )?;
+            }
         }
     }
     Ok(commands)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn chain_state_input<T>(operation: forja_core::Op, inputs: &[T]) -> Result<usize, Box<dyn Error>> {
+    let forja_core::Op::State(state) = operation else {
+        return Err("state steps require a state operation".into());
+    };
+    let suffix = state.input_suffix(inputs)?;
+    inputs
+        .len()
+        .checked_sub(suffix.len())
+        .ok_or_else(|| "missing state input suffix".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_operand_visits(
+    dispatches: std::num::NonZeroU32,
+    copies: std::num::NonZeroU32,
+) -> Result<(), Box<dyn Error>> {
+    if dispatches < copies {
+        return Err("dispatches must visit every operand set".into());
+    }
+    Ok(())
+}
+
+fn effective_dispatches(options: &Options) -> Result<std::num::NonZeroU32, Box<dyn Error>> {
+    options
+        .dispatches
+        .checked_mul(options.state_steps)
+        .ok_or_else(|| "dispatch count overflow".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chained_state_inputs_require_the_complete_suffix() {
+        for (kind, arity, source) in [("delta-rule", 9, 5), ("causal-depthwise-conv", 6, 2)] {
+            let shape: Shape = serde_json::from_value(serde_json::json!({
+                "operation":{"kind":"state","operation":kind},"inputs":[],"outputs":[]
+            }))
+            .unwrap();
+            for len in 0..arity {
+                assert!(chain_state_input(shape.operation, &vec![0; len]).is_err());
+            }
+            let mut inputs = (0..arity).collect::<Vec<_>>();
+            let index = chain_state_input(shape.operation, &inputs).unwrap();
+            assert_eq!(index, source);
+            let previous_outputs = [7, 99];
+            inputs[index] = previous_outputs[STATE_OUTPUT_INDEX];
+            assert_eq!(inputs[index], 99);
+            assert_eq!(
+                &inputs[index + 1..],
+                &(source + 1..arity).collect::<Vec<_>>()
+            );
+        }
+        assert!(chain_state_input(forja_core::Op::Matmul, &[0; 9]).is_err());
+    }
+
+    #[test]
+    fn diagnostic_dispatches_visit_every_operand_set() {
+        let count = |n| std::num::NonZeroU32::new(n).unwrap();
+        assert!(validate_operand_visits(count(1), count(2)).is_err());
+        assert!(validate_operand_visits(count(2), count(2)).is_ok());
+        assert!(validate_operand_visits(count(7), count(2)).is_ok());
+    }
+
+    #[test]
+    fn state_dispatch_counts_refuse_overflow() {
+        let mut options = state_chain_options();
+        assert_eq!(effective_dispatches(&options).unwrap().get(), 3);
+        options.dispatches = std::num::NonZeroU32::MAX;
+        assert!(effective_dispatches(&options).is_err());
+    }
+
     #[test]
     fn diagnostic_rates_check_costs_and_normalize_dispatches() {
         let count = std::num::NonZeroU32::new(4).unwrap();
@@ -295,6 +420,65 @@ mod tests {
     }
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_kernel_diagnostics_chain_state_outputs() {
+        use forja_core::Submission;
+        let shape: Shape = serde_json::from_value(serde_json::json!({
+            "operation":{"kind":"state","operation":"delta-rule"},
+            "inputs":[{"dtype":"f32","shape":[1,1],"seed":1},
+                {"dtype":"f32","shape":[1,1],"seed":2},
+                {"dtype":"f32","shape":[1,1],"seed":3},
+                {"dtype":"f32","shape":[1],"seed":4},
+                {"dtype":"f32","shape":[1],"seed":5},
+                {"dtype":"f32","shape":[1,1,1]},
+                {"dtype":"u32","shape":[2,2],"u32_values":[0,1,1,1]},
+                {"dtype":"u32","shape":[3],"u32_values":[1,1,1]},
+                {"dtype":"u32","shape":[1],"u32_values":[1]}],
+            "outputs":[{"dtype":"f32","shape":[1,1]},
+                {"dtype":"f32","shape":[1,1,1]}]}))
+        .unwrap();
+        let options = state_chain_options();
+        let backend = forja_metal::MetalBackend::new().unwrap();
+        let commands = diagnostic_commands(&backend, &shape, &options).unwrap();
+        assert_eq!(
+            forja_core::required_barriers(&commands),
+            [false, true, true]
+        );
+        backend.submit(commands.clone()).unwrap().wait().unwrap();
+        let read = |tensor| f32::from_le_bytes(backend.read(tensor).unwrap().try_into().unwrap());
+        let inputs = commands.dispatches()[0].inputs();
+        let (key, value, decay, beta) = (
+            read(&inputs[1]),
+            read(&inputs[2]),
+            read(&inputs[3]),
+            read(&inputs[4]),
+        );
+        let mut expected = 0.0;
+        for dispatch in commands.dispatches() {
+            expected *= decay;
+            expected += (value - expected * key) * beta * key;
+            let actual = read(&dispatch.outputs()[STATE_OUTPUT_INDEX]);
+            assert!(
+                golden_fixtures::normwise_relative_error(&[expected], &[actual]).unwrap() <= 1e-5
+            );
+        }
+    }
+
+    fn state_chain_options() -> Options {
+        Options {
+            variant: "delta-rule.simd".into(),
+            shape: PathBuf::new(),
+            json: PathBuf::new(),
+            reps: std::num::NonZeroU32::new(1).unwrap(),
+            warmups: 0,
+            serial: false,
+            copies: std::num::NonZeroU32::new(1).unwrap(),
+            dispatches: std::num::NonZeroU32::new(1).unwrap(),
+            state_steps: std::num::NonZeroU32::new(3).unwrap(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_kernel_diagnostics_authenticate_delta_block_stages() {
         let root = std::env::temp_dir().join(format!("forja-block-kernel-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -328,6 +512,7 @@ mod tests {
             reps: std::num::NonZeroU32::new(1).unwrap(),
             warmups: 0,
             serial: true,
+            state_steps: std::num::NonZeroU32::new(1).unwrap(),
             copies: std::num::NonZeroU32::new(3).unwrap(),
             dispatches: std::num::NonZeroU32::new(7).unwrap(),
         };

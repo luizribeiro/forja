@@ -154,6 +154,10 @@ pub(super) struct TensorShape {
 }
 
 impl TensorShape {
+    pub(super) fn dimensions(&self) -> &[u32] {
+        &self.shape
+    }
+
     pub(super) fn layout(&self) -> Result<(DType, u64), Box<dyn Error>> {
         let (dtype, size) = match self.dtype.as_str() {
             "f32" => (DType::F32, 4_u64),

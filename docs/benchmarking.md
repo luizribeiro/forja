@@ -288,6 +288,13 @@ start at zero. Paged attention accepts explicit noncontiguous page tables and
 generation arrays. Core operation/catalog constraints and allocation quotas apply.
 Records say `kernel-diagnostic` and `model_benchmark:false`; use them for screens,
 never as model benchmarks or accepted model baselines.
+For recurrent diagnostics, `--state-steps N` chains scalar delta-rule or
+single-token convolution updates through distinct destination buffers. Each
+operand set holds its own chain; `--serial` also serializes the sets through the
+shared first output. These are diagnostic tensor dependencies, using fixed test
+authentication metadata, rather than engine state transactions. Records include
+the chain length, total dispatch count and all resident destination bytes.
+
 Rates count logical operands and FLOPs rather than hardware transactions or
 instruction throughput. Quantized matrix diagnostics also report compiled
 execution width, threadgroup limits and static threadgroup storage; these limits
