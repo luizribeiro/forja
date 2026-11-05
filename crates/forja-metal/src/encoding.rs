@@ -9851,6 +9851,7 @@ fn quantized_constants(
 #[cfg(test)]
 thread_local! {
     static FORCED_QMV_ROWS: Cell<Option<u32>> = const { Cell::new(None) };
+    static FORCED_STAGED_ROWS: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 fn shared_quant_columns(dispatch: &Dispatch) -> Option<u32> {
@@ -9864,6 +9865,11 @@ fn shared_quant_columns(dispatch: &Dispatch) -> Option<u32> {
 }
 
 fn staged_quant_geometry(rows: u32) -> Result<(u32, u32, usize), BackendError> {
+    #[cfg(test)]
+    let rows = FORCED_STAGED_ROWS.with(|forced| forced.get().unwrap_or(rows));
+    if !(1..=8).contains(&rows) {
+        return Err(BackendError::InvalidInput);
+    }
     let threads = u64::from(rows)
         .checked_mul(32)
         .ok_or(BackendError::InvalidInput)?;
@@ -10728,6 +10734,47 @@ mod tests {
 
     use super::*;
 
+    fn shared_quant_canary(
+        variant_name: &str,
+        bits: u8,
+    ) -> (MetalBackend, CommandList, Tensor, Vec<u8>) {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1, 64]).unwrap();
+        let packed = backend
+            .alloc(DType::U32, &[7, u32::from(bits) * 2])
+            .unwrap();
+        let scales = backend.alloc(DType::F16, &[7, 1]).unwrap();
+        let biases = backend.alloc(DType::F16, &[7, 1]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let canary = 17_f32.to_le_bytes().repeat(7);
+        backend.write(&output, &canary).unwrap();
+        let inputs = [&input, &packed, &scales, &biases];
+        let op = Op::QuantMatmul {
+            bits,
+            group_size: 64,
+        };
+        let variant = backend
+            .validate_variant_for_op(op, &inputs, &[&output], variant_name)
+            .unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(op, &inputs, &output).unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+        (backend, commands, output, canary)
+    }
+
+    #[test]
+    fn metal_staged_quant_invalid_rows_refused_without_writing() {
+        for rows in [0, 9] {
+            let (backend, commands, output, canary) =
+                shared_quant_canary("quant-matmul.vector8-staged", 4);
+            FORCED_STAGED_ROWS.set(Some(rows));
+            let submission = backend.submit(commands);
+            FORCED_STAGED_ROWS.set(None);
+            assert!(matches!(submission, Err(BackendError::InvalidInput)));
+            assert_eq!(backend.read(&output).unwrap(), canary);
+        }
+    }
+
     #[test]
     fn metal_shared_quant_unsupported_bucket_reports_error_without_writing() {
         for (variant_name, bits) in [
@@ -10736,27 +10783,7 @@ mod tests {
             ("quant-matmul.vector8-staged", 8),
         ] {
             for bucket in [0, 3, 16] {
-                let backend = MetalBackend::new().unwrap();
-                let input = backend.alloc(DType::F32, &[1, 64]).unwrap();
-                let packed = backend
-                    .alloc(DType::U32, &[7, u32::from(bits) * 2])
-                    .unwrap();
-                let scales = backend.alloc(DType::F16, &[7, 1]).unwrap();
-                let biases = backend.alloc(DType::F16, &[7, 1]).unwrap();
-                let output = backend.alloc(DType::F32, &[1, 7]).unwrap();
-                let canary = 17_f32.to_le_bytes().repeat(7);
-                backend.write(&output, &canary).unwrap();
-                let inputs = [&input, &packed, &scales, &biases];
-                let op = Op::QuantMatmul {
-                    bits,
-                    group_size: 64,
-                };
-                let variant = backend
-                    .validate_variant_for_op(op, &inputs, &[&output], variant_name)
-                    .unwrap();
-                let mut commands = CommandList::new();
-                commands.dispatch(op, &inputs, &output).unwrap();
-                assert!(commands.set_last_backend_data(BackendDispatchData::new(variant)));
+                let (backend, commands, output, canary) = shared_quant_canary(variant_name, bits);
                 FORCED_QMV_ROWS.set(Some(bucket));
                 let submission = backend.submit(commands);
                 FORCED_QMV_ROWS.set(None);
