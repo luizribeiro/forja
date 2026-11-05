@@ -11,6 +11,8 @@ pub(super) struct Shape {
     pub(super) outputs: Vec<TensorShape>,
     #[serde(default)]
     pub(super) epilogue: Option<DiagnosticEpilogue>,
+    #[serde(default)]
+    pub(super) append: Option<[TensorShape; 2]>,
 }
 
 #[derive(Deserialize)]

@@ -63,6 +63,10 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         &config.limits,
     )?;
     let dispatches = effective_dispatches(options)?;
+    let actual_dispatches = dispatches
+        .get()
+        .checked_mul(if shape.append.is_some() { 3 } else { 1 })
+        .ok_or("append dispatch count overflow")?;
     let sum_bytes = |specs: &[TensorShape]| {
         specs.iter().try_fold(0_u64, |total, tensor| {
             total
@@ -70,7 +74,14 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
                 .ok_or_else(|| Box::<dyn Error>::from("allocation size overflow"))
         })
     };
-    let inputs = sum_bytes(&shape.inputs)?;
+    let inputs = sum_bytes(&shape.inputs)?
+        .checked_add(
+            shape
+                .append
+                .as_ref()
+                .map_or(Ok(0), |rows| sum_bytes(rows))?,
+        )
+        .ok_or("append operand size overflow")?;
     let bytes = sum_bytes(&shape.outputs)?
         .checked_mul(u64::from(options.state_steps.get()))
         .and_then(|outputs| outputs.checked_add(inputs))
@@ -85,9 +96,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
     let cost = if options.advance_position {
         None
     } else {
-        commands
-            .last_dispatch()
-            .and_then(forja_core::KernelCost::of)
+        uniform_dispatch_cost(&commands)
     };
     let mut samples = Vec::new();
     let count = options
@@ -110,7 +119,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
         "variant": options.variant, "serial": options.serial, "advance_position": options.advance_position, "operand_order": if options.advance_position {"consecutive"} else {"cyclic"}, "copies": options.copies.get(), "resident_operand_bytes": bytes,
-        "state_steps": options.state_steps.get(), "dispatches_per_sample": dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
+        "state_steps": options.state_steps.get(), "dispatches_per_sample": actual_dispatches, "primary_dispatches_per_sample": dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({
             "kernel": resources.kernel, "execution_width": resources.execution_width,
             "maximum_threadgroup_threads": resources.maximum_threads,
@@ -130,6 +139,19 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         options.variant, options.reps
     );
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn uniform_dispatch_cost(commands: &forja_core::CommandList) -> Option<forja_core::KernelCost> {
+    let cost = commands
+        .dispatches()
+        .first()
+        .and_then(forja_core::KernelCost::of)?;
+    commands
+        .dispatches()
+        .iter()
+        .all(|dispatch| forja_core::KernelCost::of(dispatch) == Some(cost))
+        .then_some(cost)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -181,6 +203,11 @@ fn diagnostic_commands(
                 (0..options.state_steps.get())
                     .map(|_| allocate(&shape.outputs))
                     .collect::<Result<Vec<_>, _>>()?,
+                shape
+                    .append
+                    .as_ref()
+                    .map(|rows| allocate(rows))
+                    .transpose()?,
             ))
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
@@ -188,7 +215,7 @@ fn diagnostic_commands(
     let mut commands = CommandList::new();
     for index in 0..options.dispatches.get() {
         let (operand, position) = diagnostic_visit(index, group, options.advance_position);
-        let (inputs, outputs) = &operands[usize::try_from(operand)?];
+        let (inputs, outputs, append) = &operands[usize::try_from(operand)?];
         let operation = if options.advance_position {
             advance_attention(shape.operation, position)?
         } else {
@@ -217,6 +244,9 @@ fn diagnostic_commands(
                     }
                 })
                 .collect::<Vec<_>>();
+            if let Some(rows) = append {
+                record_append(backend, &mut commands, operation, &inputs, rows)?;
+            }
             let variant =
                 backend.validate_variant_for_op(operation, &inputs, &outputs, &options.variant)?;
             if let Some(epilogue) = &epilogue {
@@ -264,6 +294,57 @@ fn validate_diagnostic_options(shape: &Shape, options: &Options) -> Result<(), B
             != Some(&1)
     {
         return Err("state steps require one convolution token".into());
+    }
+    if shape.append.is_some()
+        && (options.state_steps.get() > 1
+            || shape.epilogue.is_some()
+            || !matches!(shape.operation, forja_core::Op::PagedSdpa { causal: true, q_start, key_length, .. } if q_start.checked_add(1) == Some(key_length)))
+    {
+        return Err("append requires causal single-row paged attention through the new key".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn record_append(
+    backend: &impl Backend,
+    commands: &mut forja_core::CommandList,
+    operation: forja_core::Op,
+    inputs: &[&forja_core::Tensor],
+    rows: &[forja_core::Tensor],
+) -> Result<(), Box<dyn Error>> {
+    use forja_core::{Op, PagedCopyDirection, ViewOp};
+    let Op::PagedSdpa {
+        q_start,
+        page_tokens,
+        ..
+    } = operation
+    else {
+        return Err("append requires paged attention".into());
+    };
+    let [query, key, value, table, generations] = inputs else {
+        return Err("append requires two page planes and authentication metadata".into());
+    };
+    if query.layout().shape().get(1) != Some(&1)
+        || rows
+            .iter()
+            .any(|row| row.layout().shape().first() != Some(&1))
+    {
+        return Err("append requires exactly one query and one new key/value row".into());
+    }
+    for (row, plane) in rows.iter().zip([key, value]) {
+        let [pages, tokens, heads, width]: [u32; 4] = plane.layout().shape().try_into()?;
+        let elements = heads.checked_mul(width).ok_or("page row size overflow")?;
+        let plane = backend.view(plane, ViewOp::Reshape(vec![pages, tokens, elements]))?;
+        commands.dispatch(
+            Op::PagedCopy {
+                direction: PagedCopyDirection::IntoPages,
+                start: q_start,
+                page_tokens,
+            },
+            &[row, table, generations],
+            &plane,
+        )?;
     }
     Ok(())
 }
@@ -458,6 +539,25 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_rates_require_uniform_dispatch_work() {
+        use forja_core::{CommandList, DType, Op};
+        let backend = forja_cpu::CpuBackend::new();
+        let x = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let w = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let y = backend.alloc(DType::F32, &[1, 33]).unwrap();
+        let mut commands = CommandList::new();
+        assert!(uniform_dispatch_cost(&commands).is_none());
+        for _ in 0..2 {
+            commands.dispatch(Op::Matmul, &[&x, &w], &y).unwrap();
+        }
+        assert!(uniform_dispatch_cost(&commands).is_some());
+        let w = backend.alloc(DType::F32, &[7, 7]).unwrap();
+        let y = backend.alloc(DType::F32, &[1, 7]).unwrap();
+        commands.dispatch(Op::Matmul, &[&x, &w], &y).unwrap();
+        assert!(uniform_dispatch_cost(&commands).is_none());
+    }
+
+    #[test]
     fn diagnostic_rates_check_costs_and_normalize_dispatches() {
         let count = std::num::NonZeroU32::new(4).unwrap();
         let cost = forja_core::KernelCost {
@@ -552,6 +652,14 @@ mod tests {
         ] {
             assert_diagnostic_record(&root, variant, &shape);
         }
+        let appended = serde_json::json!({
+            "operation":{"kind":"paged-sdpa","scale":0.1,"causal":true,"q_start":6,"key_length":7,"page_tokens":32},
+            "inputs":[{"dtype":"f32","shape":[16,1,128]},
+                {"dtype":"f16","shape":[1,32,8,128]}, {"dtype":"f16","shape":[1,32,8,128]},
+                {"dtype":"u32","shape":[1,2],"u32_values":[0,1]}, {"dtype":"u32","shape":[1],"u32_values":[1]}],
+            "outputs":[{"dtype":"f32","shape":[16,1,128]}],
+            "append":[{"dtype":"f32","shape":[1,8,128],"seed":1}, {"dtype":"f32","shape":[1,8,128],"seed":2}]});
+        assert_diagnostic_record(&root, "paged-sdpa.vector", &appended);
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "macos")]
@@ -641,6 +749,56 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "macos")]
+    fn assert_appended_planes(
+        backend: &forja_metal::MetalBackend,
+        commands: &forja_core::CommandList,
+        operation: forja_core::Op,
+    ) {
+        use forja_core::{CommandList, Op, Submission};
+        let Op::PagedSdpa { q_start, .. } = operation else {
+            panic!("expected paged attention");
+        };
+        let cpu = forja_cpu::CpuBackend::new();
+        let attention = &commands.dispatches()[2];
+        for (copy, plane) in commands.dispatches()[..2]
+            .iter()
+            .zip(&attention.inputs()[1..3])
+        {
+            let Op::PagedCopy { start, .. } = copy.op() else {
+                panic!("expected page append");
+            };
+            assert_eq!(start, q_start);
+            let row = &copy.inputs()[0];
+            let source = cpu
+                .alloc(row.layout().dtype(), row.layout().shape())
+                .unwrap();
+            cpu.write(&source, &backend.read(row).unwrap()).unwrap();
+            let cast = cpu
+                .alloc(plane.layout().dtype(), row.layout().shape())
+                .unwrap();
+            let mut cast_commands = CommandList::new();
+            cast_commands.dispatch(Op::Copy, &[&source], &cast).unwrap();
+            cpu.submit(cast_commands).unwrap().wait().unwrap();
+            let row_bytes = cpu.read(&cast).unwrap();
+            let actual = backend.read(plane).unwrap();
+            let offset = usize::try_from(q_start).unwrap() * row_bytes.len();
+            let end = offset + row_bytes.len();
+            forja_testing::assert_outputs_agree(
+                plane.layout().dtype(),
+                &row_bytes,
+                &actual[offset..end],
+            )
+            .unwrap();
+            assert!(
+                actual[..offset]
+                    .iter()
+                    .chain(&actual[end..])
+                    .all(|&byte| byte == 0)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn assert_diagnostic_record(root: &std::path::Path, variant: &str, shape: &serde_json::Value) {
         let mut options = Options {
             variant: variant.into(),
@@ -656,12 +814,19 @@ mod tests {
         };
         fs::write(&options.shape, serde_json::to_vec(shape).unwrap()).unwrap();
         let backend = forja_metal::MetalBackend::new().unwrap();
-        let spec = serde_json::from_value(shape.clone()).unwrap();
+        let spec: Shape = serde_json::from_value(shape.clone()).unwrap();
         let commands = diagnostic_commands(&backend, &spec, &options).unwrap();
-        assert_eq!(
-            forja_core::required_barriers(&commands),
-            [false, true, true, true, true, true, true]
-        );
+        if spec.append.is_some() {
+            use forja_core::Submission;
+            assert_eq!(commands.dispatches().len(), 21);
+            backend.submit(commands.clone()).unwrap().wait().unwrap();
+            assert_appended_planes(&backend, &commands, spec.operation);
+        } else {
+            assert_eq!(
+                forja_core::required_barriers(&commands),
+                [false, true, true, true, true, true, true]
+            );
+        }
         run(&options, &forja_config::DevConfig::default()).unwrap();
         let record: serde_json::Value =
             serde_json::from_slice(&fs::read(&options.json).unwrap()).unwrap();
@@ -670,11 +835,19 @@ mod tests {
         assert_eq!(record["model_benchmark"], false);
         assert_eq!(record["serial"], true);
         assert_eq!(record["copies"], 3);
-        assert_eq!(record["dispatches_per_sample"], 7);
+        assert_eq!(record["primary_dispatches_per_sample"], 7);
+        assert_eq!(
+            record["dispatches_per_sample"],
+            if spec.append.is_some() { 21 } else { 7 }
+        );
         options.dispatches = std::num::NonZeroU32::new(2).unwrap();
         assert!(run(&options, &forja_config::DevConfig::default()).is_err());
         assert_eq!(record["samples"].as_array().unwrap().len(), 1);
-        assert_eq!(record["rates"].as_array().unwrap().len(), 1);
+        if spec.append.is_some() {
+            assert!(record["rates"].is_null());
+        } else {
+            assert_eq!(record["rates"].as_array().unwrap().len(), 1);
+        }
         if variant == "quant-matmul.vector8-shared" {
             assert_eq!(record["pipeline_resources"]["execution_width"], 32);
             assert!(

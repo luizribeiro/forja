@@ -301,6 +301,15 @@ variants, this measures successive appends to the same pages. Allocate space for
 every row. `operand_order` records `consecutive` for this flag and `cyclic`
 otherwise. This flag nulls `cost_per_dispatch` and `rates`.
 
+An optional `append` array in the shape supplies two ordinary
+`[1, kv_heads, head_dim]` tensors. Each visit records two authenticated copies plus
+one attention dispatch. `primary_dispatches_per_sample` counts dispatches of the
+requested variant, including all state steps; `dispatches_per_sample` also counts
+the append copies. These composite diagnostics omit single-kernel cost/rate
+estimates.
+
+Per-dispatch rates require identical logical costs across all recorded operations.
+
 Rates count logical operands and FLOPs rather than hardware transactions or
 instruction throughput. Quantized matrix diagnostics also report compiled
 execution width, threadgroup limits and static threadgroup storage; these limits
