@@ -103,6 +103,48 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
     return float4(*reinterpret_cast<device const bfloat4 *>(buffer + index * 2));
 }
 
+template <uint words_per_thread>
+uint4 load_quantized_words(device const uchar *row, ulong index, ulong word_stride, bool aligned) {
+    uint4 words = uint4(0u);
+    if (qmv_vector_contiguous != 0 || (word_stride == 1 && aligned)) {
+        if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
+        else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
+    } else {
+        for (uint i = 0; i < words_per_thread; ++i) words[i] = load_uint(row, index + ulong(i) * word_stride);
+    }
+    return words;
+}
+
+template <uint bits, uint values_per_thread>
+float load_quantized_activations(device const uchar *input, ulong base, ulong stride,
+    thread float (&activations)[values_per_thread]) {
+    float input_sum = 0.0f;
+    #pragma unroll
+    for (uint element = 0; element < values_per_thread; element += 4) {
+        ulong index = base + ulong(element) * stride;
+        float4 values;
+        if (qmv_vector_contiguous != 0 || (stride == 1 && (index & 3) == 0)) {
+            values = load_float4_contiguous(input, index, input0_dtype);
+        } else {
+            for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * stride, input0_dtype);
+        }
+        input_sum += dot(values, float4(1.0f));
+        if constexpr (bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
+        for (uint i = 0; i < 4; ++i) activations[element + i] = values[i];
+    }
+    return input_sum;
+}
+
+template <uint bits>
+float4 unpack_quantized_piece(uint word, uint part) {
+    if constexpr (bits == 4) {
+        ushort2 halves = as_type<ushort2>(word);
+        return float4(halves[part] & 15u, halves[part] & 240u, halves[part] & 3840u, halves[part] & 61440u);
+    } else {
+        return float4(as_type<uchar4>(word));
+    }
+}
+
 template <uint output_count, uint words_per_thread, uint bits, uint batch_rows>
 void quantized_vector_batch_sums(
     device const uchar *input,
@@ -145,13 +187,8 @@ void quantized_vector_batch_sums(
             if (first_column + item >= columns) continue;
             ulong index = ulong(first / values_per_word) * packed_word_stride;
             device const uchar *row = weight_base + ulong(item) * packed_row_stride * 4;
-            uint4 words = uint4(0u);
-            if (qmv_vector_contiguous != 0 || (packed_word_stride == 1 && ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0)) {
-                if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
-                else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
-            } else {
-                for (uint i = 0; i < words_per_thread; ++i) words[i] = load_uint(row, index + ulong(i) * packed_word_stride);
-            }
+            uint4 words = load_quantized_words<words_per_thread>(row, index, packed_word_stride,
+                ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0);
             ulong group = first / quant_group_size;
             tile_scale[item] = load_float(scale_rows, ulong(item) * scale_row_stride + group * scale_group_stride, input1_dtype);
             tile_bias[item] = load_float(bias_rows, ulong(item) * bias_row_stride + group * bias_group_stride, input1_dtype);
@@ -161,36 +198,20 @@ void quantized_vector_batch_sums(
         for (uint batch = 0; batch < batch_rows; ++batch) {
             if (batch >= rows) continue;
             float activations[values_per_thread];
-            float input_sum = 0.0f;
-            #pragma unroll
-            for (uint element = 0; element < values_per_thread; element += 4) {
-                ulong index = input_base + ulong(batch) * input_row_stride + ulong(first + element) * input_stride;
-                float4 values;
-                if (qmv_vector_contiguous != 0 || (input_stride == 1 && (index & 3) == 0)) {
-                    values = load_float4_contiguous(input, index, input0_dtype);
-                } else {
-                    for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * input_stride, input0_dtype);
-                }
-                input_sum += dot(values, float4(1.0f));
-                if constexpr (bits == 4) values *= float4(1.0f, 1.0f/16.0f, 1.0f/256.0f, 1.0f/4096.0f);
-                for (uint i = 0; i < 4; ++i) activations[element + i] = values[i];
-            }
+            float input_sum = load_quantized_activations<bits, values_per_thread>(input,
+                input_base + ulong(batch) * input_row_stride + first * input_stride, input_stride, activations);
             #pragma unroll
             for (uint item = 0; item < output_count; ++item) {
                 if (first_column + item >= columns) continue;
                 float value = 0.0f;
                 #pragma unroll
                 for (uint word = 0; word < words_per_thread; ++word) {
-                    if constexpr (bits == 4) {
-                        ushort2 halves = as_type<ushort2>(tile_words[item][word]);
-                        for (uint part = 0; part < 2; ++part) {
-                            uint i = word * 8 + part * 4;
-                            value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]),
-                            float4(halves[part] & 15u, halves[part] & 240u, halves[part] & 3840u, halves[part] & 61440u));
-                        }
-                    } else {
-                        uint i = word * 4;
-                        value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]), float4(as_type<uchar4>(tile_words[item][word])));
+                    constexpr uint pieces_per_word = values_per_word / 4;
+                    #pragma unroll
+                    for (uint part = 0; part < pieces_per_word; ++part) {
+                        uint i = word * values_per_word + part * 4;
+                        value += dot(float4(activations[i], activations[i+1], activations[i+2], activations[i+3]),
+                            unpack_quantized_piece<bits>(tile_words[item][word], part));
                     }
                 }
                 sums[batch][item] += tile_scale[item] * value + tile_bias[item] * input_sum;
