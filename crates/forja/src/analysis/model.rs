@@ -227,7 +227,7 @@ pub(super) fn summaries(
     for submission in &profile.submissions {
         let mut phase = Totals::default();
         let mut layers = BTreeMap::<&str, Totals>::new();
-        for dispatch in &submission.timeline {
+        for dispatch in submission.executed_dispatches() {
             let ceiling = super::ceilings(calibration, &dispatch.compute_dtype)?;
             let kind = dispatch
                 .scope

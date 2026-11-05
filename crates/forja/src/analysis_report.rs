@@ -27,7 +27,7 @@ pub(crate) fn report(
     let mut kernels = Vec::new();
     let mut unmeasured = Vec::new();
     for submission in &profile.submissions {
-        for dispatch in &submission.timeline {
+        for dispatch in submission.executed_dispatches() {
             let ceiling = ceilings(calibration, &dispatch.compute_dtype)?;
             let attribution = Attribution {
                 scale,
@@ -159,6 +159,57 @@ pub(super) fn sort(rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesced_dispatches_preserve_totals_and_refuse_hidden_work() {
+        #[derive(Debug)]
+        enum Field {
+            ReadBytes,
+            GpuTime,
+            GapBefore,
+            PaddedFlops,
+            Internal,
+            CallSite,
+        }
+
+        let (mut profile, calibration) = fixture();
+        let original = report(&profile, &calibration, 0.8).unwrap();
+        let mut coalesced = profile.submissions[0].timeline[0].clone();
+        coalesced.index = 2;
+        coalesced.physical_dispatches = 0;
+        coalesced.cost = KernelCost::default();
+        coalesced.gpu_time_seconds = 0.0;
+        coalesced.gap_before_seconds = 0.0;
+        coalesced.padded_flops = [0, 0];
+        coalesced.internal.clear();
+        profile.submissions[0].timeline.push(coalesced.clone());
+        profile.validate().unwrap();
+        assert_eq!(report(&profile, &calibration, 0.8).unwrap(), original);
+
+        for field in [
+            Field::ReadBytes,
+            Field::GpuTime,
+            Field::GapBefore,
+            Field::PaddedFlops,
+            Field::Internal,
+            Field::CallSite,
+        ] {
+            let mut invalid = coalesced.clone();
+            match field {
+                Field::ReadBytes => invalid.cost.read_bytes = 1,
+                Field::GpuTime => invalid.gpu_time_seconds = 1.0,
+                Field::GapBefore => invalid.gap_before_seconds = f64::NAN,
+                Field::PaddedFlops => invalid.padded_flops = [1, 1],
+                Field::Internal => {
+                    invalid.internal = profile.submissions[0].timeline[0].internal.clone();
+                }
+                Field::CallSite => invalid.call_site.clear(),
+            }
+            profile.submissions[0].timeline[2] = invalid;
+            assert!(profile.validate().is_err(), "field={field:?}");
+        }
+    }
+
     #[test]
     fn excess_within_calibration_uncertainty_is_visible_without_a_floor_violation() {
         let (profile, mut calibration) = fixture();

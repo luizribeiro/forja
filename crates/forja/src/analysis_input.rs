@@ -85,6 +85,12 @@ pub(crate) struct Submission {
 }
 
 impl Submission {
+    pub(crate) fn executed_dispatches(&self) -> impl Iterator<Item = &Dispatch> {
+        self.timeline
+            .iter()
+            .filter(|row| row.physical_dispatches > 0)
+    }
+
     pub(crate) fn attribution_seconds(&self) -> Result<f64, Box<dyn Error>> {
         let precise = positive(
             self.timeline
@@ -168,11 +174,19 @@ impl Profile {
             }
             positive(submission.gpu_time_seconds)?;
             for (index, dispatch) in submission.timeline.iter().enumerate() {
-                if dispatch.index != u64::try_from(index)?
-                    || dispatch.physical_dispatches == 0
-                    || dispatch.call_site.is_empty()
-                {
+                if dispatch.index != u64::try_from(index)? || dispatch.call_site.is_empty() {
                     return Err("invalid dispatch identity/count".into());
+                }
+                if dispatch.physical_dispatches == 0 {
+                    if dispatch.cost != KernelCost::default()
+                        || dispatch.gpu_time_seconds != 0.0
+                        || dispatch.gap_before_seconds != 0.0
+                        || dispatch.padded_flops != [0, 0]
+                        || !dispatch.internal.is_empty()
+                    {
+                        return Err("coalesced dispatch carries work or timing".into());
+                    }
+                    continue;
                 }
                 positive(dispatch.gpu_time_seconds)?;
                 if !dispatch.gap_before_seconds.is_finite() || dispatch.gap_before_seconds < 0.0 {
