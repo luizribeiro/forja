@@ -2049,6 +2049,9 @@ mod paged_tests;
 #[cfg(test)]
 #[path = "../tests/state_auth.rs"]
 mod state_auth_tests;
+#[cfg(test)]
+#[path = "../tests/state_lanes.rs"]
+mod state_lanes_tests;
 
 #[cfg(test)]
 pub(crate) fn drained_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> Vec<u8> {
