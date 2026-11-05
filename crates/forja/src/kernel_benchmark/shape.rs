@@ -118,9 +118,11 @@ fn state_operation<'de, D: serde::Deserializer<'de>>(
     #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
     enum StateOperation {
         DeltaRuleBlock,
+        DeltaRule,
+        CausalDepthwiseConv,
     }
     use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
-    let StateOperation::DeltaRuleBlock = StateOperation::deserialize(deserializer)?;
+    let operation = StateOperation::deserialize(deserializer)?;
     let access = || -> Result<_, Box<dyn Error>> {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1])?])?;
         let pool = StatePool::new(layout, 1, 128)?;
@@ -130,7 +132,11 @@ fn state_operation<'de, D: serde::Deserializer<'de>>(
         Ok(StateAccess::from_slot(&slot)?)
     };
     access()
-        .map(forja_core::StateOp::DeltaRuleBlock)
+        .map(|access| match operation {
+            StateOperation::DeltaRuleBlock => forja_core::StateOp::DeltaRuleBlock(access),
+            StateOperation::DeltaRule => forja_core::StateOp::DeltaRule(access),
+            StateOperation::CausalDepthwiseConv => forja_core::StateOp::CausalDepthwiseConv(access),
+        })
         .map_err(serde::de::Error::custom)
 }
 
@@ -214,6 +220,24 @@ fn seeded_bytes(dtype: DType, bytes: usize, mut seed: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_step_state_operations_are_available() {
+        for (name, kind) in [
+            ("delta-rule", forja_core::OperationKind::DeltaRule),
+            (
+                "causal-depthwise-conv",
+                forja_core::OperationKind::CausalDepthwiseConv,
+            ),
+        ] {
+            let shape: Shape = serde_json::from_value(serde_json::json!({
+                "operation": {"kind": "state", "operation": name},
+                "inputs": [], "outputs": []
+            }))
+            .unwrap();
+            assert_eq!(forja_core::OperationKind::of(shape.operation), kind);
+        }
+    }
+
     #[test]
     fn seeded_operands_are_repeatable_and_nonzero() {
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::U32] {
