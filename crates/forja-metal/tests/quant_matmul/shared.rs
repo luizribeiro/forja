@@ -68,14 +68,22 @@ fn assert_shared_group(
 ) {
     let (bits, group_size) = quantization;
     let (inner, columns) = shape;
-    for rows in [1, 2, 4, 7, 8] {
+    for (rows, strided) in [
+        (1, false),
+        (2, false),
+        (3, false),
+        (4, false),
+        (7, true),
+        (8, false),
+        (3, true),
+    ] {
         let mut specs = [
             TensorSpec::contiguous(dtype, &[rows, inner]),
             TensorSpec::contiguous(DType::U32, &[columns, inner * u32::from(bits) / 32]),
             TensorSpec::contiguous(parameters, &[columns, inner / group_size]),
             TensorSpec::contiguous(parameters, &[columns, inner / group_size]),
         ];
-        if rows == 7 {
+        if strided {
             for spec in &mut specs {
                 let [height, width] = <[u32; 2]>::try_from(spec.allocation_shape()).unwrap();
                 *spec = TensorSpec::sliced(
