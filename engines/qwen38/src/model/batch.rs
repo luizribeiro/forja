@@ -32,7 +32,11 @@ impl Model {
         let quant = if batch == 1 {
             self.quant_decode.as_ref()
         } else {
-            self.quant_decode_batch.as_ref()
+            self.quant_decode_batch.as_ref().map(
+                |[pair, wide]| {
+                    if batch == 2 { pair } else { wide }
+                },
+            )
         };
         forja_sdk::profile_scope("embedding", "global", None)?;
         let mut hidden = self.embedding.embed(tokens)?;

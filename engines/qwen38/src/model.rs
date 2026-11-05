@@ -20,7 +20,7 @@ pub struct Model {
     quant: Option<Variant>,
     quant_decode: Option<Variant>,
     #[cfg(target_family = "wasm")]
-    quant_decode_batch: Option<Variant>,
+    quant_decode_batch: Option<[Variant; 2]>,
     attention: Option<Variant>,
     delta: Option<Variant>,
     pub(crate) sample: Option<Variant>,
@@ -49,7 +49,7 @@ impl Model {
             "delta-prefill",
         ];
         #[cfg(target_family = "wasm")]
-        sites.push("quant-decode-batch");
+        sites.extend(["quant-decode-batch", "quant-decode-batch-wide"]);
         if pool.is_some() {
             sites.extend(["paged-attention.prefill", "paged-attention.decode"]);
         }
@@ -121,10 +121,7 @@ impl Model {
                 .map(|picks| picks.at("quant-decode", 0))
                 .transpose()?,
             #[cfg(target_family = "wasm")]
-            quant_decode_batch: picks
-                .as_ref()
-                .map(|picks| picks.at("quant-decode-batch", 0))
-                .transpose()?,
+            quant_decode_batch: picks.as_ref().map(decode_batch_variants).transpose()?,
             attention: picks
                 .as_ref()
                 .map(|picks| picks.at("attention", 0))
@@ -266,6 +263,14 @@ impl Model {
             router_logits: Vec::new(),
         })
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn decode_batch_variants(picks: &EngineSelections) -> Result<[Variant; 2]> {
+    Ok([
+        picks.at("quant-decode-batch", 0)?,
+        picks.at("quant-decode-batch-wide", 0)?,
+    ])
 }
 
 fn load_config(load: &EngineLoadConfig, mut config: Config) -> Result<(Config, u32)> {

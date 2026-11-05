@@ -37,6 +37,7 @@ paged-cache = true
 quant = "quant-matmul.tiled"
 quant-decode = "quant-matmul.gemv"
 quant-decode-batch = "quant-matmul.row-gemv"
+quant-decode-batch-wide = "quant-matmul.row-gemv"
 attention = "sdpa.vector-256-two-pass"
 sample = "sample.parallel"
 "paged-attention.prefill" = "paged-sdpa.steel-bounded-256"

@@ -102,7 +102,11 @@ fn metal_qwen38_decode_profiles_share_the_one_row_reduction_class() {
             "quant-matmul.tiled-k64"
         };
         assert_eq!(fixed["quant"], prefill_variant);
-        for site in ["quant-decode", "quant-decode-batch"] {
+        for site in [
+            "quant-decode",
+            "quant-decode-batch",
+            "quant-decode-batch-wide",
+        ] {
             let variant = variants
                 .iter()
                 .find(|variant| variant["name"].as_str() == Some(fixed[site].as_str()))
