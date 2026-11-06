@@ -92,110 +92,115 @@ uv run --no-project --python 3.12 --with-requirements support/golden/qwen38-requ
 
 ## Results
 
-Measured on Apple M3 Ultra (80 GPU cores, 512 GiB), macOS 27.0.1 build 26A434,
-using the checkpoint and original tokenizer pinned above. Frozen candidate source
-is `c8e62a90`; binary SHA256 starts `a7c0d1f9`, component `002b6cc1` and profile file
-`69c58302`. The absolute reference is verified inference source `b7f9fa45`,
-component `da16c0b6`: its native measurements use the corrected measurement-only
-harness at `b6aa46bd`; HTTP uses its original server binary.
+Historical measurements on Apple M3 Ultra (80 GPU cores, 512 GiB), macOS 27.0.1
+build 26A434, using the pinned checkpoint and original tokenizer above. Candidate
+source is `3bd3f609`; binary SHA256 starts `4fc0f98a4567`, component
+`4d2c44b8ed0d`, default profile file `3628daaf0fa4`.
+The absolute reference is verified inference source `b7f9fa45`, component
+`da16c0b6`; native measurements use its corrected measurement-only harness at
+`b6aa46bd`, while HTTP uses its original server. The same frozen `b6aa46bd`
+HTTP client drives every server.
 
-Fresh MLX measurements use mlx-lm 0.31.3 / MLX 0.32.2, identical quantized bytes,
-greedy sampling and a 2,048-token prefill step. MLX uses native BF16 KV; Forja uses
-F16 KV. Both retain F32 recurrent state. HTTP uses unseeded greedy requests,
-decode/prompt concurrency 32/8, ten cache entries and a 24 GiB prefix-cache ceiling
-on both servers. Forja includes its 2 GiB state snapshots within that ceiling and
-retains a 48 GiB live quota. Multiple live MLX BatchGenerator request IDs were
-verified; timing observation was disabled. No competitor measurements were reused.
-Serving uses primed 512-token prompts and 128 generated tokens at concurrency 1/4.
-Every primary serving request hit the cache: Forja restored 448 tokens and replayed a
-64-token canonical suffix; MLX restored 511 and processed one. TTFT includes
-restoration and this different suffix work.
+**These results apply only to `3bd3f609`.** Source `8e4f0bc9` includes two host
+kernel safety fixes that change the host binary. These records do not validate
+that binary; completing any pending coverage requires a newly frozen candidate
+and fresh measurements, including fresh primary runs for unconfirmed failures.
 
-Randomized ABBA/BAAB blocks use a fresh loaded native pair with independently
-randomized startup order. HTTP starts a fresh server for each whole-workload leg.
-Throughput is wall tok/s; TTFT/ITL
-are milliseconds. Absolute values are block means with descriptive 95% cluster
-bootstrap intervals (4,000 resamples); these intervals have no optional-stopping
-coverage claim. Scores are exponentiated median paired log ratios with calibrated
-sign-test intervals; latency scores invert the ratio so higher always favors Forja.
-Scores can differ from the ratio of the displayed means.
-PASS requires an original protected improvement decision at Y=0. Noise/drift
-vetoes retain history collection without acceptance. FAIL confirmations cannot
-rescue an improvement claim. Intervals are per row, without a joint coverage claim.
-Rows with noise/drift vetoes have unprotected score intervals.
-Values and intervals use primary runs; FAIL twice records a separate confirmation.
-All primary timing runs passed the foreign-GPU audit. Native MLX failures repeated
-in valid confirmations. Both serving confirmation attempts had foreign GPU activity,
-so those fourteen primary FAILs remain unconfirmed.
+Fresh competitor measurements use mlx-lm 0.31.3 / MLX 0.32.2, identical affine
+q4/group-64 tensors, greedy sampling and a 2,048-token prefill step. MLX uses
+BF16 KV; Forja uses F16 KV. Both retain F32 recurrent state. HTTP omits seed and
+uses decode/prompt concurrency 32/8, ten cache entries and a 24 GiB prefix-cache
+ceiling. Forja includes its 2 GiB state snapshots within that ceiling and retains
+a 48 GiB live quota. The multiple-request MLX BatchGenerator admission proof was
+revalidated against installed runtime/adapter hashes; observation was disabled
+for timing. No competitor measurements were reused.
+
+Serving uses primed 512-token prompts and 128 generated tokens. The measured
+c1/c4 requests all hit the cache: Forja restored 448 tokens, MLX 511. TTFT includes
+restoration and this different suffix work. Serial-versus-c4 output tokens matched
+within each implementation; these workloads had no request errors.
+
+Randomized ABBA/BAAB blocks use a fresh loaded native pair per block, randomized
+startup order and fresh request state. HTTP starts a fresh server per workload leg.
+Throughput is wall tok/s; TTFT/ITL are milliseconds. Absolute values are block
+means with descriptive 95% cluster bootstrap intervals (4,000 resamples), without
+optional-stopping coverage. Scores are exponentiated median paired log ratios
+with calibrated sign-test intervals; latency scores invert the ratio so higher
+favors Forja. Intervals are per row, with no joint coverage claim.
+PASS requires original protected improvement at Y=0; X=2% is recorded in the plans.
+Noise/drift vetoes require all 30 blocks and prevent acceptance of a positive result.
+Their score intervals are unprotected; cap means inconclusive. FAIL twice requires
+one fresh confirmation passing the foreign-GPU audit. Confirmation cannot rescue
+an improvement claim. Values use valid primary runs. The invalid first absolute-
+reference serving attempt is excluded; its single retry passed the GPU audit.
 
 ### Against the absolute reference
 
-| Workload | Forja [interval] | Reference [interval] | Score [interval] | Primary blocks | Decision |
+| Workload | Forja [interval] | Reference [interval] | Score [interval] | Blocks | Decision |
 | --- | ---: | ---: | ---: | ---: | --- |
-| pp512 | 321.840 [317.524, 326.098] | 300.330 [296.315, 304.341] | 1.149 [0.960, 1.151] | 30 | inconclusive |
-| pp2048 | 339.636 [336.852, 342.401] | 325.885 [323.463, 328.285] | 1.042 [1.015, 1.070] | 6 | PASS |
-| tg128@512 | 27.383 [27.359, 27.409] | 3.219 [3.215, 3.223] | 8.511 [8.489, 8.522] | 6 | PASS |
-| c1 throughput | 22.851 [22.837, 22.864] | 3.161 [3.156, 3.164] | 7.234 [7.208, 7.245] | 6 | PASS |
-| c1 TTFT p50 | 961.479 [960.459, 962.481] | 1011.975 [1010.526, 1013.443] | 1.052 [1.049, 1.055] | 30 | history collected |
-| c1 TTFT p90 | 961.479 [960.445, 962.461] | 1011.975 [1010.566, 1013.475] | 1.052 [1.049, 1.055] | 30 | history collected |
-| c1 TTFT p99 | 961.479 [960.487, 962.457] | 1011.975 [1010.539, 1013.414] | 1.052 [1.049, 1.055] | 30 | history collected |
-| c1 ITL p50 | 36.286 [36.255, 36.306] | 310.985 [310.501, 311.563] | 8.565 [8.543, 8.602] | 6 | PASS |
-| c1 ITL p90 | 36.663 [36.633, 36.701] | 311.761 [311.326, 312.328] | 8.501 [8.464, 8.536] | 6 | PASS |
-| c1 ITL p99 | 37.299 [37.198, 37.420] | 312.284 [312.055, 312.519] | 8.381 [8.356, 8.407] | 30 | history collected |
-| c4 throughput | 33.287 [33.269, 33.302] | 11.887 [11.872, 11.900] | 2.800 [2.796, 2.809] | 6 | PASS |
-| c4 TTFT p50 | 2412.729 [2410.091, 2415.452] | 2521.800 [2519.195, 2524.552] | 1.046 [1.044, 1.048] | 30 | history collected |
-| c4 TTFT p90 | 2518.910 [2516.213, 2521.876] | 2845.204 [2842.632, 2847.737] | 1.130 [1.129, 1.132] | 30 | history collected |
-| c4 TTFT p99 | 2518.910 [2516.130, 2521.867] | 2845.204 [2842.665, 2847.825] | 1.130 [1.129, 1.132] | 30 | history collected |
-| c4 ITL p50 | 101.942 [101.916, 101.971] | 319.508 [318.976, 320.223] | 3.131 [3.127, 3.149] | 6 | PASS |
-| c4 ITL p90 | 102.260 [102.214, 102.312] | 320.340 [319.754, 321.191] | 3.129 [3.125, 3.152] | 6 | PASS |
-| c4 ITL p99 | 102.715 [102.674, 102.758] | 320.278 [319.997, 320.584] | 3.117 [3.114, 3.120] | 30 | history collected |
+| pp512 | 319.343 [315.857, 322.762] | 307.926 [304.766, 311.117] | 0.980 [0.979, 1.127] | 30 | inconclusive |
+| pp2048 | 339.908 [337.806, 342.015] | 327.662 [325.839, 329.477] | 1.024 [1.022, 1.064] | 6 | PASS |
+| tg128@512 | 28.420 [28.412, 28.427] | 3.220 [3.210, 3.229] | 8.826 [8.776, 8.881] | 6 | PASS |
+| c1 throughput | 26.716 [26.683, 26.750] | 3.157 [3.154, 3.160] | 8.456 [8.446, 8.485] | 6 | PASS |
+| c1 TTFT p50 | 324.828 [322.243, 327.284] | 1008.346 [1005.275, 1011.114] | 3.104 [3.059, 3.148] | 6 | PASS |
+| c1 TTFT p90 | 324.828 [322.221, 327.284] | 1008.346 [1005.344, 1011.247] | 3.104 [3.059, 3.148] | 6 | PASS |
+| c1 TTFT p99 | 324.828 [322.233, 327.284] | 1008.346 [1005.376, 1011.247] | 3.104 [3.059, 3.148] | 6 | PASS |
+| c1 ITL p50 | 34.938 [34.913, 34.969] | 311.332 [311.069, 311.564] | 8.910 [8.893, 8.926] | 6 | PASS |
+| c1 ITL p90 | 35.313 [35.250, 35.409] | 312.652 [312.267, 312.993] | 8.859 [8.816, 8.874] | 6 | PASS |
+| c1 ITL p99 | 36.180 [36.080, 36.280] | 313.464 [313.061, 313.867] | 8.679 [8.600, 8.742] | 6 | PASS |
+| c4 throughput | 49.431 [49.401, 49.456] | 11.892 [11.885, 11.899] | 4.158 [4.146, 4.162] | 6 | PASS |
+| c4 TTFT p50 | 1179.471 [1137.043, 1216.730] | 2515.304 [2513.343, 2517.302] | 1.987 [1.978, 2.268] | 30 | inconclusive: history collected |
+| c4 TTFT p90 | 1352.244 [1346.843, 1359.684] | 2835.419 [2832.088, 2838.902] | 2.100 [2.055, 2.109] | 6 | PASS |
+| c4 TTFT p99 | 1352.244 [1346.672, 1360.086] | 2835.419 [2831.908, 2838.590] | 2.100 [2.055, 2.109] | 6 | PASS |
+| c4 ITL p50 | 71.254 [71.250, 71.258] | 319.312 [319.130, 319.501] | 4.480 [4.477, 4.484] | 30 | inconclusive: history collected |
+| c4 ITL p90 | 71.441 [71.436, 71.447] | 320.275 [320.069, 320.503] | 4.481 [4.478, 4.486] | 30 | inconclusive: history collected |
+| c4 ITL p99 | 79.524 [78.895, 80.139] | 321.455 [321.207, 321.705] | 3.985 [3.965, 4.085] | 30 | inconclusive: history collected |
 
 ### Against MLX
 
-| Workload | Forja [interval] | Reference [interval] | Score [interval] | Primary blocks | Decision |
+| Workload | Forja [interval] | Reference [interval] | Score [interval] | Blocks | Decision |
 | --- | ---: | ---: | ---: | ---: | --- |
-| pp512 | 318.595 [310.108, 327.111] | 413.661 [402.272, 424.635] | 0.770 [0.704, 0.850] | 6 | FAIL twice |
-| pp2048 | 339.732 [336.905, 342.424] | 445.932 [442.899, 448.926] | 0.762 [0.743, 0.781] | 6 | FAIL twice |
-| tg128@512 | 27.380 [27.329, 27.418] | 37.246 [37.182, 37.292] | 0.735 [0.732, 0.737] | 6 | FAIL twice |
-| c1 throughput | 22.833 [22.818, 22.847] | 32.629 [32.580, 32.676] | 0.699 [0.698, 0.702] | 6 | unconfirmed FAIL |
-| c1 TTFT p50 | 962.522 [961.150, 963.995] | 184.588 [183.214, 186.033] | 0.192 [0.189, 0.194] | 30 | unconfirmed FAIL |
-| c1 TTFT p90 | 962.522 [961.185, 964.040] | 184.588 [183.228, 185.981] | 0.192 [0.189, 0.194] | 30 | unconfirmed FAIL |
-| c1 TTFT p99 | 962.522 [961.133, 964.000] | 184.588 [183.171, 185.995] | 0.192 [0.189, 0.194] | 30 | unconfirmed FAIL |
-| c1 ITL p50 | 36.279 [36.256, 36.305] | 29.377 [29.337, 29.422] | 0.809 [0.808, 0.813] | 6 | unconfirmed FAIL |
-| c1 ITL p90 | 36.658 [36.638, 36.681] | 29.652 [29.627, 29.678] | 0.809 [0.808, 0.810] | 30 | unconfirmed FAIL |
-| c1 ITL p99 | 37.380 [37.290, 37.471] | 30.357 [30.207, 30.488] | 0.812 [0.807, 0.816] | 6 | unconfirmed FAIL |
-| c4 throughput | 33.290 [33.278, 33.299] | 93.968 [93.831, 94.107] | 0.354 [0.353, 0.355] | 6 | unconfirmed FAIL |
-| c4 TTFT p50 | 2411.811 [2406.864, 2417.902] | 531.869 [524.800, 540.094] | 0.219 [0.217, 0.228] | 6 | unconfirmed FAIL |
-| c4 TTFT p90 | 2518.023 [2513.126, 2524.041] | 533.842 [526.714, 542.121] | 0.211 [0.209, 0.219] | 6 | unconfirmed FAIL |
-| c4 TTFT p99 | 2518.023 [2513.148, 2524.233] | 533.842 [526.713, 541.807] | 0.211 [0.209, 0.219] | 6 | unconfirmed FAIL |
-| c4 ITL p50 | 101.946 [101.931, 101.964] | 38.441 [38.409, 38.474] | 0.377 [0.376, 0.378] | 6 | unconfirmed FAIL |
-| c4 ITL p90 | 102.229 [102.207, 102.254] | 38.723 [38.696, 38.752] | 0.379 [0.378, 0.379] | 6 | unconfirmed FAIL |
-| c4 ITL p99 | 102.700 [102.674, 102.729] | 39.130 [39.005, 39.270] | 0.381 [0.379, 0.384] | 6 | unconfirmed FAIL |
+| pp512 | 321.174 [313.584, 328.459] | 416.639 [406.099, 426.048] | 0.771 [0.712, 0.845] | 6 | FAIL twice |
+| pp2048 | 341.939 [339.888, 343.983] | 445.076 [442.222, 447.953] | 0.778 [0.748, 0.782] | 6 | FAIL twice |
+| tg128@512 | 28.430 [28.418, 28.441] | 37.337 [37.325, 37.349] | 0.762 [0.761, 0.762] | 30 | FAIL twice |
+| c1 throughput | 26.736 [26.721, 26.752] | 32.744 [32.646, 32.830] | 0.817 [0.812, 0.821] | 6 | FAIL twice |
+| c1 TTFT p50 | 319.709 [319.387, 320.019] | 178.614 [176.747, 181.373] | 0.555 [0.548, 0.562] | 30 | FAIL twice |
+| c1 TTFT p90 | 319.709 [319.382, 320.016] | 178.614 [176.658, 181.230] | 0.555 [0.548, 0.562] | 30 | FAIL twice |
+| c1 TTFT p99 | 319.709 [319.380, 320.006] | 178.614 [176.699, 181.170] | 0.555 [0.548, 0.562] | 30 | FAIL twice |
+| c1 ITL p50 | 34.940 [34.922, 34.963] | 29.275 [29.258, 29.288] | 0.838 [0.835, 0.839] | 6 | FAIL twice |
+| c1 ITL p90 | 35.368 [35.279, 35.449] | 29.610 [29.585, 29.635] | 0.838 [0.833, 0.841] | 6 | FAIL twice |
+| c1 ITL p99 | 36.049 [35.863, 36.208] | 30.237 [30.106, 30.377] | 0.836 [0.829, 0.856] | 6 | FAIL twice |
+| c4 throughput | 49.422 [49.400, 49.446] | 94.650 [94.573, 94.718] | 0.522 [0.521, 0.523] | 6 | FAIL twice |
+| c4 TTFT p50 | 1180.663 [1142.596, 1218.225] | 512.854 [510.265, 515.502] | 0.413 [0.403, 0.463] | 30 | FAIL twice |
+| c4 TTFT p90 | 1354.069 [1348.973, 1358.997] | 514.291 [508.378, 519.654] | 0.379 [0.370, 0.389] | 6 | FAIL twice |
+| c4 TTFT p99 | 1354.069 [1348.847, 1359.042] | 514.291 [508.314, 519.818] | 0.379 [0.370, 0.389] | 6 | FAIL twice |
+| c4 ITL p50 | 71.255 [71.251, 71.259] | 38.293 [38.284, 38.301] | 0.537 [0.537, 0.538] | 30 | FAIL twice |
+| c4 ITL p90 | 71.440 [71.432, 71.447] | 38.555 [38.544, 38.567] | 0.540 [0.539, 0.540] | 30 | FAIL twice |
+| c4 ITL p99 | 79.529 [78.874, 80.133] | 39.151 [38.982, 39.357] | 0.494 [0.482, 0.498] | 30 | FAIL twice |
+| pp16384 | 305.433 [305.207, 305.687] | 428.487 [428.201, 428.743] | 0.712 [0.712, 0.715] | 6 | FAIL; confirmation pending |
+| tg128@4096 | 27.656 [27.647, 27.664] | 36.434 [36.423, 36.445] | 0.759 [0.759, 0.760] | 30 | FAIL; confirmation pending |
 
-These records cover a subset. pp16,384, tg128@4,096, the separate
-tg128@32,768 group, and all twelve conversation turns (TTFT and decode) remain
-unmeasured here. There is no accepted full-profile baseline.
+### Pending coverage
 
-Frozen setup SHA256: `1b7e5c00154c690ddba5308a7cf5082683672db55793b75bac0508d2d2c280bb`.
-Summary record SHA256: `e9917e161da257a0aa3219d323e427d1c37269071d71f9a2de725fe6a4ce9504`.
-Raw commands, artifacts, benchmark records, gate decisions and confirmations are
-retained with these identities. See [benchmarking](../../docs/benchmarking.md) for
-the protocol, thresholds, noise checks and interval assumptions.
+The eight-hour GPU measurement budget stopped further collection. Every item
+below also needs a new candidate identity after the host binary changed at
+`8e4f0bc9`; the frozen `3bd3f609` records cannot complete that coverage.
 
-## Porting notes
+| Workload | Absolute reference | MLX |
+| --- | --- | --- |
+| pp16,384; tg128@4,096 | Pending measurement | Primary FAILs above; confirmation pending |
+| Serving c2/c8: throughput, TTFT and ITL p50/p90/p99 | Pending measurement | Pending measurement |
+| Twelve-turn conversation: cold turn-1 TTFT, cached turn-2–12 TTFT, every turn’s decode and cache hits | Pending measurement | Pending measurement |
+| Separate long group: tg128@32,768; pp65,536/131,072/262,016 | Pending measurement | Pending measurement |
+| Peak RSS at 32K | Pending measurement support | Pending measurement support |
 
-Prompt projections use the tiled reduction class; inputs shorter than 16 rows
-are zero-padded and cropped. Decode projections use the row-GEMV reduction
-class in every serving bucket, with independent rows for batches of 2, 4 and 8.
+True peak RSS needs measurement-tooling support: native records report physical
+footprint and HTTP records sample RSS at case boundaries; neither establishes an
+RSS high-water mark. Long-context performance and conversation cache behavior
+remain unqualified. There is no accepted full-profile baseline.
 
-Decay uses GPU float32 `exp_rounded`/`ln_1p` with a softplus threshold of 20,
-matching the reference operation order without scalar readbacks. The block
-transform uses F32 MMA products, fixed-tree solves and 32-column carry panels;
-16-column panels share its reduction class and produce identical state/output bits. The checkpoint's ordinary RMS weights
-already include the unit offset. The
-DeltaNet gated norm uses direct multipliers, with normalization rounded to BF16
-before the learned weight and float32 SiLU gate. Convolution taps are stored as
-`[channels, width, 1]` and are loaded as `[width, channels]`; history keeps raw
-pre-convolution rows. Full attention splits query and gate within each head and
-rotates only the first 64 of its 256 dimensions. Vision and draft modules are not
-executed.
+Frozen setup SHA256: `d432b45bdb5cb9e2eff6274776d655d0dfd5dad0b6a09f0e92eaefa04f505dff`.
+Summary record SHA256: `dd06e4295eaa6c2974d83e2edeccc049a251627cda1446d9b64e6dbc68fca9f6`.
+Raw artifacts, commands, records, validity audits and stop reasons are retained
+with these identities. See [benchmarking](../../docs/benchmarking.md) for the
+protocol, thresholds, noise checks and interval assumptions.
