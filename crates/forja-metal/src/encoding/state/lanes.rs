@@ -6,16 +6,21 @@ use super::{
 use crate::variants::MetalVariant;
 
 pub(in crate::encoding) fn steps_variant(dispatch: &Dispatch) -> bool {
-    dispatch
-        .backend_data::<crate::ValidatedVariant>()
-        .is_some_and(|variant| variant.name() == "delta-rule.simd-steps")
+    matches!(
+        super::super::selected_variant(dispatch),
+        Some(MetalVariant::DeltaRuleSteps)
+    )
 }
 
 pub(in crate::encoding) fn lane_variant(dispatch: &Dispatch) -> bool {
     matches!(
         super::super::selected_variant(dispatch),
-        Some(MetalVariant::DeltaRuleLanes | MetalVariant::CausalDepthwiseConvLanes)
-    ) || steps_variant(dispatch)
+        Some(
+            MetalVariant::DeltaRuleLanes
+                | MetalVariant::CausalDepthwiseConvLanes
+                | MetalVariant::DeltaRuleSteps
+        )
+    )
 }
 
 pub(in crate::encoding) fn lane_group(dispatches: &[Dispatch]) -> usize {
@@ -34,9 +39,13 @@ pub(in crate::encoding) fn lane_group(dispatches: &[Dispatch]) -> usize {
                     a.layout().shape() == b.layout().shape()
                         && a.layout().dtype() == b.layout().dtype()
                 })
-            || dispatches[..index]
-                .iter()
-                .any(|prior| !independent(prior, candidate))
+            || if steps_variant(first) {
+                !super::steps::chain_member(&dispatches[..index], candidate)
+            } else {
+                dispatches[..index]
+                    .iter()
+                    .any(|prior| !independent(prior, candidate))
+            }
         {
             break;
         }

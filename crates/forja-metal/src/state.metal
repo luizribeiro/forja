@@ -36,21 +36,19 @@ void state_delta_rule_compute(
     device float *next, constant TensorLayout *layouts,
     constant StateParams &params, device atomic_uint *error_flag,
     uint3 group, uint simd_group,
-    uint lane) {
+    uint lane, thread float *state, bool carried) {
     uint head = group.y;
     uint column = group.x * 4 + simd_group;
     uint out_index = head * params.values + column;
     uint q_head = head / (params.heads / params.q_heads);
     uint per_thread = (params.keys + 31) / 32;
-    float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
     float prediction = 0.0f;
     float d = load_float(decay,physical_index(layouts[3],head),program_input3_dtype);
     for (uint i=0; i<per_thread; ++i) {
         uint k = lane * per_thread + i;
-        state[i] = 0.0f;
         if (k < params.keys) {
             uint index = (head * params.keys + k) * params.values + column;
-            state[i] = previous[physical_index(layouts[5],index)] * d;
+            state[i] = (carried ? state[i] : previous[physical_index(layouts[5],index)]) * d;
             prediction += state[i] * load_float(key,physical_index(layouts[1],q_head * params.keys+k),input1_dtype);
         }
     }
@@ -90,8 +88,35 @@ kernel void state_delta_rule(
         return;
     }
     if (!authenticate_state(table,generations,params.access,error_flag)) { return; }
+    float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
     state_delta_rule_compute(query, key, value, decay, beta, previous, table, generations,
-        activity, output, next, layouts, params, error_flag, group, simd_group, lane);
+        activity, output, next, layouts, params, error_flag, group, simd_group, lane, state, false);
+}
+
+bool state_delta_rule_indirect(
+    constant ulong *pointers, constant TensorLayout *all_layouts,
+    constant StateParams *all_params, device atomic_uint *error_flag,
+    uint3 group, uint simd_group, uint lane, thread float *state, bool carried) {
+    constant ulong *p = pointers + group.z * 11;
+    constant TensorLayout *layouts = all_layouts + group.z * 8;
+    constant StateParams &params = all_params[group.z];
+    uint column = group.x * 4 + simd_group;
+    if (column >= params.values) return false;
+    device uchar *output = reinterpret_cast<device uchar *>(p[9]);
+    device const uint *activity = reinterpret_cast<device const uint *>(p[8]);
+    if (activity[0] == 0) {
+        if (lane == 0) store_float(output, physical_index(layouts[6], group.y * params.values + column), output_dtype, 0.0f);
+        return false;
+    }
+    device const uint2 *table = reinterpret_cast<device const uint2 *>(p[6]);
+    device const uint *generations = reinterpret_cast<device const uint *>(p[7]);
+    if (!authenticate_state(table, generations, params.access, error_flag)) return false;
+    state_delta_rule_compute(reinterpret_cast<device const uchar *>(p[0]),
+        reinterpret_cast<device const uchar *>(p[1]), reinterpret_cast<device const uchar *>(p[2]),
+        reinterpret_cast<device const uchar *>(p[3]), reinterpret_cast<device const uchar *>(p[4]),
+        reinterpret_cast<device const float *>(p[5]), table, generations, activity, output,
+        reinterpret_cast<device float *>(p[10]), layouts, params, error_flag, group, simd_group, lane, state, carried);
+    return true;
 }
 
 kernel void state_delta_rule_lanes(
@@ -99,25 +124,21 @@ kernel void state_delta_rule_lanes(
     constant StateParams *all_params [[buffer(2)]], device atomic_uint *error_flag [[buffer(3)]],
     uint3 group [[threadgroup_position_in_grid]], uint simd_group [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constant ulong *p = pointers + group.z * 11;
-    constant TensorLayout *layouts = all_layouts + group.z * 8;
-    constant StateParams &params = all_params[group.z];
-    uint column = group.x * 4 + simd_group;
-    if (column >= params.values) return;
-    device uchar *output = reinterpret_cast<device uchar *>(p[9]);
-    device const uint *activity = reinterpret_cast<device const uint *>(p[8]);
-    if (activity[0] == 0) {
-        if (lane == 0) store_float(output, physical_index(layouts[6], group.y * params.values + column), output_dtype, 0.0f);
-        return;
+    float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
+    state_delta_rule_indirect(pointers, all_layouts, all_params, error_flag, group, simd_group, lane, state, false);
+}
+
+kernel void state_delta_rule_steps(
+    constant ulong *pointers [[buffer(0)]], constant TensorLayout *all_layouts [[buffer(1)]],
+    constant StateParams *all_params [[buffer(2)]], device atomic_uint *error_flag [[buffer(3)]],
+    constant uint &steps [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    float state[(FORJA_DELTA_RULE_MAX_KEYS + 31) / 32];
+    bool carried = false;
+    for (uint step = 0; step < steps; ++step) {
+        group.z = step;
+        carried = state_delta_rule_indirect(pointers, all_layouts, all_params, error_flag, group, simd_group, lane, state, carried);
     }
-    device const uint2 *table = reinterpret_cast<device const uint2 *>(p[6]);
-    device const uint *generations = reinterpret_cast<device const uint *>(p[7]);
-    if (!authenticate_state(table, generations, params.access, error_flag)) return;
-    state_delta_rule_compute(reinterpret_cast<device const uchar *>(p[0]),
-        reinterpret_cast<device const uchar *>(p[1]), reinterpret_cast<device const uchar *>(p[2]),
-        reinterpret_cast<device const uchar *>(p[3]), reinterpret_cast<device const uchar *>(p[4]),
-        reinterpret_cast<device const float *>(p[5]), table, generations, activity, output,
-        reinterpret_cast<device float *>(p[10]), layouts, params, error_flag, group, simd_group, lane);
 }
 
 struct ConvStateParams {

@@ -7,6 +7,14 @@ enum Geometry {
     Conv([u32; 3]),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Schedule {
+    Lanes,
+    Steps,
+    InactiveStep,
+    TypedSteps,
+}
+
 #[test]
 fn metal_authenticated_state_lanes_match_singles_with_inactive_rows() {
     let backend = forja_metal::MetalBackend::new().unwrap();
@@ -49,6 +57,62 @@ fn metal_lane_batches_preserve_odd_keys_values_and_history_tails() {
     }
 }
 
+#[test]
+fn metal_chained_state_steps_match_every_single_version() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for geometry in [Geometry::Delta([48, 16, 128, 128])] {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for steps in [1, 2, 3] {
+                compare_schedule(&backend, geometry, dtype, steps, false, Schedule::Steps);
+                compare_schedule(
+                    &backend,
+                    geometry,
+                    dtype,
+                    steps,
+                    false,
+                    Schedule::TypedSteps,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn metal_chained_state_steps_preserve_odd_strided_views_and_refuse_stale_versions() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for geometry in [
+        Geometry::Delta([6, 2, 7, 33]),
+        Geometry::Delta([6, 2, 33, 7]),
+        Geometry::Delta([1, 1, 1, 1]),
+        Geometry::Delta([1, 1, 7, 4097]),
+        Geometry::Delta([6, 2, 255, 7]),
+        Geometry::Delta([1, 1, 256, 1]),
+    ] {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for steps in [2, 3, 7, 8, 9] {
+                compare_schedule(&backend, geometry, dtype, steps, false, Schedule::Steps);
+                compare_schedule(
+                    &backend,
+                    geometry,
+                    dtype,
+                    steps,
+                    false,
+                    Schedule::TypedSteps,
+                );
+            }
+        }
+        compare_schedule(&backend, geometry, DType::BF16, 4, true, Schedule::Steps);
+        compare_schedule(
+            &backend,
+            geometry,
+            DType::BF16,
+            3,
+            false,
+            Schedule::InactiveStep,
+        );
+    }
+}
+
 fn compare(
     backend: &forja_metal::MetalBackend,
     geometry: Geometry,
@@ -56,17 +120,54 @@ fn compare(
     lanes: usize,
     corrupt: bool,
 ) {
+    compare_schedule(backend, geometry, dtype, lanes, corrupt, Schedule::Lanes);
+}
+
+#[allow(clippy::too_many_lines)]
+fn compare_schedule(
+    backend: &forja_metal::MetalBackend,
+    geometry: Geometry,
+    dtype: DType,
+    lanes: usize,
+    corrupt: bool,
+    schedule: Schedule,
+) {
+    let chained = schedule != Schedule::Lanes;
     let delta = matches!(geometry, Geometry::Delta(_));
-    let specs = specifications(geometry, dtype);
-    let name = if delta {
-        "delta-rule.simd-lanes"
-    } else {
-        "causal-depthwise-conv.direct-lanes"
+    let mut specs = specifications(geometry, dtype);
+    if schedule == Schedule::TypedSteps
+        && let Geometry::Delta([heads, q_heads, keys, _]) = geometry
+    {
+        specs[0] = TensorSpec::permuted(dtype, &[keys, q_heads], &[1, 0]);
+        specs[1] = specs[0].clone();
+        specs[3] = TensorSpec::contiguous(dtype, &[heads]);
+    }
+    let name = match schedule {
+        Schedule::Lanes if delta => "delta-rule.simd-lanes",
+        Schedule::Lanes => "causal-depthwise-conv.direct-lanes",
+        Schedule::Steps | Schedule::InactiveStep | Schedule::TypedSteps => {
+            assert!(delta);
+            "delta-rule.simd-steps"
+        }
     };
     let mut batch = CommandList::new();
-    let mut results = Vec::new();
+    let mut results: Vec<(
+        forja_core::Tensor,
+        forja_core::Tensor,
+        forja_core::Tensor,
+        forja_core::Tensor,
+    )> = Vec::new();
     for lane in 0..lanes {
-        let (access, inputs) = lane_inputs(backend, &specs, lane, corrupt);
+        let (access, mut inputs) = lane_inputs(backend, &specs, lane, corrupt);
+        let source = inputs.len() - 4;
+        if matches!(schedule, Schedule::Steps | Schedule::TypedSteps) {
+            backend
+                .write(inputs.last().unwrap(), &1_u32.to_le_bytes())
+                .unwrap();
+        }
+        if chained && let Some(previous) = results.last() {
+            inputs[source] = previous.1.clone();
+        }
         let op = Op::State(if delta {
             StateOp::DeltaRule(access)
         } else {
@@ -97,12 +198,16 @@ fn compare(
                 )
                 .unwrap();
         }
-        if !corrupt {
+        let mut single_inputs = inputs.clone();
+        if chained && let Some(previous) = results.last() {
+            single_inputs[source] = previous.3.clone();
+        }
+        if !corrupt || lane != 2 {
             let mut single = CommandList::new();
             single
                 .dispatch_many(
                     op,
-                    &inputs.iter().collect::<Vec<_>>(),
+                    &single_inputs.iter().collect::<Vec<_>>(),
                     &[&single_output, &single_state],
                 )
                 .unwrap();
@@ -120,6 +225,18 @@ fn compare(
     let submission = backend.submit_profiled(batch).unwrap();
     if corrupt {
         assert!(submission.wait().is_err());
+        if chained {
+            for (output, state, expected, expected_state) in &results {
+                assert_eq!(
+                    super::refused_read_canary_bytes(backend, output),
+                    backend.read(expected).unwrap()
+                );
+                assert_eq!(
+                    super::drained_canary_bytes(backend, state),
+                    backend.read(expected_state).unwrap()
+                );
+            }
+        }
         return;
     }
     submission.wait().unwrap();
@@ -132,7 +249,11 @@ fn compare(
             .iter()
             .map(|p| p.physical_dispatches)
             .sum::<u64>(),
-        1
+        if chained {
+            u64::try_from(lanes.div_ceil(8)).unwrap()
+        } else {
+            1
+        }
     );
     for (output, state, expected, expected_state) in results {
         assert_eq!(
@@ -170,7 +291,7 @@ fn lane_inputs(
     lane: usize,
     corrupt: bool,
 ) -> (forja_core::StateAccess, Vec<forja_core::Tensor>) {
-    let (access, metadata) = lane_metadata(lane);
+    let (access, metadata) = lane_metadata(lane % 8);
     let mut specs = specs.to_vec();
     specs.extend(metadata);
     let mut values = DeterministicValues::new(0x6a09_e667 + u64::try_from(lane).unwrap());

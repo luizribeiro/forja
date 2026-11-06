@@ -16,6 +16,7 @@ use crate::matmul::{MatrixLayout, classify};
 pub(crate) enum MetalVariant {
     DeltaRule,
     DeltaRuleLanes,
+    DeltaRuleSteps,
     DeltaBlockWy64,
     DeltaBlockWy64Mma16,
     DeltaBlockWy64Mma32,
@@ -1546,6 +1547,13 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         ]
     ),
     batch_invariant_variant!(@class "delta-rule.simd";
+        "delta-rule.simd-steps", DeltaRule, DeltaRuleSteps,
+        &[value(dim("key width", QUERY, Axis::Index(1)), Relation::Range { min: 1, max: crate::geometry::DELTA_RULE_MAX_KEYS })],
+        &["adjacent chained state versions with matching scalar types and geometry."],
+        &["independent lanes or intervening operations."],
+        &["Runs at most eight dependent single-token steps, retaining every output and authenticated state version."]
+    ),
+    batch_invariant_variant!(@class "delta-rule.simd";
         "delta-rule.simd-lanes", DeltaRule, DeltaRuleLanes,
         &[value(dim("key width", QUERY, Axis::Index(1)), Relation::Range { min: 1, max: crate::geometry::DELTA_RULE_MAX_KEYS })],
         &["adjacent independent lanes with matching geometry and scalar types."],
@@ -2423,6 +2431,7 @@ mod tests {
                 "sample.portable",
                 "sample.parallel",
                 "delta-rule.simd",
+                "delta-rule.simd-steps",
                 "delta-rule.simd-lanes",
                 "delta-rule-block.wy64-fixed",
                 "delta-rule-block.wy64-mma-v16",
@@ -2479,8 +2488,10 @@ mod tests {
                     &[&y, &state],
                 )
                 .unwrap();
-            let result = resolve(commands.last_dispatch().unwrap(), "delta-rule.simd", METAL4);
-            assert_eq!(result.is_ok(), keys <= 256);
+            for name in ["delta-rule.simd", "delta-rule.simd-steps"] {
+                let result = resolve(commands.last_dispatch().unwrap(), name, METAL4);
+                assert_eq!(result.is_ok(), keys <= 256);
+            }
             assert!(
                 resolve(
                     commands.last_dispatch().unwrap(),
@@ -3491,6 +3502,11 @@ mod tests {
                 "sdpa.vector-256-two-pass",
                 sdpa_dispatch(DType::F32, 6, 1, 33, 256, 256),
                 "mlx_sdpa_vector_2pass_256",
+            ),
+            (
+                "delta-rule.simd-steps",
+                state_dispatch(forja_core::StateOp::DeltaRule),
+                "state_delta_rule_steps",
             ),
             (
                 "delta-rule.simd-lanes",
