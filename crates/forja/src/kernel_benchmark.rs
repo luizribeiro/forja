@@ -1,6 +1,8 @@
 use std::{error::Error, fs, path::PathBuf, time::Instant};
 
 use forja_core::Backend;
+#[cfg(any(target_os = "macos", test))]
+mod row_chunks;
 mod shape;
 use shape::{Shape, TensorShape};
 
@@ -29,6 +31,9 @@ pub(crate) struct Options {
     /// Advance paged attention by one position on each visit to an operand set.
     #[arg(long)]
     pub(crate) advance_position: bool,
+    /// Split dense matrix rows into bounded dispatches sharing the weights.
+    #[arg(long)]
+    pub(crate) row_chunk: Option<std::num::NonZeroU32>,
     /// Reuse the first output to serialize dispatches through write dependencies.
     #[arg(long)]
     pub(crate) serial: bool,
@@ -63,10 +68,6 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         &config.limits,
     )?;
     let dispatches = effective_dispatches(options)?;
-    let actual_dispatches = dispatches
-        .get()
-        .checked_mul(if shape.append.is_some() { 3 } else { 1 })
-        .ok_or("append dispatch count overflow")?;
     let sum_bytes = |specs: &[TensorShape]| {
         specs.iter().try_fold(0_u64, |total, tensor| {
             total
@@ -93,6 +94,14 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         return Err("kernel diagnostic exceeds live-byte quota".into());
     }
     let commands = diagnostic_commands(&backend, &shape, options)?;
+    let actual_dispatches = u32::try_from(commands.dispatches().len())?;
+    let primary_dispatches = if shape.append.is_some() {
+        dispatches.get()
+    } else {
+        actual_dispatches
+    };
+    let rate_dispatches =
+        std::num::NonZeroU32::new(actual_dispatches).ok_or("diagnostic requires a dispatch")?;
     let cost = if options.advance_position {
         None
     } else {
@@ -119,7 +128,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
         "variant": options.variant, "serial": options.serial, "advance_position": options.advance_position, "operand_order": if options.advance_position {"consecutive"} else {"cyclic"}, "copies": options.copies.get(), "resident_operand_bytes": bytes,
-        "state_steps": options.state_steps.get(), "dispatches_per_sample": actual_dispatches, "primary_dispatches_per_sample": dispatches.get(), "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
+        "state_steps": options.state_steps.get(), "row_chunk": options.row_chunk.map(std::num::NonZeroU32::get), "dispatches_per_sample": actual_dispatches, "primary_dispatches_per_sample": primary_dispatches, "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({
             "kernel": resources.kernel, "execution_width": resources.execution_width,
             "maximum_threadgroup_threads": resources.maximum_threads,
@@ -127,7 +136,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
             "observed_registers_per_thread": null, "observed_occupancy": null,
             "basis": "compiled pipeline limits; not measured occupancy or register allocation"
         })),
-        "rates": cost.map(|cost| diagnostic_rates(cost, dispatches, &samples)).transpose()?,
+        "rates": cost.map(|cost| diagnostic_rates(cost, rate_dispatches, &samples)).transpose()?,
         "warmups": options.warmups, "samples": samples, "provenance": {
             "commit": crate::provenance::commit(), "dirty": crate::provenance::dirty(),
             "binary_sha256": golden_fixtures::sha256_file(std::env::current_exe()?)?,
@@ -180,7 +189,7 @@ fn diagnostic_commands(
     shape: &Shape,
     options: &Options,
 ) -> Result<forja_core::CommandList, Box<dyn Error>> {
-    use forja_core::{BackendDispatchData, CommandList};
+    use forja_core::CommandList;
     let allocate = |specs: &[TensorShape]| {
         specs
             .iter()
@@ -247,29 +256,78 @@ fn diagnostic_commands(
             if let Some(rows) = append {
                 record_append(backend, &mut commands, operation, &inputs, rows)?;
             }
-            let variant =
-                backend.validate_variant_for_op(operation, &inputs, &outputs, &options.variant)?;
-            if let Some(epilogue) = &epilogue {
-                commands.dispatch_epilogue(operation, &inputs, outputs[0], epilogue, &[])?;
-                if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
-                    return Err("missing diagnostic dispatch".into());
-                }
-            } else {
-                commands.dispatch_many_with_backend_data(
-                    operation,
-                    &inputs,
-                    &outputs,
-                    BackendDispatchData::new(variant),
-                )?;
-            }
+            record_diagnostic_dispatch(
+                backend,
+                &mut commands,
+                operation,
+                &inputs,
+                &outputs,
+                epilogue.as_ref(),
+                options,
+            )?;
         }
     }
     Ok(commands)
 }
 
 #[cfg(target_os = "macos")]
+fn record_diagnostic_dispatch(
+    backend: &forja_metal::MetalBackend,
+    commands: &mut forja_core::CommandList,
+    operation: forja_core::Op,
+    inputs: &[&forja_core::Tensor],
+    outputs: &[&forja_core::Tensor],
+    epilogue: Option<&std::sync::Arc<forja_core::program::PreparedEpilogue>>,
+    options: &Options,
+) -> Result<(), Box<dyn Error>> {
+    use forja_core::BackendDispatchData;
+    let mut record = |inputs: &[&forja_core::Tensor],
+                      outputs: &[&forja_core::Tensor]|
+     -> Result<(), Box<dyn Error>> {
+        let variant =
+            backend.validate_variant_for_op(operation, inputs, outputs, &options.variant)?;
+        if let Some(epilogue) = epilogue {
+            commands.dispatch_epilogue(operation, inputs, outputs[0], epilogue, &[])?;
+            if !commands.set_last_backend_data(BackendDispatchData::new(variant)) {
+                return Err("missing diagnostic dispatch".into());
+            }
+        } else {
+            commands.dispatch_many_with_backend_data(
+                operation,
+                inputs,
+                outputs,
+                BackendDispatchData::new(variant),
+            )?;
+        }
+        Ok(())
+    };
+    if let Some(chunk) = options.row_chunk {
+        for (inputs, outputs) in row_chunks::views(backend, operation, inputs, outputs, chunk)? {
+            record(
+                &inputs.iter().collect::<Vec<_>>(),
+                &outputs.iter().collect::<Vec<_>>(),
+            )?;
+        }
+    } else {
+        record(inputs, outputs)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn validate_diagnostic_options(shape: &Shape, options: &Options) -> Result<(), Box<dyn Error>> {
     validate_operand_visits(options.dispatches, options.copies)?;
+    if options.row_chunk.is_some() && options.serial {
+        return Err("--row-chunk cannot be combined with --serial".into());
+    }
+    if options.row_chunk.is_some()
+        && (shape.epilogue.is_some()
+            || shape.append.is_some()
+            || options.state_steps.get() != 1
+            || options.advance_position)
+    {
+        return Err("row chunks require an ordinary matrix diagnostic".into());
+    }
     if options.state_steps.get() > 1
         && !matches!(
             shape.operation,
@@ -474,6 +532,60 @@ mod tests {
     }
 
     #[test]
+    fn row_chunks_refuse_incompatible_diagnostic_options() {
+        type Edit = fn(&mut Shape, &mut Options);
+        let ordinary = || {
+            let shape = serde_json::from_value(serde_json::json!({
+                "operation":{"kind":"matmul"},
+                "inputs":[{"dtype":"f32","shape":[9,7]}, {"dtype":"f32","shape":[7,33]}],
+                "outputs":[{"dtype":"f32","shape":[9,33]}]
+            }))
+            .unwrap();
+            let options = Options {
+                variant: "matmul.gemv".into(),
+                state_steps: std::num::NonZeroU32::new(1).unwrap(),
+                row_chunk: std::num::NonZeroU32::new(8),
+                ..state_chain_options()
+            };
+            (shape, options)
+        };
+        let (shape, mut options) = ordinary();
+        assert!(validate_diagnostic_options(&shape, &options).is_ok());
+        options.row_chunk = None;
+        options.serial = true;
+        assert!(validate_diagnostic_options(&shape, &options).is_ok());
+        let cases: [(&str, Edit); 5] = [
+            ("epilogue", |s, _| {
+                s.epilogue = Some(shape::DiagnosticEpilogue::Identity);
+            }),
+            ("append", |s, _| {
+                s.append = Some(
+                    serde_json::from_value(serde_json::json!([
+                        {"dtype":"f32","shape":[1,7]}, {"dtype":"f32","shape":[1,7]}
+                    ]))
+                    .unwrap(),
+                );
+            }),
+            ("state steps", |_, o| {
+                o.state_steps = std::num::NonZeroU32::new(2).unwrap();
+            }),
+            ("positions", |_, o| o.advance_position = true),
+            ("serial", |_, o| o.serial = true),
+        ];
+        for (name, edit) in cases {
+            let (mut shape, mut options) = ordinary();
+            edit(&mut shape, &mut options);
+            let error = validate_diagnostic_options(&shape, &options).unwrap_err();
+            let expected = if name == "serial" {
+                "--row-chunk cannot be combined with --serial"
+            } else {
+                "row chunks require an ordinary matrix diagnostic"
+            };
+            assert_eq!(error.to_string(), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn state_dispatch_counts_refuse_overflow() {
         let mut options = state_chain_options();
         assert_eq!(effective_dispatches(&options).unwrap().get(), 3);
@@ -555,6 +667,33 @@ mod tests {
         let y = backend.alloc(DType::F32, &[1, 7]).unwrap();
         commands.dispatch(Op::Matmul, &[&x, &w], &y).unwrap();
         assert!(uniform_dispatch_cost(&commands).is_none());
+    }
+
+    #[test]
+    fn chunked_dispatch_costs_distinguish_unequal_tails() {
+        use forja_core::{CommandList, DType, Op};
+        let backend = forja_cpu::CpuBackend::new();
+        for rows in [9, 16] {
+            let input = backend.alloc(DType::F32, &[rows, 7]).unwrap();
+            let weight = backend.alloc(DType::F32, &[7, 33]).unwrap();
+            let output = backend.alloc(DType::F32, &[rows, 33]).unwrap();
+            let chunks = row_chunks::views(
+                &backend,
+                Op::Matmul,
+                &[&input, &weight],
+                &[&output],
+                std::num::NonZeroU32::new(8).unwrap(),
+            )
+            .unwrap();
+            let mut commands = CommandList::new();
+            for (inputs, outputs) in &chunks {
+                commands
+                    .dispatch(Op::Matmul, &inputs.iter().collect::<Vec<_>>(), &outputs[0])
+                    .unwrap();
+            }
+            assert_eq!(commands.dispatches().len(), 2);
+            assert_eq!(uniform_dispatch_cost(&commands).is_some(), rows == 16);
+        }
     }
 
     #[test]
@@ -716,6 +855,7 @@ mod tests {
             warmups: 0,
             serial: false,
             advance_position: false,
+            row_chunk: None,
             copies: std::num::NonZeroU32::new(1).unwrap(),
             dispatches: std::num::NonZeroU32::new(1).unwrap(),
             state_steps: std::num::NonZeroU32::new(3).unwrap(),
@@ -808,6 +948,7 @@ mod tests {
             warmups: 0,
             serial: true,
             advance_position: false,
+            row_chunk: None,
             state_steps: std::num::NonZeroU32::new(1).unwrap(),
             copies: std::num::NonZeroU32::new(3).unwrap(),
             dispatches: std::num::NonZeroU32::new(7).unwrap(),

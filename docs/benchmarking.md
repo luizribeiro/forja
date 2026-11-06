@@ -300,6 +300,11 @@ dispatch count must be a multiple of the operand-set count. With append-and-atte
 variants, this measures successive appends to the same pages. Allocate space for
 every row. `operand_order` records `consecutive` for this flag and `cyclic`
 otherwise. This flag nulls `cost_per_dispatch` and `rates`.
+`--row-chunk N` splits ordinary dense or quantized matrix rows into consecutive
+dispatches sharing each operand set's weights. The selected variant is validated
+for every chunk. Row chunks cannot be combined with `--serial`, epilogues, append
+copies, state chains, or advancing positions.
+Records include the chunk limit and actual dispatch count; unequal tails omit rates.
 
 An optional `append` array in the shape supplies two ordinary
 `[1, kv_heads, head_dim]` tensors. Each visit records two authenticated copies plus
