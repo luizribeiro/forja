@@ -7868,6 +7868,9 @@ impl MetalBackend {
                 arguments.write(lanes * 8 * 112)?;
                 arguments.write(lanes * 8 * size_of::<u32>())?;
                 arguments.write(2 * size_of::<u32>())?;
+                if state::steps_variant(dispatch) {
+                    arguments.write(size_of::<u32>())?;
+                }
                 consumed = index + lanes;
             } else {
                 self.size_dispatch_arguments(dispatch, &mut arguments)?;

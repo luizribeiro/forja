@@ -9,7 +9,7 @@ use super::{
 
 mod block;
 mod lanes;
-pub(super) use lanes::{fold_profiles, lane_group, lane_variant};
+pub(super) use lanes::{fold_profiles, lane_group, lane_variant, steps_variant};
 #[cfg(test)]
 mod block_tests;
 

@@ -5,11 +5,17 @@ use super::{
 };
 use crate::variants::MetalVariant;
 
+pub(in crate::encoding) fn steps_variant(dispatch: &Dispatch) -> bool {
+    dispatch
+        .backend_data::<crate::ValidatedVariant>()
+        .is_some_and(|variant| variant.name() == "delta-rule.simd-steps")
+}
+
 pub(in crate::encoding) fn lane_variant(dispatch: &Dispatch) -> bool {
     matches!(
         super::super::selected_variant(dispatch),
         Some(MetalVariant::DeltaRuleLanes | MetalVariant::CausalDepthwiseConvLanes)
-    )
+    ) || steps_variant(dispatch)
 }
 
 pub(in crate::encoding) fn lane_group(dispatches: &[Dispatch]) -> usize {
@@ -65,8 +71,10 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         };
         let (kernel, _, mut groups) = state_geometry(operation, first.inputs(), first.outputs())?;
-        groups.depth = dispatches.len();
+        let steps = steps_variant(first);
+        groups.depth = if steps { 1 } else { dispatches.len() };
         let kernel = match kernel {
+            "state_delta_rule" if steps => "state_delta_rule_steps",
             "state_delta_rule" => "state_delta_rule_lanes",
             "state_causal_conv" => "state_causal_conv_lanes",
             _ => return Err(BackendError::UnsupportedOperation),
@@ -95,10 +103,14 @@ impl MetalBackend {
             params.extend(parameter);
         }
         let pipeline = self.state_pipeline(kernel, first)?;
-        let buffers = [pointers, layouts, params, error_state().to_vec()]
+        let mut buffers = [pointers, layouts, params, error_state().to_vec()]
             .iter()
             .map(|bytes| arguments.write(bytes))
             .collect::<Result<Vec<_>, _>>()?;
+        if steps {
+            let count = u32::try_from(dispatches.len()).map_err(|_| BackendError::InvalidInput)?;
+            buffers.push(arguments.write(&count.to_ne_bytes())?);
+        }
         set_pipeline(encoder, &pipeline);
         for (index, buffer) in buffers.iter().enumerate() {
             bindings.bind(table, index, buffer);
