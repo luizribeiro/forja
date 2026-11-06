@@ -8769,25 +8769,15 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 "copy_strided"
             }
         }
-        Op::State(forja_core::StateOp::DeltaRule(_)) => {
-            if matches!(
-                selected_variant(dispatch),
-                Some(MetalVariant::DeltaRuleLanes)
-            ) {
-                "state_delta_rule_lanes"
-            } else {
-                "state_delta_rule"
-            }
-        }
+        Op::State(forja_core::StateOp::DeltaRule(_)) => match selected_variant(dispatch) {
+            Some(MetalVariant::DeltaRuleLanes) => "state_delta_rule_lanes",
+            _ => "state_delta_rule",
+        },
         Op::State(forja_core::StateOp::DeltaRuleBlock(_)) => "state_delta_rule_block",
         Op::State(forja_core::StateOp::CausalDepthwiseConv(_)) => {
-            if matches!(
-                selected_variant(dispatch),
-                Some(MetalVariant::CausalDepthwiseConvLanes)
-            ) {
-                "state_causal_conv_lanes"
-            } else {
-                "state_causal_conv"
+            match selected_variant(dispatch) {
+                Some(MetalVariant::CausalDepthwiseConvLanes) => "state_causal_conv_lanes",
+                _ => "state_causal_conv",
             }
         }
         Op::PagedCopy { .. } => "paged_copy",
