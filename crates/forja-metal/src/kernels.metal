@@ -322,6 +322,21 @@ void sort_eight_candidates_descending(thread ulong (&candidates)[8]) {
     order_candidates_descending(candidates[3], candidates[4]);
 }
 
+// Eight SIMD groups (the host caps sampling at 256 threads) times the host maximum fast top-k of 20.
+constexpr constant uint fast_top_slots = 160;
+
+void load_fast_top_merge(
+    threadgroup const ulong *simd_top,
+    uint simd_lane,
+    uint group_width,
+    thread ulong (&merged)[8]) {
+    uint written = min((group_width + 31) / 32 * sample_fast_topk, fast_top_slots);
+    for (uint slot = 0; slot < 8; ++slot) {
+        uint index = simd_lane + slot * 32;
+        merged[slot] = index < written ? simd_top[index] : 0;
+    }
+}
+
 kernel void argmax_partials(
     device const uchar *input [[buffer(0)]],
     device ulong *output [[buffer(1)]],
@@ -864,7 +879,7 @@ kernel void sample_masked_partials(
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup ulong simd_top[160];
+    threadgroup ulong simd_top[fast_top_slots];
     threadgroup uint partial_keys[32];
     threadgroup uint partial_indices[32];
     threadgroup uint partial_counts[32];
@@ -927,9 +942,7 @@ kernel void sample_masked_partials(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
         ulong merged[8];
-        for (uint slot = 0; slot < 8; ++slot) {
-            merged[slot] = simd_top[simd_lane + slot * 32];
-        }
+        load_fast_top_merge(simd_top, simd_lane, group_width, merged);
         sort_eight_candidates_descending(merged);
         uint merged_cursor = 0;
         for (uint rank = 0; rank < sample_fast_topk; ++rank) {
@@ -964,7 +977,7 @@ kernel void sample_masked_finalize(
     uint group_width [[threads_per_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-    threadgroup ulong simd_top[160];
+    threadgroup ulong simd_top[fast_top_slots];
     threadgroup ulong ordered[20];
     threadgroup float weights[20];
     threadgroup uint keep;
@@ -1052,9 +1065,7 @@ kernel void sample_masked_finalize(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
             ulong merged[8];
-            for (uint slot = 0; slot < 8; ++slot) {
-                merged[slot] = simd_top[simd_lane + slot * 32];
-            }
+            load_fast_top_merge(simd_top, simd_lane, group_width, merged);
             sort_eight_candidates_descending(merged);
             uint merged_cursor = 0;
             for (uint rank = 0; rank < sample_fast_topk; ++rank) {
@@ -1553,7 +1564,7 @@ kernel void sample_topk_partials(
             memory_order_relaxed) != sample_refine) {
         return;
     }
-    threadgroup ulong simd_top[160];
+    threadgroup ulong simd_top[fast_top_slots];
     uint chunk = group % chunks;
     uint first = chunk * reduction_chunk_width;
     uint end = first + min(reduction_chunk_width, width - first);
@@ -1578,9 +1589,7 @@ kernel void sample_topk_partials(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
         ulong merged[8];
-        for (uint slot = 0; slot < 8; ++slot) {
-            merged[slot] = simd_top[simd_lane + slot * 32];
-        }
+        load_fast_top_merge(simd_top, simd_lane, group_width, merged);
         sort_eight_candidates_descending(merged);
         uint merged_cursor = 0;
         for (uint rank = 0; rank < sample_fast_topk; ++rank) {
@@ -1618,7 +1627,7 @@ kernel void sample_topk_finalize(
             memory_order_relaxed) != sample_refine) {
         return;
     }
-    threadgroup ulong simd_top[160];
+    threadgroup ulong simd_top[fast_top_slots];
     threadgroup ulong ordered[20];
     threadgroup float weights[20];
     threadgroup uint keep;
@@ -1644,9 +1653,7 @@ kernel void sample_topk_finalize(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
         ulong merged[8];
-        for (uint slot = 0; slot < 8; ++slot) {
-            merged[slot] = simd_top[simd_lane + slot * 32];
-        }
+        load_fast_top_merge(simd_top, simd_lane, group_width, merged);
         sort_eight_candidates_descending(merged);
         uint merged_cursor = 0;
         for (uint rank = 0; rank < sample_fast_topk; ++rank) {
