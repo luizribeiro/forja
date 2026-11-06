@@ -1576,9 +1576,10 @@ impl GraphTemplate {
                     backend_data,
                 } => {
                     let concrete = dispatch.instantiate(values, self.limits)?;
-                    backend_data
-                        .clone()
-                        .map_or(concrete.clone(), |data| concrete.with_backend_data(data))
+                    match backend_data {
+                        Some(data) => concrete.with_backend_data(data.clone()),
+                        None => concrete,
+                    }
                 }
                 TemplateDispatch::Rule {
                     dispatch,
@@ -1599,12 +1600,10 @@ impl GraphTemplate {
                         .with_backend_data(data)
                 }
             };
-            let concrete = self
-                .profile_scopes
-                .get(&index)
-                .map_or(concrete.clone(), |scope| {
-                    concrete.with_profile_scope(Arc::clone(scope))
-                });
+            let concrete = match self.profile_scopes.get(&index) {
+                Some(scope) => concrete.with_profile_scope(Arc::clone(scope)),
+                None => concrete,
+            };
             commands.push_and_reset_validation(concrete);
         }
         commands.set_precomputed_barriers(self.required_barriers.clone());
