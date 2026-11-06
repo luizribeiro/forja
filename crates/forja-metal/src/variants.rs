@@ -673,7 +673,13 @@ const TOP_K_PARTIALS: &[Constraint] = &[operation(
     OperationValue::TopK,
     Relation::Range { min: 1, max: 64 },
 )];
-const PAGED_SDPA: &[Constraint] = &[value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS))];
+const PAGED_SDPA: &[Constraint] = &[
+    value(PAGED_KEY_WIDTH, Relation::OneOf(WIDTHS)),
+    Constraint::DimensionsEqual {
+        left: PAGED_KEY_WIDTH,
+        right: PAGED_VALUE_WIDTH,
+    },
+];
 const PAGED_SDPA_DECOMPOSED: &[Constraint] = &[
     value(
         QUERY_LENGTH,
@@ -2825,6 +2831,16 @@ mod tests {
         query_length: u32,
         width: u32,
     ) -> Dispatch {
+        paged_sdpa_dispatch_with_widths(dtype, group, query_length, width, width)
+    }
+
+    fn paged_sdpa_dispatch_with_widths(
+        dtype: DType,
+        group: u32,
+        query_length: u32,
+        width: u32,
+        value_width: u32,
+    ) -> Dispatch {
         let backend = CpuBackend::new();
         let kv_heads = 8;
         let query_heads = kv_heads * group;
@@ -2832,11 +2848,13 @@ mod tests {
             .alloc(DType::F32, &[query_heads, query_length, width])
             .unwrap();
         let key = backend.alloc(dtype, &[2, 32, kv_heads, width]).unwrap();
-        let value = backend.alloc(dtype, &[2, 32, kv_heads, width]).unwrap();
+        let value = backend
+            .alloc(dtype, &[2, 32, kv_heads, value_width])
+            .unwrap();
         let table = backend.alloc(DType::U32, &[2, 2]).unwrap();
         let generations = backend.alloc(DType::U32, &[2]).unwrap();
         let output = backend
-            .alloc(DType::F32, &[query_heads, query_length, width])
+            .alloc(DType::F32, &[query_heads, query_length, value_width])
             .unwrap();
         let mut commands = CommandList::new();
         commands
@@ -3164,6 +3182,45 @@ mod tests {
                 METAL4
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn paged_attention_refuses_value_width_differing_from_key_width() {
+        let mut exercised = 0;
+        for (group, query_length, width, value_width) in [
+            (1, 1, 128, 64),
+            (8, 1, 128, 64),
+            (2, 7, 128, 64),
+            (2, 7, 64, 128),
+            (8, 1, 256, 128),
+            (2, 33, 256, 128),
+        ] {
+            let equal =
+                paged_sdpa_dispatch_with_widths(DType::F16, group, query_length, width, width);
+            let narrower = paged_sdpa_dispatch_with_widths(
+                DType::F16,
+                group,
+                query_length,
+                width,
+                value_width,
+            );
+            for definition in REGISTRY
+                .iter()
+                .filter(|definition| definition.operation == OperationKind::PagedSdpa)
+                .filter(|definition| resolve(&equal, definition.name, METAL4).is_ok())
+            {
+                exercised += 1;
+                assert!(
+                    resolve(&narrower, definition.name, METAL4).is_err(),
+                    "{} accepted key width {width} with value width {value_width}",
+                    definition.name
+                );
+            }
+        }
+        assert!(
+            exercised >= 10,
+            "only {exercised} variant and shape pairs were exercised"
         );
     }
 
