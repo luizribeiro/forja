@@ -926,22 +926,14 @@ pub(super) struct MetalProgram {
     signature: KernelSignature,
     specializations: Mutex<Vec<RowSpecialization>>,
     rereading: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    resident: Option<LazyProgramPipeline>,
+    resident: Option<ComputePipeline>,
 }
 
 // SAFETY: Compiled pipeline states are immutable, and Metal permits encoding them from multiple
 // host threads.
 unsafe impl Send for MetalProgram {}
-// SAFETY: Compiled pipeline states are immutable; the mutexes and `OnceLock` synchronize
-// initialization and cache access.
+// SAFETY: Compiled pipeline states are immutable; the mutex synchronizes specialization access.
 unsafe impl Sync for MetalProgram {}
-
-struct LazyProgramPipeline {
-    key: ProgramPipelineKey,
-    source: String,
-    state: OnceLock<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    compilation: Mutex<()>,
-}
 
 /// Opaque state retained by a prepared Metal scalar program.
 pub struct MetalProgramHandle(pub(super) Arc<MetalProgram>);
@@ -952,6 +944,7 @@ impl MetalProgram {
         backend: &MetalBackend,
         dispatch: &Dispatch,
         fallback: ProgramPipeline,
+        allow_compile: bool,
     ) -> Result<ProgramPipeline, BackendError> {
         if self.validated.program().kind != ProgramKind::Row || fallback.compile_fallback {
             return Ok(fallback);
@@ -976,7 +969,7 @@ impl MetalProgram {
                 ..fallback
             });
         }
-        if cache.len() >= MAX_ROW_SPECIALIZATIONS {
+        if !allow_compile || cache.len() >= MAX_ROW_SPECIALIZATIONS {
             return Ok(fallback);
         }
         if !backend
@@ -1037,41 +1030,14 @@ impl MetalProgram {
         }
     }
 
-    fn select(&self, backend: &MetalBackend, width: u32) -> Result<ProgramPipeline, BackendError> {
-        let Some(resident) = self
-            .resident
-            .as_ref()
-            .filter(|_| width <= map_codegen::REGISTER_RESIDENT_WIDTH)
-        else {
+    fn select(&self, width: u32) -> Result<ProgramPipeline, BackendError> {
+        if self.validated.program().kind != ProgramKind::Row
+            || width > map_codegen::REGISTER_RESIDENT_WIDTH
+        {
             return Ok(self.rereading(false));
-        };
-        let pipeline = if let Some(pipeline) = resident.state.get() {
-            pipeline
-        } else {
-            let _compilation = resident
-                .compilation
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
-            if let Some(pipeline) = resident.state.get() {
-                pipeline
-            } else {
-                let compile_allowed = backend
-                    .program_compile_tokens
-                    .lock()
-                    .map_err(|_| BackendError::ExecutionFailed)?
-                    .consume(1);
-                if !compile_allowed {
-                    return Ok(self.rereading(true));
-                }
-                let pipeline = backend
-                    .pipelines
-                    .compile_program_source(&resident.key, &resident.source)?;
-                resident
-                    .state
-                    .set(pipeline)
-                    .map_err(|_| BackendError::ExecutionFailed)?;
-                resident.state.get().ok_or(BackendError::ExecutionFailed)?
-            }
+        }
+        let Some(pipeline) = &self.resident else {
+            return Ok(self.rereading(true));
         };
         if pipeline.maxTotalThreadsPerThreadgroup()
             >= usize::try_from(width).map_err(|_| BackendError::ExecutionFailed)?
@@ -2534,17 +2500,19 @@ impl MetalBackend {
         let rereading = self
             .pipelines
             .compile_program_source(&rereading_key, &rereading_source)?;
-        // The bound row width is unavailable at preparation. The rereading pipeline works for
-        // every width; the resident candidate is compiled only when a dispatch can select it.
-        let resident = (program.program().kind == ProgramKind::Row).then(|| {
+        let resident = if program.program().kind == ProgramKind::Row
+            && self
+                .program_compile_tokens
+                .lock()
+                .map_err(|_| BackendError::ExecutionFailed)?
+                .consume(1)
+        {
             let key = ProgramPipelineKey::new(program, signature, true);
-            LazyProgramPipeline {
-                source: map_codegen::generate(program, signature, true, &[]),
-                key,
-                state: OnceLock::new(),
-                compilation: Mutex::new(()),
-            }
-        });
+            let source = map_codegen::generate(program, signature, true, &[]);
+            Some(self.pipelines.compile_program_source(&key, &source)?)
+        } else {
+            None
+        };
         let program = Arc::new(MetalProgram {
             validated: program.clone(),
             signature: signature.clone(),
@@ -2554,6 +2522,25 @@ impl MetalBackend {
         });
         prepared.insert(cache_key, Arc::downgrade(&program));
         Ok(MetalProgramHandle(program))
+    }
+
+    pub(super) fn prepare_program_dispatch(&self, dispatch: &Dispatch) -> Result<(), BackendError> {
+        let Some(prepared) = dispatch.prepared_program() else {
+            return Ok(());
+        };
+        let handle = prepared
+            .backend_handle::<MetalProgramHandle>()
+            .ok_or(BackendError::InvalidInput)?;
+        let width = dispatch
+            .output()
+            .layout()
+            .shape()
+            .last()
+            .copied()
+            .unwrap_or(1);
+        let fallback = handle.0.select(width)?;
+        handle.0.specialize(self, dispatch, fallback, true)?;
+        Ok(())
     }
 
     pub(super) fn submit_commands(
@@ -2594,6 +2581,12 @@ impl MetalBackend {
     ) -> Result<PreparedMetalGraph, BackendError> {
         let fallback_count = self.pipelines.epilogue_counts()?.fallbacks;
         self.prepare_graph_epilogues(graph)?;
+        for (_, _, dispatch) in graph
+            .backend_dispatch_candidates()
+            .map_err(BackendError::from)?
+        {
+            self.prepare_program_dispatch(&dispatch)?;
+        }
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
             .then(|| self.prepare_encoding_plan(graph))
             .transpose();
@@ -7728,8 +7721,8 @@ impl MetalBackend {
             .last()
             .copied()
             .unwrap_or(1);
-        let pipeline = handle.0.select(self, width)?;
-        let pipeline = handle.0.specialize(self, dispatch, pipeline)?;
+        let pipeline = handle.0.select(width)?;
+        let pipeline = handle.0.specialize(self, dispatch, pipeline, false)?;
         if pipeline.compile_fallback {
             *state.compile_fallbacks = state.compile_fallbacks.saturating_add(1);
         }
@@ -12037,7 +12030,7 @@ mod tests {
             .backend_handle::<MetalProgramHandle>()
             .unwrap()
             .0
-            .select(&reference, 1)
+            .select(1)
             .unwrap();
         for width in [1, 7, 33, 128, 256, 512, 1024, 2048, 4097, 7] {
             let bytes = (0..=width * 2)
@@ -12062,7 +12055,15 @@ mod tests {
                     commands
                         .dispatch_kernel(prepared, &[&input], &[&output])
                         .unwrap();
+                    backend
+                        .prepare_dispatch(commands.last_dispatch().unwrap())
+                        .unwrap();
+                    let allowance = backend.pipelines.pipeline_budget.load(Ordering::Acquire);
                     backend.submit(commands).unwrap().wait().unwrap();
+                    assert_eq!(
+                        backend.pipelines.pipeline_budget.load(Ordering::Acquire),
+                        allowance
+                    );
                     backend.read(&output).unwrap()
                 })
                 .collect::<Vec<_>>();
@@ -12113,7 +12114,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_dispatch_only_charges_lazy_row_compilation() {
+    fn prepared_dispatch_reuses_pipelines_without_compiling() {
         let budget = crate::ProgramCompileBudget::new(1, Duration::from_hours(24)).unwrap();
         let map_backend = MetalBackend::with_program_compile_budget(budget).unwrap();
         let map = Program {
@@ -12153,6 +12154,50 @@ mod tests {
             row_backend.read(&output).unwrap(),
             [1.0_f32.to_le_bytes(); 33].concat()
         );
+    }
+
+    #[test]
+    fn dynamic_program_replays_use_only_prepared_pipelines() {
+        let backend = MetalBackend::new().unwrap();
+        let signature = KernelSignature::new(1, vec![], vec![DType::F32], 0);
+        let program = Program {
+            kind: ProgramKind::Row,
+            insts: vec![Inst::Const(1.0)],
+            outputs: vec![(0, 0)],
+        }
+        .validate()
+        .unwrap();
+        let prepared = prepare_program(&backend, program, signature).unwrap();
+        let allocation = backend.alloc(DType::F32, &[4097]).unwrap();
+        let space = ParamSpace::new(std::iter::once(1..=4097).collect()).unwrap();
+        let output = symbolic_prefix(&allocation, space.clone(), Affine::parameter(0, 0, 1));
+        let mut template = GraphTemplate::new(space, GraphLimits::default());
+        template
+            .dispatch_kernel(&prepared, &[], &[&output])
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        let allowance = backend.pipelines.pipeline_budget.load(Ordering::Acquire);
+        for width in [1, 7, 33, 4097] {
+            backend
+                .replay_graph(&graph, vec![width], false, None)
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(
+                backend.pipelines.pipeline_budget.load(Ordering::Acquire),
+                allowance
+            );
+            let view = backend
+                .view(
+                    &allocation,
+                    ViewOp::Slice(vec![Slice::new(0, width, 1).unwrap()]),
+                )
+                .unwrap();
+            assert_eq!(
+                backend.read(&view).unwrap(),
+                vec![1.0_f32.to_le_bytes(); width as usize].concat()
+            );
+        }
     }
 
     #[test]

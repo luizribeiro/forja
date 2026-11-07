@@ -634,6 +634,15 @@ pub trait Backend {
         signature: &KernelSignature,
     ) -> Result<Self::ProgramHandle, BackendError>;
 
+    /// Prepares optional specializations for concrete bindings before execution.
+    /// This does not submit device work. Backends may use a generic prepared pipeline.
+    ///
+    /// # Errors
+    /// Returns a compilation, quota or incompatible-backend error.
+    fn prepare_dispatch(&self, _dispatch: &crate::Dispatch) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Allocates a contiguous tensor initialized to zero.
     ///
     /// # Errors

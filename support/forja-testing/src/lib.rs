@@ -78,7 +78,16 @@ pub fn prepare_program<B: Backend>(
             .collect(),
         0,
     );
-    forja_core::program::prepare_program(backend, program.clone(), signature)
+    let prepared = forja_core::program::prepare_program(backend, program.clone(), signature)?;
+    let refusal = || forja_core::program::PrepareError::Backend(BackendError::InvalidInput);
+    let mut commands = CommandList::new();
+    commands
+        .dispatch_kernel(&prepared, inputs, outputs)
+        .map_err(|_| refusal())?;
+    backend
+        .prepare_dispatch(commands.last_dispatch().ok_or_else(refusal)?)
+        .map_err(forja_core::program::PrepareError::Backend)?;
+    Ok(prepared)
 }
 
 /// A tensor allocation and metadata-only views used by backend tests.

@@ -1276,6 +1276,11 @@ impl Backend for MetalBackend {
         self.prepare_scalar_program(program, signature)
     }
 
+    fn prepare_dispatch(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {
+        self.compiler.ensure_enabled()?;
+        self.prepare_program_dispatch(dispatch)
+    }
+
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {
         self.reclaim_completed();
         let byte_len = element_count(shape)?
