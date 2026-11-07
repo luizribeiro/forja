@@ -865,11 +865,7 @@ impl SampleCommonBindings<'_> {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PipelineKey {
-    name: String,
-    constants: Vec<(u32, u32)>,
-}
+type PipelineKey = crate::pipeline_identity::PipelineKey<crate::pipeline_identity::SourceIdentity>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ProgramPipelineKey {
@@ -10454,14 +10450,17 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
     Ok(bytes)
 }
 
+type CalibrationSources =
+    HashMap<(String, Vec<(u32, u32)>), crate::pipeline_identity::SourceIdentity>;
+
 pub(super) struct PipelineCache {
     pub(super) compiler: Arc<crate::compiler::Compiler>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     max_threadgroup_memory_length: AtomicUsize,
     pipeline_budget: AtomicUsize,
-    fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    safe_state_library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    sources: [crate::pipeline_identity::SourceIdentity; 3],
+    calibration_sources: Mutex<CalibrationSources>,
+    libraries: [Retained<ProtocolObject<dyn MTLLibrary>>; 3],
     pipelines: crate::compile_cache::CompileCache<PipelineKey, ComputePipeline>,
     epilogue_libraries: crate::compile_cache::CompileCache<
         epilogue_codegen::SourceKey,
@@ -10484,6 +10483,20 @@ struct EpilogueCompileCounts {
     pipelines: u64,
     cache_hits: u64,
     fallbacks: u64,
+}
+
+fn catalog_library(name: &str) -> usize {
+    if matches!(
+        name,
+        "state_causal_conv"
+            | "state_causal_conv_lanes"
+            | "calibration_read_serial"
+            | "calibration_read_group"
+    ) {
+        2
+    } else {
+        usize::from(nan_preserving_kernel(name))
+    }
 }
 
 impl PipelineCache {
@@ -10520,10 +10533,25 @@ impl PipelineCache {
         constants: &[(u32, u32)],
     ) -> Result<bool, BackendError> {
         self.compiler.ensure_enabled()?;
-        let key = PipelineKey {
-            name: name.to_owned(),
-            constants: crate::pipeline_constants::canonical(constants)?,
-        };
+        let identity = crate::pipeline_identity::SourceIdentity::new(
+            Arc::from(source),
+            crate::pipeline_identity::MathMode::Fast,
+        );
+        let constants = crate::pipeline_constants::canonical(constants)?;
+        let alias = (name.to_owned(), constants.clone());
+        let mut aliases = self
+            .calibration_sources
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        if aliases
+            .get(&alias)
+            .is_some_and(|existing| existing != &identity)
+        {
+            return Err(BackendError::InvalidInput);
+        }
+        aliases.insert(alias, identity.clone());
+        drop(aliases);
+        let key = PipelineKey::new(identity, name, &constants, &[])?;
         let result = self.pipelines.compile(
             key,
             || self.charge_pipeline(),
@@ -10532,7 +10560,7 @@ impl PipelineCache {
                 let library =
                     self.compiler
                         .library(&self.device, &NSString::from_str(source), &options)?;
-                let values = function_constants(constants)?;
+                let values = function_constants(&constants)?;
                 let function =
                     self.compiler
                         .function(&library, &NSString::from_str(name), &values)?;
@@ -10571,10 +10599,18 @@ impl PipelineCache {
         source: &str,
         compiler: crate::compiler::Compiler,
     ) -> Result<Self, BackendError> {
-        let safe_source = NSString::from_str(&format!(
+        use crate::pipeline_identity::{MathMode, SourceIdentity};
+        let raw: Arc<str> = Arc::from(source);
+        let safe: Arc<str> = Arc::from(format!(
             "#pragma clang fp contract(off)\n#define FORJA_SAFE_STATE_CONV 1\n{source}"
         ));
-        let source = NSString::from_str(source);
+        let sources = [
+            SourceIdentity::new(Arc::clone(&raw), MathMode::Fast),
+            SourceIdentity::new(Arc::clone(&raw), MathMode::Relaxed),
+            SourceIdentity::new(Arc::clone(&safe), MathMode::Safe),
+        ];
+        let safe_source = NSString::from_str(&safe);
+        let source = NSString::from_str(&raw);
         let fast_options = compile_options(MTLMathMode::Fast);
         let fast_library = compiler.library(device, &source, &fast_options)?;
         let nan_preserving_options = compile_options(MTLMathMode::Relaxed);
@@ -10586,14 +10622,26 @@ impl PipelineCache {
             device: device.clone(),
             max_threadgroup_memory_length: AtomicUsize::new(device.maxThreadgroupMemoryLength()),
             pipeline_budget: AtomicUsize::new(256),
-            fast_library,
-            nan_preserving_library,
-            safe_state_library,
+            sources,
+            calibration_sources: Mutex::new(HashMap::new()),
+            libraries: [fast_library, nan_preserving_library, safe_state_library],
             pipelines: crate::compile_cache::CompileCache::default(),
             epilogue_libraries: crate::compile_cache::CompileCache::default(),
             epilogue_pipelines: crate::compile_cache::CompileCache::default(),
             epilogue_counts: Mutex::new(EpilogueCompileCounts::default()),
         })
+    }
+
+    fn key(&self, name: &str, constants: &[(u32, u32)]) -> Result<PipelineKey, BackendError> {
+        let constants = crate::pipeline_constants::canonical(constants)?;
+        let source = self
+            .calibration_sources
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .get(&(name.to_owned(), constants.clone()))
+            .cloned()
+            .unwrap_or_else(|| self.sources[catalog_library(name)].clone());
+        PipelineKey::new(source, name, &constants, &[])
     }
 
     pub(super) fn get(
@@ -10602,28 +10650,24 @@ impl PipelineCache {
         constants: &[(u32, u32)],
     ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
-        let key = PipelineKey {
-            name: name.to_owned(),
-            constants: crate::pipeline_constants::canonical(constants)?,
-        };
+        let key = self.key(name, constants)?;
+        if self
+            .calibration_sources
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .contains_key(&(name.to_owned(), key.constants.clone()))
+        {
+            return self
+                .pipelines
+                .get(&key)?
+                .ok_or(BackendError::UnsupportedOperation);
+        }
         self.pipelines.compile(
             key,
             || self.charge_pipeline(),
             || {
                 let values = function_constants(constants)?;
-                let library = if matches!(
-                    name,
-                    "state_causal_conv"
-                        | "state_causal_conv_lanes"
-                        | "calibration_read_serial"
-                        | "calibration_read_group"
-                ) {
-                    &self.safe_state_library
-                } else if nan_preserving_kernel(name) {
-                    &self.nan_preserving_library
-                } else {
-                    &self.fast_library
-                };
+                let library = &self.libraries[catalog_library(name)];
                 let function =
                     self.compiler
                         .function(library, &NSString::from_str(name), &values)?;
@@ -11088,10 +11132,7 @@ mod tests {
                 )
                 .unwrap();
             pipelines.pipelines.insert(
-                PipelineKey {
-                    name: "copy_contiguous".to_owned(),
-                    constants: vec![(0, 4), (2, 4)],
-                },
+                pipelines.key("copy_contiguous", &[(0, 4), (2, 4)]).unwrap(),
                 pipeline,
             );
             assert_backends_agree(
@@ -11135,6 +11176,28 @@ mod tests {
                 assert_eq!(actual == "copy_contiguous_f32x4", i % 4 == 0 && o % 4 == 0);
             }
         }
+    }
+
+    #[test]
+    fn calibration_source_redefinition_refuses_before_quota_charge() {
+        let backend = MetalBackend::new().unwrap();
+        let cache = &backend.pipelines;
+        let source = "#include <metal_stdlib>\nkernel void source_identity_probe() {}";
+        assert_eq!(
+            cache.try_calibration_shader(source, "source_identity_probe", &[]),
+            Ok(true)
+        );
+        let remaining = cache.pipeline_budget.load(Ordering::Acquire);
+        assert_eq!(
+            cache.try_calibration_shader(
+                &format!("{source}\n// different source"),
+                "source_identity_probe",
+                &[]
+            ),
+            Err(BackendError::InvalidInput)
+        );
+        assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), remaining);
+        assert!(cache.get("source_identity_probe", &[]).is_ok());
     }
 
     #[test]
