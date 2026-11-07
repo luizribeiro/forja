@@ -1,6 +1,8 @@
 //! Core types and contracts shared by Forja's trusted backends.
 //! Use this crate to describe validated tensor views and operation signatures.
 
+mod alignment;
+pub use alignment::ByteAlignment;
 mod backend;
 mod cost;
 mod graph;
