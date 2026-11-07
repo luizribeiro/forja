@@ -128,21 +128,60 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
     if tile.contains(&0) {
         return None;
     }
-    let mut first = 0_u64;
-    let mut pairs = 0_u64;
-    while first < u64::from(query[1]) {
-        let end = first.checked_add(tile[0])?.min(u64::from(query[1]));
-        let limit = if causal {
-            u64::from(start).checked_add(end)?.min(u64::from(keys))
+    let queries = u64::from(query[1]);
+    let trips = if causal {
+        let full = queries / tile[0];
+        let bias = u64::from(start)
+            .checked_add(tile[1].checked_sub(1)?)?
+            .checked_add(tile[0])?;
+        let full_trips = floor_sum(full, tile[1], tile[0], bias)?;
+        full_trips.checked_add(if queries.is_multiple_of(tile[0]) {
+            0
         } else {
-            u64::from(keys)
-        };
-        pairs = pairs.checked_add(tile[0].checked_mul(round(limit, tile[1])?)?)?;
-        first = end;
-    }
+            u64::from(start).checked_add(queries)?.div_ceil(tile[1])
+        })?
+    } else {
+        queries
+            .div_ceil(tile[0])
+            .checked_mul(u64::from(keys).div_ceil(tile[1]))?
+    };
+    let pairs = product(&[trips, tile[0], tile[1]])?;
     let width =
         u64::from(query[2]).checked_add(u64::from(*dispatch.output().layout().shape().last()?))?;
     Some([product(&[2, u64::from(query[0]), pairs, width])?; 2])
+}
+
+fn triangular(value: u64) -> Option<u64> {
+    let previous = value.checked_sub(1)?;
+    if value.is_multiple_of(2) {
+        (value / 2).checked_mul(previous)
+    } else {
+        value.checked_mul(previous / 2)
+    }
+}
+
+fn floor_sum(mut count: u64, mut divisor: u64, mut slope: u64, mut bias: u64) -> Option<u64> {
+    let mut sum = 0_u64;
+    loop {
+        if count == 0 {
+            return Some(sum);
+        }
+        if slope >= divisor {
+            sum = sum.checked_add(triangular(count)?.checked_mul(slope / divisor)?)?;
+            slope %= divisor;
+        }
+        if bias >= divisor {
+            sum = sum.checked_add(count.checked_mul(bias / divisor)?)?;
+            bias %= divisor;
+        }
+        let top = slope.checked_mul(count)?.checked_add(bias)?;
+        if top < divisor {
+            return Some(sum);
+        }
+        count = top / divisor;
+        bias = top % divisor;
+        std::mem::swap(&mut divisor, &mut slope);
+    }
 }
 
 fn round(value: u64, tile: u64) -> Option<u64> {
@@ -156,6 +195,27 @@ fn round(value: u64, tile: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{CommandList, DType, cost::tests::tensor};
+
+    #[test]
+    fn floor_sum_matches_a_schedule_walk() {
+        for count in [0_u64, 1, 7, 33, 4097] {
+            for divisor in [1, 7, 16, 33] {
+                for slope in [1, 7, 32, 96] {
+                    for bias in [0, 1, 7, 33, 4097] {
+                        let walked = (0..count)
+                            .map(|index| (index * slope + bias) / divisor)
+                            .sum();
+                        assert_eq!(floor_sum(count, divisor, slope, bias), Some(walked));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            floor_sum(u64::from(u32::MAX), 1, 1, 0),
+            triangular(u64::from(u32::MAX))
+        );
+        assert_eq!(floor_sum(u64::MAX, 1, 1, 0), None);
+    }
 
     #[test]
     fn matrix_padding_is_separate_from_logical_work() {
@@ -188,6 +248,61 @@ mod tests {
         );
         assert_eq!(round(u64::MAX, 32), None);
     }
+    #[test]
+    fn attention_padding_matches_query_and_key_tile_walks() {
+        for queries in [1_u32, 7, 33, 4097] {
+            for start in [0_u32, 7, 4097] {
+                let keys = start + queries;
+                let query = tensor(1, DType::F32, &[16, queries, 128]);
+                let key = tensor(2, DType::F16, &[8, keys, 128]);
+                let value = tensor(3, DType::F16, &[8, keys, 128]);
+                let output = tensor(4, DType::F32, &[16, queries, 128]);
+                for causal in [false, true] {
+                    let mut commands = CommandList::new();
+                    commands
+                        .dispatch(
+                            Op::Sdpa {
+                                scale: 1.0,
+                                causal,
+                                q_start: start,
+                            },
+                            &[&query, &key, &value],
+                            &output,
+                        )
+                        .unwrap();
+                    let dispatch = commands.last_dispatch().unwrap();
+                    let cost = KernelCost::of(dispatch).unwrap();
+                    for tiles in [
+                        &[(128, [16, 8])][..],
+                        &[(128, [32, 32])],
+                        &[(128, [96, 16])],
+                    ] {
+                        let model = CostModel {
+                            attention_tiles: tiles,
+                            ..CostModel::default()
+                        };
+                        let [q_tile, k_tile] = tiles[0].1;
+                        let mut pairs = 0_u64;
+                        for q_start in (0..queries).step_by(q_tile as usize) {
+                            let limit = if causal {
+                                start + (q_start + q_tile).min(queries)
+                            } else {
+                                keys
+                            };
+                            for _ in (0..limit).step_by(k_tile as usize) {
+                                pairs += u64::from(q_tile) * u64::from(k_tile);
+                            }
+                        }
+                        assert_eq!(
+                            model.padded_flops(dispatch, cost),
+                            Some([2 * 16 * pairs * 256; 2])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn attention_padding_follows_causal_key_tiles() {
         let query = tensor(1, DType::F32, &[16, 7, 128]);
