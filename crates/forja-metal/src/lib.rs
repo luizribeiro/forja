@@ -27,6 +27,8 @@ mod matmul;
 #[cfg(target_os = "macos")]
 mod memory;
 #[cfg(target_os = "macos")]
+mod pipeline_constants;
+#[cfg(target_os = "macos")]
 mod profile_cost;
 #[cfg(target_os = "macos")]
 mod registers;

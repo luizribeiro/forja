@@ -79,14 +79,13 @@ impl PipelineKey {
     pub(super) fn new(
         source: SourceKey,
         implementation: &str,
-        mut constants: Vec<(u32, u32)>,
-    ) -> Self {
-        constants.sort_unstable();
-        Self {
+        constants: &[(u32, u32)],
+    ) -> Result<Self, forja_core::BackendError> {
+        Ok(Self {
             source,
             implementation: implementation.to_owned(),
-            constants,
-        }
+            constants: crate::pipeline_constants::canonical(constants)?,
+        })
     }
 }
 
@@ -203,12 +202,16 @@ pub(super) fn generate_helper(epilogue: &PreparedEpilogue) -> Result<String, Sou
         .ok_or(SourceError::AddressStructure)
 }
 
-pub(super) fn generate_source(epilogue: &PreparedEpilogue) -> Result<String, SourceError> {
-    generate_source_from_header(crate::map_codegen::SHARED_HEADER, epilogue)
+pub(super) fn generate_source(
+    family: FamilySourceTag,
+    epilogue: &PreparedEpilogue,
+) -> Result<String, SourceError> {
+    generate_source_from_header(crate::map_codegen::SHARED_HEADER, family, epilogue)
 }
 
 fn generate_source_from_header(
     shared_header: &str,
+    family: FamilySourceTag,
     epilogue: &PreparedEpilogue,
 ) -> Result<String, SourceError> {
     if shared_header.matches(IDENTITY_HELPER).count() != 1 {
@@ -216,30 +219,15 @@ fn generate_source_from_header(
     }
     let helper = generate_helper(epilogue)?;
     let header = shared_header.replacen(IDENTITY_HELPER, &helper, 1);
+    let kernel_source = match family {
+        FamilySourceTag::Dense => include_str!("matmul.metal"),
+        FamilySourceTag::Quant | FamilySourceTag::GatherQuant => include_str!("quant_matmul.metal"),
+    };
     Ok(format!(
-        "{}{header}\n{}",
+        "{}{header}\n{}\n{}\n{kernel_source}",
         crate::geometry::shader_defines(),
-        concat!(
-            include_str!("kernels.metal"),
-            "\n",
-            include_str!("steel_gemm_loader.metal"),
-            "\n",
-            include_str!("steel_gemm_mma.metal"),
-            "\n",
-            include_str!("matmul.metal"),
-            "\n",
-            include_str!("quant_matmul.metal"),
-            "\n",
-            include_str!("gather_matmul.metal"),
-            "\n",
-            include_str!("attention_accumulation.metal"),
-            "\n",
-            include_str!("steel_attention.metal"),
-            "\n",
-            include_str!("sdpa_kernels.metal"),
-            "\n",
-            include_str!("sdpa_vector.metal")
-        )
+        include_str!("steel_gemm_loader.metal"),
+        include_str!("steel_gemm_mma.metal"),
     ))
 }
 
@@ -358,15 +346,36 @@ mod tests {
 
     #[test]
     fn runtime_libraries_include_the_shared_shader_geometry() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Dense, &bias_epilogue()).unwrap();
         assert!(source.starts_with(&crate::geometry::shader_defines()));
+    }
+
+    #[test]
+    fn runtime_libraries_include_only_the_requested_family() {
+        for family in [
+            FamilySourceTag::Dense,
+            FamilySourceTag::Quant,
+            FamilySourceTag::GatherQuant,
+        ] {
+            let source = generate_source(family, &bias_epilogue()).unwrap();
+            assert!(!source.contains("kernel void sdpa"));
+            assert!(!source.contains("kernel void sample"));
+            assert_eq!(
+                source.contains("kernel void gemv("),
+                family == FamilySourceTag::Dense
+            );
+            assert_eq!(
+                source.contains("kernel void quantized_gemv("),
+                family != FamilySourceTag::Dense
+            );
+        }
     }
 
     #[test]
     fn pipeline_keys_canonicalize_function_constants() {
         let source = SourceKey::new(FamilySourceTag::Dense, &bias_epilogue());
-        let first = PipelineKey::new(source.clone(), "gemv", vec![(2, 1), (0, 0)]);
-        let second = PipelineKey::new(source, "gemv", vec![(0, 0), (2, 1)]);
+        let first = PipelineKey::new(source.clone(), "gemv", &[(2, 1), (0, 0)]).unwrap();
+        let second = PipelineKey::new(source, "gemv", &[(0, 0), (2, 1)]).unwrap();
         assert_eq!(first, second);
     }
 
@@ -396,14 +405,14 @@ mod tests {
             IDENTITY_HELPER.replace("    return accumulator0;", "  return accumulator0;");
         let header = crate::map_codegen::SHARED_HEADER.replacen(IDENTITY_HELPER, &reformatted, 1);
         assert_eq!(
-            generate_source_from_header(&header, &bias_epilogue()),
+            generate_source_from_header(&header, FamilySourceTag::Dense, &bias_epilogue()),
             Err(SourceError::IdentityHelperCount)
         );
     }
 
     #[test]
     fn dense_splices_are_after_reductions_and_inside_edges() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Dense, &bias_epilogue()).unwrap();
         for kernel in ["kernel void gemv(", "kernel void gemv_transposed("] {
             let start = source.find(kernel).unwrap();
             let body = &source[start..];
@@ -421,7 +430,7 @@ mod tests {
 
     #[test]
     fn steel_splice_is_after_barriers_and_inside_edges() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Dense, &bias_epilogue()).unwrap();
         let start = source.find("void steel_gemm(").unwrap();
         let body =
             &source[start..source[start..].find("#define DEFINE_STEEL_GEMM").unwrap() + start];
@@ -436,7 +445,7 @@ mod tests {
 
     #[test]
     fn quant_splices_follow_collectives_and_edge_checks() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Quant, &bias_epilogue()).unwrap();
         for (kernel, collectives, edge) in [
             (
                 "kernel void quantized_gemv(",
@@ -472,7 +481,7 @@ mod tests {
 
     #[test]
     fn quant_gemm_splices_follow_collectives_and_edge_checks() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Quant, &bias_epilogue()).unwrap();
         for (kernel, end_marker, collective, edge) in [
             (
                 "kernel void quantized_gemm_small_m(",
@@ -498,7 +507,7 @@ mod tests {
 
     #[test]
     fn gather_quant_splices_preserve_routes_after_collectives_and_edges() {
-        let source = generate_source(&bias_epilogue()).unwrap();
+        let source = generate_source(FamilySourceTag::Quant, &bias_epilogue()).unwrap();
         let route_start = source.find("kernel void gather_quantized_gemv(").unwrap();
         let route = &source[route_start
             ..source[route_start..]

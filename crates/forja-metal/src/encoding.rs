@@ -10347,7 +10347,7 @@ impl PipelineCache {
         self.compiler.ensure_enabled()?;
         let key = PipelineKey {
             name: name.to_owned(),
-            constants: constants.to_vec(),
+            constants: crate::pipeline_constants::canonical(constants)?,
         };
         let result = self.pipelines.compile(
             key,
@@ -10423,7 +10423,7 @@ impl PipelineCache {
         self.compiler.ensure_enabled()?;
         let key = PipelineKey {
             name: name.to_owned(),
-            constants: constants.to_vec(),
+            constants: crate::pipeline_constants::canonical(constants)?,
         };
         self.pipelines.compile(
             key,
@@ -10470,8 +10470,7 @@ impl PipelineCache {
     ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
         let source_key = epilogue_codegen::SourceKey::new(family, epilogue);
-        let pipeline_key =
-            epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants.to_vec());
+        let pipeline_key = epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants)?;
         if let Some(pipeline) = self.epilogue_pipelines.get(&pipeline_key)? {
             self.epilogue_hit()?;
             return Ok(pipeline);
@@ -10487,7 +10486,7 @@ impl PipelineCache {
                     source_key.clone(),
                     || Ok(()),
                     || {
-                        let generated = epilogue_codegen::generate_source(epilogue)
+                        let generated = epilogue_codegen::generate_source(family, epilogue)
                             .map_err(|_| program_compile_failed(source_key.hash))?;
                         let options = compile_options(MTLMathMode::Safe);
                         let library = self
@@ -10542,7 +10541,7 @@ impl PipelineCache {
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
         let source = epilogue_codegen::SourceKey::new(family, epilogue);
-        let key = epilogue_codegen::PipelineKey::new(source, name, constants.to_vec());
+        let key = epilogue_codegen::PipelineKey::new(source, name, constants)?;
         if let Some(pipeline) = self.epilogue_pipelines.get(&key)? {
             self.epilogue_hit()?;
             return Ok(pipeline);
@@ -10566,10 +10565,10 @@ impl PipelineCache {
                 epilogue_codegen::PipelineKey::new(
                     source,
                     request.implementation,
-                    request.constants.clone(),
+                    &request.constants,
                 )
             })
-            .collect::<HashSet<_>>();
+            .collect::<Result<HashSet<_>, _>>()?;
         let mut count = 0;
         for key in keys {
             if !self.epilogue_pipelines.contains_key(&key)? {
@@ -10661,7 +10660,7 @@ fn function_constants(
     constants: &[(u32, u32)],
 ) -> Result<Retained<MTLFunctionConstantValues>, BackendError> {
     let values = MTLFunctionConstantValues::new();
-    for &(index, value) in constants {
+    for (index, value) in crate::pipeline_constants::canonical(constants)? {
         // SAFETY: `value` is live for the call, its type matches `MTLDataType::UInt`, and the
         // caller supplies indices declared by the selected kernel.
         unsafe {
