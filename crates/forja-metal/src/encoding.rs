@@ -8649,7 +8649,7 @@ fn delta_block_kernels(dispatch: &Dispatch) -> [&'static str; 4] {
     }
 }
 
-fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
+pub(crate) fn internal_gather_dispatch_names(dispatch: &Dispatch) -> &'static [&'static str] {
     if !matches!(dispatch.op(), Op::GatherQuantMatmul { .. }) || !grouped_gather_dispatch(dispatch)
     {
         return &[];

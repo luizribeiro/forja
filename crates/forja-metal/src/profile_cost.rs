@@ -227,5 +227,24 @@ mod tests {
                 .write_bytes,
             17 * 4 + (4 + 16) * 12
         );
+        let selected = crate::variants::resolve(
+            dispatch,
+            "gather-quant-matmul.grouped-small-m",
+            &[forja_core::DeviceCapability::Metal4],
+        )
+        .unwrap();
+        commands.set_last_backend_data(forja_core::BackendDispatchData::new(selected));
+        let dispatch = commands.last_dispatch().unwrap();
+        let setup = scheduled::route_setup(dispatch).unwrap();
+
+        assert_eq!(
+            setup.read_bytes,
+            7 * 8 * 4 * 2 + 16 * 4 + 7 * 8 * 4 * 16 * 2 + 16 * 4
+        );
+        assert!(setup.scalar_ops > 7 * 8 * 16 * 2);
+        assert!(
+            scheduled::of(dispatch).unwrap().read_bytes
+                >= logical(dispatch).unwrap().read_bytes + setup.read_bytes
+        );
     }
 }

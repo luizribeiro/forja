@@ -3,6 +3,7 @@ mod row_program;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     let mut cost = super::of(dispatch)?;
+    cost = cost.checked_add(route_setup(dispatch)?)?;
     if matches!(dispatch.op(), Op::Program(_)) {
         return row_program::of(dispatch, cost);
     }
@@ -39,6 +40,21 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .checked_add(weight_bytes)?;
     cost.flops = flops;
     Some(cost)
+}
+
+pub(super) fn route_setup(dispatch: &Dispatch) -> Option<KernelCost> {
+    let mut setup = KernelCost::default();
+    for &kernel in crate::encoding::internal_gather_dispatch_names(dispatch)
+        .iter()
+        .take(3)
+    {
+        setup = setup.checked_add(super::internal(dispatch, kernel, None)?)?;
+    }
+    setup.scalar_ops = setup
+        .scalar_ops
+        .checked_add(setup.read_bytes.checked_div(4)?.checked_mul(8)?)?
+        .checked_add(setup.write_bytes.checked_div(4)?.checked_mul(4)?)?;
+    Some(setup)
 }
 
 #[cfg(test)]
