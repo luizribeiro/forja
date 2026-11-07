@@ -90,3 +90,30 @@ kernel void calibration_gather(device const float *input [[buffer(0)]],
     uint address = (index * 0x9e3779b9u) & calibration_iterations;
     output[index] = input[address];
 }
+
+#define calibration_serial_kernel(name, expression) \
+kernel void name(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], \
+                 uint index [[thread_position_in_grid]]) { \
+    float value = input[index]; \
+    if (index == 0) { \
+        for (uint iteration = 0; iteration < calibration_iterations; ++iteration) { \
+            value = expression; \
+        } \
+    } \
+    output[index] = value; \
+}
+calibration_serial_kernel(calibration_scalar_serial, fma(value, 0.9999999f, 0.0000001f))
+calibration_serial_kernel(calibration_sfu_serial, fast::exp(-value))
+
+kernel void calibration_dependent_read(device const uint *input [[buffer(0)]],
+                                       device uint *output [[buffer(1)]],
+                                       uint index [[thread_position_in_grid]]) {
+    if (index != 0) { output[index] = input[index]; return; }
+    uint cursor = 0;
+    uint checksum = 0;
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        cursor = input[cursor];
+        checksum += cursor;
+    }
+    output[0] = checksum;
+}

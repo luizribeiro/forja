@@ -4,12 +4,17 @@ use crate::{CalibrationSample, MetalBackend};
 
 const ELEMENTS: u32 = 2048 * crate::calibration::THREADS;
 const GATHER_ELEMENTS: u32 = 1 << 27;
+const SERIAL_ITERATIONS: u32 = 1 << 18;
+const DEPENDENT_ELEMENTS: u32 = 4096;
 
 #[derive(Clone, Copy)]
 pub(super) enum WorkProbe {
     Scalar,
     Sfu,
     Gather,
+    ScalarSerial,
+    SfuSerial,
+    DependentRead,
 }
 
 impl WorkProbe {
@@ -18,12 +23,16 @@ impl WorkProbe {
             Self::Scalar => "calibration_scalar",
             Self::Sfu => "calibration_sfu",
             Self::Gather => "calibration_gather",
+            Self::ScalarSerial => "calibration_scalar_serial",
+            Self::SfuSerial => "calibration_sfu_serial",
+            Self::DependentRead => "calibration_dependent_read",
         }
     }
 
     pub(super) const fn constants(self) -> [(u32, u32); 2] {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
+            Self::ScalarSerial | Self::SfuSerial | Self::DependentRead => SERIAL_ITERATIONS,
             _ => crate::calibration::ITERATIONS,
         };
         [(220, iterations), (221, 0)]
@@ -32,15 +41,24 @@ impl WorkProbe {
     const fn elements(self) -> u32 {
         match self {
             Self::Gather => GATHER_ELEMENTS,
+            Self::ScalarSerial | Self::SfuSerial => crate::calibration::THREADS,
+            Self::DependentRead => DEPENDENT_ELEMENTS,
             _ => ELEMENTS,
         }
     }
 
     fn units(self) -> Option<u64> {
+        match self {
+            Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
+            Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
+            Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),
+            _ => {}
+        }
         u64::from(self.elements()).checked_mul(match self {
             Self::Scalar => u64::from(crate::calibration::ITERATIONS) * 2,
             Self::Sfu => u64::from(crate::calibration::ITERATIONS),
             Self::Gather => 8,
+            _ => 0,
         })
     }
 }
@@ -60,7 +78,14 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         }
         let mut samples = Vec::new();
-        for probe in [WorkProbe::Scalar, WorkProbe::Sfu, WorkProbe::Gather] {
+        for probe in [
+            WorkProbe::Scalar,
+            WorkProbe::Sfu,
+            WorkProbe::Gather,
+            WorkProbe::ScalarSerial,
+            WorkProbe::SfuSerial,
+            WorkProbe::DependentRead,
+        ] {
             let input = self.alloc(DType::F32, &[probe.elements()])?;
             let output = match self.alloc(DType::F32, &[probe.elements()]) {
                 Ok(output) => output,
@@ -70,12 +95,21 @@ impl MetalBackend {
                 }
             };
             let result = (|| {
-                if !matches!(probe, WorkProbe::Gather) {
+                if matches!(probe, WorkProbe::DependentRead) {
+                    let cycle = (0..DEPENDENT_ELEMENTS)
+                        .flat_map(|i| {
+                            (i.wrapping_mul(0x9e37_79b9).wrapping_add(1) & (DEPENDENT_ELEMENTS - 1))
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>();
+                    self.write(&input, &cycle)?;
+                } else if !matches!(probe, WorkProbe::Gather) {
                     self.write(
                         &input,
                         &vec![
                             1.0_f32.to_le_bytes();
-                            usize::try_from(ELEMENTS).map_err(|_| BackendError::InvalidInput)?
+                            usize::try_from(probe.elements())
+                                .map_err(|_| BackendError::InvalidInput)?
                         ]
                         .concat(),
                     )?;
@@ -98,7 +132,16 @@ impl MetalBackend {
                         Ok(commands)
                     },
                 )?;
-                if !matches!(probe, WorkProbe::Gather)
+                if matches!(probe, WorkProbe::DependentRead) {
+                    let checksum = u32::try_from(
+                        u64::from(SERIAL_ITERATIONS) * u64::from(DEPENDENT_ELEMENTS - 1) / 2,
+                    )
+                    .map_err(|_| BackendError::InvalidInput)?;
+                    if self.read(&output)?.get(..4) != Some(checksum.to_le_bytes().as_slice()) {
+                        return Err(BackendError::ExecutionFailed);
+                    }
+                }
+                if !matches!(probe, WorkProbe::Gather | WorkProbe::DependentRead)
                     && self.read(&output)?.as_chunks::<4>().0.iter().any(|bytes| {
                         let value = f32::from_le_bytes(*bytes);
                         !value.is_finite() || !(0.5..=1.01).contains(&value)
@@ -133,15 +176,31 @@ mod tests {
     }
 
     #[test]
+    fn dependent_reads_visit_every_address_before_repeating() {
+        let mut seen = vec![false; DEPENDENT_ELEMENTS as usize];
+        let mut cursor = 0_u32;
+        for _ in 0..DEPENDENT_ELEMENTS {
+            assert!(!seen[cursor as usize]);
+            seen[cursor as usize] = true;
+            cursor = cursor.wrapping_mul(0x9e37_79b9).wrapping_add(1) & (DEPENDENT_ELEMENTS - 1);
+        }
+        assert_eq!(cursor, 0);
+        assert!(SERIAL_ITERATIONS.is_multiple_of(DEPENDENT_ELEMENTS));
+    }
+
+    #[test]
     fn metal_work_probes_execute_observable_arithmetic_and_reads() {
         let backend = MetalBackend::new().unwrap();
         let samples = backend.calibrate_work(0, 1).unwrap();
-        assert_eq!(samples.len(), 3);
-        for (sample, probe) in
-            samples
-                .iter()
-                .zip([WorkProbe::Scalar, WorkProbe::Sfu, WorkProbe::Gather])
-        {
+        assert_eq!(samples.len(), 6);
+        for (sample, probe) in samples.iter().zip([
+            WorkProbe::Scalar,
+            WorkProbe::Sfu,
+            WorkProbe::Gather,
+            WorkProbe::ScalarSerial,
+            WorkProbe::SfuSerial,
+            WorkProbe::DependentRead,
+        ]) {
             assert_eq!(sample.name, probe.kernel());
             assert_eq!(Some(sample.units), probe.units());
             assert!(!sample.gpu.is_zero());

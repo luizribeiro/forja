@@ -83,6 +83,9 @@ const PROBES: &[&str] = &[
     "calibration_scalar",
     "calibration_sfu",
     "calibration_gather",
+    "calibration_scalar_serial",
+    "calibration_sfu_serial",
+    "calibration_dependent_read",
 ];
 
 fn probe_mode(
@@ -101,7 +104,10 @@ fn probe_mode(
             | "dependent_dispatch"
             | "calibration_scalar"
             | "calibration_sfu"
-            | "calibration_gather",
+            | "calibration_gather"
+            | "calibration_scalar_serial"
+            | "calibration_sfu_serial"
+            | "calibration_dependent_read",
             None,
         ) => Ok(None),
         _ => Err("invalid calibration arithmetic mode".into()),
@@ -149,7 +155,7 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(
-        json!({"schema_version": 6, "kind": "device-calibration", "model_benchmark": false,
+        json!({"schema_version": 7, "kind": "device-calibration", "model_benchmark": false,
         "identity": identity, "warmups": options.warmups, "repetitions": options.reps,
         "timestamp_method": "unprofiled-command-buffer", "interval_method": "binomial-order-statistic-median",
         "bf16_arithmetic": if samples.iter().any(|sample| !sample.screening && sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
@@ -171,7 +177,7 @@ fn sample_json(sample: &forja_metal::CalibrationSample) -> Value {
 }
 
 pub(crate) fn validate(record: &Value, identity: &Value) -> Result<(), Box<dyn Error>> {
-    if record["schema_version"] != 6 || record["identity"] != *identity {
+    if record["schema_version"] != 7 || record["identity"] != *identity {
         return Err("calibration identity or schema mismatch; recalibrate".into());
     }
     for &name in PROBES {
