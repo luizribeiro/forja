@@ -6,6 +6,14 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     cost = cost
         .checked_add(route_setup(dispatch)?)?
         .checked_add(epilogue_calls(dispatch)?)?;
+    if matches!(dispatch.op(), Op::Sample { .. } | Op::SampleMasked { .. }) {
+        let visits = dispatch.work()?;
+        cost.scalar_ops = cost.scalar_ops.max(visits.checked_mul(32)?);
+        cost.sfu_ops = cost.sfu_ops.max(visits.checked_mul(4)?);
+        cost.read_bytes = cost
+            .read_bytes
+            .checked_add(visits.checked_mul(dispatch.inputs()[0].layout().dtype().byte_size())?)?;
+    }
     if matches!(dispatch.op(), Op::Program(_)) {
         return row_program::of(dispatch, cost);
     }
@@ -42,6 +50,36 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .checked_add(weight_bytes)?;
     cost.flops = flops;
     Some(cost)
+}
+
+pub(crate) fn launches(dispatch: &Dispatch) -> Option<u64> {
+    let grouped = crate::encoding::internal_gather_dispatch_names(dispatch);
+    if !grouped.is_empty() {
+        return u64::try_from(grouped.len()).ok();
+    }
+    Some(match dispatch.op() {
+        Op::Sample {
+            rejection_rounds, ..
+        } if !crate::encoding::parallel_sampling(dispatch) => {
+            u64::from(rejection_rounds).checked_mul(4)?.checked_add(7)?
+        }
+        Op::Sample { .. } | Op::SampleMasked { .. } | Op::Argmax { .. } | Op::TopK { .. } => 2,
+        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
+            u64::from(dispatch.inputs()[0].layout().shape()[0])
+                .checked_mul(12)?
+                .checked_add(16)?
+        }
+        Op::State(_) | Op::Matmul | Op::QuantMatmul { .. } => 4,
+        Op::Program(_)
+        | Op::Copy
+        | Op::PagedCopy { .. }
+        | Op::RmsNorm { .. }
+        | Op::Rope { .. }
+        | Op::Embed
+        | Op::QuantEmbed { .. }
+        | Op::GatherMatmul
+        | Op::GatherQuantMatmul { .. } => 1,
+    })
 }
 
 fn epilogue_calls(dispatch: &Dispatch) -> Option<KernelCost> {
@@ -90,6 +128,49 @@ mod tests {
     use super::*;
     use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability};
     use forja_cpu::CpuBackend;
+
+    #[test]
+    fn metal_sampling_launch_bound_covers_encoded_rejection_rounds() {
+        use forja_core::{Backend, Submission};
+        let backend = crate::MetalBackend::new().unwrap();
+        let logits = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let controls = backend.alloc(DType::U32, &[5]).unwrap();
+        backend
+            .write(
+                &controls,
+                &[0_u32, 1, 1.0_f32.to_bits(), 7, 0]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let output = backend.alloc(DType::U32, &[7]).unwrap();
+        for rounds in [1, 4, 8] {
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    Op::Sample {
+                        position: 0,
+                        chunk_width: 2048,
+                        fast_top_k: 8,
+                        fast_max_chunks: 32,
+                        rejection_rounds: rounds,
+                    },
+                    &[&logits, &controls],
+                    &output,
+                )
+                .unwrap();
+            let dispatch = commands.last_dispatch().unwrap();
+            let bound = launches(dispatch).unwrap();
+            let cost = of(dispatch).unwrap();
+            assert!(cost.scalar_ops >= dispatch.work().unwrap());
+            assert!(cost.sfu_ops > super::super::of(dispatch).unwrap().sfu_ops);
+            let submission = backend.submit_profiled(commands).unwrap();
+            submission.wait().unwrap();
+            let actual = submission.profile().unwrap().per_dispatch[0].physical_dispatches;
+            assert!(actual > 1 && actual <= bound);
+        }
+    }
 
     #[test]
     fn scalar_epilogues_price_casts_selects_and_special_functions() {

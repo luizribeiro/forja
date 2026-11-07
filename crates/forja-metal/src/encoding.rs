@@ -8536,6 +8536,11 @@ fn dispatch_profile(
     barrier: bool,
     physical_dispatches: u64,
 ) -> Result<DispatchProfile, BackendError> {
+    if physical_dispatches
+        > crate::profile_cost::scheduled::launches(dispatch).ok_or(BackendError::InvalidInput)?
+    {
+        return Err(BackendError::InvalidInput);
+    }
     let (variant, alternatives, model) = crate::variants::profile_selection(dispatch);
     let cost = crate::profile_cost::of(dispatch).ok_or(BackendError::InvalidInput)?;
     let padded_flops = crate::profile_cost::state_block::padded_flops(dispatch)
