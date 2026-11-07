@@ -402,3 +402,66 @@ fn tiled_quant_input_checks_absolute_alignment() {
         None,
     );
 }
+
+#[test]
+fn attention_tile_vectors_check_absolute_origins() {
+    let padded = |shape: &[u32]| {
+        let count = shape.iter().product::<u32>();
+        TensorSpec::sliced(
+            DType::F32,
+            &[count + 4],
+            &[Slice::new(0, count, 1).unwrap()],
+        )
+        .reshaped(shape)
+    };
+    let query = padded(&[16, 7, 128]);
+    let cache = padded(&[8, 33, 128]);
+    let paged = padded(&[2, 64, 8, 128]);
+    let words = |values: &[u32]| values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    for paged_cache in [false, true] {
+        let (variant, op, inputs) = if paged_cache {
+            (
+                "paged-sdpa.steel",
+                Op::PagedSdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: 26,
+                    key_length: 33,
+                    page_tokens: 64,
+                },
+                vec![
+                    query.clone(),
+                    paged.clone(),
+                    paged.clone(),
+                    TensorSpec::initialized(DType::U32, &[1, 2], words(&[1, 7])),
+                    TensorSpec::initialized(DType::U32, &[2], words(&[0, 7])),
+                ],
+            )
+        } else {
+            (
+                "sdpa.steel",
+                Op::Sdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: true,
+                    q_start: 26,
+                },
+                vec![query.clone(), cache.clone(), cache.clone()],
+            )
+        };
+        for operand in 0..3 {
+            assert_variant(
+                Some(variant),
+                op,
+                &inputs,
+                &TensorSpec::contiguous(DType::F32, &[16, 7, 128]),
+                Canary {
+                    load: "load_float4_contiguous(source, source_offset, dtype)",
+                    pointer: "source + source_offset * steel_attention_dtype_size(dtype)",
+                    alignment: 16,
+                    zero: "float4(0)",
+                },
+                Some(operand),
+            );
+        }
+    }
+}

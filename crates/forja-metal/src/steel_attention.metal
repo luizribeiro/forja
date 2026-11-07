@@ -33,7 +33,7 @@ void steel_attention_load_tile(
     uint dtype,
     uint row_extent,
     bool rows_aligned,
-    bool vector_aligned,
+    BoundByteAlignment alignment,
     threadgroup T *destination,
     uint thread_index) {
     if (steel_vectorized_loaders == 0) {
@@ -60,7 +60,7 @@ void steel_attention_load_tile(
         bool valid = assigned && (rows_aligned || row < row_extent);
         uint source_offset = row * row_stride + column * column_stride;
         uint destination_offset = row * DST_ROW + column * DST_COLUMN;
-        if (valid && column_stride == 1 && vector_aligned) {
+        if (valid && column_stride == 1 && alignment.supports(4 * steel_attention_dtype_size(dtype))) {
             float4 values = load_float4_contiguous(source, source_offset, dtype);
             for (uint element = 0; element < VECTOR_WIDTH; ++element) {
                 destination[destination_offset + element * DST_COLUMN] = T(values[element]);
@@ -104,7 +104,8 @@ void steel_attention_body(
         + query_base * steel_attention_dtype_size(input0_dtype);
     steel_attention_load_tile<TileT, BQ, BD, LDQ, 1, THREADS>(
         query_pointer, uint(params.q_strides[1]), uint(params.q_strides[2]), input0_dtype,
-        params.query_length - first_query, false, query_base % 4 == 0,
+        params.query_length - first_query, false,
+        bound_alignment(query + query_base * steel_attention_dtype_size(input0_dtype)),
         query_tile, thread_index);
 
     using Fragment = SteelMMAFragment<float>;
