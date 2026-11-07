@@ -52,10 +52,40 @@ directories; the dev shell defaults it to `~/.cache/forja/models`.
    letting existing references drain.
 
 The host bounds Metal compilation with `limits.pipeline_compilations` (256 attempts
-per backend lifetime) and `limits.compile_budget` (`"60s"` cumulative compiler wall
-time, including initial libraries). Cache hits cost no attempts; failed compiles
+per backend lifetime) and `limits.compile_budget` (`"60s"` compiler wall time
+per engine load). Cache hits cost no attempts; failed compiles
 consume their attempt. Budget expiry disables that backend's compilation and GPU
 submission. These are operator settings; engine components cannot raise them.
+
+Metal admits work using conservative device calibration and the actual encoded
+launch schedule, in addition to the logical work and dispatch-count limits. With
+the default ten-second deadline, forecasts are limited to two seconds per dispatch
+and command buffer and eight seconds per submission. Shorter host deadlines lower
+these ceilings and bound waits for resources. Engine components cannot raise them.
+Each buffer also pays a calibrated startup reserve. Admission calibrates cold and
+warm device observations, retains their raw rates, and reuses an exact source,
+device and OS-build match for at most one hour under
+`~/Library/Caches/forja/work-admission/`. Removing that directory forces calibration
+in a fresh host process.
+
+An oversized copy, RMS normalization, plain two-dimensional matrix or attention
+query dispatch can split along output rows. Reductions retain their full K
+dimension and order; attention retains its full cache and absolute query positions.
+Other oversized operations are refused. The host preflights the whole submission,
+then commits buffers sequentially, checking completion, device flags and the
+measured/predicted ratio before committing the next buffer. A ratio above four,
+a missing timestamp or timeout quarantines that encoded pipeline composition for
+the current load. Valid completed outputs remain readable; three independent
+failures of the same composition suspend the load. A timeout followed by a valid
+completion retracts its uncertain evidence. A new load clears the quarantine.
+
+Graph loading prepares the finite catalog specialization domains and generic
+addressing fallbacks. Pipeline identity includes full skeleton source, math mode,
+canonical constants and hook hashes. Prewarming reduces first-use latency. Cache
+misses, including those during replay and lazy graph creation, can compile within
+the pipeline quota and the current load's remaining compiler allowance. Starting
+another load refreshes the wall-time allowance; it does not replenish pipeline
+attempts or give eviction credit.
 
 See [benchmarking](benchmarking.md) for serving workloads, prefix-cache evidence
 and competitor comparisons, and [architecture and safety](architecture.md) for

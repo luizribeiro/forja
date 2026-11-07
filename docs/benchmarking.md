@@ -342,6 +342,13 @@ forja profile --engine /path/engine.wasm --model /path/model --mode prefill --co
 forja analyze --profile /path/evidence/pp16k/profile.json --calibration calibration.json --json analysis.json
 ```
 
+Profile submissions retain raw admission calibration and each command buffer's
+forecast, startup reserve, GPU counter interval and backstop threshold. Analysis
+reports measured/predicted ratios from these unscaled intervals; a submission
+average cannot hide an individual buffer overrun. Dispatch ratios exclude the
+buffer startup reserve and serve as diagnostics rather than backstop decisions.
+Legacy profiles without admission records retain their roofline analysis.
+
 Use `--mode prefill --step-tokens 512 --context 16384` to profile a cold paged
 serving lane with an engine-declared prompt bucket. Every step is retained. Add
 `--prefix-context N` to measure only the suffix; cache preparation is reported
