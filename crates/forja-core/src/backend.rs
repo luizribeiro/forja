@@ -784,7 +784,7 @@ pub trait Backend {
         let commands = graph
             .template()
             .instantiate(&values)
-            .map_err(|_| BackendError::InvalidInput)?;
+            .map_err(BackendError::from)?;
         self.submit(commands)
     }
 
@@ -804,7 +804,7 @@ pub trait Backend {
         let commands = graph
             .template()
             .instantiate(&values)
-            .map_err(|_| BackendError::InvalidInput)?;
+            .map_err(BackendError::from)?;
         self.submit_profiled(commands)
     }
 
@@ -840,7 +840,7 @@ pub trait Backend {
         let commands = graph
             .template()
             .instantiate(&values)
-            .map_err(|_| BackendError::InvalidInput)?;
+            .map_err(BackendError::from)?;
         let commands = bindings
             .apply(commands)
             .map_err(|_| BackendError::InvalidInput)?;

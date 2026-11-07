@@ -6,3 +6,6 @@
 mod profile;
 #[path = "../weights.rs"]
 mod weights;
+
+#[path = "../work_limits.rs"]
+mod work_limits;

@@ -1,18 +1,19 @@
+mod work;
+
 use std::{
     any::Any,
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
     Affine, BackendDispatchData, ByteHull, CommandList, Dispatch, Op, OpError, ParamError,
     ParamSpace, ParamValues, SymbolicLayout, SymbolicLayoutError, Tensor, TensorError,
-    byte_ranges_overlap, gather_matmul_flops, gather_quant_matmul_dispatch_flops, matmul_flops,
+    byte_ranges_overlap,
     ops::{BufferAccess, dispatch_accesses},
-    program::{BindError, Inst, PreparedEpilogue, PreparedProgram, ProgramKind},
-    quant_matmul_flops, sdpa_flops,
+    program::{BindError, PreparedEpilogue, PreparedProgram},
 };
 
 /// A reason graph-template construction or instantiation failed.
@@ -59,6 +60,17 @@ impl Error for GraphError {
     }
 }
 
+impl From<GraphError> for crate::BackendError {
+    fn from(error: GraphError) -> Self {
+        match error {
+            GraphError::DispatchLimit | GraphError::TensorElementsLimit | GraphError::WorkLimit => {
+                Self::QuotaExceeded
+            }
+            _ => Self::InvalidInput,
+        }
+    }
+}
+
 impl From<ParamError> for GraphError {
     fn from(error: ParamError) -> Self {
         Self::Parameter(error)
@@ -89,29 +101,13 @@ impl From<OpError> for GraphError {
     }
 }
 
-fn generic_gather_quant_flops(dispatch: &Dispatch) -> Option<u64> {
-    let inputs = dispatch.primitive_inputs();
-    let indices = if inputs.len() == 8 { 7 } else { 4 };
-    inputs
-        .first()
-        .zip(inputs.get(1))
-        .zip(inputs.get(indices))
-        .and_then(|((input, packed), indices)| {
-            gather_quant_matmul_dispatch_flops(
-                input.layout().shape(),
-                packed.layout().shape(),
-                indices.layout().shape(),
-                inputs.len(),
-            )
-        })
-}
-
 /// Resource bounds applied to graph dispatches at creation and instantiation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     dispatches: usize,
     tensor_elements: u64,
     work_per_dispatch: u64,
+    work_per_submission: u64,
 }
 
 impl GraphLimits {
@@ -122,105 +118,59 @@ impl GraphLimits {
             dispatches,
             tensor_elements,
             work_per_dispatch,
+            work_per_submission: u64::MAX,
         }
     }
 
-    fn check_dispatch(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
-        let mut work = 0_u64;
-        for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
-            work = work
-                .checked_add(self.tensor_work(tensor)?)
-                .ok_or(GraphError::WorkLimit)?;
-        }
-        let flops = match dispatch.op() {
-            Op::Matmul => dispatch
-                .inputs()
-                .first()
-                .zip(dispatch.inputs().get(1))
-                .and_then(|(left, right)| {
-                    matmul_flops(left.layout().shape(), right.layout().shape())
-                }),
-            Op::GatherMatmul => dispatch
-                .inputs()
-                .first()
-                .zip(dispatch.inputs().get(1))
-                .zip(dispatch.inputs().get(2))
-                .and_then(|((input, weights), indices)| {
-                    gather_matmul_flops(
-                        input.layout().shape(),
-                        weights.layout().shape(),
-                        indices.layout().shape(),
-                    )
-                }),
-            Op::QuantMatmul { .. } => dispatch
-                .inputs()
-                .first()
-                .zip(dispatch.inputs().get(1))
-                .and_then(|(input, packed)| {
-                    quant_matmul_flops(input.layout().shape(), packed.layout().shape())
-                }),
-            Op::GatherQuantMatmul { .. } => generic_gather_quant_flops(dispatch),
-            Op::Sdpa { .. } => dispatch
-                .inputs()
-                .first()
-                .zip(dispatch.inputs().get(1))
-                .zip(dispatch.inputs().get(2))
-                .and_then(|((query, key), value)| {
-                    sdpa_flops(
-                        query.layout().shape(),
-                        key.layout().shape(),
-                        value.layout().shape(),
-                    )
-                }),
-            _ => Some(0),
-        }
-        .ok_or(GraphError::WorkLimit)?;
-        if work
-            .checked_add(flops)
-            .is_none_or(|total| total > self.work_per_dispatch)
-        {
-            return Err(GraphError::WorkLimit);
-        }
-        Ok(())
+    /// Sets the complete-submission allowance, using the same units as [`Dispatch::work`].
+    #[must_use]
+    pub const fn with_submission_work_limit(mut self, work: u64) -> Self {
+        self.work_per_submission = work;
+        self
     }
 
-    fn check_program(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
-        let program = dispatch
-            .prepared_program()
-            .ok_or(GraphError::WorkLimit)?
-            .validated();
-        let elements = self.tensor_work(dispatch.output())?;
-        let mut work = 0_u64;
+    /// Reports whether these limits admit every graph governed by `other`.
+    #[must_use]
+    pub const fn permits(self, other: Self) -> bool {
+        self.dispatches >= other.dispatches
+            && self.tensor_elements >= other.tensor_elements
+            && self.work_per_dispatch >= other.work_per_dispatch
+            && self.work_per_submission >= other.work_per_submission
+    }
+
+    /// Checks one validated dispatch against operand and logical work bounds.
+    /// # Errors
+    /// Returns an element or work-limit error before backend execution.
+    pub fn check_dispatch(&self, dispatch: &Dispatch) -> Result<(), GraphError> {
         for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
-            work = work
-                .checked_add(self.tensor_work(tensor)?)
-                .ok_or(GraphError::WorkLimit)?;
+            self.tensor_work(tensor)?;
         }
-        let reduction_passes = if program.program().kind == ProgramKind::Row {
-            program
-                .program()
-                .insts
-                .iter()
-                .filter(|inst| matches!(inst, Inst::Reduce(_, _)))
-                .count()
-        } else {
-            0
-        };
-        let passes = program
-            .program()
-            .insts
-            .len()
-            .checked_add(reduction_passes)
-            .and_then(|count| u64::try_from(count).ok())
-            .ok_or(GraphError::WorkLimit)?;
-        if passes
-            .checked_mul(elements)
-            .and_then(|program_work| work.checked_add(program_work))
-            .is_none_or(|total| total > self.work_per_dispatch)
-        {
-            return Err(GraphError::WorkLimit);
+        self.charge(0, dispatch).map(|_| ())
+    }
+
+    /// Checks a concrete command list, including the sum over every dispatch.
+    /// # Errors
+    /// Returns an element, dispatch-count or work-limit error before backend execution.
+    pub fn check_commands(&self, commands: &CommandList) -> Result<(), GraphError> {
+        if commands.len() > self.dispatches {
+            return Err(GraphError::DispatchLimit);
         }
-        Ok(())
+        commands
+            .dispatches()
+            .iter()
+            .try_fold(0, |total, dispatch| {
+                self.check_dispatch(dispatch)?;
+                self.charge(total, dispatch)
+            })
+            .map(|_| ())
+    }
+
+    fn charge(&self, total: u64, dispatch: &Dispatch) -> Result<u64, GraphError> {
+        let work = dispatch.work().ok_or(GraphError::WorkLimit)?;
+        total
+            .checked_add(work)
+            .filter(|&sum| work <= self.work_per_dispatch && sum <= self.work_per_submission)
+            .ok_or(GraphError::WorkLimit)
     }
 
     fn tensor_work(&self, tensor: &Tensor) -> Result<u64, GraphError> {
@@ -871,11 +821,17 @@ impl DynamicDispatch {
         inputs.iter().chain(outputs)
     }
 
-    fn instantiate(
+    fn instantiate_checked(
         &self,
         values: &ParamValues,
         limits: GraphLimits,
     ) -> Result<Dispatch, GraphError> {
+        let dispatch = self.instantiate(values)?;
+        limits.check_dispatch(&dispatch)?;
+        Ok(dispatch)
+    }
+
+    fn instantiate(&self, values: &ParamValues) -> Result<Dispatch, GraphError> {
         match self {
             Self::Operation {
                 op,
@@ -888,7 +844,6 @@ impl DynamicDispatch {
                 let output_refs = outputs.iter().collect::<Vec<_>>();
                 let dispatch =
                     Dispatch::new_many(op.instantiate(values)?, &input_refs, &output_refs)?;
-                limits.check_dispatch(&dispatch)?;
                 Ok(dispatch)
             }
             Self::Program {
@@ -901,7 +856,6 @@ impl DynamicDispatch {
                 let input_refs = inputs.iter().collect::<Vec<_>>();
                 let output_refs = outputs.iter().collect::<Vec<_>>();
                 let dispatch = Dispatch::kernel(program, &input_refs, &output_refs)?;
-                limits.check_program(&dispatch)?;
                 Ok(dispatch)
             }
             Self::Epilogue {
@@ -925,7 +879,6 @@ impl DynamicDispatch {
                     epilogue,
                     &input_refs[*primitive_input_count..],
                 )?;
-                limits.check_dispatch(&dispatch)?;
                 Ok(dispatch)
             }
         }
@@ -1076,6 +1029,7 @@ pub struct GraphTemplate {
     upper_barriers: Vec<bool>,
     required_barriers: Vec<bool>,
     memory_arena: Option<crate::BufferId>,
+    work_cache: Arc<Mutex<work::WorkCache>>,
 }
 
 /// A validated graph template with optional backend-owned preparation state.
@@ -1168,7 +1122,7 @@ impl GraphTemplate {
 
     /// Creates an empty graph template governed by the supplied resource bounds.
     #[must_use]
-    pub const fn new(space: ParamSpace, limits: GraphLimits) -> Self {
+    pub fn new(space: ParamSpace, limits: GraphLimits) -> Self {
         Self {
             profile_scopes: BTreeMap::new(),
             space,
@@ -1179,6 +1133,7 @@ impl GraphTemplate {
             upper_barriers: Vec::new(),
             required_barriers: Vec::new(),
             memory_arena: None,
+            work_cache: Arc::new(Mutex::new(work::WorkCache::default())),
         }
     }
 
@@ -1254,11 +1209,13 @@ impl GraphTemplate {
         }
         let mut rebound = Self::new(self.space.clone(), self.limits);
         rebound.memory_arena = Some(arena.buffer());
+        rebound.work_cache = Arc::clone(&self.work_cache);
         rebound.profile_scopes.clone_from(&self.profile_scopes);
         for dispatch in &self.dispatches {
             let dispatch = dispatch.rebase(&plan.placements, arena.buffer())?;
             let (accesses, hull_accesses) = match &dispatch {
                 TemplateDispatch::Static(dispatch) => {
+                    self.limits.check_dispatch(dispatch)?;
                     let accesses = dispatch_accesses(dispatch);
                     let hulls = accesses.iter().map(BufferAccess::as_hull).collect();
                     (accesses, hulls)
@@ -1337,7 +1294,7 @@ impl GraphTemplate {
                     dispatch,
                     backend_data,
                 } => {
-                    let concrete = dispatch.instantiate(&lower, self.limits)?;
+                    let concrete = dispatch.instantiate_checked(&lower, self.limits)?;
                     candidates.push((
                         index,
                         true,
@@ -1360,7 +1317,7 @@ impl GraphTemplate {
                         }
                         values[slot] = lo;
                         let concrete = dispatch
-                            .instantiate(&self.space.values(values.clone())?, self.limits)?
+                            .instantiate_checked(&self.space.values(values.clone())?, self.limits)?
                             .with_backend_data(data.clone());
                         candidates.push((index, true, concrete));
                         lo = hi.saturating_add(1);
@@ -1542,7 +1499,8 @@ impl GraphTemplate {
     /// Records a concrete dispatch already validated at its command-list boundary.
     #[doc(hidden)]
     pub fn record_validated(&mut self, dispatch: Dispatch) -> Result<(), GraphError> {
-        // This relies on the host constructing the graph with its command-validation limits.
+        self.work_cache = Arc::new(Mutex::new(work::WorkCache::default()));
+        self.limits.check_dispatch(&dispatch)?;
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
         }
@@ -1568,6 +1526,8 @@ impl GraphTemplate {
             return Err(GraphError::ParameterSpaceMismatch);
         }
         let mut commands = CommandList::new();
+        let mut total = 0;
+        let mut cache = self.work_cache.lock().map_err(|_| GraphError::WorkLimit)?;
         for (index, dispatch) in self.dispatches.iter().enumerate() {
             let concrete = match dispatch {
                 TemplateDispatch::Static(dispatch) => dispatch.as_ref().clone(),
@@ -1575,7 +1535,7 @@ impl GraphTemplate {
                     dispatch,
                     backend_data,
                 } => {
-                    let concrete = dispatch.instantiate(values, self.limits)?;
+                    let concrete = dispatch.instantiate(values)?;
                     match backend_data {
                         Some(data) => concrete.with_backend_data(data.clone()),
                         None => concrete,
@@ -1595,11 +1555,15 @@ impl GraphTemplate {
                         .find(|(hi, _)| value <= hi)
                         .map(|(_, data)| data.clone())
                         .ok_or(GraphError::ParameterSpaceMismatch)?;
-                    dispatch
-                        .instantiate(values, self.limits)?
-                        .with_backend_data(data)
+                    dispatch.instantiate(values)?.with_backend_data(data)
                 }
             };
+            if !matches!(dispatch, TemplateDispatch::Static(_)) {
+                let work = cache.work(index, &concrete).ok_or(GraphError::WorkLimit)?;
+                concrete.reuse_work(work);
+                self.limits.check_dispatch(&concrete)?;
+            }
+            total = self.limits.charge(total, &concrete)?;
             let concrete = match self.profile_scopes.get(&index) {
                 Some(scope) => concrete.with_profile_scope(Arc::clone(scope)),
                 None => concrete,
@@ -1615,6 +1579,7 @@ impl GraphTemplate {
         dispatch: DynamicDispatch,
         backend_data: Option<BackendDispatchData>,
     ) -> Result<(), GraphError> {
+        self.work_cache = Arc::new(Mutex::new(work::WorkCache::default()));
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
         }
@@ -1633,9 +1598,9 @@ impl GraphTemplate {
         let first = corners
             .next()
             .ok_or(GraphError::ParameterSpaceMismatch)
-            .and_then(|values| dispatch.instantiate(&values, self.limits))?;
+            .and_then(|values| dispatch.instantiate_checked(&values, self.limits))?;
         for values in corners {
-            dispatch.instantiate(&values, self.limits)?;
+            dispatch.instantiate_checked(&values, self.limits)?;
         }
         if dispatch.is_parameter_dependent() {
             self.dispatches.push(TemplateDispatch::Dynamic {
@@ -1657,6 +1622,7 @@ impl GraphTemplate {
         parameter: u8,
         arms: Vec<(u32, BackendDispatchData)>,
     ) -> Result<(), GraphError> {
+        self.work_cache = Arc::new(Mutex::new(work::WorkCache::default()));
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
         }
@@ -1675,7 +1641,7 @@ impl GraphTemplate {
             self.space.corners_for(dispatch.parameter_mask())
         };
         for values in corners {
-            dispatch.instantiate(&values, self.limits)?;
+            dispatch.instantiate_checked(&values, self.limits)?;
         }
         self.dispatches.push(TemplateDispatch::Rule {
             dispatch,
@@ -2024,6 +1990,33 @@ mod tests {
                 .unwrap(),
             operation
         );
+    }
+
+    #[test]
+    fn replay_work_reuses_shapes_without_reusing_limit_decisions() {
+        let space = ParamSpace::new(std::iter::once(1..=7).collect()).unwrap();
+        let len = Affine::parameter(0, 0, 1);
+        let input = symbolic_prefix(80, &[7], space.clone(), len);
+        let output = symbolic_prefix(81, &[7], space.clone(), len);
+        let limits = GraphLimits::new(4096, 1_000_000_000, crate::DEFAULT_DISPATCH_WORK_LIMIT)
+            .with_submission_work_limit(crate::DEFAULT_SUBMISSION_WORK_LIMIT);
+        let mut graph = GraphTemplate::new(space, limits);
+        graph.dispatch(Op::Copy, &[&input], &output).unwrap();
+        for length in [3, 3, 7, 7] {
+            let commands = graph
+                .instantiate(&graph.values(vec![length]).unwrap())
+                .unwrap();
+            assert_eq!(commands.dispatches()[0].work(), Some(u64::from(length) * 2));
+        }
+        assert_eq!(graph.work_cache.lock().unwrap().computations, 2);
+        graph.limits.work_per_dispatch = 5;
+        assert_eq!(
+            graph
+                .instantiate(&graph.values(vec![3]).unwrap())
+                .unwrap_err(),
+            GraphError::WorkLimit
+        );
+        assert_eq!(graph.work_cache.lock().unwrap().computations, 2);
     }
 
     fn memory_graph(read_first_after_second_write: bool) -> (GraphTemplate, [Tensor; 7]) {
@@ -2478,10 +2471,10 @@ mod tests {
         .unwrap();
         let program = Dispatch::kernel(&prepared, &[&input], &[&output]).unwrap();
         assert_eq!(
-            GraphLimits::new(1, 4, 11).check_program(&program),
+            GraphLimits::new(1, 4, 11).check_dispatch(&program),
             Err(GraphError::WorkLimit)
         );
-        assert!(GraphLimits::new(1, 4, 12).check_program(&program).is_ok());
+        assert!(GraphLimits::new(1, 4, 12).check_dispatch(&program).is_ok());
     }
 
     #[test]

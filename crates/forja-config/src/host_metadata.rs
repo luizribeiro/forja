@@ -112,6 +112,7 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("limits.instances", ReloadClass::Restart),
     ("limits.dispatches_per_list", ReloadClass::Restart),
     ("limits.work_per_dispatch", ReloadClass::Restart),
+    ("limits.work_per_submission", ReloadClass::Restart),
     ("limits.guest_call_timeout", ReloadClass::Live),
     ("limits.submission_timeout", ReloadClass::Live),
     ("limits.gpu_time_budget", ReloadClass::Live),

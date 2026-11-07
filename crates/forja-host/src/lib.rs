@@ -54,15 +54,13 @@ use forja_core::{
     PagePoolError, PagedCopyDirection, PagedLayout, PagedMemoryUsage, PagedPlane, PagedSequence,
     PagedSlotBanks, ParamError, ParamSpace, ParamValues, PreparedGraph, RuleArm,
     SequenceCheckpoint, Slice, Submission, SubmissionProfile, SymbolicLayout, SymbolicLayoutError,
-    TemplateOp, TemplateTensor, Tensor, ViewOp, gather_matmul_flops,
-    gather_quant_matmul_dispatch_flops, matmul_flops,
+    TemplateOp, TemplateTensor, Tensor, ViewOp,
     program::{
         BinOp, EpilogueError, EpilogueSignature, Inst, KernelSignature, MAX_INSTRUCTIONS,
         MAX_OUTPUTS, PrepareError, PreparedEpilogue, PreparedProgram, Program, ProgramError,
         ProgramKind, RedOp, UnOp, ValidatedProgram, ValueType, prepare_epilogue_retained,
         prepare_program_retained,
     },
-    quant_matmul_flops, sdpa_flops,
 };
 use wasmtime::component::{Accessor, Component, HasData, Linker, Resource, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, Trap};
@@ -3245,6 +3243,7 @@ pub struct Limits {
     instances: usize,
     dispatches_per_list: usize,
     work_per_dispatch: u64,
+    work_per_submission: u64,
     guest_call_timeout: Duration,
     submission_timeout: Duration,
     gpu_time_budget: Duration,
@@ -3276,6 +3275,15 @@ impl Grants {
 }
 
 impl Limits {
+    fn command_limits(self) -> GraphLimits {
+        GraphLimits::new(
+            self.dispatches_per_list,
+            self.tensor_elements,
+            self.work_per_dispatch,
+        )
+        .with_submission_work_limit(self.work_per_submission)
+    }
+
     fn check_tensor_shape(&self, shape: &[u32]) -> Result<u64, compute::Error> {
         if shape.len() > self.tensor_rank {
             return Err(quota("tensor rank exceeds the guest limit"));
@@ -3331,6 +3339,7 @@ impl Limits {
             instances: 10_000,
             dispatches_per_list: 4_096,
             work_per_dispatch: forja_core::DEFAULT_DISPATCH_WORK_LIMIT,
+            work_per_submission: forja_core::DEFAULT_SUBMISSION_WORK_LIMIT,
             guest_call_timeout: Duration::from_secs(30),
             submission_timeout: Duration::from_secs(10),
             gpu_time_budget: Duration::MAX,
@@ -3353,6 +3362,13 @@ impl Limits {
     ) -> Self {
         self.dispatches_per_list = max_dispatches_per_list;
         self.work_per_dispatch = max_work_per_dispatch;
+        self
+    }
+
+    /// Overrides summed logical work in one submission; see [`forja_core::Dispatch::work`].
+    #[must_use]
+    pub const fn with_submission_work_limit(mut self, max_work: u64) -> Self {
+        self.work_per_submission = max_work;
         self
     }
 
@@ -5846,7 +5862,9 @@ impl<B: Backend + 'static> Host<B> {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
-        if let Some(operation) = concrete_op {
+        if let Some(operation) = concrete_op
+            && dispatch_space.is_none()
+        {
             self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
         }
         let template_inputs = inputs
@@ -6331,7 +6349,9 @@ impl<B: Backend + 'static> Host<B> {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
-        if let Some(operation) = concrete_op {
+        if let Some(operation) = concrete_op
+            && dispatch_space.is_none()
+        {
             self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
         }
 
@@ -6406,7 +6426,7 @@ impl<B: Backend + 'static> Host<B> {
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
         if dispatch_space.is_none() {
-            self.check_program_work(program.validated(), &input_tensors, &output_tensors)?;
+            self.check_program_work(&program, &input_tensors, &output_tensors)?;
         }
         let template_inputs = input_entries
             .iter()
@@ -6490,7 +6510,19 @@ impl<B: Backend + 'static> Host<B> {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         merge_parameter_space(entry.space.as_ref(), dispatch_space.as_ref())?;
-        self.check_dispatch_work(operation, &input_tensors, &[&output_entry.tensor])?;
+        if dispatch_space.is_none() {
+            let mut work_candidate = CommandList::new();
+            work_candidate
+                .dispatch_epilogue(
+                    operation,
+                    &input_tensors,
+                    &output_entry.tensor,
+                    &prepared,
+                    &extra_tensors,
+                )
+                .map_err(guest_error)?;
+            self.check_recorded_work(&work_candidate)?;
+        }
         let template_inputs = input_entries
             .iter()
             .map(TensorEntry::template)
@@ -6639,14 +6671,7 @@ impl<B: Backend + 'static> Host<B> {
             Some(space) => space,
             None => ParamSpace::new(Vec::new()).map_err(|error| graph_error(&error))?,
         };
-        let mut graph = GraphTemplate::new(
-            space,
-            GraphLimits::new(
-                self.limits.dispatches_per_list,
-                self.limits.tensor_elements,
-                self.limits.work_per_dispatch,
-            ),
-        );
+        let mut graph = GraphTemplate::new(space, self.limits.command_limits());
         let validation_started = Instant::now();
         let built = entry
             .recorded
@@ -6789,6 +6814,7 @@ impl<B: Backend + 'static> Host<B> {
             self.graph_replays.fetch_add(1, Ordering::AcqRel);
         }
         SubmitRequest {
+            command_limits: self.limits.command_limits(),
             backend: Arc::clone(&self.backend),
             snapshot: None,
             recording_scopes: Vec::new(),
@@ -6920,122 +6946,44 @@ impl<B: Backend + 'static> Host<B> {
         Ok(())
     }
 
+    fn check_recorded_work(&self, commands: &CommandList) -> Result<(), compute::Error> {
+        for tensor in commands
+            .dispatches()
+            .iter()
+            .flat_map(|d| d.inputs().iter().chain(d.outputs()))
+        {
+            self.check_tensor_shape(tensor.layout().shape())?;
+        }
+        self.limits
+            .command_limits()
+            .check_commands(commands)
+            .map_err(|_| dispatch_work_quota())
+    }
+
     fn check_dispatch_work(
         &self,
         operation: Op,
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<(), compute::Error> {
-        let mut work = 0_u64;
-        for tensor in inputs.iter().chain(outputs) {
-            work = work
-                .checked_add(self.check_tensor_shape(tensor.layout().shape())?)
-                .ok_or_else(dispatch_work_quota)?;
-        }
-        let flops = match operation {
-            Op::Matmul => inputs.first().zip(inputs.get(1)).and_then(|(left, right)| {
-                matmul_flops(left.layout().shape(), right.layout().shape())
-            }),
-            Op::GatherMatmul => inputs
-                .first()
-                .zip(inputs.get(1))
-                .zip(inputs.get(2))
-                .and_then(|((input, weights), indices)| {
-                    gather_matmul_flops(
-                        input.layout().shape(),
-                        weights.layout().shape(),
-                        indices.layout().shape(),
-                    )
-                }),
-            Op::QuantMatmul { .. } => {
-                inputs
-                    .first()
-                    .zip(inputs.get(1))
-                    .and_then(|(input, packed)| {
-                        quant_matmul_flops(input.layout().shape(), packed.layout().shape())
-                    })
-            }
-            Op::GatherQuantMatmul { .. } => {
-                let indices = if inputs.len() == 8 { 7 } else { 4 };
-                inputs
-                    .first()
-                    .zip(inputs.get(1))
-                    .zip(inputs.get(indices))
-                    .and_then(|((input, packed), indices)| {
-                        gather_quant_matmul_dispatch_flops(
-                            input.layout().shape(),
-                            packed.layout().shape(),
-                            indices.layout().shape(),
-                            inputs.len(),
-                        )
-                    })
-            }
-            Op::Sdpa { .. } => inputs
-                .first()
-                .zip(inputs.get(1))
-                .zip(inputs.get(2))
-                .and_then(|((query, key), value)| {
-                    sdpa_flops(
-                        query.layout().shape(),
-                        key.layout().shape(),
-                        value.layout().shape(),
-                    )
-                }),
-            _ => Some(0),
-        }
-        .ok_or_else(dispatch_work_quota)?;
-        work = work.checked_add(flops).ok_or_else(dispatch_work_quota)?;
-        if work > self.limits.work_per_dispatch {
-            return Err(dispatch_work_quota());
-        }
-        Ok(())
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(operation, inputs, outputs)
+            .map_err(guest_error)?;
+        self.check_recorded_work(&commands)
     }
 
     fn check_program_work(
         &self,
-        program: &ValidatedProgram,
+        program: &Arc<PreparedProgram>,
         inputs: &[&Tensor],
         outputs: &[&Tensor],
     ) -> Result<(), compute::Error> {
-        let elements = outputs
-            .first()
-            .ok_or_else(dispatch_work_quota)
-            .and_then(|output| self.check_tensor_shape(output.layout().shape()))?;
-        let mut work = inputs
-            .iter()
-            .chain(outputs)
-            .try_fold(0_u64, |work, tensor| {
-                work.checked_add(self.check_tensor_shape(tensor.layout().shape())?)
-                    .ok_or_else(dispatch_work_quota)
-            })?;
-        let reduction_passes = if program.program().kind == ProgramKind::Row {
-            program
-                .program()
-                .insts
-                .iter()
-                .filter(|inst| matches!(inst, Inst::Reduce(_, _)))
-                .count()
-        } else {
-            0
-        };
-        let passes = program
-            .program()
-            .insts
-            .len()
-            .checked_add(reduction_passes)
-            .and_then(|passes| u64::try_from(passes).ok())
-            .ok_or_else(dispatch_work_quota)?;
-        work = work
-            .checked_add(
-                passes
-                    .checked_mul(elements)
-                    .ok_or_else(dispatch_work_quota)?,
-            )
-            .ok_or_else(dispatch_work_quota)?;
-        if work > self.limits.work_per_dispatch {
-            return Err(dispatch_work_quota());
-        }
-        Ok(())
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_kernel(program, inputs, outputs)
+            .map_err(guest_error)?;
+        self.check_recorded_work(&commands)
     }
 
     fn prepare_read(
@@ -7251,7 +7199,9 @@ impl<B: Backend + 'static> Host<B> {
         }
         let command_space = entry.space.as_ref();
         merge_parameter_space(command_space, dispatch_space.as_ref())?;
-        if let Some(operation) = concrete_op {
+        if let Some(operation) = concrete_op
+            && dispatch_space.is_none()
+        {
             self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
         }
         let variant = if let Some(operation) = concrete_op
@@ -7269,19 +7219,12 @@ impl<B: Backend + 'static> Host<B> {
                     "variant operation requires replay parameters".to_owned(),
                 )
             })?;
-            let mut graph = GraphTemplate::new(
-                space.clone(),
-                GraphLimits::new(
-                    self.limits.dispatches_per_list,
-                    self.limits.tensor_elements,
-                    self.limits.work_per_dispatch,
-                ),
-            );
+            let mut graph = GraphTemplate::new(space.clone(), self.limits.command_limits());
             let input_refs = template_inputs.iter().collect::<Vec<_>>();
             let output_refs = template_outputs.iter().collect::<Vec<_>>();
             graph
                 .dispatch_many(template_op, &input_refs, &output_refs)
-                .map_err(|error| graph_error(&error))?;
+                .map_err(graph_admission_error)?;
             self.metal_backend()?
                 .validate_template_variant(space, template_op, &input_refs, &output_refs, name)
                 .map_err(|error| variant_error(&error))?
@@ -7350,8 +7293,6 @@ impl<B: Backend + 'static> Host<B> {
             .iter()
             .map(|resource| self.entry(resource).cloned())
             .collect::<Result<Vec<_>, _>>()?;
-        let input_tensors = entry_tensors(&input_entries);
-        let output_tensors = entry_tensors(&output_entries);
         validate_variant_rule_space(
             tensor_space(input_entries.iter().chain(&output_entries))?,
             &space,
@@ -7372,20 +7313,10 @@ impl<B: Backend + 'static> Host<B> {
             return Err(quota("command list dispatch count exceeds the guest limit"));
         }
         merge_parameter_space(entry.space.as_ref(), Some(&space))?;
-        if let Some(operation) = concrete_op {
-            self.check_dispatch_work(operation, &input_tensors, &output_tensors)?;
-        }
-        let mut graph = GraphTemplate::new(
-            space.clone(),
-            GraphLimits::new(
-                self.limits.dispatches_per_list,
-                self.limits.tensor_elements,
-                self.limits.work_per_dispatch,
-            ),
-        );
+        let mut graph = GraphTemplate::new(space.clone(), self.limits.command_limits());
         graph
             .dispatch_many(template_op, &input_refs, &output_refs)
-            .map_err(|error| graph_error(&error))?;
+            .map_err(graph_admission_error)?;
         let variants = self
             .metal_backend()?
             .validate_variant_rule(&space, &rule, template_op, &input_refs, &output_refs)
@@ -7597,6 +7528,7 @@ struct SubmitRequest<B: Backend> {
     backend: Arc<B>,
     snapshot: Option<Arc<state::StateCharge>>,
     work: SubmissionWork,
+    command_limits: GraphLimits,
     captured_state: Vec<StateCapture>,
     protected_batch: Option<hybrid::ProtectedBatch<B>>,
     state_owners: Vec<forja_core::CompletionResource>,
@@ -7624,6 +7556,16 @@ enum SubmissionWork {
         values: Vec<u32>,
         bindings: forja_core::ReplayBindings,
     },
+}
+
+impl SubmissionWork {
+    fn check_limits(&self, limits: GraphLimits) -> Result<(), BackendError> {
+        match self {
+            Self::Commands(commands) => limits.check_commands(commands).map_err(BackendError::from),
+            Self::Replay { graph, .. } if limits.permits(graph.limits()) => Ok(()),
+            Self::Replay { .. } => Err(BackendError::QuotaExceeded),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -8394,6 +8336,7 @@ where
                 backend,
                 snapshot: _snapshot,
                 work,
+                command_limits,
                 captured_state: _captured_state,
                 protected_batch,
                 state_owners,
@@ -8412,6 +8355,8 @@ where
                 taints,
                 profile,
             } = self;
+            let reservation = reservation
+                .and_then(|reservation| work.check_limits(command_limits).map(|()| reservation));
             let submitted = taints
                 .queue
                 .lock()
@@ -9665,10 +9610,6 @@ fn symbolic_view(
     }
 }
 
-fn entry_tensors(entries: &[TensorEntry]) -> Vec<&Tensor> {
-    entries.iter().map(|entry| &entry.tensor).collect()
-}
-
 fn tensor_space<'a>(
     entries: impl Iterator<Item = &'a TensorEntry>,
 ) -> Result<Option<ParamSpace>, compute::Error> {
@@ -9693,6 +9634,15 @@ fn merge_parameter_space(
         ));
     }
     Ok(())
+}
+
+fn graph_admission_error(error: forja_core::GraphError) -> compute::Error {
+    match error {
+        forja_core::GraphError::DispatchLimit
+        | forja_core::GraphError::TensorElementsLimit
+        | forja_core::GraphError::WorkLimit => quota(&error.to_string()),
+        error => graph_error(&error),
+    }
 }
 
 fn graph_error(error: &impl ToString) -> compute::Error {
@@ -15948,14 +15898,7 @@ mod tests {
         let graph = host.create_graph(commands).unwrap();
         let entry = host.table.get(&graph).unwrap();
 
-        assert_eq!(
-            entry.graph.limits(),
-            forja_core::GraphLimits::new(
-                limits.dispatches_per_list,
-                limits.tensor_elements,
-                limits.work_per_dispatch,
-            )
-        );
+        assert_eq!(entry.graph.limits(), limits.command_limits());
     }
 
     #[test]
@@ -17337,6 +17280,41 @@ mod tests {
             Err(compute::Error::Quota(_))
         ));
         assert!(host.table.get(&commands).unwrap().commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_summed_submission_work_before_execution() {
+        for replay in [false, true] {
+            let mut host = Host::new(
+                CpuBackend::new(),
+                GENEROUS
+                    .with_command_limits(4, 27)
+                    .with_submission_work_limit(27),
+            );
+            let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+            let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+            let tensor = host.entry(&output).unwrap().tensor.clone();
+            let canary = 17_f32.to_ne_bytes().repeat(7);
+            host.backend.write(&tensor, &canary).unwrap();
+            let commands = host.command_list().unwrap();
+            for _ in 0..2 {
+                host.dispatch(
+                    &commands,
+                    compute::Op::Copy,
+                    &[Resource::new_borrow(input.rep())],
+                    &output,
+                )
+                .unwrap();
+            }
+            let request = if replay {
+                let graph = host.create_graph(commands).unwrap();
+                host.prepare_replay(&graph, Vec::new()).unwrap()
+            } else {
+                host.prepare_submit(commands).unwrap()
+            };
+            assert!(matches!(request.run().await, Err(compute::Error::Quota(_))));
+            assert_eq!(host.backend.read(&tensor).unwrap(), canary);
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Logical algorithm work; cache reuse and instruction throughput are measured separately.
 
 mod attention;
+
 #[cfg(test)]
 mod copies;
 mod routed;
@@ -174,6 +175,41 @@ pub(super) fn product(values: &[u64]) -> Option<u64> {
     values
         .iter()
         .try_fold(1_u64, |product, value| product.checked_mul(*value))
+}
+
+/// Counts admission work: operand elements, logical arithmetic (including SFUs once),
+/// one pass per program/epilogue instruction, and 1,024 visits per sampling logit.
+/// Overflow refuses admission. This logical unit is not a GPU-time prediction.
+pub(crate) fn dispatch_work(dispatch: &Dispatch) -> Option<u64> {
+    let cost = KernelCost::of(dispatch)?;
+    let mut work = cost.flops.checked_add(cost.scalar_ops)?;
+    for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
+        work = work.checked_add(tensor.layout().element_count())?;
+    }
+    for program in [
+        dispatch.prepared_program().map(|p| p.validated()),
+        dispatch.prepared_epilogue().map(|p| p.validated()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        work = work.checked_add(
+            u64::try_from(program.program().insts.len())
+                .ok()?
+                .checked_mul(dispatch.output().layout().element_count())?,
+        )?;
+    }
+    if matches!(dispatch.op(), Op::Sample { .. } | Op::SampleMasked { .. }) {
+        work = work.checked_add(
+            dispatch
+                .inputs()
+                .first()?
+                .layout()
+                .element_count()
+                .checked_mul(1024)?,
+        )?;
+    }
+    Some(work)
 }
 
 #[cfg(test)]

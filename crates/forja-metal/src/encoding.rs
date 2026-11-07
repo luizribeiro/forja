@@ -2806,9 +2806,7 @@ impl MetalBackend {
         } else {
             graph.template()
         };
-        let commands = template
-            .instantiate(&values)
-            .map_err(|_| BackendError::InvalidInput)?;
+        let commands = template.instantiate(&values).map_err(BackendError::from)?;
         for &index in &state.variant_rechecks {
             let dispatch = commands
                 .dispatches()
@@ -3029,7 +3027,7 @@ impl MetalBackend {
                     facts
                         .refine(dispatch, &mut profile.cost)
                         .ok_or(BackendError::InvalidInput)?;
-                    Ok(profile)
+                    Ok::<_, BackendError>(profile)
                 })
                 .collect::<Result<Vec<_>, _>>()?
         } else {

@@ -1,8 +1,6 @@
 use super::{StateCharge, StateSequenceHandle, StateStorage, pool_error};
 use crate::{Limits, compute, guest_error, invalid_handle, quota};
-use forja_core::{
-    Backend, CommandList, DType, KernelCost, Op, StateAccess, StateOp, StateTransaction, Tensor,
-};
+use forja_core::{Backend, CommandList, DType, Op, StateAccess, StateOp, StateTransaction, Tensor};
 use std::sync::Arc;
 
 pub(super) struct StateMetadata<B: Backend> {
@@ -446,12 +444,8 @@ impl<B: Backend> StateCommands<B> {
         plane: usize,
         dispatch: forja_core::Dispatch,
     ) -> Result<(), compute::Error> {
-        let cost = KernelCost::of(&dispatch).ok_or_else(|| quota("state work overflow"))?;
-        let work = cost
-            .flops
-            .checked_add(cost.scalar_ops)
-            .and_then(|n| n.checked_add(cost.read_bytes))
-            .and_then(|n| n.checked_add(cost.write_bytes))
+        let work = dispatch
+            .work()
             .ok_or_else(|| quota("state work overflow"))?;
         if work > self.limits.work_per_dispatch
             || self.commands.len() >= self.limits.dispatches_per_list

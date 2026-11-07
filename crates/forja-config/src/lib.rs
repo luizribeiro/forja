@@ -506,8 +506,10 @@ pub struct Limits {
     pub instances: u32,
     /// Maximum dispatches recorded in one command list.
     pub dispatches_per_list: Unbounded<u32>,
-    /// Maximum work items in one dispatch.
+    /// Maximum logical admission work in one dispatch; see [`forja_core::Dispatch::work`].
     pub work_per_dispatch: Unbounded<u64>,
+    /// Maximum summed logical admission work in one complete GPU submission.
+    pub work_per_submission: Unbounded<u64>,
     /// Maximum CPU time for one guest export call.
     pub guest_call_timeout: Duration,
     /// Maximum time to wait for one GPU submission.
@@ -531,6 +533,7 @@ impl Default for Limits {
             instances: 10_000,
             dispatches_per_list: Unbounded::Limited(4_096),
             work_per_dispatch: Unbounded::Limited(forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
+            work_per_submission: Unbounded::Limited(forja_core::DEFAULT_SUBMISSION_WORK_LIMIT),
             guest_call_timeout: Duration::from_secs(300),
             submission_timeout: Duration::from_secs(60),
             gpu_time_budget: Unbounded::Limited(Duration::from_secs(3_600)),
@@ -620,6 +623,10 @@ mod tests {
         assert_eq!(
             limits.work_per_dispatch,
             Unbounded::Limited(forja_core::DEFAULT_DISPATCH_WORK_LIMIT)
+        );
+        assert_eq!(
+            limits.work_per_submission,
+            Unbounded::Limited(forja_core::DEFAULT_SUBMISSION_WORK_LIMIT)
         );
         assert_eq!(
             limits.guest_call_timeout.get(),
@@ -861,6 +868,7 @@ fixtures = "golden/qwen3-0.6b"
         for key in [
             "dispatches_per_list",
             "work_per_dispatch",
+            "work_per_submission",
             "gpu_time_budget",
         ] {
             assert!(!limits.get(key).unwrap().is_table(), "{key}");

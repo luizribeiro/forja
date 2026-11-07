@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     ops::Range,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -438,6 +438,7 @@ pub struct Dispatch {
     program: Option<ProgramDispatch>,
     epilogue: Option<EpilogueDispatch>,
     backend_data: Option<BackendDispatchData>,
+    work: OnceLock<Option<u64>>,
 }
 
 /// Type-erased backend selection retained with a validated dispatch.
@@ -469,6 +470,7 @@ impl fmt::Debug for Dispatch {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Dispatch")
+            .field("work", &self.work)
             .field("profile_scope", &self.profile_scope)
             .field("op", &self.op)
             .field("inputs", &self.inputs)
@@ -499,6 +501,7 @@ impl Dispatch {
             &self.outputs.iter().collect::<Vec<_>>(),
         )?;
         self.op = Op::State(operation);
+        self.work.take();
         Ok(())
     }
 
@@ -690,6 +693,7 @@ impl Dispatch {
             program: None,
             epilogue: None,
             backend_data: None,
+            work: OnceLock::new(),
         })
     }
 
@@ -764,7 +768,21 @@ impl Dispatch {
             }),
             epilogue: None,
             backend_data: None,
+            work: OnceLock::new(),
         })
+    }
+
+    /// Returns checked logical admission work, cached for this validated signature.
+    ///
+    /// Counts operand elements, logical arithmetic/SFUs once, program instruction passes,
+    /// and bounded sampling visits. It does not predict GPU duration.
+    #[must_use]
+    pub fn work(&self) -> Option<u64> {
+        *self.work.get_or_init(|| crate::cost::dispatch_work(self))
+    }
+
+    pub(crate) fn reuse_work(&self, work: u64) {
+        let _ = self.work.set(Some(work));
     }
 
     /// Returns the operation configuration.

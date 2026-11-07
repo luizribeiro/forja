@@ -283,6 +283,10 @@ impl TryFrom<(&ConfigLimits, u64)> for HostLimits {
             Unbounded::Unlimited => u64::MAX,
             Unbounded::Limited(value) => value,
         };
+        let work_per_submission = match limits.work_per_submission {
+            Unbounded::Unlimited => u64::MAX,
+            Unbounded::Limited(value) => value,
+        };
         let gpu_time_budget = match limits.gpu_time_budget {
             Unbounded::Unlimited => Duration::MAX,
             Unbounded::Limited(value) => value.get(),
@@ -303,6 +307,7 @@ impl TryFrom<(&ConfigLimits, u64)> for HostLimits {
                 usize::try_from(limits.instances)?,
             )
             .with_command_limits(dispatches_per_list, work_per_dispatch)
+            .with_submission_work_limit(work_per_submission)
             .with_guest_call_timeout(limits.guest_call_timeout.get())
             .with_gpu_limits(limits.submission_timeout.get(), gpu_time_budget),
         ))
