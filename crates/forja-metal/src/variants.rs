@@ -368,6 +368,9 @@ const QUANT_VECTOR: &[Constraint] = &[
     operation(OperationValue::GroupSize, Relation::MultipleOf(32)),
 ];
 const QUANT_ROW_GEMV: &[Constraint] = &[value(QUANT_M, Relation::Range { min: 2, max: 8 })];
+/// Contiguous input/packed layouts and packed widths divisible by 64 words
+/// (from the inner multiple of 256) let the dispatch-level alignment hoist cover
+/// every row and lane.
 const Q8_FAST_SUFFIX: &[Constraint] = &[
     operation(OperationValue::Bits, Relation::Equal(8)),
     operation(OperationValue::GroupSize, Relation::MultipleOf(8)),

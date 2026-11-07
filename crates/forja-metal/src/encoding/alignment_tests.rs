@@ -162,6 +162,49 @@ fn gather_vectors_check_absolute_weight_alignment() {
     );
 }
 
+fn assert_float_vector_origins(
+    variant: &str,
+    bits: u8,
+    rows: u32,
+    skew_input: bool,
+    skew_operand: Option<usize>,
+) {
+    for (dtype, ty, bytes) in [
+        (DType::F32, "float4", 4),
+        (DType::F16, "half4", 2),
+        (DType::BF16, "bfloat4", 2),
+    ] {
+        let load = format!("*reinterpret_cast<device const {ty} *>(buffer + index * {bytes})");
+        let pointer = format!("buffer + index * {bytes}");
+        let zero = format!("{ty}(0)");
+        let mut inputs = quant_inputs(rows, 8, bits, dtype, skew_input, false);
+        if skew_operand.is_some() {
+            inputs[0] = TensorSpec::sliced(
+                dtype,
+                &[rows * 1024 + 4],
+                &[forja_core::Slice::new(0, rows * 1024, 1).unwrap()],
+            )
+            .reshaped(&[rows, 1024]);
+        }
+        assert_variant(
+            Some(variant),
+            Op::QuantMatmul {
+                bits,
+                group_size: 64,
+            },
+            &inputs,
+            &TensorSpec::contiguous(dtype, &[rows, 8]),
+            Canary {
+                load: &load,
+                pointer: &pointer,
+                alignment: 4 * bytes,
+                zero: &zero,
+            },
+            skew_operand,
+        );
+    }
+}
+
 #[test]
 fn contiguous_float_vectors_check_absolute_alignment() {
     for (variant, bits, skew_input, skew_operand) in [
@@ -170,43 +213,13 @@ fn contiguous_float_vectors_check_absolute_alignment() {
         ("quant-matmul.q8-fast-gemv", 8, false, Some(0)),
         ("quant-matmul.q8-fast-gemv-n2", 8, false, Some(0)),
     ] {
-        for (dtype, ty, bytes) in [
-            (DType::F32, "float4", 4),
-            (DType::F16, "half4", 2),
-            (DType::BF16, "bfloat4", 2),
-        ] {
-            let load = format!("*reinterpret_cast<device const {ty} *>(buffer + index * {bytes})");
-            let pointer = format!("buffer + index * {bytes}");
-            let zero = format!("{ty}(0)");
-            let mut inputs = quant_inputs(1, 8, bits, dtype, skew_input, false);
-            if skew_operand.is_some() {
-                inputs[0] = TensorSpec::sliced(
-                    dtype,
-                    &[1, 1028],
-                    &[
-                        forja_core::Slice::new(0, 1, 1).unwrap(),
-                        forja_core::Slice::new(0, 1024, 1).unwrap(),
-                    ],
-                );
-            }
-            assert_variant(
-                Some(variant),
-                Op::QuantMatmul {
-                    bits,
-                    group_size: 64,
-                },
-                &inputs,
-                &TensorSpec::contiguous(dtype, &[1, 8]),
-                Canary {
-                    load: &load,
-                    pointer: &pointer,
-                    alignment: 4 * bytes,
-                    zero: &zero,
-                },
-                skew_operand,
-            );
-        }
+        assert_float_vector_origins(variant, bits, 1, skew_input, skew_operand);
     }
+}
+
+#[test]
+fn q8_fast_activation_vectors_check_multiple_row_origins() {
+    assert_float_vector_origins("quant-matmul.q8-fast-gemv", 8, 4, false, Some(0));
 }
 
 #[test]
