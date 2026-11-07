@@ -750,6 +750,24 @@ impl MetalBackend {
         )
     }
 
+    /// Creates a backend with a lifetime allowance for pipeline compile attempts.
+    /// Cache hits are free; failed compilations consume the allowance.
+    ///
+    /// # Errors
+    /// Returns an error for a zero allowance or an unavailable Metal device.
+    pub fn with_pipeline_limit(count: usize) -> Result<Self, BackendError> {
+        if count == 0 {
+            return Err(BackendError::InvalidInput);
+        }
+        let backend = Self::new()?;
+        backend
+            .pipelines
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?
+            .set_initial_pipeline_budget(count);
+        Ok(backend)
+    }
+
     /// Creates a backend with an explicit reusable graph execution strategy.
     ///
     /// # Errors

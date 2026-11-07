@@ -10438,6 +10438,7 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
 pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     max_threadgroup_memory_length: usize,
+    pipeline_budget: AtomicUsize,
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
@@ -10461,6 +10462,19 @@ struct EpilogueCompileCounts {
 }
 
 impl PipelineCache {
+    fn charge_pipeline(&self) -> Result<(), BackendError> {
+        self.pipeline_budget
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map(|_| ())
+            .map_err(|_| BackendError::QuotaExceeded)
+    }
+
+    pub(super) fn set_initial_pipeline_budget(&self, count: usize) {
+        self.pipeline_budget.store(count, Ordering::Release);
+    }
+
     fn validate_pipeline_memory(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -10484,6 +10498,7 @@ impl PipelineCache {
         if self.calibration_native.contains(&key) {
             return Ok(true);
         }
+        self.charge_pipeline()?;
         let options = compile_options(MTLMathMode::Fast);
         let Ok(library) = self
             .device
@@ -10532,6 +10547,7 @@ impl PipelineCache {
         Ok(Self {
             device: device.clone(),
             max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),
+            pipeline_budget: AtomicUsize::new(256),
             fast_library,
             nan_preserving_library,
             pipelines: HashMap::new(),
@@ -10558,6 +10574,7 @@ impl PipelineCache {
         if self.unavailable_pipelines.contains(&key) {
             return Err(BackendError::UnsupportedOperation);
         }
+        self.charge_pipeline()?;
         let values = function_constants(constants)?;
         let library = if nan_preserving_kernel(name) {
             &self.nan_preserving_library
@@ -10594,6 +10611,7 @@ impl PipelineCache {
             self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
             return Ok(pipeline.clone());
         }
+        self.charge_pipeline()?;
         if self.epilogue_libraries.contains_key(&source_key) {
             self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
         } else {
@@ -10697,6 +10715,7 @@ impl PipelineCache {
         key: &ProgramPipelineKey,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        self.charge_pipeline()?;
         let source = NSString::from_str(source);
         let options = compile_options(MTLMathMode::Safe);
         let library = self
@@ -16011,6 +16030,27 @@ mod tests {
             }
         }
         assert!(cache.get("copy_contiguous_f32x4", &[]).is_ok());
+    }
+
+    #[test]
+    fn pipeline_compile_allowance_counts_misses_and_failed_attempts() {
+        assert!(matches!(
+            MetalBackend::with_pipeline_limit(0),
+            Err(BackendError::InvalidInput)
+        ));
+        let backend = MetalBackend::with_pipeline_limit(2).unwrap();
+        let mut cache = backend.pipelines.lock().unwrap();
+        assert!(matches!(
+            cache.get("missing_kernel", &[]),
+            Err(BackendError::ExecutionFailed)
+        ));
+        assert!(cache.get("copy_contiguous_f32x4", &[]).is_ok());
+        assert!(cache.get("copy_contiguous_f32x4", &[]).is_ok());
+        assert!(matches!(
+            cache.get("missing_other_kernel", &[]),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), 0);
     }
 
     #[test]
