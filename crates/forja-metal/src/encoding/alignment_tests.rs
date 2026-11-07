@@ -11,6 +11,13 @@ struct Canary<'a> {
     zero: &'a str,
 }
 
+const Q8_VECTOR_WORDS: Canary<'static> = Canary {
+    load: "*(device const uint4 *)(packed + index * sizeof(uint))",
+    pointer: "packed + index * sizeof(uint)",
+    alignment: 16,
+    zero: "uint4(0)",
+};
+
 fn assert_variant(
     name: Option<&str>,
     op: Op,
@@ -274,13 +281,32 @@ fn q8_vector_words_check_absolute_alignment() {
             },
             &inputs,
             &TensorSpec::contiguous(DType::F32, &[rows, 8]),
-            Canary {
-                load: "*(device const uint4 *)(packed + index * sizeof(uint))",
-                pointer: "packed + index * sizeof(uint)",
-                alignment: 16,
-                zero: "uint4(0)",
-            },
+            Q8_VECTOR_WORDS,
             None,
+        );
+    }
+}
+
+#[test]
+fn q8_packed_vectors_check_absolute_base() {
+    for (variant, rows) in [("quant-matmul.gemv", 1), ("quant-matmul.row-gemv", 4)] {
+        let mut inputs = quant_inputs(rows, 9, 8, DType::F32, false, false);
+        inputs[1] = TensorSpec::sliced(
+            DType::U32,
+            &[9 * 256 + 4],
+            &[forja_core::Slice::new(0, 9 * 256, 1).unwrap()],
+        )
+        .reshaped(&[9, 256]);
+        assert_variant(
+            Some(variant),
+            Op::QuantMatmul {
+                bits: 8,
+                group_size: 64,
+            },
+            &inputs,
+            &TensorSpec::contiguous(DType::F32, &[rows, 9]),
+            Q8_VECTOR_WORDS,
+            Some(1),
         );
     }
 }
