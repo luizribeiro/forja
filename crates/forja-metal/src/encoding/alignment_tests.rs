@@ -132,3 +132,37 @@ fn q8_fast_packed_load_checks_the_absolute_address() {
         );
     }
 }
+
+#[test]
+fn gather_vectors_check_absolute_weight_alignment() {
+    let rows = 3;
+    let indices = (0..rows * 2)
+        .map(|i: u32| i % 7)
+        .flat_map(u32::to_ne_bytes)
+        .collect();
+    assert_variant(
+        None,
+        Op::GatherMatmul,
+        &[
+            TensorSpec::contiguous(DType::F32, &[rows, 1024]),
+            TensorSpec::sliced(
+                DType::F32,
+                &[7, 1024, 36],
+                &[
+                    forja_core::Slice::new(0, 7, 1).unwrap(),
+                    forja_core::Slice::new(0, 1024, 1).unwrap(),
+                    forja_core::Slice::new(1, 32, 1).unwrap(),
+                ],
+            ),
+            TensorSpec::initialized(DType::U32, &[rows, 2], indices),
+        ],
+        &TensorSpec::contiguous(DType::F32, &[rows, 2, 32]),
+        Canary {
+            load: "*reinterpret_cast<device const float4 *>(buffer + index * 4)",
+            pointer: "buffer + index * 4",
+            alignment: 16,
+            zero: "float4(0)",
+        },
+        false,
+    );
+}

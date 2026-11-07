@@ -69,7 +69,8 @@ kernel void gather_gemv(
                 ulong(inner) * params.weight_inner_stride +
                 ulong(first_column) * params.weight_column_stride;
             if (params.weight_column_stride == 1 && first_column + 3 < params.columns &&
-                (weight_index & 3) == 0) {
+                ulong(weights + weight_index * (input1_dtype == 0 ? 4 : 2)) %
+                    (input1_dtype == 0 ? 16 : 8) == 0) {
                 float4 values = gather_load_float4(weights, weight_index, input1_dtype);
                 for (uint item = 0; item < 4; ++item) {
                     sums[item] += activation * values[item];
