@@ -10373,6 +10373,16 @@ struct EpilogueCompileCounts {
 }
 
 impl PipelineCache {
+    fn validate_pipeline_memory(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    ) -> Result<(), BackendError> {
+        if pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length {
+            return Err(BackendError::UnsupportedOperation);
+        }
+        Ok(())
+    }
+
     pub(super) fn try_calibration_shader(
         &mut self,
         source: &str,
@@ -10405,6 +10415,9 @@ impl PipelineCache {
         else {
             return Ok(false);
         };
+        if self.validate_pipeline_memory(&pipeline).is_err() {
+            return Ok(false);
+        }
         self.calibration_native.insert(key.clone());
         self.pipelines.insert(key, pipeline);
         Ok(true)
@@ -10471,16 +10484,9 @@ impl PipelineCache {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| BackendError::ExecutionFailed)?;
-        if (name.starts_with("state_block_")
-            || name.starts_with("steel_attention_")
-            || name.starts_with("paged_steel_attention_")
-            || ((name.starts_with("paged_sdpa_2pass_")
-                || name.starts_with("mlx_sdpa_vector_2pass_"))
-                && name.ends_with("_256")))
-            && pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length
-        {
+        if let Err(error) = self.validate_pipeline_memory(&pipeline) {
             self.unavailable_pipelines.insert(key);
-            return Err(BackendError::UnsupportedOperation);
+            return Err(error);
         }
         self.pipelines.insert(key, pipeline.clone());
         Ok(pipeline)
@@ -10526,6 +10532,7 @@ impl PipelineCache {
             .device
             .newComputePipelineStateWithFunction_error(&function)
             .map_err(|_| program_compile_failed(source_key.hash))?;
+        self.validate_pipeline_memory(&pipeline)?;
         self.epilogue_pipelines
             .insert(pipeline_key, pipeline.clone());
         self.epilogue_counts.pipelines = self.epilogue_counts.pipelines.saturating_add(1);
@@ -10642,9 +10649,12 @@ impl PipelineCache {
         let function = library
             .newFunctionWithName_constantValues_error(&name, &values)
             .map_err(|_| program_compile_failed(key.hash))?;
-        self.device
+        let pipeline = self
+            .device
             .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| program_compile_failed(key.hash))
+            .map_err(|_| program_compile_failed(key.hash))?;
+        self.validate_pipeline_memory(&pipeline)?;
+        Ok(pipeline)
     }
 }
 
@@ -15460,6 +15470,21 @@ mod tests {
         }
     }
 
+    fn pipeline_storage_limit_below(name: &str, constants: &[(u32, u32)]) -> usize {
+        let backend = MetalBackend::new().unwrap();
+        let cache = Mutex::new(
+            PipelineCache::new(&backend.device, crate::storage::shader_source()).unwrap(),
+        );
+        cache
+            .lock()
+            .unwrap()
+            .get(name, constants)
+            .unwrap()
+            .staticThreadgroupMemoryLength()
+            .checked_sub(1)
+            .unwrap()
+    }
+
     #[test]
     fn metal_steel_256_matches_cpu_and_refuses_insufficient_threadgroup_memory() {
         let backend = MetalBackend::new().unwrap();
@@ -15485,9 +15510,11 @@ mod tests {
             )
             .unwrap();
         }
-        backend.set_pipeline_threadgroup_memory_limit_for_test(28_000);
-        let mut pipelines = backend.pipelines.lock().unwrap();
-        assert!(matches!(
+        backend.set_pipeline_threadgroup_memory_limit_for_test(pipeline_storage_limit_below(
+            "steel_attention_256",
+            &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)],
+        ));
+        let mut pipelines = backend.pipelines.lock().unwrap();        assert!(matches!(
             pipelines.get(
                 "steel_attention_256",
                 &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)]
@@ -15671,15 +15698,46 @@ mod tests {
     #[test]
     fn metal_steel_attention_falls_back_over_mocked_threadgroup_limit() {
         let backend = MetalBackend::new().unwrap();
-        backend.set_pipeline_threadgroup_memory_limit_for_test(1);
+        backend.set_pipeline_threadgroup_memory_limit_for_test(pipeline_storage_limit_below(
+            "steel_attention_half_128_96x16",
+            &[
+                (0, 0),
+                (1, 1),
+                (2, 0),
+                (3, 1),
+                (211, 0),
+                (212, 1),
+                (217, 1),
+                (219, 0),
+            ],
+        ));
         assert_half_steel_profile_case(&backend, DType::F16, 2, 7, 32, 4, 128);
     }
 
     #[test]
     fn metal_gqa_vector_attention_falls_back_over_mocked_threadgroup_limit() {
         let backend = MetalBackend::new().unwrap();
-        backend.set_pipeline_threadgroup_memory_limit_for_test(1);
+        backend.set_pipeline_threadgroup_memory_limit_for_test(pipeline_storage_limit_below(
+            vector_kernel("mlx_sdpa_vector_2pass_1_gqa", 128).unwrap(),
+            &[(0, 0), (1, 1), (2, 0), (3, 1)],
+        ));
         assert_gqa_profile_case(&backend, DType::F16, 33, 128);
+    }
+
+    #[test]
+    fn scalar_catalog_pipelines_refuse_excess_threadgroup_storage() {
+        let backend = MetalBackend::new().unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(1);
+        let mut cache = backend.pipelines.lock().unwrap();
+        for kernel in ["rms_norm_single", "rms_norm_looped"] {
+            for _ in 0..2 {
+                assert!(matches!(
+                    cache.get(kernel, &[(0, 0), (1, 0), (2, 0)]),
+                    Err(BackendError::UnsupportedOperation)
+                ));
+            }
+        }
+        assert!(cache.get("copy_contiguous_f32x4", &[]).is_ok());
     }
 
     #[test]
