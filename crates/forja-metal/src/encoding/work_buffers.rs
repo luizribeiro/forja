@@ -1,6 +1,6 @@
 use super::{
-    BackendError, CommandList, CommandResources, CommitResidency, Completion, CompletionAccess,
-    DispatchProfile, Duration, GpuTimestamps, GraphArenaReservation, Instant,
+    BackendError, Cell, CommandList, CommandResources, CommitResidency, Completion,
+    CompletionAccess, DispatchProfile, Duration, GpuTimestamps, GraphArenaReservation, Instant,
     InternalDispatchProfile, MTL4CommandBuffer, MetalBackend, MetalSubmission, Mutex,
     PreparedMetalGraph, ProfileTimestampGranularity, ProtocolObject, RefCell, Retained, Submission,
     SubmissionObjects, SubmissionProfile,
@@ -9,6 +9,19 @@ use super::{
 use super::{DType, LAST_SUBMIT_NANOS, Op, store_duration};
 
 thread_local! { static OWNERS: RefCell<Vec<forja_core::CompletionResource>> = const { RefCell::new(Vec::new()) }; }
+thread_local! { static CALL_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) }; }
+pub(crate) struct TimeoutScope(Option<Duration>);
+impl TimeoutScope {
+    pub(crate) fn enter(timeout: Duration) -> Self {
+        Self(CALL_TIMEOUT.replace(Some(timeout)))
+    }
+}
+impl Drop for TimeoutScope {
+    fn drop(&mut self) {
+        CALL_TIMEOUT.set(self.0);
+    }
+}
+
 pub(crate) struct SubmissionOwners(Vec<forja_core::CompletionResource>);
 impl SubmissionOwners {
     pub(crate) fn enter(owners: Vec<forja_core::CompletionResource>) -> Self {
@@ -105,23 +118,57 @@ fn partition(
 }
 
 impl MetalBackend {
+    pub(crate) fn command_timeout(&self) -> Duration {
+        if crate::work_admission::calibrating() {
+            self.gpu_timeout
+        } else {
+            CALL_TIMEOUT
+                .get()
+                .map_or(self.gpu_timeout, |timeout| timeout.min(self.gpu_timeout))
+        }
+    }
+
+    fn submission_limits(&self) -> Result<forja_core::GpuWorkLimits, BackendError> {
+        let base = self.work_limits;
+        let Some(timeout) = CALL_TIMEOUT
+            .get()
+            .filter(|&timeout| !crate::work_admission::calibrating() && timeout < base.timeout())
+        else {
+            return Ok(base);
+        };
+        let limits = forja_core::GpuWorkLimits::for_timeout(timeout)
+            .map_err(|_| BackendError::QuotaExceeded)?;
+        let command = limits
+            .command_buffer()
+            .min(base.command_buffer())
+            .min(timeout / base.backstop_ratio() / 2);
+        forja_core::GpuWorkLimits::new(
+            limits.dispatch().min(base.dispatch()).min(command),
+            command,
+            limits.submission().min(base.submission()),
+            timeout,
+            base.backstop_ratio(),
+        )
+        .map_err(|_| BackendError::QuotaExceeded)
+    }
+
     fn split_oversized_outputs(
         &self,
         commands: &CommandList,
         predictions: &[Duration],
         reserve: Duration,
+        limits: forja_core::GpuWorkLimits,
     ) -> Result<Option<CommandList>, BackendError> {
-        let budget = self
-            .work_limits
+        let budget = limits
             .dispatch()
-            .min(self.work_limits.command_buffer().saturating_sub(reserve));
+            .min(limits.command_buffer().saturating_sub(reserve));
         if !predictions.iter().any(|&p| p > budget) {
             return Ok(None);
         }
         let total = predictions.iter().try_fold(Duration::ZERO, |sum, &p| {
             sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
         })?;
-        if total > self.work_limits.submission() {
+        if total > limits.submission() {
             return Err(BackendError::QuotaExceeded);
         }
         let mut split = CommandList::new();
@@ -159,19 +206,20 @@ impl MetalBackend {
         graph_arena: Option<&GraphArenaReservation>,
         granularity: ProfileTimestampGranularity,
     ) -> Result<MetalSubmission, BackendError> {
+        let limits = self.submission_limits()?;
         let started = Instant::now();
         let first =
             self.prepare_commands::<PROFILE>(commands.clone(), graph, graph_arena, granularity)?;
         if let Some(split) =
-            self.split_oversized_outputs(&commands, &first.predictions, first.reserve)?
+            self.split_oversized_outputs(&commands, &first.predictions, first.reserve, limits)?
         {
             drop(first);
             return self.submit_commands_inner::<PROFILE>(split, None, graph_arena, granularity);
         }
-        let ranges = partition(&first.predictions, self.work_limits, first.reserve)?;
+        let ranges = partition(&first.predictions, limits, first.reserve)?;
         let deadline = || {
             Instant::now()
-                .checked_add(self.gpu_timeout)
+                .checked_add(limits.timeout())
                 .ok_or(BackendError::InvalidInput)
         };
         let result = if ranges.len() == 1 {
@@ -198,8 +246,7 @@ impl MetalBackend {
                     graph_arena,
                     granularity,
                 )?;
-                if partition(&prepared.predictions, self.work_limits, prepared.reserve)?.len() != 1
-                {
+                if partition(&prepared.predictions, limits, prepared.reserve)?.len() != 1 {
                     return Err(BackendError::QuotaExceeded);
                 }
                 predictions.push(
@@ -214,7 +261,7 @@ impl MetalBackend {
             let total = predictions.iter().try_fold(Duration::ZERO, |sum, &p| {
                 sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
             })?;
-            if total > self.work_limits.submission() {
+            if total > limits.submission() {
                 return Err(BackendError::QuotaExceeded);
             }
             let overhead = started.elapsed();
@@ -339,6 +386,60 @@ mod tests {
             Err(BackendError::QuotaExceeded)
         );
     }
+    #[test]
+    fn caller_deadlines_refuse_before_commit_and_do_not_leak_between_calls() {
+        use forja_core::Backend;
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[4097]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        backend
+            .prepare_dispatch(commands.last_dispatch().unwrap())
+            .unwrap();
+        let serial = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.submit_with_timeout(
+                commands.clone(),
+                Vec::new(),
+                false,
+                Duration::from_micros(1)
+            ),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial);
+        backend
+            .submit_with_timeout(commands, Vec::new(), false, Duration::from_secs(10))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial + 1);
+    }
+
+    #[test]
+    fn caller_deadline_bounds_slot_backpressure_before_commit() {
+        use forja_core::Backend;
+        let backend = MetalBackend::new().unwrap();
+        backend.prepare_work_estimation().unwrap();
+        let input = backend.alloc(DType::F32, &[33]).unwrap();
+        let output = backend.alloc(DType::F32, &[33]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        backend
+            .prepare_dispatch(commands.last_dispatch().unwrap())
+            .unwrap();
+        let held = (0..super::super::MAX_IN_FLIGHT_SUBMISSIONS)
+            .map(|_| backend.in_flight.checkout(&backend, 4096).unwrap())
+            .collect::<Vec<_>>();
+        let serial = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.submit_with_timeout(commands, Vec::new(), false, Duration::from_micros(1)),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial);
+        drop(held);
+    }
+
     #[test]
     fn buffer_reserve_is_charged_for_every_partition() {
         let limits = forja_core::GpuWorkLimits::new(

@@ -1131,7 +1131,7 @@ impl MetalBackend {
                 return Err(BackendError::QuotaExceeded);
             }
             if let Some(completion) = slot.completion.as_ref().and_then(Weak::upgrade) {
-                completion.wait(self.gpu_timeout)?;
+                completion.wait(self.command_timeout())?;
             }
         }
         let elements = bytes
@@ -1367,7 +1367,7 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_buffer_mut(buffer)?;
-        buffer.wait_pending(self.gpu_timeout)?;
+        buffer.wait_pending(self.command_timeout())?;
         buffer
             .bytes()
             .get(start..end)
@@ -1412,7 +1412,7 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_mut(tensor)?;
-        buffer.overwrite(range, bytes, self.gpu_timeout)
+        buffer.overwrite(range, bytes, self.command_timeout())
     }
 
     fn read(&self, tensor: &Tensor) -> Result<Vec<u8>, BackendError> {
@@ -1421,7 +1421,7 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_mut(tensor)?;
-        buffer.wait_pending(self.gpu_timeout)?;
+        buffer.wait_pending(self.command_timeout())?;
         gather(buffer.bytes(), tensor.layout())
     }
 
@@ -1431,7 +1431,7 @@ impl Backend for MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
         let buffer = buffers.get_mut(tensor)?;
-        buffer.wait_pending_range(&tensor.layout().byte_span(), self.gpu_timeout)?;
+        buffer.wait_pending_range(&tensor.layout().byte_span(), self.command_timeout())?;
         gather(buffer.bytes(), tensor.layout())
     }
 
@@ -1442,7 +1442,7 @@ impl Backend for MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let completion = buffers
             .get_mut(tensor)?
-            .wait_pending_mode(self.gpu_timeout, false);
+            .wait_pending_mode(self.command_timeout(), false);
         if completion == Err(BackendError::Timeout) {
             return completion;
         }
@@ -1459,6 +1459,34 @@ impl Backend for MetalBackend {
 
     fn submit(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
         self.submit_commands(commands)
+    }
+
+    fn submit_with_timeout(
+        &self,
+        commands: CommandList,
+        owners: Vec<forja_core::CompletionResource>,
+        profiled: bool,
+        timeout: Duration,
+    ) -> Result<Self::Submission, BackendError> {
+        let _timeout = crate::encoding::TimeoutScope::enter(timeout);
+        if profiled {
+            self.submit_profiled_retained(commands, owners)
+        } else {
+            self.submit_retained(commands, owners)
+        }
+    }
+
+    fn replay_with_timeout(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &forja_core::ReplayBindings,
+        owners: Vec<forja_core::CompletionResource>,
+        profiled: bool,
+        timeout: Duration,
+    ) -> Result<Self::Submission, BackendError> {
+        let _timeout = crate::encoding::TimeoutScope::enter(timeout);
+        self.replay_bound_retained(graph, values, bindings, owners, profiled)
     }
 
     fn submit_retained(

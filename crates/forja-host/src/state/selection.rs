@@ -231,7 +231,12 @@ impl<B: Backend> StateSelectionBatch<B> {
         commands: forja_core::CommandList,
     ) -> Result<StateSelectionSubmission<B>, compute::Error> {
         let backend = Arc::clone(&self.selections[0].sequence.storage.backend);
-        self.submit_using(|owners| backend.submit_retained(commands, owners))
+        let timeout = self.selections[0]
+            .sequence
+            .storage
+            .limits
+            .submission_timeout;
+        self.submit_using(|owners| backend.submit_with_timeout(commands, owners, false, timeout))
     }
 
     pub(crate) fn submit_using(

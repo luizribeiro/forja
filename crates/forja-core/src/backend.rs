@@ -775,6 +775,46 @@ pub trait Backend {
         Err(BackendError::UnsupportedOperation)
     }
 
+    /// Admits retained work against the caller's completion timeout.
+    /// # Errors
+    /// Returns admission or execution failure. The default retains ordinary submission behavior.
+    fn submit_with_timeout(
+        &self,
+        commands: CommandList,
+        owners: Vec<CompletionResource>,
+        profiled: bool,
+        _timeout: Duration,
+    ) -> Result<Self::Submission, BackendError> {
+        if profiled {
+            self.submit_profiled_retained(commands, owners)
+        } else {
+            self.submit_retained(commands, owners)
+        }
+    }
+
+    /// Admits replay work against the caller's completion timeout.
+    /// # Errors
+    /// Returns binding, admission or execution failure.
+    fn replay_with_timeout(
+        &self,
+        graph: &PreparedGraph,
+        values: Vec<u32>,
+        bindings: &crate::ReplayBindings,
+        owners: Vec<CompletionResource>,
+        profiled: bool,
+        _timeout: Duration,
+    ) -> Result<Self::Submission, BackendError> {
+        if owners.is_empty() && bindings.is_empty() {
+            if profiled {
+                self.replay_profiled(graph, values)
+            } else {
+                self.replay(graph, values)
+            }
+        } else {
+            self.replay_bound_retained(graph, values, bindings, owners, profiled)
+        }
+    }
+
     /// Prepares a validated graph for repeated execution.
     ///
     /// The default tier retains the template unchanged. Backend-specific encoding plans may be

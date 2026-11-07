@@ -48,15 +48,13 @@ impl<B: Backend> StateRecording<B> {
         *last = queue_position;
         let commands = std::mem::take(&mut self.commands);
         let retained = self.retained_resources();
-        let submission = if profiled {
-            storage.backend.submit_profiled_retained(commands, retained)
-        } else {
-            storage.backend.submit_retained(commands, retained)
-        }
-        .inspect_err(|_| {
-            storage.poisoned.store(true, Ordering::Release);
-        })
-        .map_err(guest_error)?;
+        let submission = storage
+            .backend
+            .submit_with_timeout(commands, retained, profiled, self.limits.submission_timeout)
+            .inspect_err(|_| {
+                storage.poisoned.store(true, Ordering::Release);
+            })
+            .map_err(guest_error)?;
         self.handed_off = true;
         Ok(StateSubmission {
             recording: self,

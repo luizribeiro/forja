@@ -11,7 +11,7 @@ pub(crate) use state::block_schedule;
 mod state_cache_tests;
 mod work_buffers;
 mod work_identity;
-pub(super) use work_buffers::SubmissionOwners;
+pub(super) use work_buffers::{SubmissionOwners, TimeoutScope};
 
 use std::{
     cell::{Cell, RefCell},
@@ -2157,7 +2157,7 @@ impl InFlightTracker {
             #[cfg(test)]
             self.backpressure_waits.fetch_add(1, Ordering::Relaxed);
             if let Some(pending) = pending {
-                pending.wait(backend.gpu_timeout)?;
+                pending.wait(backend.command_timeout())?;
             } else {
                 let progress = self
                     .progress_lock
@@ -2179,7 +2179,7 @@ impl InFlightTracker {
                 }
                 let (_progress, wait) = self
                     .progress
-                    .wait_timeout(progress, backend.gpu_timeout)
+                    .wait_timeout(progress, backend.command_timeout())
                     .map_err(|_| BackendError::ExecutionFailed)?;
                 if wait.timed_out() {
                     return Err(BackendError::QuotaExceeded);
@@ -8474,7 +8474,7 @@ impl MetalBackend {
             if order_on_queue {
                 dependency = dependency.max(buffer.pending_event_value());
             } else {
-                buffer.drain_pending(self.gpu_timeout)?;
+                buffer.drain_pending(self.command_timeout())?;
             }
         }
         let mut initialized = HashMap::<BufferId, forja_core::WrittenRanges>::new();
@@ -8509,7 +8509,7 @@ impl MetalBackend {
             Some(timestamps),
             Arc::downgrade(&self.in_flight),
             dependencies,
-            self.gpu_timeout,
+            self.command_timeout(),
         );
         for access in accesses {
             buffers.get_mut(&access.tensor)?.track(
@@ -8585,9 +8585,9 @@ impl MetalBackend {
         registration.register(event_value);
         Ok(MetalSubmission {
             completion,
-            timeout: self.gpu_timeout,
+            timeout: self.command_timeout(),
             deadline: Instant::now()
-                .checked_add(self.gpu_timeout)
+                .checked_add(self.command_timeout())
                 .ok_or(BackendError::InvalidInput)?,
             prefixes: Vec::new(),
             profile: None,

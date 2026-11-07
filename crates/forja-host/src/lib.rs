@@ -8364,23 +8364,23 @@ where
                 .queue
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)
-                .and_then(|_order| match reservation {
-                    Err(error) => Err(error),
-                    Ok(reservation) => match taints.begin(&access) {
-                        Err(error) => Err(error),
-                        Ok(taint) => match hybrid::SubmittedWork::<B>::queue(
-                            protected_batch,
-                            state_owners,
-                            |owners| submit_work(backend.as_ref(), work, owners, profile.is_some()),
-                        ) {
-                            Err(error) => Err(taint.refuse(error, timeout)),
-                            Ok(submission) => {
-                                let serial = submission.backend().completion_serial();
-                                let marked = PagedUse::mark_all(&paged, serial);
-                                Ok((submission, reservation, taint, serial, marked))
-                            }
+                .and_then(|_order| {
+                    let reservation = reservation?;
+                    let taint = taints.begin(&access)?;
+                    match hybrid::SubmittedWork::<B>::queue(
+                        protected_batch,
+                        state_owners,
+                        |owners| {
+                            submit_work(backend.as_ref(), work, owners, profile.is_some(), timeout)
                         },
-                    },
+                    ) {
+                        Err(error) => Err(taint.refuse(error, timeout)),
+                        Ok(submission) => {
+                            let serial = submission.backend().completion_serial();
+                            let marked = PagedUse::mark_all(&paged, serial);
+                            Ok((submission, reservation, taint, serial, marked))
+                        }
+                    }
                 });
             let (submission, reservation, taint, serial, marked) = match submitted {
                 Ok(submitted) => {
@@ -8452,28 +8452,17 @@ fn submit_work<B: Backend>(
     work: SubmissionWork,
     owners: Vec<forja_core::CompletionResource>,
     profiled: bool,
+    timeout: Duration,
 ) -> Result<B::Submission, BackendError> {
     match work {
-        SubmissionWork::Commands(commands) if profiled => {
-            backend.submit_profiled_retained(commands, owners)
-        }
-        SubmissionWork::Commands(commands) => backend.submit_retained(commands, owners),
-        SubmissionWork::Replay {
-            graph,
-            values,
-            bindings,
-        } if owners.is_empty() && bindings.is_empty() => {
-            if profiled {
-                backend.replay_profiled(&graph, values)
-            } else {
-                backend.replay(&graph, values)
-            }
+        SubmissionWork::Commands(commands) => {
+            backend.submit_with_timeout(commands, owners, profiled, timeout)
         }
         SubmissionWork::Replay {
             graph,
             values,
             bindings,
-        } => backend.replay_bound_retained(&graph, values, &bindings, owners, profiled),
+        } => backend.replay_with_timeout(&graph, values, &bindings, owners, profiled, timeout),
     }
 }
 

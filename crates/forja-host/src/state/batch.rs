@@ -57,7 +57,14 @@ impl<B: Backend> StateBatch<B> {
             }
         }
         let storage = Arc::clone(&self.recordings[0].storage);
-        self.submit_using(|owners| storage.backend.submit_retained(commands, owners))
+        self.submit_using(|owners| {
+            storage.backend.submit_with_timeout(
+                commands,
+                owners,
+                false,
+                storage.limits.submission_timeout,
+            )
+        })
     }
 
     pub(crate) fn submit_using(
