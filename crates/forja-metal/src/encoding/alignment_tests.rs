@@ -17,7 +17,7 @@ fn assert_variant(
     inputs: &[TensorSpec],
     output: &TensorSpec,
     canary: Canary<'_>,
-    skew_packed: bool,
+    skew_operand: Option<usize>,
 ) {
     let backend = MetalBackend::new().unwrap();
     let source = crate::storage::shader_source().replace(
@@ -43,9 +43,8 @@ fn assert_variant(
         |commands| {
             let dispatch = commands.last_dispatch().unwrap();
             let pick = name.map(|name| backend.validate_variant(dispatch, name).unwrap());
-            if skew_packed {
-                let packed = &dispatch.inputs()[1];
-                crate::storage::skew_read_origin_for_test(&backend, packed);
+            if let Some(index) = skew_operand {
+                crate::storage::skew_read_origin_for_test(&backend, &dispatch.inputs()[index]);
             }
             if let Some(pick) = pick {
                 assert!(commands.set_last_backend_data(BackendDispatchData::new(pick)));
@@ -123,7 +122,7 @@ fn q8_fast_packed_load_checks_the_absolute_address() {
                     alignment: 8,
                     zero: "uint2(0)",
                 },
-                true,
+                Some(1),
             );
         }
     }
@@ -159,36 +158,53 @@ fn gather_vectors_check_absolute_weight_alignment() {
             alignment: 16,
             zero: "float4(0)",
         },
-        false,
+        None,
     );
 }
 
 #[test]
 fn contiguous_float_vectors_check_absolute_alignment() {
-    for (dtype, ty, bytes) in [
-        (DType::F32, "float4", 4),
-        (DType::F16, "half4", 2),
-        (DType::BF16, "bfloat4", 2),
+    for (variant, bits, skew_input, skew_operand) in [
+        ("quant-matmul.gemv", 4, true, None),
+        ("quant-matmul.q8-fast-gemv", 8, false, Some(0)),
+        ("quant-matmul.q8-fast-gemv-n2", 8, false, Some(0)),
     ] {
-        let load = format!("*reinterpret_cast<device const {ty} *>(buffer + index * {bytes})");
-        let pointer = format!("buffer + index * {bytes}");
-        let zero = format!("{ty}(0)");
-        assert_variant(
-            Some("quant-matmul.gemv"),
-            Op::QuantMatmul {
-                bits: 4,
-                group_size: 64,
-            },
-            &quant_inputs(1, 8, 4, dtype, true, false),
-            &TensorSpec::contiguous(dtype, &[1, 8]),
-            Canary {
-                load: &load,
-                pointer: &pointer,
-                alignment: 4 * bytes,
-                zero: &zero,
-            },
-            false,
-        );
+        for (dtype, ty, bytes) in [
+            (DType::F32, "float4", 4),
+            (DType::F16, "half4", 2),
+            (DType::BF16, "bfloat4", 2),
+        ] {
+            let load = format!("*reinterpret_cast<device const {ty} *>(buffer + index * {bytes})");
+            let pointer = format!("buffer + index * {bytes}");
+            let zero = format!("{ty}(0)");
+            let mut inputs = quant_inputs(1, 8, bits, dtype, skew_input, false);
+            if skew_operand.is_some() {
+                inputs[0] = TensorSpec::sliced(
+                    dtype,
+                    &[1, 1028],
+                    &[
+                        forja_core::Slice::new(0, 1, 1).unwrap(),
+                        forja_core::Slice::new(0, 1024, 1).unwrap(),
+                    ],
+                );
+            }
+            assert_variant(
+                Some(variant),
+                Op::QuantMatmul {
+                    bits,
+                    group_size: 64,
+                },
+                &inputs,
+                &TensorSpec::contiguous(dtype, &[1, 8]),
+                Canary {
+                    load: &load,
+                    pointer: &pointer,
+                    alignment: 4 * bytes,
+                    zero: &zero,
+                },
+                skew_operand,
+            );
+        }
     }
 }
 
@@ -214,7 +230,7 @@ fn packed_vector_words_check_absolute_alignment() {
                 alignment,
                 zero: &zero,
             },
-            false,
+            None,
         );
     }
 }
@@ -235,7 +251,7 @@ fn q8_vector_words_check_absolute_alignment() {
             alignment: 16,
             zero: "uint4(0)",
         },
-        false,
+        None,
     );
 }
 
@@ -264,7 +280,7 @@ fn grouped_input_vectors_check_absolute_alignment() {
             alignment: 16,
             zero: "float4(0)",
         },
-        false,
+        None,
     );
 }
 
@@ -291,6 +307,6 @@ fn tiled_quant_input_checks_absolute_alignment() {
             alignment: 16,
             zero: "QuantizedGemmRead16{}",
         },
-        false,
+        None,
     );
 }

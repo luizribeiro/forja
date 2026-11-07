@@ -93,12 +93,7 @@ struct QuantMatmulParams {
     uint group_size;
 };
 
-float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtype) {
-    uint bytes = dtype == 0 ? 4 : 2;
-    if ((ulong(buffer + index * bytes) % (4 * bytes)) != 0) {
-        return float4(load_float(buffer, index, dtype), load_float(buffer, index + 1, dtype),
-            load_float(buffer, index + 2, dtype), load_float(buffer, index + 3, dtype));
-    }
+float4 load_aligned_float4_contiguous(device const uchar *buffer, ulong index, uint dtype) {
     if (dtype == 0) {
         return *reinterpret_cast<device const float4 *>(buffer + index * 4);
     }
@@ -106,6 +101,15 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
         return float4(*reinterpret_cast<device const half4 *>(buffer + index * 2));
     }
     return float4(*reinterpret_cast<device const bfloat4 *>(buffer + index * 2));
+}
+
+float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtype) {
+    uint bytes = dtype == 0 ? 4 : 2;
+    if ((ulong(buffer + index * bytes) % (4 * bytes)) != 0) {
+        return float4(load_float(buffer, index, dtype), load_float(buffer, index + 1, dtype),
+            load_float(buffer, index + 2, dtype), load_float(buffer, index + 3, dtype));
+    }
+    return load_aligned_float4_contiguous(buffer, index, dtype);
 }
 
 template <uint words_per_thread>
@@ -655,7 +659,7 @@ SHARED_QUANT_KERNEL(quantized_gemv_shared_n4, 4)
 
 #undef SHARED_QUANT_KERNEL
 
-template <uint output_count, bool packed_aligned>
+template <uint output_count, bool vectors_aligned>
 void quantized_gemv_q8_fast_impl(
     device const uchar *input,
     device const uchar *packed,
@@ -672,15 +676,15 @@ void quantized_gemv_q8_fast_impl(
     float sums[output_count] = {0.0f};
     for (uint block = 0; block < params.inner; block += 256) {
         uint first_inner = block + uint(lane) * 8;
-        float4 activations0 = load_float4_contiguous(
+        ulong input_index = params.input_offset + ulong(tile.y) * params.input_row_stride +
+            ulong(first_inner);
+        float4 activations0 = vectors_aligned ? load_aligned_float4_contiguous(
+            input, input_index, input0_dtype) : load_float4_contiguous(
+            input, input_index, input0_dtype);
+        float4 activations1 = vectors_aligned ? load_aligned_float4_contiguous(
+            input, input_index + 4, input0_dtype) : load_float4_contiguous(
             input,
-            params.input_offset + ulong(tile.y) * params.input_row_stride +
-                ulong(first_inner),
-            input0_dtype);
-        float4 activations1 = load_float4_contiguous(
-            input,
-            params.input_offset + ulong(tile.y) * params.input_row_stride +
-                ulong(first_inner + 4),
+            input_index + 4,
             input0_dtype);
         float input_sum = dot(activations0, float4(1.0f)) +
             dot(activations1, float4(1.0f));
@@ -692,7 +696,7 @@ void quantized_gemv_q8_fast_impl(
                 ulong packed_index = params.packed_offset +
                     ulong(column) * params.packed_width + ulong(first_word);
                 uint2 words;
-                if constexpr (packed_aligned) {
+                if constexpr (vectors_aligned) {
                     words = *reinterpret_cast<device const uint2 *>(packed + packed_index * sizeof(uint));
                 } else {
                     words = uint2(load_uint(packed, packed_index), load_uint(packed, packed_index + 1));
@@ -744,8 +748,10 @@ void quantized_gemv_q8_fast_body(
     ushort simdgroup,
     ushort lane,
     uint2 tile) {
-    // The q8-fast contract makes row and lane offsets multiples of eight bytes.
-    if (ulong(packed + params.packed_offset * sizeof(uint)) % 8 == 0) {
+    // The q8-fast contract keeps row and lane offsets aligned for both vector loads.
+    uint input_bytes = input0_dtype == 0 ? 4 : 2;
+    if (ulong(input + params.input_offset * input_bytes) % (4 * input_bytes) == 0 &&
+        ulong(packed + params.packed_offset * sizeof(uint)) % 8 == 0) {
         quantized_gemv_q8_fast_impl<output_count, true>(
             input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
             simdgroup, lane, tile);
