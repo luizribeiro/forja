@@ -311,6 +311,42 @@ fn q8_packed_vectors_check_absolute_base() {
     }
 }
 
+fn assert_q8_strided_operand(operand: usize) {
+    for (variant, rows) in [("quant-matmul.gemv", 1), ("quant-matmul.row-gemv", 4)] {
+        let mut inputs = quant_inputs(rows, 9, 8, DType::F32, false, false);
+        let [height, width]: [u32; 2] = inputs[operand].allocation_shape().try_into().unwrap();
+        inputs[operand] = TensorSpec::sliced(
+            inputs[operand].dtype(),
+            &[height, width * 2],
+            &[
+                forja_core::Slice::new(0, height, 1).unwrap(),
+                forja_core::Slice::new(0, width, 2).unwrap(),
+            ],
+        );
+        assert_variant(
+            Some(variant),
+            Op::QuantMatmul {
+                bits: 8,
+                group_size: 64,
+            },
+            &inputs,
+            &TensorSpec::contiguous(DType::F32, &[rows, 9]),
+            Q8_VECTOR_WORDS,
+            None,
+        );
+    }
+}
+
+#[test]
+fn q8_input_stride_uses_checked_fallback() {
+    assert_q8_strided_operand(0);
+}
+
+#[test]
+fn q8_packed_word_stride_uses_checked_fallback() {
+    assert_q8_strided_operand(1);
+}
+
 #[test]
 fn grouped_input_vectors_check_absolute_alignment() {
     let mut inputs = quant_inputs(33, 32, 4, DType::F32, true, false);
