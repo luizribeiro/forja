@@ -383,7 +383,7 @@ void paged_sdpa_2pass_1_gqa_body(
         for (uint element = 0; element < elements_per_thread; ++element) {
             uint column = simd_lane * elements_per_thread + element;
             q[local_head][element] = params.scale
-                * load_float(query, q_base + (IndependentHeads ? ulong(column) * params.q_strides[2] : column), input0_dtype);
+                * load_float(query, q_base + ulong(column) * params.q_strides[2], input0_dtype);
             result[local_head][element] = 0.0f;
         }
         maximum[local_head] = negative_finite_sentinel();
@@ -725,7 +725,7 @@ void paged_sdpa_body(
         + ulong(query_row) * params.q_strides[1];
     for (uint element = 0; element < elements_per_thread; ++element) {
         uint column = simd_lane * elements_per_thread + element;
-        q[element] = params.scale * load_float(query, q_base + column, input0_dtype);
+        q[element] = params.scale * load_float(query, q_base + ulong(column) * params.q_strides[2], input0_dtype);
         result[element] = 0.0f;
     }
     float maximum = negative_finite_sentinel();

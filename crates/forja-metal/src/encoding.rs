@@ -10861,6 +10861,59 @@ mod tests {
         assert_eq!(sample_thread_count(&[1024, 256, 512]), Ok(256));
     }
 
+    #[test]
+    fn paged_decode_honors_query_inner_stride() {
+        let backend = MetalBackend::new().unwrap();
+        for variant in ["paged-sdpa.vector", "paged-sdpa.vector-gqa-two-pass-32"] {
+            forja_testing::assert_backends_agree_many_selected_with(
+                &CpuBackend::new(),
+                &backend,
+                Op::PagedSdpa {
+                    scale: 128.0_f32.sqrt().recip(),
+                    causal: false,
+                    q_start: 96,
+                    key_length: 97,
+                    page_tokens: 64,
+                },
+                &[
+                    TensorSpec::sliced(
+                        DType::F32,
+                        &[16, 1, 257],
+                        &[
+                            Slice::new(0, 16, 1).unwrap(),
+                            Slice::new(0, 1, 1).unwrap(),
+                            Slice::new(1, 128, 2).unwrap(),
+                        ],
+                    ),
+                    TensorSpec::contiguous(DType::F16, &[2, 64, 8, 128]),
+                    TensorSpec::contiguous(DType::F16, &[2, 64, 8, 128]),
+                    TensorSpec::initialized(
+                        DType::U32,
+                        &[2, 2],
+                        [1_u32, 1, 0, 1]
+                            .into_iter()
+                            .flat_map(u32::to_ne_bytes)
+                            .collect(),
+                    ),
+                    TensorSpec::initialized(
+                        DType::U32,
+                        &[2],
+                        [1_u32, 1].into_iter().flat_map(u32::to_ne_bytes).collect(),
+                    ),
+                ],
+                &[TensorSpec::contiguous(DType::F32, &[16, 1, 128])],
+                &[0],
+                |commands| {
+                    let pick = backend
+                        .validate_variant(commands.last_dispatch().unwrap(), variant)
+                        .unwrap();
+                    assert!(commands.set_last_backend_data(BackendDispatchData::new(pick)));
+                },
+            )
+            .unwrap();
+        }
+    }
+
     fn shared_quant_canary(
         variant_name: &str,
         bits: u8,
