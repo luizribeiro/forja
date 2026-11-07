@@ -10765,6 +10765,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fast_top_merge_ignores_poisoned_unwritten_candidates() {
+        let backend = MetalBackend::new().unwrap();
+        let source = format!(
+            "{}{}",
+            crate::storage::shader_source(),
+            r"
+            kernel void fast_top_merge_canary(device uint *output [[buffer(1)]],
+                uint lane [[thread_position_in_threadgroup]],
+                uint width [[threads_per_threadgroup]],
+                uint simd_lane [[thread_index_in_simdgroup]],
+                uint simd_group [[simdgroup_index_in_threadgroup]]) {
+                threadgroup ulong candidates[256];
+                uint written = width / 32 * sample_fast_topk;
+                candidates[lane] = lane < written ? ulong(lane + 1) : ~0ul;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group == 0) {
+                    ulong merged[8];
+                    load_fast_top_merge(candidates, simd_lane, width, merged);
+                    for (uint slot = 0; slot < 8; ++slot)
+                        output[simd_lane + slot * 32] = uint(merged[slot]);
+                }
+            }
+        "
+        );
+        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        for top_k in 1..=20 {
+            let expected = (0_u32..256)
+                .map(|index| if index < 8 * top_k { index + 1 } else { 0 })
+                .flat_map(u32::to_ne_bytes)
+                .collect();
+            let mut pipelines = backend.pipelines.lock().unwrap();
+            let pipeline = pipelines
+                .get(
+                    "fast_top_merge_canary",
+                    &[(SAMPLE_FAST_TOP_K_CONSTANT, top_k)],
+                )
+                .unwrap();
+            pipelines.pipelines.insert(
+                PipelineKey {
+                    name: "copy_contiguous".to_owned(),
+                    constants: vec![(0, 4), (2, 4)],
+                },
+                pipeline,
+            );
+            drop(pipelines);
+            assert_backends_agree(
+                &CpuBackend::new(),
+                &backend,
+                Op::Copy,
+                &[TensorSpec::initialized(DType::U32, &[256], expected)],
+                &TensorSpec::contiguous(DType::U32, &[256]),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn copy_vectorization_checks_the_bound_address() {
         let backend = MetalBackend::new().unwrap();
         let input = backend.alloc(DType::F32, &[12]).unwrap();
