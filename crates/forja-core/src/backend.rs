@@ -394,6 +394,15 @@ pub enum BackendError {
         /// Operator-specific offending value.
         value: u32,
     },
+    /// Measured command-buffer time exceeded its calibrated admission backstop.
+    GpuPredictionExceeded {
+        /// Summed source-derived forecast.
+        predicted: Duration,
+        /// Device timestamps, absent when timing resolution failed.
+        measured: Option<Duration>,
+        /// Host-selected maximum measured/predicted ratio.
+        ratio: u32,
+    },
     /// Submitted work did not complete before its configured deadline.
     Timeout,
     /// An argument does not belong to this backend or violates an API rule.

@@ -9902,6 +9902,9 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
         GuestFailure::Layout(error) => compute::Error::Layout(error.to_string()),
         GuestFailure::Op(error) => compute::Error::OpSignature(error.to_string()),
         GuestFailure::Backend(BackendError::QuotaExceeded) => quota("backend quota exceeded"),
+        GuestFailure::Backend(error @ BackendError::GpuPredictionExceeded { .. }) => {
+            quota(&error.to_string())
+        }
         GuestFailure::Backend(BackendError::AllocationFailed) => {
             compute::Error::BackendExecution("backend allocation failed".to_owned())
         }
@@ -17554,6 +17557,11 @@ mod tests {
             super::guest_error(BackendError::ExecutionFailed),
             compute::Error::BackendExecution(_)
         ));
+        assert!(
+            matches!(super::guest_error(BackendError::GpuPredictionExceeded {
+            predicted: Duration::from_millis(1), measured: Some(Duration::from_millis(7)), ratio: 4,
+        }), compute::Error::Quota(message) if message.contains("GpuPredictionExceeded"))
+        );
         let diagnostic = super::guest_error(BackendError::DeviceErrorFlag {
             submission: 17,
             dispatch: 3,
