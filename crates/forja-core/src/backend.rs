@@ -512,6 +512,8 @@ pub struct SubmissionProfile {
     pub work_calibration: Option<Arc<crate::WorkCalibration>>,
     /// Summed admission forecast across all command buffers.
     pub predicted_gpu: Duration,
+    /// Calibrated startup allowances included in the summed forecast.
+    pub command_buffer_reserve: Duration,
     /// Number of sequential command buffers.
     pub command_buffers: u64,
     /// Scalar-program dispatch recording on the submitting thread.

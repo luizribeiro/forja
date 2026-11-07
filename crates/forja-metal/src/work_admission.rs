@@ -45,6 +45,7 @@ impl TestCalibration {
                 units: 1,
                 gpu: Duration::from_nanos(1),
             }],
+            Duration::ZERO,
         )
         .unwrap();
         Self(TEST_CALIBRATION.replace(Some(Arc::new(rates))))
@@ -67,15 +68,16 @@ pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>
 
     let (device, rates) = CALIBRATION
         .get_or_init(|| {
+            let _scope = CalibrationScope::enter();
             let cache = cache::Cache::new(backend);
             if let Some(rates) = cache.as_ref().and_then(cache::Cache::read) {
                 return Ok((backend.device.registryID(), Arc::new(rates)));
             }
             let probe = MetalBackend::new()?;
-            let mut samples = probe.calibrate_memory(1, 6)?;
-            samples.extend(probe.calibrate_compute(1, 6)?);
-            samples.extend(probe.calibrate_dispatch(1, 6)?);
-            samples.extend(probe.calibrate_work(1, 6)?);
+            let mut samples = probe.calibrate_memory(0, 6)?;
+            samples.extend(probe.calibrate_compute(0, 6)?);
+            samples.extend(probe.calibrate_dispatch(0, 6)?);
+            samples.extend(probe.calibrate_work(0, 6)?);
             samples.extend(probe.calibrate_compute_group(6)?);
             samples.extend(probe.calibrate_work_group(6)?);
             let rates = from_samples(&samples)?;
@@ -94,26 +96,8 @@ pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>
 
 #[allow(clippy::cast_precision_loss)]
 fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, BackendError> {
-    let rate = |names: &[&str]| -> Result<f64, BackendError> {
-        let mut minimum = f64::INFINITY;
-        for name in names {
-            let observations = samples
-                .iter()
-                .filter(|s| !s.screening && s.name == *name)
-                .collect::<Vec<_>>();
-            if observations.is_empty() {
-                return Err(BackendError::InvalidInput);
-            }
-            for s in observations {
-                let value = s.units as f64 / s.gpu.as_secs_f64();
-                if !value.is_finite() || value <= 0.0 {
-                    return Err(BackendError::InvalidInput);
-                }
-                minimum = minimum.min(value);
-            }
-        }
-        Ok(minimum * 0.5)
-    };
+    let rate = |names: &[&str]| sample_rate(samples, names, true);
+    let latency = |names: &[&str]| sample_rate(samples, names, false);
     let read = rate(&["streaming_read"])?;
     let copy = rate(&["streaming_copy"])?;
     let gather = rate(&["calibration_gather"])?;
@@ -122,7 +106,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
         "calibration_mma_f16",
         "calibration_mma_bf16",
     ])?;
-    let launch = 1.0 / rate(&["dependent_dispatch"])?;
+    let launch = 1.0 / latency(&["dependent_dispatch"])?;
     let serial_read = rate(&["calibration_read_serial"])?;
     let dependent = rate(&["calibration_dependent_read"])?;
     let serial = rate(&["calibration_scalar_serial"])?;
@@ -162,7 +146,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
     ];
     WorkCalibration::new(
         rates,
-        1.0 / rate(&["calibration_group_dispatch"])?,
+        1.0 / latency(&["calibration_group_dispatch"])?,
         u64::from(crate::calibration::THREADS),
         dependent,
         samples
@@ -178,8 +162,74 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
                 gpu: s.gpu,
             })
             .collect(),
+        startup_reserve(samples)?,
     )
     .ok_or(BackendError::InvalidInput)
+}
+
+fn same_work(a: &CalibrationSample, b: &CalibrationSample) -> bool {
+    a.name == b.name
+        && a.kernel == b.kernel
+        && a.units == b.units
+        && a.arithmetic == b.arithmetic
+        && a.independent_chains == b.independent_chains
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn sample_rate(
+    samples: &[CalibrationSample],
+    names: &[&str],
+    steady: bool,
+) -> Result<f64, BackendError> {
+    let mut minimum = f64::INFINITY;
+    for name in names {
+        let mut found = false;
+        for sample in samples.iter().filter(|s| !s.screening && s.name == *name) {
+            found = true;
+            if sample.units == 0 || sample.gpu.is_zero() {
+                return Err(BackendError::InvalidInput);
+            }
+            let time = if steady {
+                samples
+                    .iter()
+                    .filter(|s| !s.screening && same_work(s, sample))
+                    .map(|s| s.gpu)
+                    .min()
+                    .ok_or(BackendError::InvalidInput)?
+            } else {
+                sample.gpu
+            };
+            minimum = minimum.min(sample.units as f64 / time.as_secs_f64());
+        }
+        if !found {
+            return Err(BackendError::InvalidInput);
+        }
+    }
+    let rate = minimum * 0.5;
+    if rate.is_finite() && rate > 0.0 {
+        Ok(rate)
+    } else {
+        Err(BackendError::InvalidInput)
+    }
+}
+
+fn startup_reserve(samples: &[CalibrationSample]) -> Result<Duration, BackendError> {
+    samples
+        .iter()
+        .filter(|s| !s.screening)
+        .map(|sample| {
+            let steady = samples
+                .iter()
+                .filter(|s| !s.screening && same_work(s, sample))
+                .map(|s| s.gpu)
+                .min()
+                .unwrap_or(sample.gpu);
+            sample.gpu.saturating_sub(steady)
+        })
+        .max()
+        .unwrap_or_default()
+        .checked_mul(2)
+        .ok_or(BackendError::InvalidInput)
 }
 
 pub(super) fn trusted_probe(d: &Dispatch) -> bool {
@@ -271,6 +321,58 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_reserve_compares_only_identical_probe_workloads() {
+        let sample = CalibrationSample {
+            name: "streaming_read",
+            kernel: "read",
+            arithmetic: None,
+            independent_chains: 0,
+            screening: false,
+            units: 1024,
+            wall: Duration::from_millis(7),
+            gpu: Duration::from_millis(7),
+        };
+        let mut samples = vec![sample.clone()];
+        samples.push(CalibrationSample {
+            gpu: Duration::from_millis(2),
+            ..sample.clone()
+        });
+        samples.push(CalibrationSample {
+            units: 4097,
+            gpu: Duration::from_secs(1),
+            ..sample.clone()
+        });
+        samples.push(CalibrationSample {
+            screening: true,
+            gpu: Duration::from_secs(2),
+            ..sample
+        });
+        assert_eq!(startup_reserve(&samples), Ok(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn sustained_rate_plus_startup_bounds_every_raw_observation() {
+        let samples = [2_u64, 7, 3].map(|ms| CalibrationSample {
+            name: "streaming_read",
+            kernel: "read",
+            arithmetic: None,
+            independent_chains: 0,
+            screening: false,
+            units: 1024,
+            wall: Duration::from_millis(ms),
+            gpu: Duration::from_millis(ms),
+        });
+        let steady = sample_rate(&samples, &["streaming_read"], true).unwrap();
+        let latency = sample_rate(&samples, &["streaming_read"], false).unwrap();
+        assert!(steady > latency);
+        let forecast =
+            Duration::from_secs_f64(1024.0 / steady) + startup_reserve(&samples).unwrap();
+        for sample in samples {
+            assert!(forecast >= sample.gpu * 2);
+        }
+    }
+
     #[test]
     fn calibration_refuses_missing_zero_or_unmeasured_rates() {
         assert!(from_samples(&[]).is_err());

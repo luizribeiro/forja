@@ -3056,7 +3056,10 @@ impl MetalBackend {
             })
             .transpose()?
             .unwrap_or_else(|| vec![Duration::ZERO; dispatches.len()]);
-        let predicted = predictions.iter().try_fold(Duration::ZERO, |sum, &value| {
+        let reserve = work_calibration
+            .as_ref()
+            .map_or(Duration::ZERO, |rates| rates.command_buffer_reserve());
+        let predicted = predictions.iter().try_fold(reserve, |sum, &value| {
             sum.checked_add(value).ok_or(BackendError::QuotaExceeded)
         })?;
         let resources =
@@ -3104,6 +3107,7 @@ impl MetalBackend {
         if let Some(profile) = &mut profile {
             profile.work_calibration.clone_from(&work_calibration);
             profile.command_buffers = 1;
+            profile.command_buffer_reserve = reserve;
             profile.predicted_gpu = predicted;
         }
         if PROFILE {
@@ -3136,6 +3140,7 @@ impl MetalBackend {
             dispatch_profiles,
             internal_profiles,
             predictions,
+            reserve,
         })
     }
 

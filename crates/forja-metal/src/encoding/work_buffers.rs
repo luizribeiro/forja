@@ -26,6 +26,7 @@ pub(super) fn retain_owners(completion: &Completion) {
 
 pub(super) struct PreparedBuffer {
     pub(super) predictions: Vec<Duration>,
+    pub(super) reserve: Duration,
     pub(super) command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     pub(super) accesses: Vec<CompletionAccess>,
     pub(super) resources: CommandResources,
@@ -65,9 +66,13 @@ impl PreparedBuffer {
 fn partition(
     predictions: &[Duration],
     limits: forja_core::GpuWorkLimits,
+    reserve: Duration,
 ) -> Result<Vec<std::ops::Range<usize>>, BackendError> {
     let mut ranges = Vec::new();
-    let (mut start, mut buffer, mut total) = (0, Duration::ZERO, Duration::ZERO);
+    if reserve >= limits.command_buffer() {
+        return Err(BackendError::QuotaExceeded);
+    }
+    let (mut start, mut buffer, mut total) = (0, reserve, reserve);
     for (index, &time) in predictions.iter().enumerate() {
         if time > limits.dispatch() {
             return Err(BackendError::QuotaExceeded);
@@ -82,11 +87,18 @@ fn partition(
         {
             ranges.push(start..index);
             start = index;
-            buffer = Duration::ZERO;
+            buffer = reserve;
+            total = total
+                .checked_add(reserve)
+                .ok_or(BackendError::QuotaExceeded)?;
         }
         buffer = buffer
             .checked_add(time)
+            .filter(|sum| *sum <= limits.command_buffer())
             .ok_or(BackendError::QuotaExceeded)?;
+        if total > limits.submission() {
+            return Err(BackendError::QuotaExceeded);
+        }
     }
     ranges.push(start..predictions.len());
     Ok(ranges)
@@ -97,8 +109,13 @@ impl MetalBackend {
         &self,
         commands: &CommandList,
         predictions: &[Duration],
+        reserve: Duration,
     ) -> Result<Option<CommandList>, BackendError> {
-        if !predictions.iter().any(|&p| p > self.work_limits.dispatch()) {
+        let budget = self
+            .work_limits
+            .dispatch()
+            .min(self.work_limits.command_buffer().saturating_sub(reserve));
+        if !predictions.iter().any(|&p| p > budget) {
             return Ok(None);
         }
         let total = predictions.iter().try_fold(Duration::ZERO, |sum, &p| {
@@ -109,7 +126,7 @@ impl MetalBackend {
         }
         let mut split = CommandList::new();
         for (dispatch, &time) in commands.dispatches().iter().zip(predictions) {
-            if time <= self.work_limits.dispatch() {
+            if time <= budget {
                 split.record_validated(dispatch.clone());
                 continue;
             }
@@ -145,11 +162,13 @@ impl MetalBackend {
         let started = Instant::now();
         let first =
             self.prepare_commands::<PROFILE>(commands.clone(), graph, graph_arena, granularity)?;
-        if let Some(split) = self.split_oversized_outputs(&commands, &first.predictions)? {
+        if let Some(split) =
+            self.split_oversized_outputs(&commands, &first.predictions, first.reserve)?
+        {
             drop(first);
             return self.submit_commands_inner::<PROFILE>(split, None, graph_arena, granularity);
         }
-        let ranges = partition(&first.predictions, self.work_limits)?;
+        let ranges = partition(&first.predictions, self.work_limits, first.reserve)?;
         let deadline = || {
             Instant::now()
                 .checked_add(self.gpu_timeout)
@@ -179,14 +198,15 @@ impl MetalBackend {
                     graph_arena,
                     granularity,
                 )?;
-                if partition(&prepared.predictions, self.work_limits)?.len() != 1 {
+                if partition(&prepared.predictions, self.work_limits, prepared.reserve)?.len() != 1
+                {
                     return Err(BackendError::QuotaExceeded);
                 }
                 predictions.push(
                     prepared
                         .predictions
                         .iter()
-                        .try_fold(Duration::ZERO, |sum, &p| {
+                        .try_fold(prepared.reserve, |sum, &p| {
                             sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
                         })?,
                 );
@@ -207,7 +227,7 @@ impl MetalBackend {
                 let actual = prepared
                     .predictions
                     .iter()
-                    .try_fold(Duration::ZERO, |sum, &p| {
+                    .try_fold(prepared.reserve, |sum, &p| {
                         sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
                     })?;
                 if actual > forecast || Instant::now() >= deadline {
@@ -261,6 +281,7 @@ pub(super) fn merge_profiles(
         macro_rules! add { ($($field:ident),*) => {$(total.$field = total.$field.checked_add(profile.$field)?;)*}; }
         add!(
             predicted_gpu,
+            command_buffer_reserve,
             command_buffers,
             program_compile_fallbacks,
             epilogue_library_compilations,
@@ -306,18 +327,43 @@ mod tests {
         .unwrap();
         let ms = Duration::from_millis;
         assert_eq!(
-            partition(&[ms(600), ms(401), ms(599)], limits),
+            partition(&[ms(600), ms(401), ms(599)], limits, Duration::ZERO),
             Ok(vec![0..1, 1..3])
         );
         assert_eq!(
-            partition(&[ms(1001)], limits),
+            partition(&[ms(1001)], limits, Duration::ZERO),
             Err(BackendError::QuotaExceeded)
         );
         assert_eq!(
-            partition(&[ms(1000); 9], limits),
+            partition(&[ms(1000); 9], limits, Duration::ZERO),
             Err(BackendError::QuotaExceeded)
         );
     }
+    #[test]
+    fn buffer_reserve_is_charged_for_every_partition() {
+        let limits = forja_core::GpuWorkLimits::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::from_secs(10),
+            4,
+        )
+        .unwrap();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            partition(&[ms(600), ms(401), ms(599)], limits, ms(50)),
+            Ok(vec![0..1, 1..2, 2..3])
+        );
+        assert_eq!(
+            partition(&[ms(1000)], limits, ms(50)),
+            Err(BackendError::QuotaExceeded)
+        );
+        assert_eq!(
+            partition(&[ms(1); 9], limits, ms(999)),
+            Err(BackendError::QuotaExceeded)
+        );
+    }
+
     #[test]
     fn failed_prefix_does_not_commit_the_remaining_buffer() {
         use forja_core::Backend;
@@ -343,10 +389,16 @@ mod tests {
             )
             .unwrap();
         let budget = *prepared.predictions.iter().max().unwrap();
+        let reserve = prepared.reserve;
         drop(prepared);
-        backend.work_limits =
-            forja_core::GpuWorkLimits::new(budget, budget, budget * 3, Duration::from_secs(10), 4)
-                .unwrap();
+        backend.work_limits = forja_core::GpuWorkLimits::new(
+            budget,
+            budget + reserve,
+            (budget + reserve) * 3,
+            Duration::from_secs(10),
+            4,
+        )
+        .unwrap();
         let serial = *backend.next_event_value.lock().unwrap();
         assert!(matches!(
             backend.submit_commands(commands),
@@ -377,12 +429,13 @@ mod tests {
             )
             .unwrap();
         let original = prepared.predictions[0];
+        let reserve = prepared.reserve;
         drop(prepared);
         let budget = original * 3 / 4;
         backend.work_limits = forja_core::GpuWorkLimits::new(
             budget,
-            budget,
-            original * 4,
+            budget + reserve,
+            (original + reserve) * 8,
             Duration::from_secs(10),
             4,
         )
@@ -424,11 +477,18 @@ mod tests {
             )
             .unwrap();
         let unit = prepared.predictions[0];
+        let reserve = prepared.reserve;
         drop(prepared);
-        let buffer = unit + unit / 2;
-        backend.work_limits =
-            forja_core::GpuWorkLimits::new(buffer, buffer, unit * 4, Duration::from_secs(10), 4)
-                .unwrap();
+        let dispatch_budget = unit + unit / 2;
+        let buffer = dispatch_budget + reserve;
+        backend.work_limits = forja_core::GpuWorkLimits::new(
+            dispatch_budget,
+            buffer,
+            (unit + reserve) * 4,
+            Duration::from_secs(10),
+            4,
+        )
+        .unwrap();
         let before = *backend.next_event_value.lock().unwrap();
         let submission = backend.submit_commands_profiled(commands).unwrap();
         submission.wait().unwrap();
@@ -437,7 +497,7 @@ mod tests {
         let profile = submission.profile().unwrap();
         assert_eq!(profile.command_buffers, 3);
         assert_eq!(profile.per_dispatch.len(), 3);
-        assert_eq!(profile.predicted_gpu, unit * 3);
+        assert_eq!(profile.predicted_gpu, (unit + reserve) * 3);
         assert_eq!(Some(profile.gpu_time), submission.gpu_time());
     }
 }

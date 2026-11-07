@@ -157,14 +157,31 @@ mod tests {
             gpu: Duration::from_secs(1),
         };
         assert!(
-            WorkCalibration::new([rate; 3], 0.0, 128, 1.0, vec![observation.clone()]).is_none()
+            WorkCalibration::new(
+                [rate; 3],
+                0.0,
+                128,
+                1.0,
+                vec![observation.clone()],
+                Duration::ZERO
+            )
+            .is_none()
         );
         assert!(
-            WorkCalibration::new([rate; 3], 1.0, 128, f64::NAN, vec![observation.clone()])
-                .is_none()
+            WorkCalibration::new(
+                [rate; 3],
+                1.0,
+                128,
+                f64::NAN,
+                vec![observation.clone()],
+                Duration::ZERO
+            )
+            .is_none()
         );
-        assert!(WorkCalibration::new([rate; 3], 1.0, 128, 1.0, vec![]).is_none());
-        let rates = WorkCalibration::new([rate; 3], 0.1, 128, 1.0, vec![observation]).unwrap();
+        assert!(WorkCalibration::new([rate; 3], 1.0, 128, 1.0, vec![], Duration::ZERO).is_none());
+        let rates =
+            WorkCalibration::new([rate; 3], 0.1, 128, 1.0, vec![observation], Duration::ZERO)
+                .unwrap();
         let critical = KernelCost {
             read_bytes: 2,
             metadata_read_bytes: 2,
@@ -192,7 +209,17 @@ mod tests {
             ),
             Some(Duration::from_secs_f64(5.21))
         );
-        assert!(WorkCalibration::new([rate; 3], 0.1, 0, 1.0, rates.observations.clone()).is_none());
+        assert!(
+            WorkCalibration::new(
+                [rate; 3],
+                0.1,
+                0,
+                1.0,
+                rates.observations.clone(),
+                Duration::ZERO
+            )
+            .is_none()
+        );
         let invalid = KernelCost {
             metadata_read_bytes: 3,
             ..critical
@@ -225,12 +252,14 @@ mod tests {
                 units: 7,
                 gpu: Duration::from_millis(33),
             }],
+            Duration::from_millis(7),
         )
         .unwrap();
         let record = calibration.cache_record("device/source/OS");
         let reused = WorkCalibration::from_cache_record(&record, "device/source/OS").unwrap();
         assert_eq!(reused.observations, calibration.observations);
         assert_eq!(reused.rates, calibration.rates);
+        assert_eq!(reused.command_buffer_reserve(), Duration::from_millis(7));
         assert!(reused.reused);
         assert!(WorkCalibration::from_cache_record(&record, "device/source/other OS").is_none());
         assert!(WorkCalibration::from_cache_record(&record.replace("33", "0"), "other").is_none());
@@ -288,6 +317,7 @@ pub struct WorkCalibration {
     group_threads: u64,
     dependent_read: f64,
     observations: Vec<WorkObservation>,
+    reserve: Duration,
     reused: bool,
 }
 impl WorkCalibration {
@@ -299,6 +329,7 @@ impl WorkCalibration {
         group_threads: u64,
         dependent_read: f64,
         observations: Vec<WorkObservation>,
+        reserve: Duration,
     ) -> Option<Self> {
         (group_seconds.is_finite()
             && group_seconds > 0.0
@@ -313,9 +344,16 @@ impl WorkCalibration {
             group_threads,
             dependent_read,
             observations,
+            reserve,
             reused: false,
         })
     }
+    /// Returns the independently calibrated allowance for cold command-buffer startup.
+    #[must_use]
+    pub const fn command_buffer_reserve(&self) -> Duration {
+        self.reserve
+    }
+
     /// Prices aggregate work and the longest serial/cooperative path independently.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -348,7 +386,8 @@ impl WorkCalibration {
     #[must_use]
     pub fn json(&self) -> serde_json::Value {
         serde_json::json!({"kind":"admission calibration, not model throughput", "reused":self.reused,
-            "rate_policy":"half the slowest independent observation; twice launch/group latency",
+            "rate_policy":"zero warmups; half steady rates per identical workload; twice worst launch/group latency and within-probe GPU spread",
+            "command_buffer_reserve_seconds":self.reserve.as_secs_f64(),
             "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
             "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
             "dependent_read_bytes_per_second":self.dependent_read,
@@ -402,6 +441,7 @@ impl WorkCalibration {
             value["group_reference_threads"].as_u64()?,
             value["dependent_read_bytes_per_second"].as_f64()?,
             observations,
+            Duration::try_from_secs_f64(value["command_buffer_reserve_seconds"].as_f64()?).ok()?,
         )?;
         result.reused = true;
         Some(result)
