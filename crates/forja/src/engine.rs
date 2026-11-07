@@ -366,6 +366,12 @@ pub(crate) fn metal_backend(
         usize::try_from(limits.pipeline_compilations)?,
         limits.compile_budget.get(),
     )?;
+    let timeout = limits
+        .submission_timeout
+        .get()
+        .min(std::time::Duration::from_secs(10));
+    let backend = backend.with_work_limits(forja_core::GpuWorkLimits::for_timeout(timeout)?);
+    backend.prepare_work_estimation()?;
     Ok((backend, live_bytes))
 }
 

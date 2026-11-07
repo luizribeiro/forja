@@ -2870,8 +2870,7 @@ impl MetalBackend {
         #[cfg(test)]
         let submit_started = Instant::now();
         self.compiler.ensure_enabled()?;
-        let work_calibration = if PROFILE
-            && !crate::work_admission::calibrating()
+        let work_calibration = if !crate::work_admission::calibrating()
             && !commands
                 .dispatches()
                 .iter()
@@ -3011,6 +3010,27 @@ impl MetalBackend {
         let physical_counts = std::mem::take(&mut encoded.physical_counts);
         let launch_work = std::mem::take(&mut encoded.launch_work);
         debug_assert_eq!(launch_work.len(), dispatches.len());
+        let predictions = work_calibration
+            .as_ref()
+            .map(|rates| {
+                dispatches
+                    .iter()
+                    .zip(&launch_work)
+                    .map(|(dispatch, work)| {
+                        crate::work_admission::predict(
+                            rates,
+                            dispatch,
+                            work.launches,
+                            work.groups,
+                            work.threads,
+                            work.attention,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_else(|| vec![Duration::ZERO; dispatches.len()]);
+        let predicted = crate::work_admission::admit(&predictions, self.work_limits)?;
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -3032,7 +3052,8 @@ impl MetalBackend {
                 .zip(&barriers)
                 .zip(&physical_counts)
                 .zip(&launch_work)
-                .map(|(((dispatch, &barrier), &count), work)| {
+                .zip(&predictions)
+                .map(|((((dispatch, &barrier), &count), work), &prediction)| {
                     let mut profile = dispatch_profile(dispatch, barrier, count)?;
                     if let Some(schedule) = work.attention {
                         let (total, critical) =
@@ -3042,16 +3063,7 @@ impl MetalBackend {
                         profile.critical_path_cost = critical;
                     }
                     profile.physical_threadgroups = work.groups;
-                    if let Some(rates) = &work_calibration {
-                        profile.predicted_gpu = crate::work_admission::predict(
-                            rates,
-                            dispatch,
-                            work.launches,
-                            work.groups,
-                            work.threads,
-                            work.attention,
-                        )?;
-                    }
+                    profile.predicted_gpu = prediction;
                     facts
                         .refine(dispatch, &mut profile.cost)
                         .ok_or(BackendError::InvalidInput)?;
@@ -3064,13 +3076,7 @@ impl MetalBackend {
         if let Some(profile) = &mut profile {
             profile.work_calibration = work_calibration;
             profile.command_buffers = 1;
-            profile.predicted_gpu =
-                dispatch_profiles
-                    .iter()
-                    .try_fold(Duration::ZERO, |sum, p| {
-                        sum.checked_add(p.predicted_gpu)
-                            .ok_or(BackendError::InvalidInput)
-                    })?;
+            profile.predicted_gpu = predicted;
         }
         if PROFILE {
             state::fold_profiles(&dispatches, &mut dispatch_profiles)?;
@@ -14048,7 +14054,7 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_work_never_exposes_an_active_output() {
+    fn short_deadline_refuses_work_before_queue_commit() {
         let backend = MetalBackend::with_gpu_timeout(Duration::from_micros(1)).unwrap();
         let shape = [1024, 4097];
         let input = backend.alloc(DType::F32, &shape).unwrap();
@@ -14056,14 +14062,12 @@ mod tests {
         let mut commands = CommandList::new();
         commands.dispatch(Op::Copy, &[&input], &output).unwrap();
 
-        assert_eq!(
-            backend.submit(commands).unwrap().wait(),
-            Err(BackendError::Timeout)
-        );
-        match backend.read(&output) {
-            Ok(bytes) => assert_eq!(bytes.len(), 1024 * 4097 * 4),
-            Err(error) => assert_eq!(error, BackendError::Timeout),
-        }
+        let serial = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial);
     }
 
     #[test]

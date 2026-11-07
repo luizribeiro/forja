@@ -574,6 +574,7 @@ pub struct MetalBackend {
     pub(super) next_event_value: Mutex<u64>,
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
+    pub(super) work_limits: forja_core::GpuWorkLimits,
     pub(super) graph_replay: MetalGraphReplay,
     graph_arenas: Mutex<GraphArenaPool>,
     allocation_limit: AtomicU64,
@@ -910,6 +911,14 @@ impl MetalBackend {
         )
     }
 
+    /// Selects host-controlled admission budgets and their completion deadline.
+    #[must_use]
+    pub fn with_work_limits(mut self, limits: forja_core::GpuWorkLimits) -> Self {
+        self.gpu_timeout = limits.timeout();
+        self.work_limits = limits;
+        self
+    }
+
     /// Creates a backend with a deadline for each wait on submitted GPU work.
     ///
     /// # Errors
@@ -1004,6 +1013,7 @@ impl MetalBackend {
             next_event_value: Mutex::new(1),
             event_listener,
             gpu_timeout,
+            work_limits: forja_core::GpuWorkLimits::for_timeout(gpu_timeout)?,
             graph_replay,
             graph_arenas: Mutex::new(GraphArenaPool::default()),
             allocation_limit: AtomicU64::new(u64::MAX),
