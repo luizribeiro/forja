@@ -30,6 +30,14 @@ class LookupTests(unittest.TestCase):
                 lookup.extend([token])
                 self.assertEqual(lookup.proposal(7), naive(history, minimum, 7))
 
+    def test_longest_eligible_match_disambiguates_recent_suffix(self):
+        history = list(range(64)) + list(range(32, 40)) + [999] + list(range(40))
+        self.assertEqual(SuffixLookup(history, 8).proposal(2), [999, 0])
+        self.assertEqual(SuffixLookup(history, 8, 32).proposal(2), [40, 41])
+        self.assertEqual(SuffixLookup(history, 32, 32).proposal(2), [40, 41])
+        with self.assertRaises(ValueError):
+            SuffixLookup([], 32, 8)
+
     def test_bad_parameters(self):
         with self.assertRaises(ValueError):
             SuffixLookup([], 0)

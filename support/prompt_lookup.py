@@ -4,10 +4,13 @@
 class SuffixLookup:
     """Index the most recent earlier continuation at a fixed match threshold."""
 
-    def __init__(self, history, minimum_match):
+    def __init__(self, history, minimum_match, maximum_match=None):
         if minimum_match < 1:
             raise ValueError("minimum_match must be positive")
         self.minimum_match = minimum_match
+        self.maximum_match = minimum_match if maximum_match is None else maximum_match
+        if self.maximum_match < minimum_match:
+            raise ValueError("maximum_match must cover minimum_match")
         self.history = []
         self.ends = {}
         self.extend(history)
@@ -16,8 +19,8 @@ class SuffixLookup:
         """Publish observed tokens, retaining earlier continuation starts."""
         for token in tokens:
             end = len(self.history)
-            if end >= self.minimum_match:
-                self.ends[tuple(self.history[end - self.minimum_match:end])] = end
+            for size in range(self.minimum_match, min(self.maximum_match, end) + 1):
+                self.ends[tuple(self.history[end - size:end])] = end
             self.history.append(token)
 
     def proposal(self, depth):
@@ -26,11 +29,15 @@ class SuffixLookup:
             raise ValueError("depth must be nonnegative")
         if len(self.history) < self.minimum_match:
             return []
-        end = self.ends.get(tuple(self.history[-self.minimum_match:]))
-        return [] if end is None else self.history[end:end + depth]
+        for size in range(min(len(self.history), self.maximum_match), self.minimum_match - 1, -1):
+            end = self.ends.get(tuple(self.history[-size:]))
+            if end is not None:
+                return self.history[end:end + depth]
+        return []
 
 
-def replay(prompt, tokens, minimum_match, depth, max_context=None, enabled=True):
+def replay(prompt, tokens, minimum_match, depth, max_context=None, enabled=True,
+           maximum_match=None):
     """Reconstruct a reference stream and mark entry/exit bubbles per episode.
 
     The first output token is already pending. A zero-accept round, exhausted
@@ -40,7 +47,7 @@ def replay(prompt, tokens, minimum_match, depth, max_context=None, enabled=True)
         raise ValueError("depth and context cap must be positive")
     if not tokens:
         return {"rounds": [], "episodes": 0, "bubble_count": 0}
-    index = SuffixLookup([*prompt, tokens[0]], minimum_match)
+    index = SuffixLookup([*prompt, tokens[0]], minimum_match, maximum_match)
     offset, episodes, active, drain = 0, 0, False, False
     rounds, reconstructed = [], tokens[:1]
     while offset + 1 < len(tokens):
