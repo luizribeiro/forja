@@ -15952,6 +15952,91 @@ mod tests {
     }
 
     #[test]
+    fn generated_pipeline_paths_refuse_excess_threadgroup_storage() {
+        let backend = MetalBackend::new().unwrap();
+        let program = row_program(&CpuBackend::new(), 33);
+        let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
+        let key = ProgramPipelineKey::new(program.program(), &signature, false);
+        let source = map_codegen::generate(program.program(), &signature, false, &[]);
+        let cache = &backend.pipelines;
+        let pipeline = cache.compile_program_source(&key, &source).unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(
+            pipeline
+                .staticThreadgroupMemoryLength()
+                .checked_sub(1)
+                .unwrap(),
+        );
+        assert!(matches!(
+            cache.compile_program_source(&key, &source),
+            Err(BackendError::UnsupportedOperation)
+        ));
+
+        let backend = MetalBackend::new().unwrap();
+        let cache = &backend.pipelines;
+        let constants = [(220, 1), (221, 0)];
+        let pipeline = cache.get("calibration_threadgroup", &constants).unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(
+            pipeline
+                .staticThreadgroupMemoryLength()
+                .checked_sub(1)
+                .unwrap(),
+        );
+        let allowance = cache.pipeline_budget.load(Ordering::Acquire);
+        for _ in 0..2 {
+            assert!(
+                !cache
+                    .try_calibration_shader(
+                        crate::storage::shader_source(),
+                        "calibration_threadgroup",
+                        &[(220, 2), (221, 0)]
+                    )
+                    .unwrap()
+            );
+            assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), allowance - 1);
+        }
+    }
+
+    #[test]
+    fn refused_epilogue_pipeline_is_memoized_without_another_quota_charge() {
+        let backend = MetalBackend::new().unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![Inst::Input(0)],
+                outputs: vec![(0, 0)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![], DType::F32),
+        )
+        .unwrap();
+        let mut constants = vec![(0, 0), (1, 0), (2, 0)];
+        constants.extend(dense_epilogue_specialization(GEMM_64_64_FLOAT, 64, 64, 16));
+        let family = epilogue_codegen::FamilySourceTag::Dense;
+        let pipeline = backend
+            .pipelines
+            .prepare_epilogue(family, &epilogue, GEMM_64_64_FLOAT.kernel, &constants)
+            .unwrap();
+        let limit = pipeline
+            .staticThreadgroupMemoryLength()
+            .checked_sub(1)
+            .unwrap();
+        let backend = MetalBackend::new().unwrap();
+        backend.set_pipeline_threadgroup_memory_limit_for_test(limit);
+        let cache = &backend.pipelines;
+        let allowance = cache.pipeline_budget.load(Ordering::Acquire);
+        for _ in 0..2 {
+            assert!(matches!(
+                cache.prepare_epilogue(family, &epilogue, GEMM_64_64_FLOAT.kernel, &constants),
+                Err(BackendError::UnsupportedOperation)
+            ));
+            assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), allowance - 1);
+        }
+        assert_eq!(cache.epilogue_counts().unwrap().libraries, 1);
+        assert_eq!(cache.epilogue_counts().unwrap().pipelines, 0);
+    }
+
+    #[test]
     fn pipeline_compile_allowance_counts_misses_and_failed_attempts() {
         assert!(matches!(
             MetalBackend::with_pipeline_limit(0),
