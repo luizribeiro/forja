@@ -93,6 +93,47 @@ fn partition(
 }
 
 impl MetalBackend {
+    fn split_oversized_outputs(
+        &self,
+        commands: &CommandList,
+        predictions: &[Duration],
+    ) -> Result<Option<CommandList>, BackendError> {
+        if !predictions.iter().any(|&p| p > self.work_limits.dispatch()) {
+            return Ok(None);
+        }
+        let total = predictions.iter().try_fold(Duration::ZERO, |sum, &p| {
+            sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
+        })?;
+        if total > self.work_limits.submission() {
+            return Err(BackendError::QuotaExceeded);
+        }
+        let mut split = CommandList::new();
+        for (dispatch, &time) in commands.dispatches().iter().zip(predictions) {
+            if time <= self.work_limits.dispatch() {
+                split.record_validated(dispatch.clone());
+                continue;
+            }
+            let halves = dispatch
+                .split_output_rows()
+                .map_err(|_| BackendError::InvalidInput)?
+                .ok_or(BackendError::QuotaExceeded)?;
+            for half in halves {
+                if let Some(&variant) = half.backend_data::<crate::ValidatedVariant>() {
+                    self.validate_variant(&half, variant.name())
+                        .map_err(|_| BackendError::QuotaExceeded)?;
+                }
+                split.record_validated(half);
+            }
+            if split.len() > 4096 {
+                return Err(BackendError::QuotaExceeded);
+            }
+        }
+        if split.len() > 4096 {
+            return Err(BackendError::QuotaExceeded);
+        }
+        Ok(Some(split))
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_commands_inner<const PROFILE: bool>(
         &self,
@@ -104,6 +145,10 @@ impl MetalBackend {
         let started = Instant::now();
         let first =
             self.prepare_commands::<PROFILE>(commands.clone(), graph, graph_arena, granularity)?;
+        if let Some(split) = self.split_oversized_outputs(&commands, &first.predictions)? {
+            drop(first);
+            return self.submit_commands_inner::<PROFILE>(split, None, graph_arena, granularity);
+        }
         let ranges = partition(&first.predictions, self.work_limits)?;
         let deadline = || {
             Instant::now()
@@ -309,6 +354,50 @@ mod tests {
         ));
         assert_eq!(*backend.next_event_value.lock().unwrap(), serial + 1);
         assert_eq!(backend.read(&target).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn oversized_copy_splits_output_views_without_changing_bits() {
+        use forja_core::Backend;
+        let mut backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[33, 4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[33, 4097]).unwrap();
+        let expected = (0..33 * 4097_u32)
+            .flat_map(u32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        backend.write(&input, &expected).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let prepared = backend
+            .prepare_commands::<false>(
+                commands.clone(),
+                None,
+                None,
+                ProfileTimestampGranularity::Precise,
+            )
+            .unwrap();
+        let original = prepared.predictions[0];
+        drop(prepared);
+        let budget = original * 3 / 4;
+        backend.work_limits = forja_core::GpuWorkLimits::new(
+            budget,
+            budget,
+            original * 4,
+            Duration::from_secs(10),
+            4,
+        )
+        .unwrap();
+        let submission = backend.submit_commands_profiled(commands).unwrap();
+        submission.wait().unwrap();
+        assert_eq!(backend.read(&output).unwrap(), expected);
+        let profile = submission.profile().unwrap();
+        assert!(profile.command_buffers > 1);
+        assert!(
+            profile
+                .per_dispatch
+                .iter()
+                .all(|d| d.predicted_gpu <= budget)
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::Slice;
 use std::{
     any::Any,
     error::Error,
@@ -556,6 +557,55 @@ impl Dispatch {
         }
         Ok(rebound)
     }
+    /// Bisects independent output rows while preserving each reduction's full extent.
+    /// Programs, epilogues and operations with state or indexed output ownership refuse splitting.
+    /// Backend selections survive and must be revalidated on both returned views.
+    /// # Errors
+    /// Returns an error when checked slicing or the reconstructed signature fails.
+    #[doc(hidden)]
+    pub fn split_output_rows(&self) -> Result<Option<[Self; 2]>, OpError> {
+        let shape = self.output().layout().shape();
+        if self.program.is_some() || self.epilogue.is_some() {
+            return Ok(None);
+        }
+        let independent_dimensions = match self.op {
+            Op::Copy => shape.len(),
+            Op::RmsNorm { .. } => shape.len().saturating_sub(1),
+            Op::Matmul | Op::QuantMatmul { .. } if shape.len() == 2 => 1,
+            _ => return Ok(None),
+        };
+        let Some(axis) = (0..independent_dimensions).find(|&axis| shape[axis] > 1) else {
+            return Ok(None);
+        };
+        let half = shape[axis] / 2;
+        let slice = |tensor: &Tensor, start, len| {
+            let mut slices = tensor
+                .layout()
+                .shape()
+                .iter()
+                .map(|&extent| Slice::new(0, extent, 1))
+                .collect::<Result<Vec<_>, _>>()?;
+            slices[axis] = Slice::new(start, len, 1)?;
+            Tensor::from_allocation(
+                tensor.buffer(),
+                tensor.layout().slice(&slices)?,
+                tensor.is_writable(),
+            )
+            .map_err(|_| LayoutError::ArithmeticOverflow)
+        };
+        let make = |start, len| {
+            let mut inputs = self.inputs.clone();
+            inputs[0] = slice(&inputs[0], start, len).map_err(OpError::Layout)?;
+            let output = slice(self.output(), start, len).map_err(OpError::Layout)?;
+            let mut split =
+                Self::new_many(self.op, &inputs.iter().collect::<Vec<_>>(), &[&output])?;
+            split.backend_data.clone_from(&self.backend_data);
+            split.profile_scope.clone_from(&self.profile_scope);
+            Ok::<_, OpError>(split)
+        };
+        Ok(Some([make(0, half)?, make(half, shape[axis] - half)?]))
+    }
+
     /// Returns query, key pages, value pages, table, and generations for paged attention.
     ///
     /// Appended page planes are writable outputs; ordinary paged attention reads its inputs.
@@ -2320,6 +2370,39 @@ mod tests {
             fast_max_chunks: 102,
             rejection_rounds: 2,
         }
+    }
+
+    #[test]
+    fn output_row_splits_preserve_reduction_operands_and_view_offsets() {
+        let input = tensor(1, DType::F32, &[33, 1024], &[1024, 1]);
+        let weight = tensor(2, DType::F32, &[1024], &[1]);
+        let output = tensor(3, DType::F32, &[33, 1024], &[1, 33]);
+        let dispatch =
+            Dispatch::new(Op::RmsNorm { eps: 1e-6 }, &[&input, &weight], &output).unwrap();
+        let [first, second] = dispatch.split_output_rows().unwrap().unwrap();
+        assert_eq!(first.output().layout().shape(), &[16, 1024]);
+        assert_eq!(second.output().layout().shape(), &[17, 1024]);
+        assert_eq!(second.inputs()[0].layout().offset(), 16 * 1024);
+        assert_eq!(second.output().layout().offset(), 16);
+        assert_eq!(first.inputs()[1], weight);
+        assert_eq!(second.inputs()[1], weight);
+        let square = tensor(7, DType::F32, &[33, 33], &[33, 1]);
+        let product = tensor(8, DType::F32, &[33, 33], &[33, 1]);
+        let matrix = Dispatch::new(Op::Matmul, &[&square, &square], &product).unwrap();
+        let [first, second] = matrix.split_output_rows().unwrap().unwrap();
+        assert_eq!(first.inputs()[0].layout().shape(), &[16, 33]);
+        assert_eq!(second.inputs()[0].layout().shape(), &[17, 33]);
+        assert_eq!(first.inputs()[1], square);
+        assert_eq!(second.inputs()[1], square);
+        let one = tensor(4, DType::F32, &[1, 1024], &[1024, 1]);
+        let out = tensor(5, DType::F32, &[1, 1024], &[1024, 1]);
+        assert!(
+            Dispatch::new(Op::RmsNorm { eps: 1e-6 }, &[&one, &weight], &out)
+                .unwrap()
+                .split_output_rows()
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn tensor(buffer: u64, dtype: DType, shape: &[u32], strides: &[u64]) -> Tensor {
