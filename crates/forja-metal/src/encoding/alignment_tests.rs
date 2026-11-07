@@ -166,3 +166,135 @@ fn gather_vectors_check_absolute_weight_alignment() {
         false,
     );
 }
+
+#[test]
+fn contiguous_float_vectors_check_absolute_alignment() {
+    for (dtype, ty, bytes) in [
+        (DType::F32, "float4", 4),
+        (DType::F16, "half4", 2),
+        (DType::BF16, "bfloat4", 2),
+    ] {
+        let load = format!("*reinterpret_cast<device const {ty} *>(buffer + index * {bytes})");
+        let pointer = format!("buffer + index * {bytes}");
+        let zero = format!("{ty}(0)");
+        assert_variant(
+            Some("quant-matmul.gemv"),
+            Op::QuantMatmul {
+                bits: 4,
+                group_size: 64,
+            },
+            &quant_inputs(1, 8, 4, dtype, true, false),
+            &TensorSpec::contiguous(dtype, &[1, 8]),
+            Canary {
+                load: &load,
+                pointer: &pointer,
+                alignment: 4 * bytes,
+                zero: &zero,
+            },
+            false,
+        );
+    }
+}
+
+#[test]
+fn packed_vector_words_check_absolute_alignment() {
+    for (variant, ty, alignment) in [
+        ("quant-matmul.vector8", "uint2", 8),
+        ("quant-matmul.vector16", "uint4", 16),
+    ] {
+        let load = format!("*reinterpret_cast<device const {ty} *>(row + index * 4)");
+        let zero = format!("{ty}(0)");
+        assert_variant(
+            Some(variant),
+            Op::QuantMatmul {
+                bits: 4,
+                group_size: 64,
+            },
+            &quant_inputs(1, 8, 4, DType::F32, false, true),
+            &TensorSpec::contiguous(DType::F32, &[1, 8]),
+            Canary {
+                load: &load,
+                pointer: "row + index * 4",
+                alignment,
+                zero: &zero,
+            },
+            false,
+        );
+    }
+}
+
+#[test]
+fn q8_vector_words_check_absolute_alignment() {
+    assert_variant(
+        Some("quant-matmul.row-gemv"),
+        Op::QuantMatmul {
+            bits: 8,
+            group_size: 64,
+        },
+        &quant_inputs(4, 8, 8, DType::F32, false, true),
+        &TensorSpec::contiguous(DType::F32, &[4, 8]),
+        Canary {
+            load: "*(device const uint4 *)(packed + index * sizeof(uint))",
+            pointer: "packed + index * sizeof(uint)",
+            alignment: 16,
+            zero: "uint4(0)",
+        },
+        false,
+    );
+}
+
+#[test]
+fn grouped_input_vectors_check_absolute_alignment() {
+    let mut inputs = quant_inputs(33, 32, 4, DType::F32, true, false);
+    inputs[1] = TensorSpec::contiguous(DType::U32, &[7, 32, 128]);
+    inputs[2] = TensorSpec::contiguous(DType::F16, &[7, 32, 16]);
+    inputs[3] = TensorSpec::contiguous(DType::F16, &[7, 32, 16]);
+    let indices = (0..66_u32)
+        .map(|i| i % 7)
+        .flat_map(u32::to_ne_bytes)
+        .collect();
+    inputs.push(TensorSpec::initialized(DType::U32, &[33, 2], indices));
+    assert_variant(
+        Some("gather-quant-matmul.grouped-32x32-2x2"),
+        Op::GatherQuantMatmul {
+            bits: 4,
+            group_size: 64,
+        },
+        &inputs,
+        &TensorSpec::contiguous(DType::F32, &[33, 2, 32]),
+        Canary {
+            load: "*reinterpret_cast<device const float4 *>(source)",
+            pointer: "source",
+            alignment: 16,
+            zero: "float4(0)",
+        },
+        false,
+    );
+}
+
+#[test]
+fn tiled_quant_input_checks_absolute_alignment() {
+    let mut inputs = quant_inputs(33, 32, 4, DType::F32, false, false);
+    inputs[0] = TensorSpec::sliced(
+        DType::F32,
+        &[33 * 1024 + 1],
+        &[forja_core::Slice::new(1, 33 * 1024, 1).unwrap()],
+    )
+    .reshaped(&[33, 1024]);
+    assert_variant(
+        Some("quant-matmul.tiled"),
+        Op::QuantMatmul {
+            bits: 4,
+            group_size: 64,
+        },
+        &inputs,
+        &TensorSpec::contiguous(DType::F32, &[33, 32]),
+        Canary {
+            load: "*reinterpret_cast<device const QuantizedGemmRead16 *>(\n                    source + read * vector_elements)",
+            pointer: "source + read * vector_elements",
+            alignment: 16,
+            zero: "QuantizedGemmRead16{}",
+        },
+        false,
+    );
+}

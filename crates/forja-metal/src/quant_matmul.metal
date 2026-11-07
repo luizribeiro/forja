@@ -94,6 +94,11 @@ struct QuantMatmulParams {
 };
 
 float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtype) {
+    uint bytes = dtype == 0 ? 4 : 2;
+    if ((ulong(buffer + index * bytes) % (4 * bytes)) != 0) {
+        return float4(load_float(buffer, index, dtype), load_float(buffer, index + 1, dtype),
+            load_float(buffer, index + 2, dtype), load_float(buffer, index + 3, dtype));
+    }
     if (dtype == 0) {
         return *reinterpret_cast<device const float4 *>(buffer + index * 4);
     }
@@ -106,7 +111,8 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
 template <uint words_per_thread>
 uint4 load_quantized_words(device const uchar *row, ulong index, ulong word_stride, bool aligned) {
     uint4 words = uint4(0u);
-    if (qmv_vector_contiguous != 0 || (word_stride == 1 && aligned)) {
+    if ((qmv_vector_contiguous != 0 || (word_stride == 1 && aligned)) &&
+        ulong(row + index * 4) % (words_per_thread * 4) == 0) {
         if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
         else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
     } else {
@@ -421,7 +427,7 @@ void quantized_q8_sums(
                 ulong index = params.packed_offset +
                     ulong(column) * params.packed_row_stride +
                     ulong(first_word) * params.packed_word_stride;
-                if (params.packed_word_stride == 1 && (index & 3) == 0) {
+                if (params.packed_word_stride == 1 && ulong(packed + index * 4) % 16 == 0) {
                     quantized_words[row] =
                         *(device const uint4 *)(packed + index * sizeof(uint));
                 } else {
@@ -1273,7 +1279,7 @@ struct GroupedInputLoader {
     void load(device const uchar *input, constant GatherQuantMatmulParams &params,
               uint inner_origin) thread {
         if (input0_dtype == 0 && inner_origin + BK <= params.inner &&
-            params.input_offset % 4 == 0 && params.input_row_stride % 4 == 0 &&
+            ulong(input + params.input_offset * 4) % 16 == 0 && params.input_row_stride % 4 == 0 &&
             params.input_inner_stride == 1) {
             for (uint chunk = 0; chunk < count; chunk += 4) {
                 float4 value = 0.0f;
@@ -1793,7 +1799,7 @@ void load_quantized_gemm_input_tile(
     constexpr uint reads_per_thread = elements_per_thread / vector_elements;
     if (thread_count == 128 && row_origin + block_rows <= params.rows &&
         inner_origin + block_inner <= params.inner &&
-        params.input_offset % vector_elements == 0 &&
+        ulong(input + params.input_offset * sizeof(T)) % 16 == 0 &&
         params.input_row_stride % vector_elements == 0 &&
         params.input_inner_stride == 1) {
         uint local_row = thread_index / 4;

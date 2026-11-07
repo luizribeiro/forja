@@ -120,6 +120,13 @@ impl TensorSpec {
         }
     }
 
+    /// Adds a reshape after the existing view operations.
+    #[must_use]
+    pub fn reshaped(mut self, shape: &[u32]) -> Self {
+        self.views.push(ViewOp::Reshape(shape.to_vec()));
+        self
+    }
+
     /// Describes a tensor viewed through an axis permutation.
     #[must_use]
     pub fn permuted(dtype: DType, allocation_shape: &[u32], axes: &[u8]) -> Self {
