@@ -8,7 +8,9 @@ mod state;
 pub(crate) use state::block_schedule;
 #[cfg(test)]
 mod state_cache_tests;
+mod work_buffers;
 mod work_identity;
+pub(super) use work_buffers::SubmissionOwners;
 
 use std::{
     cell::{Cell, RefCell},
@@ -2410,15 +2412,11 @@ impl InFlightTracker {
 pub struct MetalSubmission {
     completion: Arc<Completion>,
     timeout: Duration,
+    deadline: Instant,
+    prefixes: Vec<MetalSubmission>,
     profile: Option<Mutex<SubmissionProfile>>,
     dispatch_profiles: Vec<DispatchProfile>,
     internal_profiles: Vec<InternalDispatchProfile>,
-}
-
-impl MetalSubmission {
-    pub(super) fn retain_resources(&self, owners: Vec<forja_core::CompletionResource>) {
-        self.completion.retain_resources(owners);
-    }
 }
 
 /// Timestamp granularity used for per-dispatch GPU profiling.
@@ -2444,7 +2442,11 @@ impl Submission for MetalSubmission {
     }
 
     fn gpu_time(&self) -> Option<Duration> {
-        self.completion.gpu_time()
+        self.prefixes
+            .iter()
+            .try_fold(self.completion.gpu_time()?, |total, prefix| {
+                total.checked_add(prefix.gpu_time()?)
+            })
     }
 
     fn profile(&self) -> Option<SubmissionProfile> {
@@ -2463,14 +2465,26 @@ impl Submission for MetalSubmission {
             outer.internal.push(internal);
         }
         profile.per_dispatch = dispatches;
-        Some(profile)
+        work_buffers::merge_profiles(
+            self.prefixes
+                .iter()
+                .map(Submission::profile)
+                .chain(std::iter::once(Some(profile))),
+        )
     }
 }
 
 impl MetalSubmission {
     fn wait_profiled(&self, timeout: Duration) -> Result<(), BackendError> {
         let started = Instant::now();
-        let result = self.completion.wait(timeout);
+        for prefix in &self.prefixes {
+            prefix.wait_profiled(
+                timeout.min(self.deadline.saturating_duration_since(Instant::now())),
+            )?;
+        }
+        let result = self
+            .completion
+            .wait(timeout.min(self.deadline.saturating_duration_since(Instant::now())));
         if result == Err(BackendError::Timeout)
             && let Some(work) = self.completion.work.get()
         {
@@ -2874,15 +2888,13 @@ impl MetalBackend {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn submit_commands_inner<const PROFILE: bool>(
+    fn prepare_commands<const PROFILE: bool>(
         &self,
         commands: CommandList,
         graph: Option<&PreparedMetalGraph>,
         graph_arena: Option<&GraphArenaReservation>,
         timestamp_granularity: ProfileTimestampGranularity,
-    ) -> Result<MetalSubmission, BackendError> {
-        #[cfg(test)]
-        let submit_started = Instant::now();
+    ) -> Result<work_buffers::PreparedBuffer, BackendError> {
         self.compiler.ensure_enabled()?;
         self.in_flight.drain_done();
         self.work_faults.check_backend()?;
@@ -3048,7 +3060,9 @@ impl MetalBackend {
             })
             .transpose()?
             .unwrap_or_else(|| vec![Duration::ZERO; dispatches.len()]);
-        let predicted = crate::work_admission::admit(&predictions, self.work_limits)?;
+        let predicted = predictions.iter().try_fold(Duration::ZERO, |sum, &value| {
+            sum.checked_add(value).ok_or(BackendError::QuotaExceeded)
+        })?;
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -3099,12 +3113,11 @@ impl MetalBackend {
         if PROFILE {
             state::fold_profiles(&dispatches, &mut dispatch_profiles)?;
         }
-        let commit_started = PROFILE.then(Instant::now);
-        let mut submission = self.commit(
-            &command_buffer,
-            &accesses,
+        Ok(work_buffers::PreparedBuffer {
+            command_buffer,
+            accesses,
             resources,
-            CommitResidency {
+            residency: CommitResidency {
                 work: work_calibration
                     .map(|_| {
                         self.work_faults.track(
@@ -3119,22 +3132,15 @@ impl MetalBackend {
                     |graph| vec![residency.clone(), graph.residency.clone()],
                 ),
                 order_on_queue: graph.is_some()
-                    || dispatches
-                        .iter()
-                        .any(|dispatch| matches!(dispatch.op(), Op::State(_))),
+                    || dispatches.iter().any(|d| matches!(d.op(), Op::State(_))),
             },
             timestamps,
-            &mut objects,
-        )?;
-        if let Some(mut profile) = profile {
-            profile.commit = commit_started.map_or(Duration::ZERO, |started| started.elapsed());
-            submission.profile = Some(Mutex::new(profile));
-            submission.dispatch_profiles = dispatch_profiles;
-            submission.internal_profiles = internal_profiles;
-        }
-        #[cfg(test)]
-        store_duration(&LAST_SUBMIT_NANOS, submit_started.elapsed());
-        Ok(submission)
+            objects,
+            profile,
+            dispatch_profiles,
+            internal_profiles,
+            predictions,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8504,6 +8510,7 @@ impl MetalBackend {
             timestamps,
             residency.order_on_queue,
         )?;
+        work_buffers::retain_owners(&completion);
         if let Some(work) = residency.work {
             let _ = completion.work.set(work);
         }
@@ -8539,6 +8546,10 @@ impl MetalBackend {
         Ok(MetalSubmission {
             completion,
             timeout: self.gpu_timeout,
+            deadline: Instant::now()
+                .checked_add(self.gpu_timeout)
+                .ok_or(BackendError::InvalidInput)?,
+            prefixes: Vec::new(),
             profile: None,
             dispatch_profiles: Vec::new(),
             internal_profiles: Vec::new(),

@@ -530,7 +530,7 @@ pub struct SubmissionProfile {
     pub epilogue_compile_fallbacks: u64,
     /// Sampling rows that exhausted rejection rounds and used the exact fallback.
     pub sample_fallbacks: u64,
-    /// Command validation and hazard analysis.
+    /// Command validation, admission preflight and hazard analysis.
     pub validation: Duration,
     /// Temporary Metal buffers created while encoding.
     pub metadata_buffers: ProfileCount,

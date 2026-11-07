@@ -259,22 +259,6 @@ pub(super) fn predict(
 pub(super) type WorkFaults = forja_core::GpuWorkTracker<Arc<[usize]>>;
 pub(super) type Backstop = forja_core::GpuWorkTicket<Arc<[usize]>>;
 
-pub(super) fn admit(
-    predictions: &[Duration],
-    limits: forja_core::GpuWorkLimits,
-) -> Result<Duration, BackendError> {
-    let total = predictions.iter().try_fold(Duration::ZERO, |sum, &time| {
-        if time > limits.dispatch() {
-            return Err(BackendError::QuotaExceeded);
-        }
-        sum.checked_add(time).ok_or(BackendError::QuotaExceeded)
-    })?;
-    if total > limits.command_buffer() || total > limits.submission() {
-        return Err(BackendError::QuotaExceeded);
-    }
-    Ok(total)
-}
-
 impl MetalBackend {
     /// Prepares device-specific admission calibration before loading an engine.
     /// # Errors
@@ -287,36 +271,6 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn admission_sums_buffer_costs_and_refuses_single_reductions() {
-        let limits = forja_core::GpuWorkLimits::new(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(8),
-            Duration::from_secs(10),
-            4,
-        )
-        .unwrap();
-        assert_eq!(
-            admit(
-                &[Duration::from_millis(600), Duration::from_millis(401)],
-                limits
-            ),
-            Err(BackendError::QuotaExceeded)
-        );
-        assert_eq!(
-            admit(&[Duration::from_millis(1001)], limits),
-            Err(BackendError::QuotaExceeded)
-        );
-        assert_eq!(
-            admit(
-                &[Duration::from_millis(600), Duration::from_millis(400)],
-                limits
-            ),
-            Ok(Duration::from_secs(1))
-        );
-    }
-
     #[test]
     fn calibration_refuses_missing_zero_or_unmeasured_rates() {
         assert!(from_samples(&[]).is_err());

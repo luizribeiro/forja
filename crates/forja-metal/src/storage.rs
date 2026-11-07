@@ -1464,9 +1464,8 @@ impl Backend for MetalBackend {
         commands: CommandList,
         owners: Vec<forja_core::CompletionResource>,
     ) -> Result<Self::Submission, BackendError> {
-        let submission = self.submit_commands(commands)?;
-        submission.retain_resources(owners);
-        Ok(submission)
+        let _owners = crate::encoding::SubmissionOwners::enter(owners);
+        self.submit_commands(commands)
     }
 
     fn submit_profiled_retained(
@@ -1474,9 +1473,8 @@ impl Backend for MetalBackend {
         commands: CommandList,
         owners: Vec<forja_core::CompletionResource>,
     ) -> Result<Self::Submission, BackendError> {
-        let submission = self.submit_commands_profiled(commands)?;
-        submission.retain_resources(owners);
-        Ok(submission)
+        let _owners = crate::encoding::SubmissionOwners::enter(owners);
+        self.submit_commands_profiled(commands)
     }
 
     fn submit_profiled(&self, commands: CommandList) -> Result<Self::Submission, BackendError> {
@@ -1536,9 +1534,8 @@ impl Backend for MetalBackend {
         owners: Vec<forja_core::CompletionResource>,
         profiled: bool,
     ) -> Result<Self::Submission, BackendError> {
-        let submission = self.replay_graph(graph, values, profiled, Some(bindings))?;
-        submission.retain_resources(owners);
-        Ok(submission)
+        let _owners = crate::encoding::SubmissionOwners::enter(owners);
+        self.replay_graph(graph, values, profiled, Some(bindings))
     }
 
     fn supports_replay_overlap(&self) -> bool {
