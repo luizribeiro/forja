@@ -131,3 +131,6 @@ mod tests {
 
 mod prefix_schedule;
 pub use prefix_schedule::CanonicalPrefixSchedule;
+
+mod work_rates;
+pub use work_rates::{MemoryAccess, WorkRates};
