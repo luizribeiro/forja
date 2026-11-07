@@ -322,6 +322,11 @@ do not measure occupancy, register allocation or spills.
 
 ## Choose the next optimization
 
+Calibration records include dependent scalar arithmetic, special-function and
+scattered-read probes for work admission.
+These probes supplement the roofline ceilings; the roofline ranking still treats
+scalar and integer instruction throughput as uncalibrated.
+
 Use `forja calibrate` once per device/OS identity. Its cache includes GPU family,
 core count, memory and OS build. `--force` refreshes it; `--json calibration.json`
 saves raw observations, median confidence intervals and build/load provenance.

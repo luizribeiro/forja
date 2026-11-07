@@ -80,6 +80,9 @@ const PROBES: &[&str] = &[
     "calibration_mma_bf16",
     "calibration_threadgroup",
     "dependent_dispatch",
+    "calibration_scalar",
+    "calibration_sfu",
+    "calibration_gather",
 ];
 
 fn probe_mode(
@@ -92,7 +95,13 @@ fn probe_mode(
         ("calibration_mma_bf16", Some("bf16")) => Ok(Some("bf16_native")),
         ("calibration_mma_bf16", Some("f32")) => Ok(Some("bf16_promoted_f32")),
         (
-            "streaming_read" | "streaming_copy" | "calibration_threadgroup" | "dependent_dispatch",
+            "streaming_read"
+            | "streaming_copy"
+            | "calibration_threadgroup"
+            | "dependent_dispatch"
+            | "calibration_scalar"
+            | "calibration_sfu"
+            | "calibration_gather",
             None,
         ) => Ok(None),
         _ => Err("invalid calibration arithmetic mode".into()),
@@ -106,6 +115,7 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
     let mut samples = backend.calibrate_memory(options.warmups, options.reps)?;
     samples.extend(backend.calibrate_compute(options.warmups, options.reps)?);
     samples.extend(backend.calibrate_dispatch(options.warmups, options.reps)?);
+    samples.extend(backend.calibrate_work(options.warmups, options.reps)?);
     let mut probes = serde_json::Map::new();
     for &name in PROBES {
         let selected = samples
@@ -139,7 +149,7 @@ fn measure(options: &Options, identity: &Value) -> Result<Value, Box<dyn Error>>
         })
         .collect::<serde_json::Map<_, _>>();
     Ok(
-        json!({"schema_version": 5, "kind": "device-calibration", "model_benchmark": false,
+        json!({"schema_version": 6, "kind": "device-calibration", "model_benchmark": false,
         "identity": identity, "warmups": options.warmups, "repetitions": options.reps,
         "timestamp_method": "unprofiled-command-buffer", "interval_method": "binomial-order-statistic-median",
         "bf16_arithmetic": if samples.iter().any(|sample| !sample.screening && sample.arithmetic == Some(forja_core::DType::BF16)) { "native-bf16" } else { "compiler refused native bf16 MMA; operands promoted to f32" },
@@ -161,7 +171,7 @@ fn sample_json(sample: &forja_metal::CalibrationSample) -> Value {
 }
 
 pub(crate) fn validate(record: &Value, identity: &Value) -> Result<(), Box<dyn Error>> {
-    if record["schema_version"] != 5 || record["identity"] != *identity {
+    if record["schema_version"] != 6 || record["identity"] != *identity {
         return Err("calibration identity or schema mismatch; recalibrate".into());
     }
     for &name in PROBES {
@@ -258,6 +268,15 @@ mod tests {
             Some("bf16_promoted_f32")
         );
         assert!(probe_mode("calibration_mma_f16", Some("f32")).is_err());
+        for name in [
+            "calibration_scalar",
+            "calibration_sfu",
+            "calibration_gather",
+        ] {
+            assert_eq!(probe_mode(name, None).unwrap(), None);
+            assert!(probe_mode(name, Some("f16")).is_err());
+            assert!(PROBES.contains(&name));
+        }
     }
 
     #[test]
