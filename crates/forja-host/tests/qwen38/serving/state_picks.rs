@@ -117,6 +117,7 @@ async fn trace(
         });
         let profile = runner.take_profile().ok_or("missing decode profile")?;
         assert_state_picks(&profile, picked);
+        assert_decode_norm(&profile, bucket);
     }
     Ok(rows)
 }
@@ -155,4 +156,52 @@ fn assert_state_picks(profile: &forja_host::EngineStepProfile, picked: bool) {
             assert!(states.iter().all(|d| d.variant == Some(name)));
         }
     }
+}
+
+fn assert_decode_norm(profile: &forja_host::EngineStepProfile, bucket: u32) {
+    let config = qwen38::Config::tiny();
+    let norms = profile
+        .submissions
+        .iter()
+        .flat_map(|s| &s.per_dispatch)
+        .filter(|d| {
+            matches!(d.op, Op::RmsNorm { .. })
+                && d.inputs[0].shape == [bucket * config.value_heads, config.value_dim]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        norms.len(),
+        usize::try_from(config.layers - config.layers / config.attention_interval).unwrap()
+    );
+    for norm in norms {
+        assert_eq!((norm.kernel, norm.variant), ("rms_norm", None));
+        assert_eq!(norm.inputs[0].dtype, forja_core::DType::BF16);
+        assert_eq!(norm.outputs[0].dtype, forja_core::DType::BF16);
+    }
+}
+
+#[tokio::test]
+async fn metal_batched_recurrent_norm_matches_independent_lane_bits() -> Result<(), Box<dyn Error>>
+{
+    let mut singles = Vec::new();
+    for lane in 0..8 {
+        singles.push(trace(1, false, false, lane).await?);
+    }
+    for bucket in [2, 4, 8] {
+        let actual = trace(bucket, true, true, 0).await?;
+        for (step, actual) in actual.iter().enumerate() {
+            let expected = Row {
+                logits: singles[..usize::try_from(bucket)?]
+                    .iter()
+                    .flat_map(|lane| lane[step].logits.iter().copied())
+                    .collect(),
+                tokens: singles[..usize::try_from(bucket)?]
+                    .iter()
+                    .flat_map(|lane| lane[step].tokens.iter().copied())
+                    .collect(),
+            };
+            assert_eq!(*actual, expected, "bucket={bucket} step={step}");
+        }
+    }
+    Ok(())
 }

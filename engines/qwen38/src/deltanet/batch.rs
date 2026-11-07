@@ -1,4 +1,4 @@
-use super::{DeltaNet, DeltaProjection, rows};
+use super::{DeltaNet, DeltaProjection, Phase, rows};
 use crate::numerics;
 use forja_sdk::{Error, Result, Tensor, bf16, target::metal::Variant};
 
@@ -63,7 +63,7 @@ impl DeltaNet {
                 state_picks[0],
             )?;
         }
-        self.finish_rows(&y, input, pick)
+        self.finish_rows(&y, input, pick, Phase::Decode)
     }
 }
 fn head_rows<T: forja_sdk::Element>(tensor: &Tensor<T>, row: u32, heads: u32) -> Result<Tensor<T>> {

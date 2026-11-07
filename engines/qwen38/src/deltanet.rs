@@ -13,11 +13,18 @@ pub struct DeltaNet {
     convolution: Tensor<bf16>,
     norm: Tensor<bf16>,
     norm_unit: Tensor<f32>,
+    norm_unit_decode: Tensor<bf16>,
     log_a: Tensor<f32>,
     dt_bias: Tensor<f32>,
     carry: Carry,
     state_picks: [Option<Variant>; 2],
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Phase {
+    Prefill,
+    Decode,
+}
+
 struct DeltaProjection {
     query: Tensor<f32>,
     key: Tensor<f32>,
@@ -58,6 +65,15 @@ impl DeltaNet {
             .reshape(&[channels, config.conv_width])?
             .permute(&[1, 0])?
             .contiguous()?;
+        let norm_unit = Tensor::constant(
+            &vec![
+                1.0_f32;
+                usize::try_from(config.value_dim)
+                    .map_err(|_| forja_sdk::Error::loading("head width exceeds address space"))?
+            ],
+            &[config.value_dim],
+        )?;
+        let norm_unit_decode = norm_unit.to_dtype()?;
         Ok(Self {
             config,
             qkv: Affine::load(&weights.scoped("in_proj_qkv"), config.hidden, channels)?,
@@ -70,15 +86,8 @@ impl DeltaNet {
             out: Affine::load(&weights.scoped("out_proj"), values, config.hidden)?,
             convolution,
             norm: weights.tensor("norm.weight", &[config.value_dim])?,
-            norm_unit: Tensor::constant(
-                &vec![
-                    1.0_f32;
-                    usize::try_from(config.value_dim).map_err(|_| forja_sdk::Error::loading(
-                        "head width exceeds address space"
-                    ))?
-                ],
-                &[config.value_dim],
-            )?,
+            norm_unit,
+            norm_unit_decode,
             log_a: weights
                 .tensor::<bf16>("A_log", &[config.value_heads])?
                 .to_dtype()?,
@@ -119,7 +128,7 @@ impl DeltaNet {
         input: &Tensor<bf16>,
         pick: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
-        self.forward(input, pick, false, None)
+        self.forward(input, pick, Phase::Decode, None)
     }
     /// Applies a canonical prefill block, including its masked final tail.
     ///
@@ -131,15 +140,16 @@ impl DeltaNet {
         quant: Option<&Variant>,
         delta: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
-        self.forward(input, quant, true, delta)
+        self.forward(input, quant, Phase::Prefill, delta)
     }
     fn forward(
         &mut self,
         input: &Tensor<bf16>,
         pick: Option<&Variant>,
-        prefill: bool,
+        phase: Phase,
         delta: Option<&Variant>,
     ) -> Result<Tensor<bf16>> {
+        let prefill = phase == Phase::Prefill;
         let c = self.config;
         let tokens = input.shape().first().copied().unwrap_or(0);
         if input.shape() != [tokens, c.hidden]
@@ -206,7 +216,7 @@ impl DeltaNet {
                 self.state_picks[0].as_ref(),
             )?
         };
-        self.finish_rows(&y, input, pick)
+        self.finish_rows(&y, input, pick, phase)
     }
     fn project_mix(
         &self,
@@ -251,6 +261,7 @@ impl DeltaNet {
         y: &Tensor<bf16>,
         input: &Tensor<bf16>,
         pick: Option<&Variant>,
+        phase: Phase,
     ) -> Result<Tensor<bf16>> {
         let c = self.config;
         let tokens = input.shape()[0];
@@ -259,8 +270,13 @@ impl DeltaNet {
             .z
             .forward(input, pick)?
             .reshape(&[value_rows, c.value_dim])?;
-        let gated = numerics::gated_norm(y, &self.norm, &z, &self.norm_unit)?
-            .reshape(&[tokens, c.value_heads * c.value_dim])?;
+        let gated = match phase {
+            Phase::Prefill => numerics::gated_norm(y, &self.norm, &z, &self.norm_unit)?,
+            Phase::Decode => {
+                numerics::gated_norm_decode(y, &self.norm, &z, &self.norm_unit_decode)?
+            }
+        }
+        .reshape(&[tokens, c.value_heads * c.value_dim])?;
         self.out.forward(&gated, pick)
     }
 }

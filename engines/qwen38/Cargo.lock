@@ -496,6 +496,7 @@ dependencies = [
  "forja-core",
  "forja-cpu",
  "forja-host",
+ "forja-metal",
  "forja-program-conversions",
  "forja-sampling",
  "forja-sdk-macros",
