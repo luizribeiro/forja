@@ -62,3 +62,31 @@ kernel void calibration_threadgroup(device const float *input [[buffer(0)]],
     }
     output[index] = sum.x + sum.y + sum.z + sum.w;
 }
+
+kernel void calibration_scalar(device const float *input [[buffer(0)]],
+                               device float *output [[buffer(1)]],
+                               uint index [[thread_position_in_grid]]) {
+    float seed = input[index];
+    float value = seed;
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        value = fma(value, 0.9999999f, seed * 0.0000001f);
+    }
+    output[index] = value;
+}
+
+kernel void calibration_sfu(device const float *input [[buffer(0)]],
+                            device float *output [[buffer(1)]],
+                            uint index [[thread_position_in_grid]]) {
+    float value = input[index];
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        value = fast::exp(-value);
+    }
+    output[index] = value;
+}
+
+kernel void calibration_gather(device const float *input [[buffer(0)]],
+                               device float *output [[buffer(1)]],
+                               uint index [[thread_position_in_grid]]) {
+    uint address = (index * 0x9e3779b9u) & calibration_iterations;
+    output[index] = input[address];
+}

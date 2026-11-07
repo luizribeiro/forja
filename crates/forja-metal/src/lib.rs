@@ -44,6 +44,8 @@ mod scalar_codegen;
 mod storage;
 #[cfg(target_os = "macos")]
 mod variants;
+#[cfg(target_os = "macos")]
+mod work_calibration;
 
 #[cfg(target_os = "macos")]
 pub use bandwidth::MemoryBandwidth;

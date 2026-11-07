@@ -3529,8 +3529,16 @@ impl MetalBackend {
         };
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
-        if let Some(probe) = dispatch.backend_data::<crate::calibration::Probe>() {
-            let pipeline = self.pipelines.get(probe.kernel(), &probe.constants())?;
+        let probe = dispatch
+            .backend_data::<crate::calibration::Probe>()
+            .map(|probe| (probe.kernel(), probe.constants()))
+            .or_else(|| {
+                dispatch
+                    .backend_data::<crate::work_calibration::WorkProbe>()
+                    .map(|probe| (probe.kernel(), probe.constants()))
+            });
+        if let Some((kernel, constants)) = probe {
+            let pipeline = self.pipelines.get(kernel, &constants)?;
             let layouts = vec![
                 Self::layout_buffer(&input.layout, arguments)?,
                 Self::layout_buffer(&output.layout, arguments)?,
