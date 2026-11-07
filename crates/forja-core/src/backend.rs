@@ -453,6 +453,8 @@ pub struct DispatchProfile {
     pub compute_dtype: crate::DType,
     /// Logical operation cost, independent of tile padding.
     pub cost: crate::KernelCost,
+    /// Conservative source-level work from the selected launch schedule, for admission.
+    pub scheduled_cost: crate::KernelCost,
     /// Lower and upper executed FLOPs after tile padding.
     pub padded_flops: [u64; 2],
     /// Logical input metadata.

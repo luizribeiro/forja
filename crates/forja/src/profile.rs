@@ -509,6 +509,7 @@ mod tests {
             variant: None,
             alternatives: Vec::new(),
             cost: forja_core::KernelCost::default(),
+            scheduled_cost: forja_core::KernelCost::default(),
             padded_flops: [0; 2],
             inputs,
             outputs,
@@ -536,10 +537,15 @@ mod tests {
             write_bytes: 132,
             ..forja_core::KernelCost::default()
         };
+        dispatch.scheduled_cost = forja_core::KernelCost {
+            scalar_ops: 33,
+            ..dispatch.cost
+        };
         let timeline = record::timeline(&[dispatch.clone(), dispatch]).unwrap();
         assert_eq!(timeline[0]["call_site"], "decoder/layer-7/dispatch-0");
         assert_eq!(timeline[1]["call_site"], "decoder/layer-7/dispatch-1");
         assert_eq!(timeline[0]["cost"]["read_bytes"], 132);
+        assert_eq!(timeline[0]["scheduled_cost"]["scalar_ops"], 33);
         assert_eq!(timeline[0]["scope"]["layer_type"], "sparse");
         assert_eq!(timeline[0]["physical_dispatches"], 1);
         assert_eq!(timeline[0]["compute_dtype"], "f32");

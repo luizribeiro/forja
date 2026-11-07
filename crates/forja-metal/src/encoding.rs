@@ -8564,6 +8564,8 @@ fn dispatch_profile(
         alternatives,
         cost,
         padded_flops,
+        scheduled_cost: crate::profile_cost::scheduled::of(dispatch)
+            .ok_or(BackendError::InvalidInput)?,
         op: dispatch.op(),
         kernel: dispatch_kernel(dispatch)?,
         inputs: dispatch.inputs().iter().map(ProfileTensor::from).collect(),

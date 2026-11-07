@@ -2260,14 +2260,8 @@ pub(crate) fn bounded_name(name: &str) -> bool {
         .any(|entry| entry.name == name && entry.implementation.bounded_attention)
 }
 
-pub(crate) fn profile_selection(
-    dispatch: &Dispatch,
-) -> (
-    Option<&'static str>,
-    Vec<&'static str>,
-    forja_core::CostModel,
-) {
-    let selected = dispatch
+fn selected_entry(dispatch: &Dispatch) -> Option<ValidatedVariant> {
+    dispatch
         .backend_data::<ValidatedVariant>()
         .copied()
         .or_else(|| {
@@ -2277,7 +2271,23 @@ pub(crate) fn profile_selection(
                 METAL4,
             )
             .ok()
-        });
+        })
+}
+
+pub(crate) fn selected_cost_model(dispatch: &Dispatch) -> forja_core::CostModel {
+    selected_entry(dispatch).map_or_else(forja_core::CostModel::default, |selected| {
+        REGISTRY[selected.index].cost
+    })
+}
+
+pub(crate) fn profile_selection(
+    dispatch: &Dispatch,
+) -> (
+    Option<&'static str>,
+    Vec<&'static str>,
+    forja_core::CostModel,
+) {
+    let selected = selected_entry(dispatch);
     let Some(selected) = selected else {
         return (None, Vec::new(), forja_core::CostModel::default());
     };

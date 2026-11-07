@@ -1,6 +1,7 @@
 use forja_core::{Dispatch, KernelCost, Op};
 mod bounded;
 mod sampling;
+pub(crate) mod scheduled;
 pub(crate) mod state_block;
 
 pub(crate) fn logical(dispatch: &Dispatch) -> Option<KernelCost> {
