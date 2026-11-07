@@ -212,6 +212,36 @@ mod tests {
     }
 
     #[test]
+    fn cached_calibration_requires_exact_identity_and_valid_rates() {
+        let rate = WorkRates::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.01).unwrap();
+        let calibration = WorkCalibration::new(
+            [rate; 3],
+            0.1,
+            128,
+            10.0,
+            vec![WorkObservation {
+                name: "probe".into(),
+                kernel: "kernel".into(),
+                units: 7,
+                gpu: Duration::from_millis(33),
+            }],
+        )
+        .unwrap();
+        let record = calibration.cache_record("device/source/OS");
+        let reused = WorkCalibration::from_cache_record(&record, "device/source/OS").unwrap();
+        assert_eq!(reused.observations, calibration.observations);
+        assert_eq!(reused.rates, calibration.rates);
+        assert!(reused.reused);
+        assert!(WorkCalibration::from_cache_record(&record, "device/source/other OS").is_none());
+        assert!(WorkCalibration::from_cache_record(&record.replace("33", "0"), "other").is_none());
+        let mut value: serde_json::Value = serde_json::from_str(&record).unwrap();
+        value["calibration"]["serial"]["read_bytes_per_second"] = serde_json::json!(0);
+        assert!(
+            WorkCalibration::from_cache_record(&value.to_string(), "device/source/OS").is_none()
+        );
+    }
+
+    #[test]
     fn rates_refuse_nonfinite_and_unrepresentable_predictions() {
         for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             for index in 0..7 {
@@ -258,6 +288,7 @@ pub struct WorkCalibration {
     group_threads: u64,
     dependent_read: f64,
     observations: Vec<WorkObservation>,
+    reused: bool,
 }
 impl WorkCalibration {
     /// Validates rates for scheduling groups and pointer-dependent metadata reads.
@@ -282,6 +313,7 @@ impl WorkCalibration {
             group_threads,
             dependent_read,
             observations,
+            reused: false,
         })
     }
     /// Prices aggregate work and the longest serial/cooperative path independently.
@@ -315,12 +347,63 @@ impl WorkCalibration {
     /// Retains rates, safety factors and raw observations in diagnostic records.
     #[must_use]
     pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({"kind":"admission calibration, not model throughput",
+        serde_json::json!({"kind":"admission calibration, not model throughput", "reused":self.reused,
             "rate_policy":"half the slowest independent observation; twice launch/group latency",
             "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
             "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
             "dependent_read_bytes_per_second":self.dependent_read,
             "observations": self.observations.iter().map(|s| serde_json::json!({"name":s.name,
                 "kernel":s.kernel,"units":s.units,"gpu_seconds":s.gpu.as_secs_f64()})).collect::<Vec<_>>()})
+    }
+}
+
+impl WorkCalibration {
+    /// Encodes calibration with the exact host-controlled source and device identity.
+    #[must_use]
+    pub fn cache_record(&self, identity: &str) -> String {
+        serde_json::json!({"identity":identity,"calibration":self.json()}).to_string()
+    }
+
+    /// Revalidates cached observations and all rates, refusing a different identity.
+    #[must_use]
+    pub fn from_cache_record(record: &str, identity: &str) -> Option<Self> {
+        let root: serde_json::Value = serde_json::from_str(record).ok()?;
+        if root["identity"].as_str()? != identity {
+            return None;
+        }
+        let value = &root["calibration"];
+        let rates = |name| {
+            let rate = &value[name];
+            WorkRates::new(
+                rate["read_bytes_per_second"].as_f64()?,
+                rate["copy_bytes_per_second"].as_f64()?,
+                rate["gather_bytes_per_second"].as_f64()?,
+                rate["matrix_flops_per_second"].as_f64()?,
+                rate["scalar_ops_per_second"].as_f64()?,
+                rate["sfu_ops_per_second"].as_f64()?,
+                rate["dependent_launch_seconds"].as_f64()?,
+            )
+        };
+        let observations = value["observations"]
+            .as_array()?
+            .iter()
+            .map(|s| {
+                Some(WorkObservation {
+                    name: s["name"].as_str()?.to_owned(),
+                    kernel: s["kernel"].as_str()?.to_owned(),
+                    units: s["units"].as_u64()?,
+                    gpu: Duration::try_from_secs_f64(s["gpu_seconds"].as_f64()?).ok()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut result = Self::new(
+            [rates("aggregate")?, rates("serial")?, rates("cooperative")?],
+            value["group_seconds"].as_f64()?,
+            value["group_reference_threads"].as_u64()?,
+            value["dependent_read_bytes_per_second"].as_f64()?,
+            observations,
+        )?;
+        result.reused = true;
+        Some(result)
     }
 }

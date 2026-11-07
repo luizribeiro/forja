@@ -1,3 +1,4 @@
+mod cache;
 use crate::{CalibrationSample, MetalBackend};
 use forja_core::{
     BackendError, Dispatch, MemoryAccess, Op, StateOp, WorkCalibration, WorkObservation, WorkRates,
@@ -30,6 +31,10 @@ static CALIBRATION: OnceLock<Result<(u64, Arc<WorkCalibration>), BackendError>> 
 pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>, BackendError> {
     let (device, rates) = CALIBRATION
         .get_or_init(|| {
+            let cache = cache::Cache::new(backend);
+            if let Some(rates) = cache.as_ref().and_then(cache::Cache::read) {
+                return Ok((backend.device.registryID(), Arc::new(rates)));
+            }
             let probe = MetalBackend::new()?;
             let mut samples = probe.calibrate_memory(1, 6)?;
             samples.extend(probe.calibrate_compute(1, 6)?);
@@ -37,7 +42,11 @@ pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>
             samples.extend(probe.calibrate_work(1, 6)?);
             samples.extend(probe.calibrate_compute_group(6)?);
             samples.extend(probe.calibrate_work_group(6)?);
-            Ok((probe.device.registryID(), Arc::new(from_samples(&samples)?)))
+            let rates = from_samples(&samples)?;
+            if let Some(cache) = cache {
+                cache.write(&rates);
+            }
+            Ok((probe.device.registryID(), Arc::new(rates)))
         })
         .as_ref()
         .map_err(|e| *e)?;
