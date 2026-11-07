@@ -4,7 +4,7 @@ use objc2_metal::MTLComputePipelineState;
 use super::{
     ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, MTL4ArgumentTable,
     MTLSize, MetalBackend, Op, ProtocolObject, dispatch_threadgroups, dtype_code, encode_layout,
-    error_state, set_argument_table, set_pipeline,
+    error_state, set_argument_table,
 };
 
 #[cfg(test)]
@@ -120,8 +120,8 @@ impl MetalBackend {
             if pipeline.maxTotalThreadsPerThreadgroup() < threads.width {
                 return Err(BackendError::UnsupportedOperation);
             }
-            set_pipeline(encoder, &pipeline);
-            dispatch_threadgroups(encoder, groups, threads);
+
+            dispatch_threadgroups(&pipeline, encoder, groups, threads)?;
         }
         Ok((vec![layouts, params, flag.clone()], flag))
     }

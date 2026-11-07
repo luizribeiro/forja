@@ -1,7 +1,7 @@
 use super::{
     ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, MTL4ArgumentTable,
     MTLSize, MetalBackend, Op, ProtocolObject, Tensor, dispatch_threadgroups, error_state,
-    set_argument_table, set_pipeline, state_arguments, state_geometry,
+    set_argument_table, state_arguments, state_geometry,
 };
 use crate::variants::MetalVariant;
 
@@ -121,12 +121,13 @@ impl MetalBackend {
             let count = u32::try_from(dispatches.len()).map_err(|_| BackendError::InvalidInput)?;
             buffers.push(arguments.write(&count.to_ne_bytes())?);
         }
-        set_pipeline(encoder, &pipeline);
+
         for (index, buffer) in buffers.iter().enumerate() {
             bindings.bind(table, index, buffer);
         }
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             groups,
             MTLSize {
@@ -134,7 +135,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         let flag = buffers[3].clone();
         Ok((buffers, flag))
     }

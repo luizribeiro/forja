@@ -4,7 +4,6 @@ use super::{
     ArgumentBindings, ArgumentWriter, BackendError, BufferBinding, Dispatch, EncoderTensor,
     MTL4ArgumentTable, MTLComputePipelineState, MTLSize, MetalBackend, Op, ProtocolObject,
     Retained, dispatch_threadgroups, dtype_code, encode_layout, error_state, set_argument_table,
-    set_pipeline,
 };
 
 mod block;
@@ -61,7 +60,7 @@ impl MetalBackend {
         let params = arguments.write(&parameter_bytes)?;
         let flag = arguments.write(&error_state())?;
         let pipeline = self.state_pipeline(kernel, std::slice::from_ref(dispatch))?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in tensors.iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
@@ -70,6 +69,7 @@ impl MetalBackend {
         bindings.bind(table, tensors.len() + 2, &flag);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             groups,
             MTLSize {
@@ -77,7 +77,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((vec![layouts, params, flag.clone()], flag))
     }
     fn state_pipeline(

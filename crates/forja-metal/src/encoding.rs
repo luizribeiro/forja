@@ -3569,11 +3569,12 @@ impl MetalBackend {
             ];
             bindings.bind(table, 0, &input.buffer);
             bindings.bind(table, 1, &output.buffer);
-            set_pipeline(encoder, &pipeline);
+
             set_argument_table(encoder, table);
             let count = usize::try_from(output.layout.element_count())
                 .map_err(|_| BackendError::InvalidInput)?;
             dispatch_threadgroups(
+                &pipeline,
                 encoder,
                 MTLSize {
                     width: count
@@ -3588,7 +3589,7 @@ impl MetalBackend {
                     height: 1,
                     depth: 1,
                 },
-            );
+            )?;
             return Ok(layouts);
         }
         self.encode_copy_tensors(encoder, table, &input, &output, bindings, arguments)
@@ -3687,7 +3688,7 @@ impl MetalBackend {
                     (216, u32::from(has_activity)),
                 ],
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&ordinary, &pool, &page_table, &generations]
             .into_iter()
             .enumerate()
@@ -3705,6 +3706,7 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         }
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: elements.div_ceil(threads),
@@ -3716,7 +3718,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((
             [ordinary_layout, params, error_flag.clone()]
                 .into_iter()
@@ -3772,7 +3774,7 @@ impl MetalBackend {
                     (216, 1),
                 ],
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [ordinary, pool, page_table, generations]
             .into_iter()
             .enumerate()
@@ -3787,6 +3789,7 @@ impl MetalBackend {
         let elements = usize::try_from(elements).map_err(|_| BackendError::InvalidInput)?;
         let threads = elements.min(pipeline.maxTotalThreadsPerThreadgroup());
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: elements.div_ceil(threads),
@@ -3798,7 +3801,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(vec![ordinary_layout, params])
     }
 
@@ -3956,7 +3959,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("paged_sdpa_validate", &[(216, u32::from(has_activity))])?;
-        set_pipeline(encoder, &validation);
+
         for (index, tensor) in [&page_table, &generations].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
@@ -3966,6 +3969,7 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         if gqa_blocks.is_none() {
             dispatch_threadgroups(
+                &validation,
                 encoder,
                 MTLSize {
                     width: usize::try_from(key_length.div_ceil(page_tokens).div_ceil(64))
@@ -3978,7 +3982,7 @@ impl MetalBackend {
                     height: 1,
                     depth: 1,
                 },
-            );
+            )?;
             encode_dispatch_barrier(encoder);
             if paged_validation_split(dispatch) {
                 write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
@@ -4096,7 +4100,6 @@ impl MetalBackend {
                 .get(paged_sdpa_kernel(dispatch, q[2])?, &steel_constants);
             match pipeline {
                 Ok(pipeline) => {
-                    set_pipeline(encoder, &pipeline);
                     for (index, tensor) in
                         [&query, &key, &value, &page_table, &generations, &output]
                             .into_iter()
@@ -4109,6 +4112,7 @@ impl MetalBackend {
                     bindings.bind(table, 8, activity);
                     set_argument_table(encoder, table);
                     dispatch_threadgroups(
+                        &pipeline,
                         encoder,
                         MTLSize {
                             width: usize::try_from(q[1].div_ceil(block_query))
@@ -4123,7 +4127,7 @@ impl MetalBackend {
                                 .map_err(|_| BackendError::InvalidInput)?,
                             depth: 1,
                         },
-                    );
+                    )?;
                     let mut temporaries = vec![params, error_flag.clone()];
                     temporaries.extend(default_activity.clone());
                     return Ok((temporaries, error_flag));
@@ -4150,7 +4154,7 @@ impl MetalBackend {
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
                 .get(first_kernel, &constants)?;
-            set_pipeline(encoder, &first);
+
             for (index, tensor) in [
                 &query,
                 &key,
@@ -4187,6 +4191,7 @@ impl MetalBackend {
 
             set_argument_table(encoder, table);
             dispatch_threadgroups(
+                &first,
                 encoder,
                 MTLSize {
                     width: usize::try_from(head_groups).map_err(|_| BackendError::InvalidInput)?,
@@ -4201,7 +4206,7 @@ impl MetalBackend {
                     height: 1,
                     depth: 1,
                 },
-            );
+            )?;
             encode_dispatch_barrier(encoder);
             write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
             let second = self
@@ -4209,7 +4214,7 @@ impl MetalBackend {
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
                 .get(paged_gqa_second_pass(q[2])?, &constants)?;
-            set_pipeline(encoder, &second);
+
             for (index, tensor) in [&partials, &sums, &maxs, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
             }
@@ -4217,6 +4222,7 @@ impl MetalBackend {
             bindings.bind(table, 5, activity);
             set_argument_table(encoder, table);
             dispatch_threadgroups(
+                &second,
                 encoder,
                 MTLSize {
                     width: usize::try_from(q[0]).map_err(|_| BackendError::InvalidInput)?,
@@ -4230,7 +4236,7 @@ impl MetalBackend {
                     height: 1,
                     depth: 1,
                 },
-            );
+            )?;
             let mut temporaries = vec![
                 params,
                 error_flag.clone(),
@@ -4255,7 +4261,7 @@ impl MetalBackend {
         if pipeline.maxTotalThreadsPerThreadgroup() < 1_024 {
             return Err(BackendError::UnsupportedOperation);
         }
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&query, &key, &value, &page_table, &generations, &output]
             .into_iter()
             .enumerate()
@@ -4267,6 +4273,7 @@ impl MetalBackend {
         bindings.bind(table, 8, activity);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(q[0]).map_err(|_| BackendError::InvalidInput)?,
@@ -4278,7 +4285,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         let mut temporaries = vec![params, error_flag.clone()];
         temporaries.extend(default_activity);
         Ok((temporaries, error_flag))
@@ -4469,7 +4476,7 @@ impl MetalBackend {
                     (2, dtype_code(output.layout.dtype())),
                 ],
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&input, &weights, &indices, &output]
             .into_iter()
             .enumerate()
@@ -4480,6 +4487,7 @@ impl MetalBackend {
         bindings.bind(table, 5, &error_flag);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(16))
@@ -4495,7 +4503,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((vec![params, error_flag.clone()], error_flag))
     }
 
@@ -4541,7 +4549,7 @@ impl MetalBackend {
             pipelines.get(kernel, &constants)?
         };
         drop(pipelines);
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&input, &packed, &scales, &biases, &output]
             .into_iter()
             .enumerate()
@@ -4591,6 +4599,7 @@ impl MetalBackend {
             _ => (8, 8, 256),
         };
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(column_tile))
@@ -4604,7 +4613,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((temporaries, error_flag))
     }
 
@@ -4750,7 +4759,7 @@ impl MetalBackend {
             pipelines.get("gather_quantized_gemv", &constants)?
         };
         drop(pipelines);
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&input, &packed, &scales, &biases, &indices, &output]
             .into_iter()
             .enumerate()
@@ -4765,6 +4774,7 @@ impl MetalBackend {
         }
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(8))
@@ -4780,7 +4790,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((temporaries, error_flag))
     }
 
@@ -4839,7 +4849,7 @@ impl MetalBackend {
                 schedule.implementation,
                 &constants,
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in tensors.into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
@@ -4848,6 +4858,7 @@ impl MetalBackend {
         let layouts = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)?;
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(4))
@@ -4861,7 +4872,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         let mut temporaries = vec![params, error_flag.clone()];
         temporaries.extend(layouts);
         Ok((temporaries, error_flag))
@@ -5014,7 +5025,7 @@ impl MetalBackend {
                 "gather_quantized_pair",
                 &constants,
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [
             &input,
             &first_packed,
@@ -5040,6 +5051,7 @@ impl MetalBackend {
         }
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(8))
@@ -5055,7 +5067,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((temporaries, error_flag))
     }
 
@@ -5223,7 +5235,7 @@ impl MetalBackend {
                 "grouped_quantized_pair_32x32_2x2_blocked",
                 &constants,
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [
             input,
             gate_packed,
@@ -5247,6 +5259,7 @@ impl MetalBackend {
         let layouts = self.bind_epilogue_arguments(dispatch, table, bindings, arguments)?;
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(shape[2].div_ceil(32))
@@ -5260,7 +5273,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         let mut temporaries = vec![
             gate_params,
             up_params,
@@ -5395,7 +5408,7 @@ impl MetalBackend {
                 "gathered_pair_from_projections",
                 &constants,
             )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&gate, &up, indices, output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
@@ -5407,6 +5420,7 @@ impl MetalBackend {
             .checked_mul(shape[2])
             .ok_or(BackendError::InvalidInput)?;
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(elements.div_ceil(256))
@@ -5419,7 +5433,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         let mut temporaries = vec![
             final_params,
             gate_qmm_params,
@@ -5460,7 +5474,7 @@ impl MetalBackend {
                 "count_expert_routes",
                 &[(2, dtype_code(output.layout.dtype()))],
             )?;
-        set_pipeline(encoder, &count_pipeline);
+
         bindings.bind(table, 0, &indices.buffer);
         bindings.bind(table, 1, &offsets.buffer);
         bindings.bind(table, 2, &output.buffer);
@@ -5468,6 +5482,7 @@ impl MetalBackend {
         bindings.bind(table, 4, error_flag);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &count_pipeline,
             encoder,
             MTLSize {
                 width: 1,
@@ -5479,7 +5494,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let plan_pipeline = self
@@ -5487,7 +5502,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("plan_expert_routes", &[(16, block_rows)])?;
-        set_pipeline(encoder, &plan_pipeline);
+
         bindings.bind(table, 0, &indices.buffer);
         bindings.bind(table, 1, &sorted.buffer);
         bindings.bind(table, 2, &offsets.buffer);
@@ -5495,6 +5510,7 @@ impl MetalBackend {
         bindings.bind(table, 4, params);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &plan_pipeline,
             encoder,
             MTLSize {
                 width: 1,
@@ -5506,7 +5522,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let arrange_pipeline = self
@@ -5514,9 +5530,10 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("arrange_expert_routes", &[])?;
-        set_pipeline(encoder, &arrange_pipeline);
+
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &arrange_pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(
@@ -5533,7 +5550,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         Ok(())
     }
@@ -5582,7 +5599,7 @@ impl MetalBackend {
             pipelines.get(kernel, &constants)?
         };
         drop(pipelines);
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [input, packed, scales, biases, sorted, blocks, output]
             .into_iter()
             .enumerate()
@@ -5592,6 +5609,7 @@ impl MetalBackend {
         bindings.bind(table, 7, params);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(shape[2].div_ceil(32))
@@ -5605,7 +5623,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(())
     }
 
@@ -5762,13 +5780,14 @@ impl MetalBackend {
                     )?,
                     &constants,
                 )?;
-            set_pipeline(encoder, &pipeline);
+
             for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
             }
             bindings.bind(table, 4, &params);
             set_argument_table(encoder, table);
             dispatch_threadgroups(
+                &pipeline,
                 encoder,
                 MTLSize {
                     width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
@@ -5783,7 +5802,7 @@ impl MetalBackend {
                     height: 1,
                     depth: 1,
                 },
-            );
+            )?;
             return Ok(temporaries);
         }
 
@@ -5810,7 +5829,7 @@ impl MetalBackend {
                 )?,
                 &constants,
             )?;
-        set_pipeline(encoder, &first);
+
         for (index, tensor) in [&query, &key, &value, &intermediate, &sums, &maxs]
             .into_iter()
             .enumerate()
@@ -5820,6 +5839,7 @@ impl MetalBackend {
         bindings.bind(table, 6, &params);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &first,
             encoder,
             MTLSize {
                 width: usize::try_from(if width == 256 { query_heads } else { kv_heads })
@@ -5841,7 +5861,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         encode_dispatch_barrier(encoder);
         let second = self
             .pipelines
@@ -5858,7 +5878,7 @@ impl MetalBackend {
                 )?,
                 &constants,
             )?;
-        set_pipeline(encoder, &second);
+
         for (index, tensor) in [&intermediate, &sums, &maxs, &output]
             .into_iter()
             .enumerate()
@@ -5868,6 +5888,7 @@ impl MetalBackend {
         bindings.bind(table, 4, &params);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &second,
             encoder,
             MTLSize {
                 width: usize::try_from(query_heads).map_err(|_| BackendError::InvalidInput)?,
@@ -5879,7 +5900,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         temporaries.extend([intermediate.buffer, sums.buffer, maxs.buffer]);
         Ok(temporaries)
     }
@@ -5917,13 +5938,14 @@ impl MetalBackend {
         let params = Self::sdpa_params(
             &query, &key, &value, &output, scale, causal, q_start, 1, arguments,
         )?;
-        set_pipeline(encoder, &pipeline);
+
         for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
         }
         bindings.bind(table, 4, &params);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(query_length.div_ceil(block_query))
@@ -5936,7 +5958,7 @@ impl MetalBackend {
                 height: usize::try_from(block_query / 8).map_err(|_| BackendError::InvalidInput)?,
                 depth: 1,
             },
-        );
+        )?;
         Ok(vec![params])
     }
 
@@ -6245,7 +6267,7 @@ impl MetalBackend {
             params.extend_from_slice(&value.to_ne_bytes());
         }
         let params = arguments.write(&params)?;
-        set_pipeline(encoder, &pipeline);
+
         bindings.bind(table, 0, &scores.buffer);
         bindings.bind(table, 1, &params);
         set_argument_table(encoder, table);
@@ -6253,6 +6275,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::InvalidInput)?;
         let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: count.div_ceil(width),
@@ -6264,7 +6287,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(params)
     }
 
@@ -6333,13 +6356,14 @@ impl MetalBackend {
         };
         let launch = self.matmul_launch(shape, selected, epilogue)?;
         log_matmul_route(left, right, output, &launch, shape);
-        set_pipeline(encoder, &launch.pipeline);
+
         bindings.bind(table, 0, &left.tensor.buffer);
         bindings.bind(table, 1, &right.tensor.buffer);
         bindings.bind(table, 2, &output.tensor.buffer);
         bindings.bind(table, 3, &parameter_buffer);
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &launch.pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(columns.div_ceil(launch.block_columns))
@@ -6353,7 +6377,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(parameter_buffer)
     }
 
@@ -6538,7 +6562,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get(kernel, if vectorized { &[] } else { &constants })?;
-        set_pipeline(encoder, &pipeline);
+
         let layouts = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&output.layout, arguments)?,
@@ -6552,6 +6576,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         let width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: count.div_ceil(width),
@@ -6563,7 +6588,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(layouts)
     }
 
@@ -6684,7 +6709,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("rope", &constants)?;
-        set_pipeline(encoder, &pipeline);
+
         let mut params = [0_u8; 12];
         params[..4].copy_from_slice(&heads.to_ne_bytes());
         params[4..8].copy_from_slice(&width.to_ne_bytes());
@@ -6724,6 +6749,7 @@ impl MetalBackend {
         let thread_count = usize::try_from(pair_count).map_err(|_| BackendError::InvalidInput)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
@@ -6735,7 +6761,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(temporaries)
     }
 
@@ -6762,7 +6788,7 @@ impl MetalBackend {
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .get("embed", &constants)?;
-        set_pipeline(encoder, &pipeline);
+
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&vocab.to_ne_bytes());
         params[4..].copy_from_slice(&width.to_ne_bytes());
@@ -6792,6 +6818,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::InvalidInput)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
@@ -6803,7 +6830,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((temporaries, error_flag))
     }
 
@@ -6840,7 +6867,7 @@ impl MetalBackend {
                     (224, 0),
                 ],
             )?;
-        set_pipeline(encoder, &pipeline);
+
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&vocab.to_ne_bytes());
         params[4..].copy_from_slice(&width.to_ne_bytes());
@@ -6875,6 +6902,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::InvalidInput)?;
         let group_width = pipeline.maxTotalThreadsPerThreadgroup().clamp(1, 256);
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: thread_count.div_ceil(group_width),
@@ -6886,7 +6914,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok((temporaries, error_flag))
     }
 
@@ -6909,7 +6937,7 @@ impl MetalBackend {
             (2, dtype_code(output.layout.dtype())),
         ];
         let pipeline = self.row_pipeline("softmax_single", "softmax_looped", width, &constants)?;
-        set_pipeline(encoder, &pipeline);
+
         let temporaries = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&output.layout, arguments)?,
@@ -6922,7 +6950,7 @@ impl MetalBackend {
         bindings.bind(table, 4, &temporaries[2]);
         set_argument_table(encoder, table);
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, &output.layout, width)?;
-        dispatch_threadgroups(encoder, threadgroups, threads);
+        dispatch_threadgroups(&pipeline, encoder, threadgroups, threads)?;
         Ok(temporaries)
     }
 
@@ -6963,7 +6991,7 @@ impl MetalBackend {
             .map_err(|_| BackendError::ExecutionFailed)?;
         bindings.bind_raw(table, 0, buffers.get(input)?)?;
         drop(buffers);
-        set_pipeline(encoder, &partials_pipeline);
+
         bindings.bind(table, 1, &scratch.buffer);
         bindings.bind(table, 2, &temporaries[0]);
         bindings.bind(table, 3, &temporaries[2]);
@@ -6971,6 +6999,7 @@ impl MetalBackend {
         set_argument_table(encoder, table);
         let partial_threads = simd_thread_count(&partials_pipeline, 256)?;
         dispatch_threadgroups(
+            &partials_pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(rows)
@@ -6987,9 +7016,9 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &finalize_pipeline);
+
         bindings.bind(table, 0, &scratch.buffer);
         let buffers = self
             .buffers
@@ -7006,6 +7035,7 @@ impl MetalBackend {
             .min(256);
         let finalize_threads = simd_thread_count(&finalize_pipeline, requested_threads)?;
         dispatch_threadgroups(
+            &finalize_pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
@@ -7017,7 +7047,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         temporaries.push(scratch.buffer);
         Ok(temporaries)
     }
@@ -7086,10 +7116,11 @@ impl MetalBackend {
         for (index, temporary) in temporaries.iter().enumerate() {
             bindings.bind(table, index + 3, temporary);
         }
-        set_pipeline(encoder, &pipeline);
+
         set_argument_table(encoder, table);
         let threads = simd_thread_count(&pipeline, requested_threads)?;
         dispatch_threadgroups(
+            &pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
@@ -7101,7 +7132,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(temporaries)
     }
 
@@ -7207,7 +7238,7 @@ impl MetalBackend {
             arguments.write(&k.to_ne_bytes())?,
             arguments.write(&u32::from(normalize).to_ne_bytes())?,
         ];
-        set_pipeline(encoder, &partials_pipeline);
+
         bindings.bind(table, 0, &input.buffer);
         bindings.bind(table, 1, &scratch.buffer);
         bindings.bind(table, 2, &temporaries[1]);
@@ -7218,6 +7249,7 @@ impl MetalBackend {
         let partial_groups = usize::try_from(u64::from(rows) * u64::from(chunks))
             .map_err(|_| BackendError::ExecutionFailed)?;
         dispatch_threadgroups(
+            &partials_pipeline,
             encoder,
             MTLSize {
                 width: partial_groups,
@@ -7229,9 +7261,9 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &finalize_pipeline);
+
         for (index, tensor) in [&input, &scratch, &values, &indices]
             .into_iter()
             .enumerate()
@@ -7243,6 +7275,7 @@ impl MetalBackend {
         }
         set_argument_table(encoder, table);
         dispatch_threadgroups(
+            &finalize_pipeline,
             encoder,
             MTLSize {
                 width: usize::try_from(rows).map_err(|_| BackendError::ExecutionFailed)?,
@@ -7254,7 +7287,7 @@ impl MetalBackend {
                 height: 1,
                 depth: 1,
             },
-        );
+        )?;
         Ok(temporaries)
     }
 
@@ -7414,7 +7447,7 @@ impl MetalBackend {
         bindings.bind(table, 5, &temporaries[SAMPLE_MAX_ROUNDS]);
         bindings.bind(table, 6, &rejection_dispatch.buffer);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&prepare_pipeline, encoder, row_groups, threads)?;
+        dispatch_threadgroups(&prepare_pipeline, encoder, row_groups, threads)?;
 
         let common = SampleCommonBindings {
             logits: &logits_buffer,
@@ -7435,14 +7468,14 @@ impl MetalBackend {
             bindings.bind(table, 9, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             if round == 0 {
-                dispatch_pipeline_threadgroups(
+                dispatch_threadgroups(
                     &rejection_proposal_partials_pipeline,
                     encoder,
                     chunk_groups,
                     threads,
                 )?;
             } else {
-                dispatch_pipeline_threadgroups_indirect(
+                dispatch_threadgroups_indirect(
                     &rejection_proposal_partials_pipeline,
                     encoder,
                     &rejection_dispatch.buffer,
@@ -7456,7 +7489,7 @@ impl MetalBackend {
             bindings.bind(table, 1, &state.buffer);
             bindings.bind(table, 2, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
-            dispatch_pipeline_threadgroups(
+            dispatch_threadgroups(
                 &rejection_proposal_finalize_pipeline,
                 encoder,
                 row_groups,
@@ -7469,14 +7502,14 @@ impl MetalBackend {
             bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             if round == 0 {
-                dispatch_pipeline_threadgroups(
+                dispatch_threadgroups(
                     &rejection_threshold_partials_pipeline,
                     encoder,
                     chunk_groups,
                     threads,
                 )?;
             } else {
-                dispatch_pipeline_threadgroups_indirect(
+                dispatch_threadgroups_indirect(
                     &rejection_threshold_partials_pipeline,
                     encoder,
                     &rejection_dispatch.buffer,
@@ -7500,7 +7533,7 @@ impl MetalBackend {
             bindings.bind(table, 11, &temporaries[SAMPLE_CHUNKS]);
             bindings.bind(table, 12, &rejection_dispatch.buffer);
             set_argument_table(encoder, table);
-            dispatch_pipeline_threadgroups(
+            dispatch_threadgroups(
                 &rejection_threshold_finalize_pipeline,
                 encoder,
                 row_groups,
@@ -7516,7 +7549,7 @@ impl MetalBackend {
         bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
         bindings.bind(table, 5, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&topk_partials_pipeline, encoder, chunk_groups, threads)?;
+        dispatch_threadgroups(&topk_partials_pipeline, encoder, chunk_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
 
@@ -7532,7 +7565,7 @@ impl MetalBackend {
         bindings.bind(table, 9, &temporaries[SAMPLE_ERROR]);
         bindings.bind(table, 10, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&topk_finalize_pipeline, encoder, row_groups, threads)?;
+        dispatch_threadgroups(&topk_finalize_pipeline, encoder, row_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
 
@@ -7548,7 +7581,7 @@ impl MetalBackend {
         bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
         bindings.bind(table, 10, &temporaries[SAMPLE_ERROR]);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&exact_fallback_pipeline, encoder, row_groups, threads)?;
+        dispatch_threadgroups(&exact_fallback_pipeline, encoder, row_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
 
@@ -7557,7 +7590,7 @@ impl MetalBackend {
         bindings.bind(table, 8, &temporaries[SAMPLE_CHUNKS]);
         bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&partials_pipeline, encoder, chunk_groups, threads)?;
+        dispatch_threadgroups(&partials_pipeline, encoder, chunk_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
 
@@ -7570,7 +7603,7 @@ impl MetalBackend {
         bindings.bind(table, 6, &temporaries[SAMPLE_WIDTH]);
         bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_pipeline_threadgroups(&reduce_finalize_pipeline, encoder, row_groups, threads)?;
+        dispatch_threadgroups(&reduce_finalize_pipeline, encoder, row_groups, threads)?;
 
         temporaries.extend([
             logits_buffer,
@@ -7684,7 +7717,7 @@ impl MetalBackend {
             height: 1,
             depth: 1,
         };
-        set_pipeline(encoder, &partials_pipeline);
+
         for (index, buffer) in [
             &logits_buffer,
             &sampling_buffer,
@@ -7703,11 +7736,11 @@ impl MetalBackend {
         bindings.bind(table, 8, &temporaries[6]);
         bindings.bind(table, 9, &temporaries[7]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, chunk_groups, threads);
+        dispatch_threadgroups(&partials_pipeline, encoder, chunk_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
-        set_pipeline(encoder, &finalize_pipeline);
+
         for (index, buffer) in [
             &logits_buffer,
             &sampling_buffer,
@@ -7728,7 +7761,7 @@ impl MetalBackend {
         bindings.bind(table, 11, &temporaries[7]);
         bindings.bind(table, 12, &error_flag);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
+        dispatch_threadgroups(&finalize_pipeline, encoder, row_groups, threads)?;
         temporaries.extend([
             logits_buffer,
             sampling_buffer,
@@ -7773,7 +7806,7 @@ impl MetalBackend {
         ];
         let pipeline =
             self.row_pipeline("rms_norm_single", "rms_norm_looped", width, &constants)?;
-        set_pipeline(encoder, &pipeline);
+
         let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
             Self::layout_buffer(weight.layout(), arguments)?,
@@ -7795,7 +7828,7 @@ impl MetalBackend {
         drop(buffers);
         set_argument_table(encoder, table);
         let (threadgroups, threads) = row_dispatch_geometry(&pipeline, output.layout(), width)?;
-        dispatch_threadgroups(encoder, threadgroups, threads);
+        dispatch_threadgroups(&pipeline, encoder, threadgroups, threads)?;
         Ok(temporaries)
     }
 
@@ -7847,7 +7880,7 @@ impl MetalBackend {
         if pipeline.compile_fallback {
             *state.compile_fallbacks = state.compile_fallbacks.saturating_add(1);
         }
-        set_pipeline(encoder, &pipeline.state);
+
         let operands = program
             .inputs()
             .iter()
@@ -7889,7 +7922,12 @@ impl MetalBackend {
                 )?
             }
         };
-        dispatch_threadgroups(encoder, threadgroups, threads_per_threadgroup);
+        dispatch_threadgroups(
+            &pipeline.state,
+            encoder,
+            threadgroups,
+            threads_per_threadgroup,
+        )?;
         Ok(layouts)
     }
 
@@ -9624,7 +9662,17 @@ fn record_pipeline_launch(
     Ok(())
 }
 
-fn dispatch_pipeline_threadgroups(
+fn set_argument_table(
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    table: &ProtocolObject<dyn MTL4ArgumentTable>,
+) {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    record_plan_call(PlanCall::ArgumentTable);
+    encoder.setArgumentTable(Some(table));
+}
+
+fn dispatch_threadgroups(
     pipeline: &ComputePipeline,
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     threadgroups: MTLSize,
@@ -9642,7 +9690,7 @@ fn dispatch_pipeline_threadgroups(
     Ok(())
 }
 
-fn dispatch_pipeline_threadgroups_indirect(
+fn dispatch_threadgroups_indirect(
     pipeline: &ComputePipeline,
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     arguments: &BufferBinding,
@@ -9676,40 +9724,6 @@ fn validate_launch_threads(available: usize, threads: MTLSize) -> Result<(), Bac
         .filter(|&count| count > 0 && count <= available)
         .map(|_| ())
         .ok_or(BackendError::UnsupportedOperation)
-}
-
-fn set_pipeline(
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    pipeline: &Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-) {
-    use objc2_metal::MTL4ComputeCommandEncoder;
-
-    record_plan_call(PlanCall::Pipeline(pipeline.clone()));
-    encoder.setComputePipelineState(pipeline);
-}
-
-fn set_argument_table(
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    table: &ProtocolObject<dyn MTL4ArgumentTable>,
-) {
-    use objc2_metal::MTL4ComputeCommandEncoder;
-
-    record_plan_call(PlanCall::ArgumentTable);
-    encoder.setArgumentTable(Some(table));
-}
-
-fn dispatch_threadgroups(
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    threadgroups: MTLSize,
-    threads_per_threadgroup: MTLSize,
-) {
-    use objc2_metal::MTL4ComputeCommandEncoder;
-
-    record_plan_call(PlanCall::Dispatch {
-        threadgroups,
-        threads_per_threadgroup,
-    });
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
 }
 
 fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>) {
