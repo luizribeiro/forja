@@ -7368,7 +7368,21 @@ impl MetalBackend {
             depth: 1,
         };
         let threads = MTLSize {
-            width: simd_thread_count(&rejection_proposal_partials_pipeline, 256)?,
+            width: sample_thread_count(
+                &[
+                    &rejection_proposal_partials_pipeline,
+                    &prepare_pipeline,
+                    &rejection_proposal_finalize_pipeline,
+                    &rejection_threshold_partials_pipeline,
+                    &rejection_threshold_finalize_pipeline,
+                    &topk_partials_pipeline,
+                    &topk_finalize_pipeline,
+                    &exact_fallback_pipeline,
+                    &partials_pipeline,
+                    &reduce_finalize_pipeline,
+                ]
+                .map(|pipeline| pipeline.maxTotalThreadsPerThreadgroup()),
+            )?,
             height: 1,
             depth: 1,
         };
@@ -7614,7 +7628,10 @@ impl MetalBackend {
             depth: 1,
         };
         let threads = MTLSize {
-            width: simd_thread_count(&partials_pipeline, 256)?,
+            width: sample_thread_count(
+                &[&partials_pipeline, &finalize_pipeline]
+                    .map(|pipeline| pipeline.maxTotalThreadsPerThreadgroup()),
+            )?,
             height: 1,
             depth: 1,
         };
@@ -9778,6 +9795,13 @@ fn required_thread_count(available: usize, required: usize) -> Result<usize, Bac
     }
 }
 
+fn sample_thread_count(limits: &[usize]) -> Result<usize, BackendError> {
+    for &available in limits {
+        required_thread_count(available, 256)?;
+    }
+    Ok(256)
+}
+
 fn simd_thread_count(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     requested: usize,
@@ -10824,6 +10848,17 @@ mod tests {
         for available in [1024, 2048] {
             assert_eq!(attention_reduction_thread_count(available), Ok(1024));
         }
+    }
+
+    #[test]
+    fn sampling_refuses_any_pipeline_with_too_few_threads() {
+        for limits in [[1024, 128], [128, 1024], [256, 255]] {
+            assert_eq!(
+                sample_thread_count(&limits),
+                Err(BackendError::UnsupportedOperation)
+            );
+        }
+        assert_eq!(sample_thread_count(&[1024, 256, 512]), Ok(256));
     }
 
     fn shared_quant_canary(
