@@ -182,8 +182,13 @@ void state_causal_conv_compute(
         ulong row = index / params.channels;
         float sum = 0.0f;
         for (uint tap=0;tap<params.taps;++tap) {
+#ifdef FORJA_SAFE_STATE_CONV
+            sum = fma(causal_state_value(input,history,layouts,row+tap,channel,params),
+                load_float(weight,physical_index(layouts[1],tap*params.channels+channel),input1_dtype),sum);
+#else
             sum += causal_state_value(input,history,layouts,row+tap,channel,params)
                 * load_float(weight,physical_index(layouts[1],tap*params.channels+channel),input1_dtype);
+#endif
         }
         store_float(output,physical_index(layouts[3],index),output_dtype,sum);
     }

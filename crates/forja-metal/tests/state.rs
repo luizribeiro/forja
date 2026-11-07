@@ -64,3 +64,47 @@ fn metal_causal_conv_matches_cpu_with_strides_and_history_tails() {
         }
     }
 }
+
+#[test]
+fn metal_causal_conv_pins_ordered_fused_tap_bits() {
+    use forja_core::Backend;
+    let cpu = forja_cpu::CpuBackend::new();
+    let metal = forja_metal::MetalBackend::new().unwrap();
+    let (access, metadata) = state_test_metadata().unwrap();
+    let bytes = |values: &[f32]| {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    };
+    let mut inputs = vec![
+        TensorSpec::initialized(DType::F32, &[1, 1], bytes(&[0.0])),
+        TensorSpec::initialized(
+            DType::F32,
+            &[4, 1],
+            bytes(&[1.0, 1.0 - f32::EPSILON, 0.0, 0.0]),
+        ),
+        TensorSpec::initialized(DType::F32, &[3, 1], bytes(&[-1.0, 1.0 + f32::EPSILON, 0.0])),
+    ];
+    inputs.extend(metadata);
+    let mut output = None;
+    forja_testing::assert_backends_agree_many_selected_with(
+        &cpu,
+        &metal,
+        Op::State(StateOp::CausalDepthwiseConv(access)),
+        &inputs,
+        &[
+            TensorSpec::contiguous(DType::F32, &[1, 1]),
+            TensorSpec::contiguous(DType::F32, &[3, 1]),
+        ],
+        &[0, 1],
+        |commands| {
+            output = Some(commands.last_dispatch().unwrap().output().clone());
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        metal.read(&output.unwrap()).unwrap(),
+        0xa880_0000_u32.to_le_bytes()
+    );
+}

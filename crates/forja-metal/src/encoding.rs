@@ -10298,6 +10298,7 @@ pub(super) struct PipelineCache {
     pipeline_budget: AtomicUsize,
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    safe_state_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: crate::compile_cache::CompileCache<PipelineKey, ComputePipeline>,
     epilogue_libraries: crate::compile_cache::CompileCache<
         epilogue_codegen::SourceKey,
@@ -10407,11 +10408,16 @@ impl PipelineCache {
         source: &str,
         compiler: crate::compiler::Compiler,
     ) -> Result<Self, BackendError> {
+        let safe_source = NSString::from_str(&format!(
+            "#pragma clang fp contract(off)\n#define FORJA_SAFE_STATE_CONV 1\n{source}"
+        ));
         let source = NSString::from_str(source);
         let fast_options = compile_options(MTLMathMode::Fast);
         let fast_library = compiler.library(device, &source, &fast_options)?;
         let nan_preserving_options = compile_options(MTLMathMode::Relaxed);
         let nan_preserving_library = compiler.library(device, &source, &nan_preserving_options)?;
+        let safe_options = compile_options(MTLMathMode::Safe);
+        let safe_state_library = compiler.library(device, &safe_source, &safe_options)?;
         Ok(Self {
             compiler: Arc::new(compiler),
             device: device.clone(),
@@ -10419,6 +10425,7 @@ impl PipelineCache {
             pipeline_budget: AtomicUsize::new(256),
             fast_library,
             nan_preserving_library,
+            safe_state_library,
             pipelines: crate::compile_cache::CompileCache::default(),
             epilogue_libraries: crate::compile_cache::CompileCache::default(),
             epilogue_pipelines: crate::compile_cache::CompileCache::default(),
@@ -10441,7 +10448,9 @@ impl PipelineCache {
             || self.charge_pipeline(),
             || {
                 let values = function_constants(constants)?;
-                let library = if nan_preserving_kernel(name) {
+                let library = if matches!(name, "state_causal_conv" | "state_causal_conv_lanes") {
+                    &self.safe_state_library
+                } else if nan_preserving_kernel(name) {
                     &self.nan_preserving_library
                 } else {
                     &self.fast_library

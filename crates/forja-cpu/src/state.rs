@@ -91,8 +91,11 @@ fn causal_conv(values: &[Vec<f32>], input: &Tensor) -> Result<(Vec<f32>, Vec<f32
     for row in 0..rows {
         for channel in 0..channels {
             for tap in 0..taps {
-                output[row * channels + channel] +=
-                    joined[(row + tap) * channels + channel] * values[1][tap * channels + channel];
+                output[row * channels + channel] = joined[(row + tap) * channels + channel]
+                    .mul_add(
+                        values[1][tap * channels + channel],
+                        output[row * channels + channel],
+                    );
             }
         }
     }
@@ -222,6 +225,34 @@ mod tests {
         backend.write(&inputs[7], &[0; 12]).unwrap();
         assert!(run().is_err());
         assert_eq!(backend.read(&state).unwrap(), before);
+    }
+
+    #[test]
+    fn causal_convolution_pins_ordered_fused_tap_bits() {
+        let backend = CpuBackend::new();
+        let (access, inputs) = state_inputs(
+            &backend,
+            &[
+                (&[1, 1], vec![0.0]),
+                (&[4, 1], vec![1.0, 1.0 - f32::EPSILON, 0.0, 0.0]),
+                (&[3, 1], vec![-1.0, 1.0 + f32::EPSILON, 0.0]),
+            ],
+        );
+        let output = backend.alloc(DType::F32, &[1, 1]).unwrap();
+        let next = backend.alloc(DType::F32, &[3, 1]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_many(
+                Op::State(StateOp::CausalDepthwiseConv(access)),
+                &inputs.iter().collect::<Vec<_>>(),
+                &[&output, &next],
+            )
+            .unwrap();
+        backend.submit(commands).unwrap().wait().unwrap();
+        assert_eq!(
+            backend.read(&output).unwrap(),
+            0xa880_0000_u32.to_le_bytes()
+        );
     }
 
     #[test]
