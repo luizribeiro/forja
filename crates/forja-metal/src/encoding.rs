@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod alignment_tests;
 pub(super) mod resources;
 mod state;
 #[cfg(test)]

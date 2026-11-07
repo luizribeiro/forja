@@ -2062,6 +2062,20 @@ pub(crate) fn drained_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> V
 }
 
 #[cfg(test)]
+pub(crate) fn skew_read_origin_for_test(backend: &MetalBackend, tensor: &Tensor) {
+    let bytes = backend.read(tensor).unwrap();
+    let mut buffers = backend.buffers.lock().unwrap();
+    let buffer = buffers.get_mut(tensor).unwrap();
+    let end = bytes.len().checked_add(4).unwrap();
+    assert!(end <= buffer.len);
+    buffer
+        .overwrite(4..end, &bytes, backend.gpu_timeout)
+        .unwrap();
+    buffer.data_offset = buffer.data_offset.checked_add(4).unwrap();
+    buffer.len = buffer.len.checked_sub(4).unwrap();
+}
+
+#[cfg(test)]
 pub(crate) fn refused_read_canary_bytes(backend: &MetalBackend, tensor: &Tensor) -> Vec<u8> {
     assert!(matches!(
         backend.read(tensor),

@@ -392,13 +392,13 @@ const Q8_FAST_SUFFIX: &[Constraint] = &[
         tensor: OUTPUT,
         class: LayoutClass::Contiguous,
     },
-    Constraint::ByteOffsetAligned {
+    Constraint::ElementOffsetAligned {
         tensor: INPUT,
         alignment: 4,
     },
     Constraint::ByteOffsetAligned {
         tensor: PACKED,
-        alignment: 2,
+        alignment: 8,
     },
 ];
 const fn q8_fast_constraints(rows: Relation) -> [Constraint; Q8_FAST_SUFFIX.len() + 1] {
@@ -1906,7 +1906,9 @@ fn constraint_references_parameters(
             dimension_references_parameters(inputs, outputs, *left)
                 || dimension_references_parameters(inputs, outputs, *right)
         }
-        Constraint::Layout { tensor, .. } | Constraint::ByteOffsetAligned { tensor, .. } => {
+        Constraint::Layout { tensor, .. }
+        | Constraint::ByteOffsetAligned { tensor, .. }
+        | Constraint::ElementOffsetAligned { tensor, .. } => {
             tensor_references_parameters(inputs, outputs, *tensor)
         }
     }
@@ -2079,6 +2081,14 @@ fn check_constraint(
                 Ok(())
             } else {
                 Err(format!("{} byte offset was {offset}", tensor.name))
+            }
+        }
+        Constraint::ElementOffsetAligned { tensor, alignment } => {
+            let offset = tensor_layout(dispatch, *tensor)?.offset();
+            if *alignment != 0 && offset.is_multiple_of(*alignment) {
+                Ok(())
+            } else {
+                Err(format!("{} element offset was {offset}", tensor.name))
             }
         }
         Constraint::Capability(capability) => {
@@ -2339,6 +2349,51 @@ mod tests {
     fn quantized_core_and_catalog_pin_tail_contracts() {
         let dispatch = quant_dispatch(DType::F32, 1, 768, false);
         assert_quant_tail_refusals(&dispatch, "quant-matmul.q8-fast-gemv", (256, 8));
+    }
+
+    #[test]
+    fn q8_fast_refuses_misaligned_vector_addresses() {
+        let backend = CpuBackend::new();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let base = quant_dispatch(dtype, 1, 768, false);
+            for operand in [0, 1] {
+                let original = &base.inputs()[operand];
+                let count = u32::try_from(original.layout().element_count()).unwrap();
+                let allocation = backend
+                    .alloc(original.layout().dtype(), &[count + 4])
+                    .unwrap();
+                for offset in [1, 4] {
+                    let view = backend
+                        .view(
+                            &allocation,
+                            ViewOp::Slice(vec![Slice::new(offset, count, 1).unwrap()]),
+                        )
+                        .unwrap();
+                    let view = backend
+                        .view(&view, ViewOp::Reshape(original.layout().shape().to_vec()))
+                        .unwrap();
+                    let mut inputs = base.inputs().iter().collect::<Vec<_>>();
+                    inputs[operand] = &view;
+                    let mut commands = CommandList::new();
+                    commands
+                        .dispatch(base.op(), &inputs, base.output())
+                        .unwrap();
+                    let dispatch = commands.last_dispatch().unwrap();
+                    let aligned = if operand == 0 {
+                        offset % 4 == 0
+                    } else {
+                        offset % 2 == 0
+                    };
+                    for name in ["quant-matmul.q8-fast-gemv", "quant-matmul.q8-fast-gemv-n2"] {
+                        assert_eq!(
+                            resolve(dispatch, name, METAL4).is_ok(),
+                            aligned,
+                            "{name}, {dtype:?}, operand {operand}, offset {offset}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

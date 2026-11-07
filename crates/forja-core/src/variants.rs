@@ -317,6 +317,13 @@ pub enum Constraint {
         /// Required byte alignment.
         alignment: u64,
     },
+    /// A tensor's element offset must have the requested alignment.
+    ElementOffsetAligned {
+        /// Tensor being checked.
+        tensor: TensorRef,
+        /// Required alignment measured in elements of this tensor's dtype.
+        alignment: u64,
+    },
     /// A backend capability must be present.
     Capability(DeviceCapability),
 }
@@ -341,6 +348,11 @@ impl fmt::Display for Constraint {
                     tensor.name
                 )
             }
+            Self::ElementOffsetAligned { tensor, alignment } => write!(
+                formatter,
+                "{} element offset is aligned to {alignment}",
+                tensor.name
+            ),
             Self::Capability(capability) => write!(formatter, "requires {capability}"),
         }
     }
@@ -578,7 +590,8 @@ fn json_constraint(constraint: &Constraint) -> serde_json::Value {
             object.insert("tensor".to_owned(), tensor.name.into());
             object.insert("layout".to_owned(), class.to_string().into());
         }
-        Constraint::ByteOffsetAligned { tensor, alignment } => {
+        Constraint::ByteOffsetAligned { tensor, alignment }
+        | Constraint::ElementOffsetAligned { tensor, alignment } => {
             object.insert("tensor".to_owned(), tensor.name.into());
             object.insert("alignment".to_owned(), (*alignment).into());
         }
@@ -624,6 +637,7 @@ const fn constraint_kind(constraint: &Constraint) -> &'static str {
         Constraint::DimensionsEqual { .. } => "dims-equal",
         Constraint::Layout { .. } => "layout",
         Constraint::ByteOffsetAligned { .. } => "offset-alignment",
+        Constraint::ElementOffsetAligned { .. } => "element-offset-alignment",
         Constraint::Capability(_) => "capability",
     }
 }

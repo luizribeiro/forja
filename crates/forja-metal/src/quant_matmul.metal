@@ -684,8 +684,12 @@ void quantized_gemv_q8_fast_body(
             if (column < params.columns) {
                 ulong packed_index = params.packed_offset +
                     ulong(column) * params.packed_width + ulong(first_word);
-                uint2 words = *(device const uint2 *)(
-                    packed + packed_index * sizeof(uint));
+                uint2 words;
+                if (ulong(packed + packed_index * sizeof(uint)) % 8 == 0) {
+                    words = *reinterpret_cast<device const uint2 *>(packed + packed_index * sizeof(uint));
+                } else {
+                    words = uint2(load_uint(packed, packed_index), load_uint(packed, packed_index + 1));
+                }
                 float quantized_sum = dot(
                     activations0, float4(as_type<uchar4>(words[0]))) +
                     dot(activations1, float4(as_type<uchar4>(words[1])));

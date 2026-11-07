@@ -377,6 +377,17 @@ fn prove_atom(
                 )))
             }
         }
+        Constraint::ElementOffsetAligned { tensor, alignment } => {
+            let facts = tensor_facts(inputs, outputs, *tensor)?;
+            if *alignment != 0 && facts.offset.is_multiple_of(*alignment) {
+                Ok(())
+            } else {
+                Err(violated(format!(
+                    "{} element offset is not always aligned to {alignment}",
+                    tensor.name
+                )))
+            }
+        }
         Constraint::Capability(capability) => {
             if capabilities.contains(capability) {
                 Ok(())
