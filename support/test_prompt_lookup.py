@@ -35,3 +35,32 @@ class LookupTests(unittest.TestCase):
             SuffixLookup([], 0)
         with self.assertRaises(ValueError):
             SuffixLookup([], 1).proposal(-1)
+
+
+class ReplayTests(unittest.TestCase):
+    def test_no_trigger_preserves_plain_rounds(self):
+        from prompt_lookup import replay
+        result = replay([1, 2, 3], [7, 8, 9, 10], 3, 2)
+        self.assertEqual(result['bubble_count'], 0)
+        self.assertEqual([r['emitted'] for r in result['rounds']], [1, 1, 1])
+
+    def test_two_bubbles_even_at_terminal_episode(self):
+        from prompt_lookup import replay
+        result = replay([1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6], 1, 2)
+        self.assertEqual(result['episodes'], 1)
+        self.assertEqual(result['bubble_count'], 2)
+        self.assertEqual(sum(r['emitted'] for r in result['rounds']), 5)
+        self.assertEqual(result['rounds'][-1]['drafts'], [5])
+
+    def test_zero_accept_exits_before_retry(self):
+        from prompt_lookup import replay
+        result = replay([1, 2, 3, 1, 9], [1, 2, 3, 4, 5], 1, 2)
+        self.assertEqual(result['rounds'][0]['accepted'], 0)
+        self.assertEqual(result['rounds'][1]['drafts'], [])
+        self.assertTrue(result['rounds'][1]['exit_step'])
+
+    def test_context_cap_and_disabled_policy(self):
+        from prompt_lookup import replay
+        for kwargs in [{'max_context': 3}, {'enabled': False}]:
+            result = replay([1, 2, 3], [1, 2, 3, 1, 2], 1, 2, **kwargs)
+            self.assertEqual(result['episodes'], 0)
