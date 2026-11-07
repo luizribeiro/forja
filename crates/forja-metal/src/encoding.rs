@@ -10774,6 +10774,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn q4_packed_loads_do_not_take_misaligned_vector_branches() {
+        let backend = MetalBackend::new().unwrap();
+        let load = "*(device const uint2 *)(packed + index * sizeof(uint))";
+        let source = crate::storage::shader_source().replace(
+            load,
+            &format!("(ulong(packed + index * sizeof(uint)) % 8 == 0 ? {load} : uint2(0))"),
+        );
+        assert_ne!(source, crate::storage::shader_source());
+        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        forja_testing::assert_backends_agree_many_selected_with(
+            &CpuBackend::new(),
+            &backend,
+            Op::QuantMatmul {
+                bits: 4,
+                group_size: 64,
+            },
+            &[
+                TensorSpec::contiguous(DType::F32, &[1, 1024]),
+                TensorSpec::sliced(
+                    DType::U32,
+                    &[8, 129],
+                    &[Slice::new(0, 8, 1).unwrap(), Slice::new(1, 128, 1).unwrap()],
+                ),
+                TensorSpec::contiguous(DType::F16, &[8, 16]),
+                TensorSpec::contiguous(DType::F16, &[8, 16]),
+            ],
+            &[TensorSpec::contiguous(DType::F32, &[1, 8])],
+            &[0],
+            |commands| {
+                let pick = backend
+                    .validate_variant(commands.last_dispatch().unwrap(), "quant-matmul.gemv")
+                    .unwrap();
+                assert!(commands.set_last_backend_data(BackendDispatchData::new(pick)));
+            },
+        )
+        .unwrap();
+    }
+
     fn shared_quant_canary(
         variant_name: &str,
         bits: u8,

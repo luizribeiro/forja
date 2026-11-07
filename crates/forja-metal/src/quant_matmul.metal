@@ -347,7 +347,8 @@ void quantized_qmv_sums(
                 ulong index = packed_base + ulong(column) * packed_row_stride +
                     ulong(first_word) * packed_word_stride;
                 uint2 words = uint2(0u);
-                if (packed_word_stride == 1 && words_per_thread == 2) {
+                if (packed_word_stride == 1 && words_per_thread == 2 &&
+                    ulong(packed + index * sizeof(uint)) % 8 == 0) {
                     words = *(device const uint2 *)(packed + index * sizeof(uint));
                 } else {
                     for (uint word = 0; word < words_per_thread; ++word) {
