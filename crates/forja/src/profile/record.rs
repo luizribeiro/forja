@@ -48,6 +48,12 @@ pub(super) fn submissions(
         }
         Ok(json!({"index": index, "phase": {"mode": super::mode_name(mode), "context": context, "query_tokens": queries},
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),
+            "buffer_admission": submission.buffer_admission.iter().map(|buffer| json!({
+                "predicted_gpu_seconds": buffer.predicted_gpu.as_secs_f64(),
+                "reserve_seconds": buffer.reserve.as_secs_f64(),
+                "gpu_time_seconds": buffer.gpu_time.as_secs_f64(),
+                "backstop_ratio": buffer.backstop_ratio,
+            })).collect::<Vec<_>>(),
             "admission_calibration": submission.work_calibration.as_ref().map(|c| c.json()),
             "predicted_gpu_seconds": submission.predicted_gpu.as_secs_f64(), "command_buffer_reserve_seconds":submission.command_buffer_reserve.as_secs_f64(), "command_buffers": submission.command_buffers,
             "host_phases": {

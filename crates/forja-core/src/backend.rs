@@ -505,6 +505,19 @@ pub struct KernelProfile {
     pub gpu_time: Duration,
 }
 
+/// Raw device timing and admission bound for one committed command buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandBufferProfile {
+    /// Forecast including startup allowance.
+    pub predicted_gpu: Duration,
+    /// Startup allowance included in the forecast.
+    pub reserve: Duration,
+    /// Unscaled command-buffer counter interval.
+    pub gpu_time: Duration,
+    /// Maximum allowed measured-to-predicted ratio; zero when admission is disabled.
+    pub backstop_ratio: u32,
+}
+
 /// Host phases and device timings from one profiled submission.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SubmissionProfile {
@@ -514,6 +527,8 @@ pub struct SubmissionProfile {
     pub predicted_gpu: Duration,
     /// Calibrated startup allowances included in the summed forecast.
     pub command_buffer_reserve: Duration,
+    /// Individual command-buffer admission forecasts and measured counter intervals.
+    pub buffer_admission: Vec<CommandBufferProfile>,
     /// Number of sequential command buffers.
     pub command_buffers: u64,
     /// Scalar-program dispatch recording on the submitting thread.

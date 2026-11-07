@@ -28,9 +28,10 @@ mod variant_proof;
 mod variants;
 
 pub use backend::{
-    AllocationRegistry, Backend, BackendError, CompletionResource, DeviceInfo, DispatchProfile,
-    KernelProfile, MemoryUsage, ProfileCount, ProfileTensor, ReadonlyImport, Submission,
-    SubmissionProfile, ViewOp, automatic_buffer_pool_capacity, automatic_live_bytes,
+    AllocationRegistry, Backend, BackendError, CommandBufferProfile, CompletionResource,
+    DeviceInfo, DispatchProfile, KernelProfile, MemoryUsage, ProfileCount, ProfileTensor,
+    ReadonlyImport, Submission, SubmissionProfile, ViewOp, automatic_buffer_pool_capacity,
+    automatic_live_bytes,
 };
 pub use cost::{
     CostModel, DEFAULT_DISPATCH_WORK_LIMIT, DEFAULT_SUBMISSION_WORK_LIMIT, KernelCost,

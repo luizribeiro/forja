@@ -355,6 +355,7 @@ pub(super) fn merge_profiles(
         }
         total.work_calibration = profile.work_calibration.or(total.work_calibration);
         total.per_dispatch.extend(profile.per_dispatch);
+        total.buffer_admission.extend(profile.buffer_admission);
     }
     Some(total)
 }
@@ -599,6 +600,24 @@ mod tests {
         assert_eq!(profile.command_buffers, 3);
         assert_eq!(profile.per_dispatch.len(), 3);
         assert_eq!(profile.predicted_gpu, (unit + reserve) * 3);
+        assert_eq!(profile.buffer_admission.len(), 3);
+        assert!(
+            profile
+                .buffer_admission
+                .iter()
+                .all(|buffer| buffer.predicted_gpu == unit + reserve
+                    && buffer.reserve == reserve
+                    && buffer.backstop_ratio == 4
+                    && !buffer.gpu_time.is_zero())
+        );
+        assert_eq!(
+            profile
+                .buffer_admission
+                .iter()
+                .map(|buffer| buffer.gpu_time)
+                .sum::<Duration>(),
+            profile.gpu_time
+        );
         assert_eq!(Some(profile.gpu_time), submission.gpu_time());
     }
 }

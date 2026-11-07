@@ -2461,6 +2461,17 @@ impl Submission for MetalSubmission {
                 .and_then(|cost| crate::cost_sharing::weights(outer.cost, cost));
             outer.internal.push(internal);
         }
+        profile.gpu_time = self.completion.gpu_time()?;
+        profile.buffer_admission = vec![forja_core::CommandBufferProfile {
+            predicted_gpu: profile.predicted_gpu,
+            reserve: profile.command_buffer_reserve,
+            gpu_time: profile.gpu_time,
+            backstop_ratio: self
+                .completion
+                .work
+                .get()
+                .map_or(0, forja_core::GpuWorkTicket::ratio),
+        }];
         profile.per_dispatch = dispatches;
         work_buffers::merge_profiles(
             self.prefixes
