@@ -17,6 +17,7 @@ struct QuantEmbedParams {
     uint width;
 };
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quant_embed)
 kernel void quant_embed(
     device const uchar *packed [[buffer(0)]],
     device const uchar *scales [[buffer(1)]],
@@ -68,6 +69,8 @@ kernel void quant_embed(
         output_dtype,
         scale * float(quantized) + bias);
 }
+#endif
+
 
 struct QuantMatmulParams {
     ulong input_offset;
@@ -510,6 +513,7 @@ void quantized_q8_sums(
     }
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv)
 kernel void quantized_gemv(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -574,7 +578,10 @@ kernel void quantized_gemv(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_n2)
 kernel void quantized_gemv_n2(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -614,6 +621,8 @@ kernel void quantized_gemv_n2(
         }
     }
 }
+#endif
+
 
 template <uint batch_rows, uint output_count>
 void quantized_gemv_shared_body(
@@ -680,8 +689,14 @@ kernel void NAME( \
     } \
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_shared)
 SHARED_QUANT_KERNEL(quantized_gemv_shared, 2)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_shared_n4)
 SHARED_QUANT_KERNEL(quantized_gemv_shared_n4, 4)
+#endif
+
 
 #undef SHARED_QUANT_KERNEL
 
@@ -788,6 +803,7 @@ void quantized_gemv_q8_fast_body(
     }
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_q8_fast)
 kernel void quantized_gemv_q8_fast(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -803,7 +819,10 @@ kernel void quantized_gemv_q8_fast(
         input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
         simdgroup, lane, tile);
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_q8_fast_n2)
 kernel void quantized_gemv_q8_fast_n2(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -819,6 +838,8 @@ kernel void quantized_gemv_q8_fast_n2(
         input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
         simdgroup, lane, tile);
 }
+#endif
+
 
 struct GatherQuantMatmulParams {
     ulong input_offset;
@@ -878,6 +899,7 @@ void gather_quantized_sums(
         first_column, lane, gather_words_per_thread, sums);
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gather_quantized_gemv)
 kernel void gather_quantized_gemv(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -928,6 +950,8 @@ kernel void gather_quantized_gemv(
         }
     }
 }
+#endif
+
 
 struct GatherQuantMatmulWeightedParams {
     ulong input_offset;
@@ -965,6 +989,7 @@ struct GatherQuantMatmulWeightedParams {
     uint group_size;
 };
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gather_quantized_weighted_sum)
 kernel void gather_quantized_weighted_sum(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -1036,7 +1061,10 @@ kernel void gather_quantized_weighted_sum(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gather_quantized_weighted_sum_broad)
 kernel void gather_quantized_weighted_sum_broad(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -1103,7 +1131,10 @@ kernel void gather_quantized_weighted_sum_broad(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gather_quantized_pair)
 kernel void gather_quantized_pair(
     device const uchar *input [[buffer(0)]],
     device const uchar *gate_packed [[buffer(1)]],
@@ -1178,8 +1209,11 @@ kernel void gather_quantized_pair(
         }
     }
 }
+#endif
 
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_count_expert_routes)
 kernel void count_expert_routes(
     device const uint *indices [[buffer(0)]],
     device atomic_uint *counts [[buffer(1)]],
@@ -1214,7 +1248,10 @@ kernel void count_expert_routes(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_plan_expert_routes)
 kernel void plan_expert_routes(
     device const uint *indices [[buffer(0)]],
     device uint *sorted_routes [[buffer(1)]],
@@ -1268,7 +1305,10 @@ kernel void plan_expert_routes(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_arrange_expert_routes)
 kernel void arrange_expert_routes(
     device const uint *indices [[buffer(0)]],
     device uint *sorted_routes [[buffer(1)]],
@@ -1314,6 +1354,8 @@ kernel void arrange_expert_routes(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+#endif
+
 
 template <uint BM, uint BK, uint THREADS>
 struct GroupedInputLoader {
@@ -1552,11 +1594,24 @@ kernel void name(                                                               
         tile, input_tile, weight_tile, route_rows, route_slots);                    \
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_grouped_quantized_gemm)
 grouped_quantized_gemm_kernel(grouped_quantized_gemm, 16, 1, 2, false)
-grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8, 1, 2, false)
-grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2, 32, 2, 2, false)
-grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2_blocked, 32, 2, 2, true)
+#endif
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_grouped_quantized_gemm_small_m)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_small_m, 8, 1, 2, false)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_grouped_quantized_gemm_32x32_2x2)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2, 32, 2, 2, false)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_grouped_quantized_gemm_32x32_2x2_blocked)
+grouped_quantized_gemm_kernel(grouped_quantized_gemm_32x32_2x2_blocked, 32, 2, 2, true)
+#endif
+
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_grouped_quantized_pair_32x32_2x2_blocked)
 kernel void grouped_quantized_pair_32x32_2x2_blocked(
     device const uchar *input [[buffer(0)]],
     device const uchar *gate_packed [[buffer(1)]],
@@ -1664,7 +1719,10 @@ kernel void grouped_quantized_pair_32x32_2x2_blocked(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gathered_pair_from_projections)
 kernel void gathered_pair_from_projections(
     device const float *gate [[buffer(0)]],
     device const float *up [[buffer(1)]],
@@ -1706,7 +1764,10 @@ kernel void gathered_pair_from_projections(
         output_dtype,
         result);
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_small_m)
 kernel void quantized_gemm_small_m(
     device const uchar *input [[buffer(0)]],
     device const uchar *packed [[buffer(1)]],
@@ -1784,6 +1845,8 @@ kernel void quantized_gemm_small_m(
         }
     }
 }
+#endif
+
 
 template <typename T, uint block_inner, uint block_columns, uint tile_stride>
 void load_transposed_quantized_weight_tile(
@@ -1979,12 +2042,30 @@ kernel void name(                                                               
         simdgroup, lane, tile, input_tile, weight_tile);                            \
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_f32)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_f32, float, 32)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_f16)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_f16, half, 32)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_bf16)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_bf16, bfloat, 32)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_k64_f32)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f32, float, 64)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_k64_f16)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_f16, half, 64)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemm_tiled_k64_bf16)
 quantized_gemm_tiled_kernel(quantized_gemm_tiled_k64_bf16, bfloat, 64)
+#endif
+
 
 template <uint output_count>
 void quantized_gemv_staged_sums(
@@ -2046,6 +2127,7 @@ void quantized_gemv_staged_sums(
     for (uint item = 0; item < output_count; ++item) sums[item] = simd_sum(sums[item]);
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_quantized_gemv_staged)
 kernel void quantized_gemv_staged(
     device const uchar *input [[buffer(0)]], device const uchar *packed [[buffer(1)]],
     device const uchar *scales [[buffer(2)]], device const uchar *biases [[buffer(3)]],
@@ -2071,3 +2153,4 @@ kernel void quantized_gemv_staged(
         }
     }
 }
+#endif

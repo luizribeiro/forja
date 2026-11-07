@@ -10704,8 +10704,8 @@ impl PipelineCache {
         constants: &[(u32, u32)],
     ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
-        let source_key = epilogue_codegen::SourceKey::new(family, epilogue);
-        let pipeline_key = epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants)?;
+        let source_key = epilogue_codegen::SourceKey::new(family, epilogue, name);
+        let pipeline_key = source_key.pipeline_key(constants)?;
         if let Some(pipeline) = self.epilogue_pipelines.get(&pipeline_key)? {
             self.epilogue_hit()?;
             return Ok(pipeline);
@@ -10721,8 +10721,9 @@ impl PipelineCache {
                     source_key.clone(),
                     || Ok(()),
                     || {
-                        let generated = epilogue_codegen::generate_source(family, epilogue)
-                            .map_err(|_| program_compile_failed(source_key.hash))?;
+                        let generated =
+                            epilogue_codegen::generate_skeleton_source(family, epilogue, name)
+                                .map_err(|_| program_compile_failed(source_key.hash))?;
                         let options = compile_options(MTLMathMode::Safe);
                         let library = self
                             .compiler
@@ -10775,8 +10776,8 @@ impl PipelineCache {
         name: &str,
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        let source = epilogue_codegen::SourceKey::new(family, epilogue);
-        let key = epilogue_codegen::PipelineKey::new(source, name, constants)?;
+        let source = epilogue_codegen::SourceKey::new(family, epilogue, name);
+        let key = source.pipeline_key(constants)?;
         if let Some(pipeline) = self.epilogue_pipelines.get(&key)? {
             self.epilogue_hit()?;
             return Ok(pipeline);
@@ -10796,12 +10797,12 @@ impl PipelineCache {
         let keys = requests
             .iter()
             .map(|request| {
-                let source = epilogue_codegen::SourceKey::new(request.family, &request.epilogue);
-                epilogue_codegen::PipelineKey::new(
-                    source,
+                let source = epilogue_codegen::SourceKey::new(
+                    request.family,
+                    &request.epilogue,
                     request.implementation,
-                    &request.constants,
-                )
+                );
+                source.pipeline_key(&request.constants)
             })
             .collect::<Result<HashSet<_>, _>>()?;
         let mut count = 0;
@@ -13475,9 +13476,9 @@ mod tests {
             .unwrap();
         {
             let pipelines = &backend.pipelines;
-            assert_eq!(pipelines.epilogue_libraries.len(), 1);
+            assert_eq!(pipelines.epilogue_libraries.len(), 2);
             assert_eq!(pipelines.epilogue_pipelines.len(), 9);
-            assert_eq!(pipelines.epilogue_counts().unwrap().libraries, 1);
+            assert_eq!(pipelines.epilogue_counts().unwrap().libraries, 2);
             assert_eq!(pipelines.epilogue_counts().unwrap().pipelines, 9);
         }
 
@@ -13485,7 +13486,7 @@ mod tests {
         backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
         let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_pipelines.len(), 9);
-        assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 10);
+        assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 9);
         assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 0);
     }
 

@@ -114,11 +114,24 @@ kernel void name(                                                            \
         simdgroup_index, lane, tile);                                        \
 }
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_steel_gemm_64_64_16_2_2)
 DEFINE_STEEL_GEMM(steel_gemm_64_64_16_2_2, 64, 64, 16, 2, 2)
-DEFINE_STEEL_GEMM(steel_gemm_64_64_16_1_2, 64, 64, 16, 1, 2)
-DEFINE_STEEL_GEMM(steel_gemm_64_32_32_2_2, 64, 32, 32, 2, 2)
-DEFINE_STEEL_GEMM(steel_gemm_32_64_16_1_2, 32, 64, 16, 1, 2)
+#endif
 
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_steel_gemm_64_64_16_1_2)
+DEFINE_STEEL_GEMM(steel_gemm_64_64_16_1_2, 64, 64, 16, 1, 2)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_steel_gemm_64_32_32_2_2)
+DEFINE_STEEL_GEMM(steel_gemm_64_32_32_2_2, 64, 32, 32, 2, 2)
+#endif
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_steel_gemm_32_64_16_1_2)
+DEFINE_STEEL_GEMM(steel_gemm_32_64_16_1_2, 32, 64, 16, 1, 2)
+#endif
+
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gemv)
 kernel void gemv(
     device const uchar *a [[buffer(0)]],
     device const uchar *b [[buffer(1)]],
@@ -163,7 +176,10 @@ kernel void gemv(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_gemv_transposed)
 kernel void gemv_transposed(
     device const uchar *a [[buffer(0)]],
     device const uchar *b [[buffer(1)]],
@@ -215,7 +231,10 @@ kernel void gemv_transposed(
         }
     }
 }
+#endif
 
+
+#if !defined(FORJA_SELECTED_SKELETON) || defined(FORJA_SKELETON_column_gemv)
 kernel void column_gemv(
     device const uchar *a [[buffer(0)]],
     device const uchar *b [[buffer(1)]],
@@ -247,3 +266,4 @@ kernel void column_gemv(
     ulong d_base = params.d_offset + ulong(tile.z) * params.batch_stride_d;
     store_float(d, d_base + ulong(row) * params.ldd, output_dtype, value);
 }
+#endif

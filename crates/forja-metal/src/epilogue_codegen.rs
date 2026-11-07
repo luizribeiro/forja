@@ -42,6 +42,8 @@ pub(super) enum FamilySourceTag {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct SourceKey {
     pub(super) family: FamilySourceTag,
+    template: crate::pipeline_identity::SourceIdentity,
+    skeleton: String,
     pub(super) hash: ProgramHash,
     pub(super) accumulator_count: u8,
     pub(super) logical_rank: u8,
@@ -50,10 +52,16 @@ pub(super) struct SourceKey {
 }
 
 impl SourceKey {
-    pub(super) fn new(family: FamilySourceTag, epilogue: &PreparedEpilogue) -> Self {
+    pub(super) fn new(
+        family: FamilySourceTag,
+        epilogue: &PreparedEpilogue,
+        skeleton: &str,
+    ) -> Self {
         let signature = epilogue.signature();
         Self {
             family,
+            template: template_identity(family),
+            skeleton: skeleton.to_owned(),
             hash: epilogue.validated().content_hash(),
             accumulator_count: signature.accumulator_count(),
             logical_rank: signature.logical_rank(),
@@ -68,29 +76,19 @@ impl SourceKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct PipelineKey {
-    pub(super) source: SourceKey,
-    pub(super) implementation: String,
-    pub(super) constants: Vec<(u32, u32)>,
-}
-
-impl PipelineKey {
-    pub(super) fn new(
-        source: SourceKey,
-        implementation: &str,
+pub(super) type PipelineKey = crate::pipeline_identity::PipelineKey<SourceKey>;
+impl SourceKey {
+    pub(super) fn pipeline_key(
+        &self,
         constants: &[(u32, u32)],
-    ) -> Result<Self, forja_core::BackendError> {
-        Ok(Self {
-            source,
-            implementation: implementation.to_owned(),
-            constants: crate::pipeline_constants::canonical(constants)?,
-        })
+    ) -> Result<PipelineKey, forja_core::BackendError> {
+        PipelineKey::new(self.clone(), &self.skeleton, constants, &[self.hash])
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SourceError {
+    SkeletonName,
     IdentityHelperCount,
     AddressStructure,
 }
@@ -219,15 +217,57 @@ fn generate_source_from_header(
     }
     let helper = generate_helper(epilogue)?;
     let header = shared_header.replacen(IDENTITY_HELPER, &helper, 1);
+    Ok(stitch_source(&header, family))
+}
+
+fn stitch_source(header: &str, family: FamilySourceTag) -> String {
     let kernel_source = match family {
         FamilySourceTag::Dense => include_str!("matmul.metal"),
         FamilySourceTag::Quant | FamilySourceTag::GatherQuant => include_str!("quant_matmul.metal"),
     };
-    Ok(format!(
+    format!(
         "{}{header}\n{}\n{}\n{kernel_source}",
         crate::geometry::shader_defines(),
         include_str!("steel_gemm_loader.metal"),
-        include_str!("steel_gemm_mma.metal"),
+        include_str!("steel_gemm_mma.metal")
+    )
+}
+
+fn template_identity(family: FamilySourceTag) -> crate::pipeline_identity::SourceIdentity {
+    use crate::pipeline_identity::{MathMode, SourceIdentity};
+    use std::sync::{Arc, OnceLock};
+    static DENSE: OnceLock<SourceIdentity> = OnceLock::new();
+    static QUANT: OnceLock<SourceIdentity> = OnceLock::new();
+    let slot = match family {
+        FamilySourceTag::Dense => &DENSE,
+        _ => &QUANT,
+    };
+    slot.get_or_init(|| {
+        SourceIdentity::new(
+            Arc::from(stitch_source(crate::map_codegen::SHARED_HEADER, family)),
+            MathMode::Safe,
+        )
+    })
+    .clone()
+}
+
+pub(super) fn generate_skeleton_source(
+    family: FamilySourceTag,
+    epilogue: &PreparedEpilogue,
+    name: &str,
+) -> Result<String, SourceError> {
+    let source = generate_source(family, epilogue)?;
+    let guard = format!("defined(FORJA_SKELETON_{name})");
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || !source.contains(&guard)
+    {
+        return Err(SourceError::SkeletonName);
+    }
+    Ok(format!(
+        "#define FORJA_SELECTED_SKELETON 1\n#define FORJA_SKELETON_{name} 1\n{source}"
     ))
 }
 
@@ -372,10 +412,52 @@ mod tests {
     }
 
     #[test]
+    fn skeleton_sources_export_only_the_selected_entry_point() {
+        use objc2_foundation::NSString;
+        use objc2_metal::{
+            MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLLibrary, MTLMathMode,
+        };
+        let device = MTLCreateSystemDefaultDevice().unwrap();
+        let compiler = crate::compiler::Compiler::new(std::time::Duration::from_secs(30)).unwrap();
+        let options = MTLCompileOptions::new();
+        options.setMathMode(MTLMathMode::Safe);
+        for (family, name) in [
+            (FamilySourceTag::Dense, "gemv"),
+            (FamilySourceTag::Dense, "steel_gemm_64_32_32_2_2"),
+            (FamilySourceTag::Quant, "quantized_gemv_shared"),
+            (FamilySourceTag::Quant, "quantized_gemm_tiled_f32"),
+            (
+                FamilySourceTag::GatherQuant,
+                "grouped_quantized_pair_32x32_2x2_blocked",
+            ),
+        ] {
+            let source = generate_skeleton_source(family, &bias_epilogue(), name).unwrap();
+            let library = compiler
+                .library(&device, &NSString::from_str(&source), &options)
+                .unwrap();
+            let names = library.functionNames();
+            assert_eq!(names.count(), 1);
+            assert_eq!(names.objectAtIndex(0).to_string(), name);
+        }
+        assert_eq!(
+            generate_skeleton_source(
+                FamilySourceTag::Dense,
+                &bias_epilogue(),
+                "gemv\n#error injected"
+            ),
+            Err(SourceError::SkeletonName)
+        );
+        assert_ne!(
+            SourceKey::new(FamilySourceTag::Dense, &bias_epilogue(), "gemv"),
+            SourceKey::new(FamilySourceTag::Dense, &bias_epilogue(), "gemv_transposed")
+        );
+    }
+
+    #[test]
     fn pipeline_keys_canonicalize_function_constants() {
-        let source = SourceKey::new(FamilySourceTag::Dense, &bias_epilogue());
-        let first = PipelineKey::new(source.clone(), "gemv", &[(2, 1), (0, 0)]).unwrap();
-        let second = PipelineKey::new(source, "gemv", &[(0, 0), (2, 1)]).unwrap();
+        let source = SourceKey::new(FamilySourceTag::Dense, &bias_epilogue(), "gemv");
+        let first = source.pipeline_key(&[(2, 1), (0, 0)]).unwrap();
+        let second = source.pipeline_key(&[(0, 0), (2, 1)]).unwrap();
         assert_eq!(first, second);
     }
 
@@ -383,8 +465,8 @@ mod tests {
     fn source_keys_separate_kernel_families() {
         let epilogue = bias_epilogue();
         assert_ne!(
-            SourceKey::new(FamilySourceTag::Dense, &epilogue),
-            SourceKey::new(FamilySourceTag::Quant, &epilogue)
+            SourceKey::new(FamilySourceTag::Dense, &epilogue, "gemv"),
+            SourceKey::new(FamilySourceTag::Quant, &epilogue, "quantized_gemv")
         );
     }
 
