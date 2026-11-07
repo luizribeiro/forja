@@ -444,7 +444,7 @@ mod tests {
                 "if (column < params.columns)",
             ),
             (
-                "void quantized_gemv_q8_fast_body(",
+                "void quantized_gemv_q8_fast_impl(",
                 &["simd_sum("][..],
                 "if (column < params.columns)",
             ),

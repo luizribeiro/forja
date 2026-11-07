@@ -655,8 +655,8 @@ SHARED_QUANT_KERNEL(quantized_gemv_shared_n4, 4)
 
 #undef SHARED_QUANT_KERNEL
 
-template <uint output_count>
-void quantized_gemv_q8_fast_body(
+template <uint output_count, bool packed_aligned>
+void quantized_gemv_q8_fast_impl(
     device const uchar *input,
     device const uchar *packed,
     device const uchar *scales,
@@ -692,7 +692,7 @@ void quantized_gemv_q8_fast_body(
                 ulong packed_index = params.packed_offset +
                     ulong(column) * params.packed_width + ulong(first_word);
                 uint2 words;
-                if (ulong(packed + packed_index * sizeof(uint)) % 8 == 0) {
+                if constexpr (packed_aligned) {
                     words = *reinterpret_cast<device const uint2 *>(packed + packed_index * sizeof(uint));
                 } else {
                     words = uint2(load_uint(packed, packed_index), load_uint(packed, packed_index + 1));
@@ -729,6 +729,30 @@ void quantized_gemv_q8_fast_body(
                     value);
             }
         }
+    }
+}
+
+template <uint output_count>
+void quantized_gemv_q8_fast_body(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    device uchar *output,
+    constant QuantMatmulParams &params,
+    FORJA_EPILOGUE_PARAMETERS
+    ushort simdgroup,
+    ushort lane,
+    uint2 tile) {
+    // The q8-fast contract makes row and lane offsets multiples of eight bytes.
+    if (ulong(packed + params.packed_offset * sizeof(uint)) % 8 == 0) {
+        quantized_gemv_q8_fast_impl<output_count, true>(
+            input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
+            simdgroup, lane, tile);
+    } else {
+        quantized_gemv_q8_fast_impl<output_count, false>(
+            input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
+            simdgroup, lane, tile);
     }
 }
 
