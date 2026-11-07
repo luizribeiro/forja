@@ -7,6 +7,7 @@ const GATHER_ELEMENTS: u32 = 1 << 27;
 const SERIAL_ITERATIONS: u32 = 1 << 18;
 const DEPENDENT_ELEMENTS: u32 = 4096;
 const SERIAL_READ_ELEMENTS: u32 = 1 << 24;
+const DISPATCH_GROUPS: u32 = 1 << 18;
 
 #[derive(Clone, Copy)]
 pub(super) enum WorkProbe {
@@ -21,10 +22,11 @@ pub(super) enum WorkProbe {
     SfuGroup,
     ReadGroup,
     GatherGroup,
+    GroupDispatch,
 }
 
 impl WorkProbe {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Scalar,
         Self::Sfu,
         Self::Gather,
@@ -36,6 +38,7 @@ impl WorkProbe {
         Self::SfuGroup,
         Self::ReadGroup,
         Self::GatherGroup,
+        Self::GroupDispatch,
     ];
 
     pub(super) const fn kernel(self) -> &'static str {
@@ -51,12 +54,14 @@ impl WorkProbe {
             Self::SfuGroup => "calibration_sfu_group",
             Self::ReadGroup => "calibration_read_group",
             Self::GatherGroup => "calibration_gather_group",
+            Self::GroupDispatch => "calibration_group_dispatch",
         }
     }
 
     pub(super) const fn constants(self) -> [(u32, u32); 2] {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
+            Self::GroupDispatch => 16,
             Self::ReadSerial | Self::ReadGroup => SERIAL_READ_ELEMENTS,
             Self::ScalarSerial
             | Self::SfuSerial
@@ -72,6 +77,7 @@ impl WorkProbe {
     const fn elements(self) -> u32 {
         match self {
             Self::Gather => GATHER_ELEMENTS,
+            Self::GroupDispatch => DISPATCH_GROUPS * crate::calibration::THREADS,
             Self::ScalarSerial | Self::SfuSerial | Self::ScalarGroup | Self::SfuGroup => {
                 crate::calibration::THREADS
             }
@@ -91,6 +97,7 @@ impl WorkProbe {
 
     fn units(self) -> Option<u64> {
         match self {
+            Self::GroupDispatch => return Some(u64::from(DISPATCH_GROUPS)),
             Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
             Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
             Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),
@@ -171,7 +178,7 @@ impl WorkProbe {
 }
 
 impl MetalBackend {
-    /// Measures scalar arithmetic, special functions and scattered device-memory reads.
+    /// Measures scalar arithmetic, special functions, memory and threadgroup overhead.
     /// These observations calibrate work admission; they are not model benchmarks.
     ///
     /// # Errors

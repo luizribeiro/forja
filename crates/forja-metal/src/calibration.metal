@@ -155,3 +155,18 @@ kernel void calibration_gather_group(device const uint *input [[buffer(0)]],
     }
     output[index] = sum;
 }
+
+kernel void calibration_group_dispatch(device const float *input [[buffer(0)]],
+                                       device float *output [[buffer(1)]],
+                                       uint index [[thread_position_in_grid]],
+                                       uint lane [[thread_position_in_threadgroup]]) {
+    threadgroup float scratch[128];
+    float value = input[index];
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        scratch[lane] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        value = scratch[(lane + 1) & 127] + 0.00001f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[index] = value;
+}
