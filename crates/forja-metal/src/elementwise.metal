@@ -4,6 +4,20 @@
 #include <metal_stdlib>
 using namespace metal;
 
+/// Low address bits retained at binding, before any layout normalization.
+struct BoundByteAlignment {
+    uint low_bits;
+
+    bool supports(uint bytes) const {
+        return bytes != 0 && bytes <= 16 && (bytes & (bytes - 1)) == 0 &&
+               (low_bits & (bytes - 1)) == 0;
+    }
+};
+
+BoundByteAlignment bound_alignment(device const uchar *view) {
+    return {uint(ulong(view) & 15)};
+}
+
 constant uint input0_dtype [[function_constant(0)]];
 constant uint input1_dtype [[function_constant(1)]];
 constant uint output_dtype [[function_constant(2)]];

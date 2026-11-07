@@ -105,7 +105,7 @@ float4 load_aligned_float4_contiguous(device const uchar *buffer, ulong index, u
 
 float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtype) {
     uint bytes = dtype == 0 ? 4 : 2;
-    if ((ulong(buffer + index * bytes) % (4 * bytes)) != 0) {
+    if (!bound_alignment(buffer + index * bytes).supports(4 * bytes)) {
         return float4(load_float(buffer, index, dtype), load_float(buffer, index + 1, dtype),
             load_float(buffer, index + 2, dtype), load_float(buffer, index + 3, dtype));
     }
@@ -113,10 +113,10 @@ float4 load_float4_contiguous(device const uchar *buffer, ulong index, uint dtyp
 }
 
 template <uint words_per_thread>
-uint4 load_quantized_words(device const uchar *row, ulong index, ulong word_stride, bool aligned) {
+uint4 load_quantized_words(device const uchar *row, ulong index, ulong word_stride) {
     uint4 words = uint4(0u);
-    if ((qmv_vector_contiguous != 0 || (word_stride == 1 && aligned)) &&
-        ulong(row + index * 4) % (words_per_thread * 4) == 0) {
+    if ((qmv_vector_contiguous != 0 || word_stride == 1) &&
+        bound_alignment(row + index * 4).supports(words_per_thread * 4)) {
         if constexpr (words_per_thread == 4) words = *reinterpret_cast<device const uint4 *>(row + index * 4);
         else words.xy = *reinterpret_cast<device const uint2 *>(row + index * 4);
     } else {
@@ -197,8 +197,7 @@ void quantized_vector_batch_sums(
             if (first_column + item >= columns) continue;
             ulong index = ulong(first / values_per_word) * packed_word_stride;
             device const uchar *row = weight_base + ulong(item) * packed_row_stride * 4;
-            uint4 words = load_quantized_words<words_per_thread>(row, index, packed_word_stride,
-                ((packed_base + ulong(first_column + item) * packed_row_stride + index) % words_per_thread) == 0);
+            uint4 words = load_quantized_words<words_per_thread>(row, index, packed_word_stride);
             ulong group = first / quant_group_size;
             tile_scale[item] = load_float(scale_rows, ulong(item) * scale_row_stride + group * scale_group_stride, input1_dtype);
             tile_bias[item] = load_float(bias_rows, ulong(item) * bias_row_stride + group * bias_group_stride, input1_dtype);
@@ -352,7 +351,7 @@ void quantized_qmv_sums(
                     ulong(first_word) * packed_word_stride;
                 uint2 words = uint2(0u);
                 if (packed_word_stride == 1 && words_per_thread == 2 &&
-                    ulong(packed + index * sizeof(uint)) % 8 == 0) {
+                    bound_alignment(packed + index * sizeof(uint)).supports(8)) {
                     words = *(device const uint2 *)(packed + index * sizeof(uint));
                 } else {
                     for (uint word = 0; word < words_per_thread; ++word) {
@@ -434,7 +433,7 @@ void quantized_q8_sums_impl(
                     ulong(column) * params.packed_row_stride +
                     ulong(first_word) * params.packed_word_stride;
                 if (vectors_aligned ||
-                    (params.packed_word_stride == 1 && ulong(packed + index * 4) % 16 == 0)) {
+                    (params.packed_word_stride == 1 && bound_alignment(packed + index * 4).supports(16))) {
                     quantized_words[row] =
                         *(device const uint4 *)(packed + index * sizeof(uint));
                 } else {
@@ -501,8 +500,8 @@ void quantized_q8_sums(
     uint input_bytes = input0_dtype == 0 ? 4 : 2;
     if (params.input_inner_stride == 1 && params.packed_word_stride == 1 &&
         params.packed_row_stride % 4 == 0 &&
-        ulong(input + input_base * input_bytes) % (4 * input_bytes) == 0 &&
-        ulong(packed + params.packed_offset * sizeof(uint)) % 16 == 0) {
+        bound_alignment(input + input_base * input_bytes).supports(4 * input_bytes) &&
+        bound_alignment(packed + params.packed_offset * sizeof(uint)).supports(16)) {
         quantized_q8_sums_impl<true>(input, packed, scales, biases, params,
             input_base, first_column, lane, sums);
     } else {
@@ -777,8 +776,8 @@ void quantized_gemv_q8_fast_body(
     uint2 tile) {
     // The q8-fast contract keeps row and lane offsets aligned for both vector loads.
     uint input_bytes = input0_dtype == 0 ? 4 : 2;
-    if (ulong(input + params.input_offset * input_bytes) % (4 * input_bytes) == 0 &&
-        ulong(packed + params.packed_offset * sizeof(uint)) % 8 == 0) {
+    if (bound_alignment(input + params.input_offset * input_bytes).supports(4 * input_bytes) &&
+        bound_alignment(packed + params.packed_offset * sizeof(uint)).supports(8)) {
         quantized_gemv_q8_fast_impl<output_count, true>(
             input, packed, scales, biases, output, params, FORJA_EPILOGUE_VALUES,
             simdgroup, lane, tile);
@@ -1337,7 +1336,7 @@ struct GroupedInputLoader {
     void load(device const uchar *input, constant GatherQuantMatmulParams &params,
               uint inner_origin) thread {
         if (input0_dtype == 0 && inner_origin + BK <= params.inner &&
-            ulong(input + params.input_offset * 4) % 16 == 0 && params.input_row_stride % 4 == 0 &&
+            bound_alignment(input + params.input_offset * 4).supports(16) && params.input_row_stride % 4 == 0 &&
             params.input_inner_stride == 1) {
             for (uint chunk = 0; chunk < count; chunk += 4) {
                 float4 value = 0.0f;
@@ -1857,7 +1856,7 @@ void load_quantized_gemm_input_tile(
     constexpr uint reads_per_thread = elements_per_thread / vector_elements;
     if (thread_count == 128 && row_origin + block_rows <= params.rows &&
         inner_origin + block_inner <= params.inner &&
-        ulong(input + params.input_offset * sizeof(T)) % 16 == 0 &&
+        bound_alignment(input + params.input_offset * sizeof(T)).supports(16) &&
         params.input_row_stride % vector_elements == 0 &&
         params.input_inner_stride == 1) {
         uint local_row = thread_index / 4;
@@ -2008,7 +2007,7 @@ void quantized_gemv_staged_sums(
                 ulong base = params.packed_offset + ulong(column) * params.packed_row_stride;
                 ulong index = (first / values_per_word) * params.packed_word_stride;
                 uint4 words = load_quantized_words<2>(packed + base * 4, index,
-                    params.packed_word_stride, ((base + index) & 1) == 0);
+                    params.packed_word_stride);
                 ulong group = first / quant_group_size;
                 float scale = load_float(scales, params.scale_offset + ulong(column) * params.scale_row_stride
                     + group * params.scale_group_stride, input1_dtype);
