@@ -133,7 +133,7 @@ float load_quantized_activations(device const uchar *input, ulong base, ulong st
     for (uint element = 0; element < values_per_thread; element += 4) {
         ulong index = base + ulong(element) * stride;
         float4 values;
-        if (qmv_vector_contiguous != 0 || (stride == 1 && (index & 3) == 0)) {
+        if (qmv_vector_contiguous != 0 || stride == 1) {
             values = load_float4_contiguous(input, index, input0_dtype);
         } else {
             for (uint i = 0; i < 4; ++i) values[i] = load_float(input, index + ulong(i) * stride, input0_dtype);
@@ -326,7 +326,7 @@ void quantized_qmv_sums(
         for (uint element = 0; element < values_per_thread; element += 4) {
             ulong input_index = input_base + ulong(first_inner + element) * input_stride;
             float4 values;
-            if (input_stride == 1 && (input_index & 3) == 0) {
+            if (input_stride == 1) {
                 values = load_float4_contiguous(input, input_index, input0_dtype);
             } else {
                 for (uint item = 0; item < 4; ++item) {
@@ -451,7 +451,7 @@ void quantized_q8_sums_impl(
             ulong input_index = input_base + ulong(inner) * params.input_inner_stride;
             if constexpr (vectors_aligned) {
                 values = load_aligned_float4_contiguous(input, input_index, input0_dtype);
-            } else if (params.input_inner_stride == 1 && (input_index & 3) == 0) {
+            } else if (params.input_inner_stride == 1) {
                 values = load_float4_contiguous(input, input_index, input0_dtype);
             } else {
                 for (uint element = 0; element < 4; ++element) {

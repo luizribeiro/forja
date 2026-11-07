@@ -9895,10 +9895,6 @@ fn qmv_vector_config(dispatch: &Dispatch) -> [u32; 4] {
     let contiguous = dispatch.primitive_inputs().iter().all(|tensor| {
         let layout = tensor.layout();
         layout.is_contiguous()
-            && layout
-                .offset()
-                .checked_mul(layout.dtype().byte_size())
-                .is_some_and(|bytes| bytes.is_multiple_of(16))
     });
     let groups = if matches!(dispatch.op(), Op::GatherQuantMatmul { .. })
         || matches!(

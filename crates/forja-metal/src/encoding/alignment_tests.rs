@@ -465,3 +465,36 @@ fn attention_tile_vectors_check_absolute_origins() {
         }
     }
 }
+
+#[test]
+fn contiguous_shifted_quantized_inputs_keep_absolute_vector_guards() {
+    let mut inputs = quant_inputs(1, 8, 4, DType::F32, false, false);
+    inputs[0] = TensorSpec::sliced(
+        DType::F32,
+        &[1025],
+        &[forja_core::Slice::new(1, 1024, 1).unwrap()],
+    )
+    .reshaped(&[1, 1024]);
+    inputs[1] = TensorSpec::sliced(
+        DType::U32,
+        &[1025],
+        &[forja_core::Slice::new(1, 1024, 1).unwrap()],
+    )
+    .reshaped(&[8, 128]);
+    assert_variant(
+        Some("quant-matmul.vector8"),
+        Op::QuantMatmul {
+            bits: 4,
+            group_size: 64,
+        },
+        &inputs,
+        &TensorSpec::contiguous(DType::F32, &[1, 8]),
+        Canary {
+            load: "*reinterpret_cast<device const float4 *>(buffer + index * 4)",
+            pointer: "buffer + index * 4",
+            alignment: 16,
+            zero: "float4(0)",
+        },
+        None,
+    );
+}
