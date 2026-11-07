@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod alignment_tests;
+mod launch_work;
 pub(super) mod resources;
 mod state;
 #[cfg(test)]
@@ -620,6 +621,7 @@ struct EncodedDispatches {
     program_encoding: ProfileCount,
     program_compile_fallbacks: u64,
     physical_counts: Vec<u64>,
+    launch_work: Vec<launch_work::LaunchWork>,
     internal_profiles: Vec<InternalDispatchProfile>,
 }
 
@@ -687,6 +689,7 @@ enum PlanCall {
     },
     IndirectDispatch {
         address: u64,
+        max_threadgroups: MTLSize,
         threads_per_threadgroup: MTLSize,
     },
     Barrier,
@@ -2990,6 +2993,7 @@ impl MetalBackend {
             Vec::new()
         };
         let physical_counts = std::mem::take(&mut encoded.physical_counts);
+        debug_assert_eq!(encoded.launch_work.len(), dispatches.len());
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -3083,6 +3087,7 @@ impl MetalBackend {
             .ok_or(BackendError::ExecutionFailed)?;
         let mut internal_profiles = Vec::new();
         let mut physical_counts = Vec::new();
+        let mut launch_work = Vec::new();
         let mut consumed = 0;
         let mut previous_dispatch: Option<usize> = None;
         for (index, (dispatch, &barrier)) in plan.dispatches.iter().zip(plan.barriers).enumerate() {
@@ -3098,6 +3103,7 @@ impl MetalBackend {
                 )?;
             }
             previous_dispatch = Some(index);
+            let meter = launch_work::Meter::enter();
             let lanes = state::lane_group(&plan.dispatches[index..]);
             if barrier
                 || plan.barriers[index..index + lanes]
@@ -3118,6 +3124,11 @@ impl MetalBackend {
                 temporaries.extend(buffers);
                 error_flags.push(EncodedErrorFlag::new(flag, index, "state-lanes"));
                 consumed = index + lanes;
+                launch_work.push(meter.finish());
+                launch_work.extend(std::iter::repeat_n(
+                    launch_work::LaunchWork::default(),
+                    lanes - 1,
+                ));
                 if timestamps.is_some() {
                     physical_counts.push(1);
                     physical_counts.extend(std::iter::repeat_n(0, lanes - 1));
@@ -3145,6 +3156,7 @@ impl MetalBackend {
                     arguments,
                     graph_arena,
                 )?;
+                launch_work.push(meter.finish());
                 if timestamps.is_some() {
                     physical_counts.push(physical_dispatch_count(&plan.calls)?);
                 }
@@ -3171,6 +3183,7 @@ impl MetalBackend {
                 &mut program_encoding,
                 &mut program_compile_fallbacks,
             )?;
+            launch_work.push(meter.finish());
             if let Some(recorder) = recorder {
                 physical_counts.push(physical_dispatch_count(&recorder.finish())?);
             }
@@ -3199,6 +3212,7 @@ impl MetalBackend {
             program_encoding,
             program_compile_fallbacks,
             physical_counts,
+            launch_work,
             internal_profiles,
         })
     }
@@ -3271,14 +3285,19 @@ impl MetalBackend {
                 PlanCall::Dispatch {
                     threadgroups,
                     threads_per_threadgroup,
-                } => encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                    *threadgroups,
-                    *threads_per_threadgroup,
-                ),
+                } => {
+                    launch_work::record(*threadgroups, *threads_per_threadgroup)?;
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                        *threadgroups,
+                        *threads_per_threadgroup,
+                    );
+                }
                 PlanCall::IndirectDispatch {
                     address,
+                    max_threadgroups,
                     threads_per_threadgroup,
                 } => {
+                    launch_work::record(*max_threadgroups, *threads_per_threadgroup)?;
                     // SAFETY: The address was captured from a live retained scratch buffer and
                     // names a three-u32 indirect dispatch record initialized by the sample kernel.
                     unsafe {
@@ -7331,6 +7350,7 @@ impl MetalBackend {
                     &rejection_proposal_partials_pipeline,
                     encoder,
                     &rejection_dispatch.buffer,
+                    chunk_groups,
                     threads,
                 )?;
             }
@@ -7365,6 +7385,7 @@ impl MetalBackend {
                     &rejection_threshold_partials_pipeline,
                     encoder,
                     &rejection_dispatch.buffer,
+                    chunk_groups,
                     threads,
                 )?;
             }
@@ -8198,6 +8219,7 @@ impl MetalBackend {
             program_encoding: _,
             program_compile_fallbacks: _,
             physical_counts: _,
+            launch_work: _,
             internal_profiles: _,
         } = encoded;
         let mut indices = HashMap::<u64, usize>::new();
@@ -9535,6 +9557,7 @@ fn dispatch_threadgroups(
 ) -> Result<(), BackendError> {
     use objc2_metal::MTL4ComputeCommandEncoder;
 
+    launch_work::record(threadgroups, threads_per_threadgroup)?;
     record_pipeline_launch(pipeline, threads_per_threadgroup)?;
     encoder.setComputePipelineState(pipeline);
     record_plan_call(PlanCall::Dispatch {
@@ -9549,15 +9572,18 @@ fn dispatch_threadgroups_indirect(
     pipeline: &ComputePipeline,
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     arguments: &BufferBinding,
+    max_threadgroups: MTLSize,
     threads_per_threadgroup: MTLSize,
 ) -> Result<(), BackendError> {
     use objc2_metal::MTL4ComputeCommandEncoder;
 
     debug_assert!(arguments.len >= 3 * size_of::<u32>());
+    launch_work::record(max_threadgroups, threads_per_threadgroup)?;
     record_pipeline_launch(pipeline, threads_per_threadgroup)?;
     encoder.setComputePipelineState(pipeline);
     record_plan_call(PlanCall::IndirectDispatch {
         address: arguments.address,
+        max_threadgroups,
         threads_per_threadgroup,
     });
     // SAFETY: `arguments` retains a live allocation containing the aligned three-u32 indirect
@@ -12665,6 +12691,7 @@ mod tests {
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
             physical_counts: Vec::new(),
+            launch_work: Vec::new(),
             internal_profiles: Vec::new(),
         };
         assert!(matches!(
@@ -12690,6 +12717,7 @@ mod tests {
             program_encoding: ProfileCount::default(),
             program_compile_fallbacks: 0,
             physical_counts: Vec::new(),
+            launch_work: Vec::new(),
             internal_profiles: Vec::new(),
         };
         assert!(matches!(
@@ -14059,6 +14087,7 @@ mod tests {
                     program_encoding: ProfileCount::default(),
                     program_compile_fallbacks: 0,
                     physical_counts: Vec::new(),
+                    launch_work: Vec::new(),
                     internal_profiles: Vec::new(),
                 },
                 None,
