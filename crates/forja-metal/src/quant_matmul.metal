@@ -408,7 +408,8 @@ void quantized_qmv_sums(
     }
 }
 
-void quantized_q8_sums(
+template <bool vectors_aligned>
+void quantized_q8_sums_impl(
     device const uchar *input,
     device const uchar *packed,
     device const uchar *scales,
@@ -432,7 +433,8 @@ void quantized_q8_sums(
                 ulong index = params.packed_offset +
                     ulong(column) * params.packed_row_stride +
                     ulong(first_word) * params.packed_word_stride;
-                if (params.packed_word_stride == 1 && ulong(packed + index * 4) % 16 == 0) {
+                if (vectors_aligned ||
+                    (params.packed_word_stride == 1 && ulong(packed + index * 4) % 16 == 0)) {
                     quantized_words[row] =
                         *(device const uint4 *)(packed + index * sizeof(uint));
                 } else {
@@ -448,7 +450,9 @@ void quantized_q8_sums(
             uint inner = (first_word + word) * 4;
             float4 values;
             ulong input_index = input_base + ulong(inner) * params.input_inner_stride;
-            if (params.input_inner_stride == 1 && (input_index & 3) == 0) {
+            if constexpr (vectors_aligned) {
+                values = load_aligned_float4_contiguous(input, input_index, input0_dtype);
+            } else if (params.input_inner_stride == 1 && (input_index & 3) == 0) {
                 values = load_float4_contiguous(input, input_index, input0_dtype);
             } else {
                 for (uint element = 0; element < 4; ++element) {
@@ -481,6 +485,29 @@ void quantized_q8_sums(
     }
     for (uint row = 0; row < 8; ++row) {
         sums[row] = simd_sum(sums[row]);
+    }
+}
+
+void quantized_q8_sums(
+    device const uchar *input,
+    device const uchar *packed,
+    device const uchar *scales,
+    device const uchar *biases,
+    constant QuantMatmulParams &params,
+    ulong input_base,
+    uint first_column,
+    ushort lane,
+    thread float (&sums)[8]) {
+    uint input_bytes = input0_dtype == 0 ? 4 : 2;
+    if (params.input_inner_stride == 1 && params.packed_word_stride == 1 &&
+        params.packed_row_stride % 4 == 0 &&
+        ulong(input + input_base * input_bytes) % (4 * input_bytes) == 0 &&
+        ulong(packed + params.packed_offset * sizeof(uint)) % 16 == 0) {
+        quantized_q8_sums_impl<true>(input, packed, scales, biases, params,
+            input_base, first_column, lane, sums);
+    } else {
+        quantized_q8_sums_impl<false>(input, packed, scales, biases, params,
+            input_base, first_column, lane, sums);
     }
 }
 

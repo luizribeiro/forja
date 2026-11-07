@@ -166,6 +166,7 @@ fn gather_vectors_check_absolute_weight_alignment() {
 fn contiguous_float_vectors_check_absolute_alignment() {
     for (variant, bits, skew_input, skew_operand) in [
         ("quant-matmul.gemv", 4, true, None),
+        ("quant-matmul.gemv", 8, false, Some(0)),
         ("quant-matmul.q8-fast-gemv", 8, false, Some(0)),
         ("quant-matmul.q8-fast-gemv-n2", 8, false, Some(0)),
     ] {
@@ -237,22 +238,38 @@ fn packed_vector_words_check_absolute_alignment() {
 
 #[test]
 fn q8_vector_words_check_absolute_alignment() {
-    assert_variant(
-        Some("quant-matmul.row-gemv"),
-        Op::QuantMatmul {
-            bits: 8,
-            group_size: 64,
-        },
-        &quant_inputs(4, 8, 8, DType::F32, false, true),
-        &TensorSpec::contiguous(DType::F32, &[4, 8]),
-        Canary {
-            load: "*(device const uint4 *)(packed + index * sizeof(uint))",
-            pointer: "packed + index * sizeof(uint)",
-            alignment: 16,
-            zero: "uint4(0)",
-        },
-        None,
-    );
+    for (variant, rows, width, offset) in [
+        ("quant-matmul.gemv", 1, 260, 1),
+        ("quant-matmul.gemv", 1, 257, 0),
+        ("quant-matmul.row-gemv", 4, 260, 1),
+        ("quant-matmul.row-gemv", 4, 257, 0),
+    ] {
+        let mut inputs = quant_inputs(rows, 8, 8, DType::F32, false, false);
+        inputs[1] = TensorSpec::sliced(
+            DType::U32,
+            &[8, width],
+            &[
+                forja_core::Slice::new(0, 8, 1).unwrap(),
+                forja_core::Slice::new(offset, 256, 1).unwrap(),
+            ],
+        );
+        assert_variant(
+            Some(variant),
+            Op::QuantMatmul {
+                bits: 8,
+                group_size: 64,
+            },
+            &inputs,
+            &TensorSpec::contiguous(DType::F32, &[rows, 8]),
+            Canary {
+                load: "*(device const uint4 *)(packed + index * sizeof(uint))",
+                pointer: "packed + index * sizeof(uint)",
+                alignment: 16,
+                zero: "uint4(0)",
+            },
+            None,
+        );
+    }
 }
 
 #[test]
