@@ -360,9 +360,11 @@ pub(crate) fn metal_backend(
     let live_bytes = limits
         .resolve_live_bytes(working_set, physical_memory)?
         .get();
-    let backend = forja_metal::MetalBackend::with_graph_replay_and_pool_capacity(
+    let backend = forja_metal::MetalBackend::with_compile_limits(
         metal_graph_replay(graph_replay),
         pool_capacity,
+        usize::try_from(limits.pipeline_compilations)?,
+        limits.compile_budget.get(),
     )?;
     Ok((backend, live_bytes))
 }

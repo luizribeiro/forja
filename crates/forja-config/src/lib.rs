@@ -494,6 +494,10 @@ pub struct Limits {
     pub live_tensor_handles: u32,
     /// Maximum number of live prepared kernels.
     pub live_kernels: u32,
+    /// Maximum pipeline compilation attempts during one engine backend lifetime.
+    pub pipeline_compilations: u32,
+    /// Cumulative wall time available to the Metal compiler, including library loading.
+    pub compile_budget: Duration,
     /// Maximum number of live command graphs.
     pub live_graphs: u32,
     /// Maximum bytes returned by one tensor read.
@@ -526,6 +530,8 @@ impl Default for Limits {
             tensor_elements: 1_000_000_000,
             live_tensor_handles: 20_000,
             live_kernels: 64,
+            pipeline_compilations: 256,
+            compile_budget: Duration::from_secs(60),
             live_graphs: 16,
             read_bytes: ByteSize::new(1024 * 1024 * 1024),
             guest_memory_bytes: ByteSize::new(4 * 1024 * 1024 * 1024),
@@ -614,6 +620,8 @@ mod tests {
         assert_eq!(limits.tensor_elements, 1_000_000_000);
         assert_eq!(limits.live_tensor_handles, 20_000);
         assert_eq!(limits.live_kernels, 64);
+        assert_eq!(limits.pipeline_compilations, 256);
+        assert_eq!(limits.compile_budget, Duration::from_secs(60));
         assert_eq!(limits.live_graphs, 16);
         assert_eq!(limits.read_bytes.get(), 1024 * 1024 * 1024);
         assert_eq!(limits.guest_memory_bytes.get(), 4 * 1024 * 1024 * 1024);
@@ -648,6 +656,8 @@ mod tests {
             r#"live_bytes = "48GiB"
 dispatches_per_list = "unlimited"
 submission_timeout = "250ms"
+pipeline_compilations = 33
+compile_budget = "7s"
 "#,
         )
         .unwrap();
@@ -658,6 +668,8 @@ submission_timeout = "250ms"
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.dispatches_per_list, Unbounded::Unlimited);
         assert_eq!(limits.submission_timeout, Duration::from_millis(250));
+        assert_eq!(limits.pipeline_compilations, 33);
+        assert_eq!(limits.compile_budget, Duration::from_secs(7));
     }
 
     #[test]

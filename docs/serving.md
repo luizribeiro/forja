@@ -51,6 +51,12 @@ directories; the dev shell defaults it to `~/.cache/forja/models`.
    with a bus error. Replace a model by loading a new immutable directory and
    letting existing references drain.
 
+The host bounds Metal compilation with `limits.pipeline_compilations` (256 attempts
+per backend lifetime) and `limits.compile_budget` (`"60s"` cumulative compiler wall
+time, including initial libraries). Cache hits cost no attempts; failed compiles
+consume their attempt. Budget expiry disables that backend's compilation and GPU
+submission. These are operator settings; engine components cannot raise them.
+
 See [benchmarking](benchmarking.md) for serving workloads, prefix-cache evidence
 and competitor comparisons, and [architecture and safety](architecture.md) for
 the boundary between the host, engine and chat component.

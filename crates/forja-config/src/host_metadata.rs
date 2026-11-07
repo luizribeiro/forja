@@ -105,6 +105,8 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("limits.tensor_elements", ReloadClass::Restart),
     ("limits.live_tensor_handles", ReloadClass::Restart),
     ("limits.live_kernels", ReloadClass::Restart),
+    ("limits.pipeline_compilations", ReloadClass::Restart),
+    ("limits.compile_budget", ReloadClass::Restart),
     ("limits.live_graphs", ReloadClass::Restart),
     ("limits.read_bytes", ReloadClass::Restart),
     ("limits.guest_memory_bytes", ReloadClass::Restart),

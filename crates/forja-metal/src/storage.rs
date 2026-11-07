@@ -766,15 +766,34 @@ impl MetalBackend {
         count: usize,
         budget: Duration,
     ) -> Result<Self, BackendError> {
+        Self::with_compile_limits(
+            MetalGraphReplay::Tier2,
+            Self::automatic_pool_capacity()?,
+            count,
+            budget,
+        )
+    }
+
+    /// Creates a backend with host-selected replay, storage and compiler limits.
+    /// Compiler expiry disables GPU submission; failed compilation attempts consume the quota.
+    ///
+    /// # Errors
+    /// Refuses zero or unrepresentable limits, unavailable Metal, or compilation failure.
+    pub fn with_compile_limits(
+        graph_replay: MetalGraphReplay,
+        pool_capacity: u64,
+        count: usize,
+        budget: Duration,
+    ) -> Result<Self, BackendError> {
         if count == 0 {
             return Err(BackendError::InvalidInput);
         }
         let compiler = crate::compiler::Compiler::new(budget)?;
         let backend = Self::with_compiler_configuration(
             Duration::from_secs(10),
-            Self::automatic_pool_capacity()?,
+            pool_capacity,
             ProgramCompileBudget::default(),
-            MetalGraphReplay::Tier2,
+            graph_replay,
             compiler,
         )?;
         backend.pipelines.set_initial_pipeline_budget(count);
