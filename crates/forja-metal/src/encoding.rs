@@ -10765,6 +10765,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sampling_matches_cpu_with_poisoned_top_merge_storage() {
+        let backend = MetalBackend::new().unwrap();
+        let declaration = "threadgroup ulong simd_top[fast_top_slots];";
+        assert_eq!(
+            crate::storage::shader_source().matches(declaration).count(),
+            4
+        );
+        let source = crate::storage::shader_source().replace(
+            declaration,
+            r"
+            threadgroup ulong simd_top[256];
+            for (uint poison = lane; poison < 256; poison += group_width) simd_top[poison] = ~0ul;
+            threadgroup_barrier(mem_flags::mem_threadgroup);",
+        );
+        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        let _rounds = SampleRoundsOverride::set(0);
+        for top_k in 1..=20 {
+            for variant in ["sample.portable", "sample.parallel"] {
+                forja_testing::assert_backends_agree_many_selected_with(
+                    &CpuBackend::new(),
+                    &backend,
+                    Op::Sample {
+                        position: 33,
+                        chunk_width: 2048,
+                        fast_top_k: top_k,
+                        fast_max_chunks: 100,
+                        rejection_rounds: 1,
+                    },
+                    &[
+                        TensorSpec::contiguous(DType::F32, &[1, 4097]),
+                        TensorSpec::initialized(
+                            DType::U32,
+                            &[5],
+                            sample_params(0.7, top_k, 0.9, 7),
+                        ),
+                    ],
+                    &[TensorSpec::contiguous(DType::U32, &[1])],
+                    &[0],
+                    |commands| {
+                        let pick = backend
+                            .validate_variant(commands.last_dispatch().unwrap(), variant)
+                            .unwrap();
+                        assert!(commands.set_last_backend_data(BackendDispatchData::new(pick)));
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn fast_top_merge_ignores_poisoned_unwritten_candidates() {
         let backend = MetalBackend::new().unwrap();
         let source = format!(
