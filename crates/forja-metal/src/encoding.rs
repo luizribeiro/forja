@@ -7405,7 +7405,7 @@ impl MetalBackend {
             height: 1,
             depth: 1,
         };
-        set_pipeline(encoder, &prepare_pipeline);
+
         bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &state.buffer);
         bindings.bind(table, 2, &temporaries[SAMPLE_PARAMS_LAYOUT]);
@@ -7414,7 +7414,7 @@ impl MetalBackend {
         bindings.bind(table, 5, &temporaries[SAMPLE_MAX_ROUNDS]);
         bindings.bind(table, 6, &rejection_dispatch.buffer);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
+        dispatch_pipeline_threadgroups(&prepare_pipeline, encoder, row_groups, threads)?;
 
         let common = SampleCommonBindings {
             logits: &logits_buffer,
@@ -7428,39 +7428,64 @@ impl MetalBackend {
             let round_buffer = &temporaries[SAMPLE_ROUND_ARGUMENTS
                 + usize::try_from(round).map_err(|_| BackendError::ExecutionFailed)?];
             encode_dispatch_barrier(encoder);
-            set_pipeline(encoder, &rejection_proposal_partials_pipeline);
+
             common.bind(table, bindings, &rejection_partials.buffer);
             bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
             bindings.bind(table, 8, round_buffer);
             bindings.bind(table, 9, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             if round == 0 {
-                dispatch_threadgroups(encoder, chunk_groups, threads);
+                dispatch_pipeline_threadgroups(
+                    &rejection_proposal_partials_pipeline,
+                    encoder,
+                    chunk_groups,
+                    threads,
+                )?;
             } else {
-                dispatch_threadgroups_indirect(encoder, &rejection_dispatch.buffer, threads);
+                dispatch_pipeline_threadgroups_indirect(
+                    &rejection_proposal_partials_pipeline,
+                    encoder,
+                    &rejection_dispatch.buffer,
+                    threads,
+                )?;
             }
 
             encode_dispatch_barrier(encoder);
-            set_pipeline(encoder, &rejection_proposal_finalize_pipeline);
+
             bindings.bind(table, 0, &rejection_partials.buffer);
             bindings.bind(table, 1, &state.buffer);
             bindings.bind(table, 2, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
-            dispatch_threadgroups(encoder, row_groups, threads);
+            dispatch_pipeline_threadgroups(
+                &rejection_proposal_finalize_pipeline,
+                encoder,
+                row_groups,
+                threads,
+            )?;
 
             encode_dispatch_barrier(encoder);
-            set_pipeline(encoder, &rejection_threshold_partials_pipeline);
+
             common.bind(table, bindings, &rejection_partials.buffer);
             bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
             set_argument_table(encoder, table);
             if round == 0 {
-                dispatch_threadgroups(encoder, chunk_groups, threads);
+                dispatch_pipeline_threadgroups(
+                    &rejection_threshold_partials_pipeline,
+                    encoder,
+                    chunk_groups,
+                    threads,
+                )?;
             } else {
-                dispatch_threadgroups_indirect(encoder, &rejection_dispatch.buffer, threads);
+                dispatch_pipeline_threadgroups_indirect(
+                    &rejection_threshold_partials_pipeline,
+                    encoder,
+                    &rejection_dispatch.buffer,
+                    threads,
+                )?;
             }
 
             encode_dispatch_barrier(encoder);
-            set_pipeline(encoder, &rejection_threshold_finalize_pipeline);
+
             bindings.bind(table, 0, &logits_buffer);
             bindings.bind(table, 1, &sampling_buffer);
             bindings.bind(table, 2, &rejection_partials.buffer);
@@ -7475,10 +7500,15 @@ impl MetalBackend {
             bindings.bind(table, 11, &temporaries[SAMPLE_CHUNKS]);
             bindings.bind(table, 12, &rejection_dispatch.buffer);
             set_argument_table(encoder, table);
-            dispatch_threadgroups(encoder, row_groups, threads);
+            dispatch_pipeline_threadgroups(
+                &rejection_threshold_finalize_pipeline,
+                encoder,
+                row_groups,
+                threads,
+            )?;
         }
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &topk_partials_pipeline);
+
         bindings.bind(table, 0, &logits_buffer);
         bindings.bind(table, 1, &topk_partials.buffer);
         bindings.bind(table, 2, &state.buffer);
@@ -7486,10 +7516,10 @@ impl MetalBackend {
         bindings.bind(table, 4, &temporaries[SAMPLE_WIDTH]);
         bindings.bind(table, 5, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, chunk_groups, threads);
+        dispatch_pipeline_threadgroups(&topk_partials_pipeline, encoder, chunk_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &topk_finalize_pipeline);
+
         bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &topk_partials.buffer);
         bindings.bind(table, 2, &state.buffer);
@@ -7502,10 +7532,10 @@ impl MetalBackend {
         bindings.bind(table, 9, &temporaries[SAMPLE_ERROR]);
         bindings.bind(table, 10, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
+        dispatch_pipeline_threadgroups(&topk_finalize_pipeline, encoder, row_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &exact_fallback_pipeline);
+
         bindings.bind(table, 0, &logits_buffer);
         bindings.bind(table, 1, &sampling_buffer);
         bindings.bind(table, 2, &state.buffer);
@@ -7518,19 +7548,19 @@ impl MetalBackend {
         bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
         bindings.bind(table, 10, &temporaries[SAMPLE_ERROR]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
+        dispatch_pipeline_threadgroups(&exact_fallback_pipeline, encoder, row_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &partials_pipeline);
+
         common.bind(table, bindings, &partials.buffer);
         bindings.bind(table, 7, &temporaries[SAMPLE_POSITION]);
         bindings.bind(table, 8, &temporaries[SAMPLE_CHUNKS]);
         bindings.bind(table, 9, &temporaries[SAMPLE_MAX_ROUNDS]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, chunk_groups, threads);
+        dispatch_pipeline_threadgroups(&partials_pipeline, encoder, chunk_groups, threads)?;
 
         encode_dispatch_barrier(encoder);
-        set_pipeline(encoder, &reduce_finalize_pipeline);
+
         bindings.bind(table, 0, &sampling_buffer);
         bindings.bind(table, 1, &partials.buffer);
         bindings.bind(table, 2, &state.buffer);
@@ -7540,7 +7570,7 @@ impl MetalBackend {
         bindings.bind(table, 6, &temporaries[SAMPLE_WIDTH]);
         bindings.bind(table, 7, &temporaries[SAMPLE_CHUNKS]);
         set_argument_table(encoder, table);
-        dispatch_threadgroups(encoder, row_groups, threads);
+        dispatch_pipeline_threadgroups(&reduce_finalize_pipeline, encoder, row_groups, threads)?;
 
         temporaries.extend([
             logits_buffer,
@@ -9582,6 +9612,72 @@ fn head_matrix(
     EncoderTensor::new(tensor.buffer.clone(), layout)
 }
 
+fn record_pipeline_launch(
+    pipeline: &ComputePipeline,
+    threads_per_threadgroup: MTLSize,
+) -> Result<(), BackendError> {
+    validate_launch_threads(
+        pipeline.maxTotalThreadsPerThreadgroup(),
+        threads_per_threadgroup,
+    )?;
+    record_plan_call(PlanCall::Pipeline(pipeline.clone()));
+    Ok(())
+}
+
+fn dispatch_pipeline_threadgroups(
+    pipeline: &ComputePipeline,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    threadgroups: MTLSize,
+    threads_per_threadgroup: MTLSize,
+) -> Result<(), BackendError> {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    record_pipeline_launch(pipeline, threads_per_threadgroup)?;
+    encoder.setComputePipelineState(pipeline);
+    record_plan_call(PlanCall::Dispatch {
+        threadgroups,
+        threads_per_threadgroup,
+    });
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
+    Ok(())
+}
+
+fn dispatch_pipeline_threadgroups_indirect(
+    pipeline: &ComputePipeline,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arguments: &BufferBinding,
+    threads_per_threadgroup: MTLSize,
+) -> Result<(), BackendError> {
+    use objc2_metal::MTL4ComputeCommandEncoder;
+
+    debug_assert!(arguments.len >= 3 * size_of::<u32>());
+    record_pipeline_launch(pipeline, threads_per_threadgroup)?;
+    encoder.setComputePipelineState(pipeline);
+    record_plan_call(PlanCall::IndirectDispatch {
+        address: arguments.address,
+        threads_per_threadgroup,
+    });
+    // SAFETY: `arguments` retains a live allocation containing the aligned three-u32 indirect
+    // dispatch record initialized by the preceding sample kernels.
+    unsafe {
+        encoder.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+            arguments.address,
+            threads_per_threadgroup,
+        );
+    }
+    Ok(())
+}
+
+fn validate_launch_threads(available: usize, threads: MTLSize) -> Result<(), BackendError> {
+    threads
+        .width
+        .checked_mul(threads.height)
+        .and_then(|count| count.checked_mul(threads.depth))
+        .filter(|&count| count > 0 && count <= available)
+        .map(|_| ())
+        .ok_or(BackendError::UnsupportedOperation)
+}
+
 fn set_pipeline(
     encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
     pipeline: &Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -9614,28 +9710,6 @@ fn dispatch_threadgroups(
         threads_per_threadgroup,
     });
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_threadgroup);
-}
-
-fn dispatch_threadgroups_indirect(
-    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
-    arguments: &BufferBinding,
-    threads_per_threadgroup: MTLSize,
-) {
-    use objc2_metal::MTL4ComputeCommandEncoder;
-
-    debug_assert!(arguments.len >= 3 * size_of::<u32>());
-    record_plan_call(PlanCall::IndirectDispatch {
-        address: arguments.address,
-        threads_per_threadgroup,
-    });
-    // SAFETY: `arguments` retains a live allocation containing the aligned three-u32 indirect
-    // dispatch record initialized by the preceding sample kernels.
-    unsafe {
-        encoder.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
-            arguments.address,
-            threads_per_threadgroup,
-        );
-    }
 }
 
 fn encode_dispatch_barrier(encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>) {
@@ -10936,6 +11010,69 @@ mod tests {
                 );
                 assert_eq!(actual == "copy_contiguous_f32x4", i % 4 == 0 && o % 4 == 0);
             }
+        }
+    }
+
+    #[test]
+    fn refused_launch_retains_no_pipeline_or_dispatch_in_the_plan() {
+        let backend = MetalBackend::new().unwrap();
+        let cache = Mutex::new(
+            PipelineCache::new(&backend.device, crate::storage::shader_source()).unwrap(),
+        );
+        let pipeline = cache
+            .lock()
+            .unwrap()
+            .get("copy_contiguous_f32x4", &[])
+            .unwrap();
+        let recorder = PlanRecorderScope::enter(0, None);
+        assert_eq!(
+            record_pipeline_launch(
+                &pipeline,
+                MTLSize {
+                    width: pipeline.maxTotalThreadsPerThreadgroup() + 1,
+                    height: 1,
+                    depth: 1,
+                }
+            ),
+            Err(BackendError::UnsupportedOperation)
+        );
+        assert!(recorder.finish().is_empty());
+    }
+
+    #[test]
+    fn every_launch_checks_the_full_threadgroup_product() {
+        for width in [1, 7, 33, 256, 1024] {
+            let size = MTLSize {
+                width,
+                height: 1,
+                depth: 1,
+            };
+            assert_eq!(validate_launch_threads(width, size), Ok(()));
+            assert_eq!(
+                validate_launch_threads(width - 1, size),
+                Err(BackendError::UnsupportedOperation)
+            );
+        }
+        let size = MTLSize {
+            width: 33,
+            height: 7,
+            depth: 4,
+        };
+        assert!(validate_launch_threads(1024, size).is_ok());
+        assert!(validate_launch_threads(923, size).is_err());
+        for size in [
+            MTLSize {
+                width: 0,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: usize::MAX,
+                height: 7,
+                depth: 33,
+            },
+        ] {
+            assert!(validate_launch_threads(usize::MAX, size).is_err());
         }
     }
 
@@ -15514,7 +15651,8 @@ mod tests {
             "steel_attention_256",
             &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)],
         ));
-        let mut pipelines = backend.pipelines.lock().unwrap();        assert!(matches!(
+        let mut pipelines = backend.pipelines.lock().unwrap();
+        assert!(matches!(
             pipelines.get(
                 "steel_attention_256",
                 &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)]
