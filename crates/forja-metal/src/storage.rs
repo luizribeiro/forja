@@ -1006,6 +1006,7 @@ impl MetalBackend {
             .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
             .ok_or(BackendError::AllocationFailed)?;
         self.check_allocation_limit()?;
+        validate_allocation_origin(buffer.gpuAddress(), 0)?;
         Ok(buffer)
     }
 
@@ -1481,6 +1482,16 @@ type BufferDeallocator = RcBlock<dyn Fn(NonNull<c_void>, usize)>;
 /// Protects Metal buffer-address alignment required by kernel vector loads.
 const GPU_ADDRESS_ALIGNMENT: usize = 16;
 
+fn validate_allocation_origin(address: u64, offset: usize) -> Result<(), BackendError> {
+    let origin = address
+        .checked_add(u64::try_from(offset).map_err(|_| BackendError::InvalidInput)?)
+        .ok_or(BackendError::InvalidInput)?;
+    if !forja_core::ByteAlignment::of(origin).supports(GPU_ADDRESS_ALIGNMENT as u64) {
+        return Err(BackendError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn readonly_buffer(
     backend: &MetalBackend,
     region: MappedRegion,
@@ -1502,6 +1513,7 @@ fn readonly_buffer(
         }
         .ok_or(BackendError::AllocationFailed)?;
         backend.check_allocation_limit()?;
+        validate_allocation_origin(raw.gpuAddress(), 0)?;
         return Ok(MetalBuffer {
             raw,
             len,
@@ -1537,6 +1549,7 @@ fn readonly_buffer(
     }
     .ok_or(BackendError::AllocationFailed)?;
     backend.check_allocation_limit()?;
+    validate_allocation_origin(raw.gpuAddress(), data_offset)?;
     Ok(MetalBuffer {
         raw,
         len,
@@ -1714,6 +1727,19 @@ mod tests {
     use forja_core::{Op, Slice, Submission};
 
     use super::*;
+
+    #[test]
+    fn allocation_origins_preserve_relative_alignment_classes() {
+        for address in 0..32 {
+            for offset in 0..32 {
+                assert_eq!(
+                    validate_allocation_origin(address, offset).is_ok(),
+                    (address + offset as u64).is_multiple_of(16)
+                );
+            }
+        }
+        assert!(validate_allocation_origin(u64::MAX, 1).is_err());
+    }
 
     #[test]
     fn backend_debug_state_tracks_owned_resources() {

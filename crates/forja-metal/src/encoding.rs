@@ -225,6 +225,21 @@ fn reserve_argument(
 struct EncoderTensor {
     buffer: BufferBinding,
     layout: Layout,
+    alignment: forja_core::ByteAlignment,
+}
+
+impl EncoderTensor {
+    fn new(buffer: BufferBinding, layout: Layout) -> Result<Self, BackendError> {
+        let address = buffer
+            .address
+            .checked_add(layout.byte_span().start)
+            .ok_or(BackendError::InvalidInput)?;
+        Ok(Self {
+            buffer,
+            layout,
+            alignment: forja_core::ByteAlignment::of(address),
+        })
+    }
 }
 
 fn gather_quant_params(
@@ -3994,20 +4009,20 @@ impl MetalBackend {
                 )?);
             }
             encode_dispatch_barrier(encoder);
-            let key_heads = EncoderTensor {
-                buffer: key_scratch.buffer.clone(),
-                layout: key_scratch
+            let key_heads = EncoderTensor::new(
+                key_scratch.buffer.clone(),
+                key_scratch
                     .layout
                     .permute(&[1, 0, 2])
                     .map_err(|_| BackendError::InvalidInput)?,
-            };
-            let value_heads = EncoderTensor {
-                buffer: value_scratch.buffer.clone(),
-                layout: value_scratch
+            )?;
+            let value_heads = EncoderTensor::new(
+                value_scratch.buffer.clone(),
+                value_scratch
                     .layout
                     .permute(&[1, 0, 2])
                     .map_err(|_| BackendError::InvalidInput)?,
-            };
+            )?;
             let scores = self.scratch_tensor(DType::F32, &[q[0], q[1], key_length])?;
             temporaries.extend(self.encode_sdpa_query_key(
                 encoder,
@@ -6510,8 +6525,8 @@ impl MetalBackend {
         let kernel = copy_kernel(
             &input.layout,
             &output.layout,
-            input.buffer.address,
-            output.buffer.address,
+            input.alignment,
+            output.alignment,
         );
         let vectorized = kernel == "copy_contiguous_f32x4";
         let constants = [
@@ -6584,15 +6599,15 @@ impl MetalBackend {
             u64::try_from(view_len).map_err(|_| BackendError::InvalidInput)?,
         )
         .map_err(|_| BackendError::InvalidInput)?;
-        Ok(EncoderTensor {
-            buffer: BufferBinding {
+        EncoderTensor::new(
+            BufferBinding {
                 raw: buffer.raw.clone(),
                 offset: binding_offset,
                 len: view_len,
                 address,
             },
-            layout: normalized,
-        })
+            normalized,
+        )
     }
 
     fn encoder_dense_tensor(&self, tensor: &Tensor) -> Result<EncoderTensor, BackendError> {
@@ -6639,10 +6654,7 @@ impl MetalBackend {
         })?;
         let layout = Layout::contiguous(dtype, 0, shape.to_vec(), byte_len)
             .map_err(|_| BackendError::InvalidInput)?;
-        Ok(EncoderTensor {
-            buffer: BufferBinding::whole(buffer),
-            layout,
-        })
+        EncoderTensor::new(BufferBinding::whole(buffer), layout)
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -6936,8 +6948,9 @@ impl MetalBackend {
         let rows = u32::try_from(output.layout().element_count())
             .map_err(|_| BackendError::ExecutionFailed)?;
         let scratch = self.scratch_tensor(DType::U32, &[rows, chunks, 2])?;
+        let bound_input = self.encoder_tensor(input)?;
         let (partials_pipeline, finalize_pipeline) =
-            self.argmax_pipelines(input.layout(), width, chunk_width)?;
+            self.argmax_pipelines(&bound_input, width, chunk_width)?;
         let mut temporaries = vec![
             Self::layout_buffer(input.layout(), arguments)?,
             Self::layout_buffer(output.layout(), arguments)?,
@@ -7011,7 +7024,7 @@ impl MetalBackend {
 
     fn argmax_pipelines(
         &self,
-        input: &Layout,
+        input: &EncoderTensor,
         width: u32,
         chunk_width: u32,
     ) -> Result<(ComputePipeline, ComputePipeline), BackendError> {
@@ -7019,7 +7032,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
-        let partials = if vectorized_argmax(input, width, chunk_width) {
+        let partials = if vectorized_argmax(&input.layout, input.alignment, width, chunk_width) {
             pipelines.get(
                 "argmax_partials_f32x4",
                 &[(REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width)],
@@ -7028,7 +7041,7 @@ impl MetalBackend {
             pipelines.get(
                 "argmax_partials",
                 &[
-                    (0, dtype_code(input.dtype())),
+                    (0, dtype_code(input.layout.dtype())),
                     (REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width),
                 ],
             )?
@@ -8174,10 +8187,7 @@ impl MetalBackend {
                 .ok_or(BackendError::AllocationFailed)?,
         )
         .map_err(|_| BackendError::InvalidInput)?;
-        let scores = EncoderTensor {
-            buffer: query.buffer.clone(),
-            layout: scores_layout,
-        };
+        let scores = EncoderTensor::new(query.buffer.clone(), scores_layout)?;
         for kv_head in 0..kv_heads {
             let first_head = kv_head
                 .checked_mul(heads_per_group)
@@ -8568,15 +8578,15 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
 fn copy_kernel(
     input: &Layout,
     output: &Layout,
-    input_origin: u64,
-    output_origin: u64,
+    input_alignment: forja_core::ByteAlignment,
+    output_alignment: forja_core::ByteAlignment,
 ) -> &'static str {
     if input.is_contiguous()
         && output.is_contiguous()
         && input.dtype() == DType::F32
         && output.dtype() == DType::F32
-        && input_origin.is_multiple_of(16)
-        && output_origin.is_multiple_of(16)
+        && input_alignment.supports(16)
+        && output_alignment.supports(16)
         && output.element_count().is_multiple_of(4)
     {
         "copy_contiguous_f32x4"
@@ -8587,10 +8597,15 @@ fn copy_kernel(
     }
 }
 
-fn vectorized_argmax(input: &Layout, width: u32, chunk_width: u32) -> bool {
+fn vectorized_argmax(
+    input: &Layout,
+    alignment: forja_core::ByteAlignment,
+    width: u32,
+    chunk_width: u32,
+) -> bool {
     input.dtype() == DType::F32
         && input.is_contiguous()
-        && input.offset().is_multiple_of(4)
+        && alignment.supports(16)
         && width.is_multiple_of(4)
         && chunk_width.is_multiple_of(4)
 }
@@ -8800,8 +8815,8 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             copy_kernel(
                 input.layout(),
                 dispatch.output().layout(),
-                input.layout().byte_span().start,
-                dispatch.output().layout().byte_span().start,
+                forja_core::ByteAlignment::of(input.layout().byte_span().start),
+                forja_core::ByteAlignment::of(dispatch.output().layout().byte_span().start),
             )
         }
         Op::State(forja_core::StateOp::DeltaRule(_)) => match selected_variant(dispatch) {
@@ -8829,7 +8844,12 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
                 .shape()
                 .last()
                 .ok_or(BackendError::InvalidInput)?;
-            if vectorized_argmax(input.layout(), width, chunk_width) {
+            if vectorized_argmax(
+                input.layout(),
+                forja_core::ByteAlignment::of(input.layout().byte_span().start),
+                width,
+                chunk_width,
+            ) {
                 "argmax_partials_f32x4+finalize"
             } else {
                 "argmax_partials+finalize"
@@ -9524,10 +9544,7 @@ fn head_group(
         .layout
         .slice(&slices)
         .map_err(|_| BackendError::InvalidInput)?;
-    Ok(EncoderTensor {
-        buffer: tensor.buffer.clone(),
-        layout,
-    })
+    EncoderTensor::new(tensor.buffer.clone(), layout)
 }
 
 fn head_matrix(
@@ -9562,10 +9579,7 @@ fn head_matrix(
         tensor.layout.buffer_len(),
     )
     .map_err(|_| BackendError::InvalidInput)?;
-    Ok(EncoderTensor {
-        buffer: tensor.buffer.clone(),
-        layout,
-    })
+    EncoderTensor::new(tensor.buffer.clone(), layout)
 }
 
 fn set_pipeline(
@@ -10901,8 +10915,8 @@ mod tests {
                 let actual = copy_kernel(
                     &encoded_input.layout,
                     &encoded_output.layout,
-                    encoded_input.buffer.address,
-                    encoded_output.buffer.address,
+                    encoded_input.alignment,
+                    encoded_output.alignment,
                 );
                 let mut commands = CommandList::new();
                 commands.dispatch(Op::Copy, &[&input], &output).unwrap();
@@ -10912,6 +10926,39 @@ mod tests {
                 );
                 assert_eq!(actual == "copy_contiguous_f32x4", i % 4 == 0 && o % 4 == 0);
             }
+        }
+    }
+
+    #[test]
+    fn normalized_argmax_views_keep_their_absolute_alignment() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[4097]).unwrap();
+        for start in [0, 1] {
+            let view = backend
+                .view(
+                    &input,
+                    ViewOp::Slice(vec![Slice::new(start, 4096, 1).unwrap()]),
+                )
+                .unwrap();
+            let bound = backend.encoder_tensor(&view).unwrap();
+            assert_eq!(bound.layout.offset(), 0);
+            assert_eq!(
+                vectorized_argmax(&bound.layout, bound.alignment, 4096, 2048),
+                start == 0
+            );
+        }
+    }
+
+    #[test]
+    fn head_views_classify_the_full_address_without_double_offsetting() {
+        let backend = MetalBackend::new().unwrap();
+        let tensor = backend.alloc(DType::F32, &[16, 7, 33]).unwrap();
+        let bound = backend.encoder_tensor(&tensor).unwrap();
+        for first in [0, 1, 7] {
+            let group = head_group(&bound, first, 8).unwrap();
+            let head = head_matrix(&group, 1, false).unwrap();
+            let address = bound.buffer.address + u64::from(first + 1) * 7 * 33 * 4;
+            assert_eq!(head.alignment, forja_core::ByteAlignment::of(address));
         }
     }
 
