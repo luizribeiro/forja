@@ -3,7 +3,9 @@ mod row_program;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     let mut cost = super::of(dispatch)?;
-    cost = cost.checked_add(route_setup(dispatch)?)?;
+    cost = cost
+        .checked_add(route_setup(dispatch)?)?
+        .checked_add(epilogue_calls(dispatch)?)?;
     if matches!(dispatch.op(), Op::Program(_)) {
         return row_program::of(dispatch, cost);
     }
@@ -42,6 +44,32 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     Some(cost)
 }
 
+fn epilogue_calls(dispatch: &Dispatch) -> Option<KernelCost> {
+    let mut cost = KernelCost::default();
+    let Some(epilogue) = dispatch.prepared_epilogue() else {
+        return Some(cost);
+    };
+    let calls = dispatch.output().layout().element_count();
+    for &inst in &epilogue.validated().program().insts {
+        let (scalar, sfu) = crate::scalar_codegen::instruction_work(inst);
+        cost.scalar_ops = cost.scalar_ops.checked_add(calls.checked_mul(scalar)?)?;
+        cost.sfu_ops = cost.sfu_ops.checked_add(calls.checked_mul(sfu)?)?;
+        if let forja_core::program::Inst::Input(slot) = inst
+            && let Some(extra) =
+                slot.checked_sub(u32::from(epilogue.signature().accumulator_count()))
+        {
+            let dtype = epilogue
+                .signature()
+                .extra_dtypes()
+                .get(usize::try_from(extra).ok()?)?;
+            cost.read_bytes = cost
+                .read_bytes
+                .checked_add(calls.checked_mul(dtype.byte_size())?)?;
+        }
+    }
+    Some(cost)
+}
+
 pub(super) fn route_setup(dispatch: &Dispatch) -> Option<KernelCost> {
     let mut setup = KernelCost::default();
     for &kernel in crate::encoding::internal_gather_dispatch_names(dispatch)
@@ -62,6 +90,47 @@ mod tests {
     use super::*;
     use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability};
     use forja_cpu::CpuBackend;
+
+    #[test]
+    fn scalar_epilogues_price_casts_selects_and_special_functions() {
+        use forja_core::program::{
+            BinOp, EpilogueSignature, Inst, Program, ProgramKind, UnOp, ValueType, prepare_epilogue,
+        };
+        let backend = CpuBackend::new();
+        let input = backend.alloc(DType::F32, &[7, 33]).unwrap();
+        let weight = backend.alloc(DType::F32, &[33, 7]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 7]).unwrap();
+        let epilogue = prepare_epilogue(
+            Program {
+                kind: ProgramKind::Map,
+                insts: vec![
+                    Inst::Input(0),
+                    Inst::Const(0.0),
+                    Inst::Binary(BinOp::Lt, 0, 1),
+                    Inst::Select(2, 0, 1),
+                    Inst::Cast(ValueType::F32, 3),
+                    Inst::Unary(UnOp::Log1p, 4),
+                ],
+                outputs: vec![(0, 5)],
+            }
+            .validate()
+            .unwrap(),
+            EpilogueSignature::new(1, 2, vec![], DType::F32),
+        )
+        .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_epilogue(Op::Matmul, &[&input, &weight], &output, &epilogue, &[])
+            .unwrap();
+        let cost = epilogue_calls(commands.last_dispatch().unwrap()).unwrap();
+        assert!(cost.scalar_ops >= 49 * 5);
+        assert!(cost.sfu_ops >= 49);
+        assert_eq!(cost.read_bytes, 0);
+        assert!(
+            crate::scalar_codegen::instruction_work(Inst::Binary(BinOp::Div, 0, 1)).0
+                > crate::scalar_codegen::instruction_work(Inst::Binary(BinOp::Add, 0, 1)).0
+        );
+    }
 
     #[test]
     fn quantized_schedule_counts_decode_calls_per_tile_and_trip() {

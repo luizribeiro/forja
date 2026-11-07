@@ -1,5 +1,34 @@
 use forja_core::program::{BinOp, Inst, UnOp, ValueType};
 
+// Allow for NaN handling, range reduction and saturating conversions in helper calls.
+pub(crate) const fn instruction_work(instruction: Inst) -> (u64, u64) {
+    match instruction {
+        Inst::Input(_) | Inst::Select(..) => (4, 0),
+        Inst::Const(_) | Inst::Index(_) | Inst::Extent(_) | Inst::Reduce(..) => (0, 0),
+        Inst::Cast(..) => (32, 0),
+        Inst::Unary(op, _) => match op {
+            UnOp::Neg | UnOp::Abs | UnOp::Floor => (8, 0),
+            UnOp::Exp | UnOp::Sqrt | UnOp::Rsqrt | UnOp::Recip | UnOp::Sigmoid => (32, 4),
+            UnOp::Log | UnOp::Log1p | UnOp::ExpRounded | UnOp::Sin | UnOp::Cos | UnOp::Tanh => {
+                (128, 8)
+            }
+        },
+        Inst::Binary(op, _, _) => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => (2, 0),
+            BinOp::Div => (32, 1),
+            BinOp::Pow => (128, 8),
+            BinOp::Min
+            | BinOp::Max
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Ge
+            | BinOp::Gt => (8, 0),
+        },
+    }
+}
+
 pub(super) fn instruction_expression<I, X, E>(
     instruction: Inst,
     types: &[ValueType],
