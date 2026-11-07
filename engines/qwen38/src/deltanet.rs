@@ -156,7 +156,15 @@ impl DeltaNet {
         }
         let value_rows = rows(tokens, c.value_heads)?;
         let projected = self.qkv.forward(input, pick)?;
-        let convolved = self.carry.convolve(&projected, &self.convolution)?;
+        let convolved = self.carry.convolve(
+            &projected,
+            &self.convolution,
+            if prefill {
+                None
+            } else {
+                self.state_picks[1].as_ref()
+            },
+        )?;
         let mixed = numerics::silu_bf16(&convolved)?;
         let gate_shape = if prefill {
             vec![tokens, c.value_heads]
@@ -189,8 +197,14 @@ impl DeltaNet {
                 .reshape(&[value_rows, c.value_dim])?
         } else {
             let decay = numerics::decay(&a, &self.dt_bias, &self.log_a)?;
-            self.carry
-                .delta([&query, &key], &value, &decay, &beta, false, None)?
+            self.carry.delta(
+                [&query, &key],
+                &value,
+                &decay,
+                &beta,
+                false,
+                self.state_picks[0].as_ref(),
+            )?
         };
         self.finish_rows(&y, input, pick)
     }

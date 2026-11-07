@@ -305,3 +305,6 @@ async fn paged_cache_precisions_match_eager_at_page_boundaries() -> Result<(), B
     }
     Ok(())
 }
+
+#[path = "serving/state_picks.rs"]
+mod state_picks;

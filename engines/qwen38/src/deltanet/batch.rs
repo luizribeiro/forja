@@ -20,11 +20,7 @@ impl DeltaNet {
         {
             return Err(Error::loading("invalid recurrent lane rows"));
         }
-        let state_picks = if batch > 1 {
-            self.state_picks.each_ref().map(Option::as_ref)
-        } else {
-            [None, None]
-        };
+        let state_picks = self.state_picks.each_ref().map(Option::as_ref);
         let projected = self.qkv.forward(input, pick)?;
         let convolved = Tensor::zeros(projected.shape())?;
         for (row, &lane) in lanes.iter().enumerate() {

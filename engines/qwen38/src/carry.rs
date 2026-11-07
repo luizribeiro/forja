@@ -56,6 +56,7 @@ impl Carry {
         &mut self,
         input: &Tensor<T>,
         weights: &Tensor<T>,
+        pick: Option<&Variant>,
     ) -> Result<Tensor<T>> {
         match self {
             Self::Eager { history, .. } => history.causal_convolution(input, weights),
@@ -63,9 +64,13 @@ impl Carry {
                 cache,
                 planes,
                 lane,
-            } => cache
-                .state_at(*lane, planes[0])?
-                .causal_convolution(input, weights),
+            } => {
+                let mut output = Tensor::zeros(input.shape())?;
+                cache
+                    .state_at(*lane, planes[0])?
+                    .causal_convolution_into_with(input, weights, &mut output, pick)?;
+                Ok(output)
+            }
         }
     }
 
@@ -134,7 +139,9 @@ impl Carry {
                 if block {
                     state.delta_rule_block(qk[0], qk[1], value, decay, beta, pick)
                 } else {
-                    state.delta_rule(qk[0], qk[1], value, decay, beta)
+                    let mut output = Tensor::zeros(value.shape())?;
+                    state.delta_rule_into_with(qk, value, decay, beta, &mut output, pick)?;
+                    Ok(output)
                 }
             }
         }
