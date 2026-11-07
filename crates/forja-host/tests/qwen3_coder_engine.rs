@@ -26,7 +26,6 @@ const LIMITS: Limits = Limits::new(
     20_000,
     1024 * 1024 * 1024,
 )
-.with_command_limits(4_096, u64::MAX)
 .with_guest_call_timeout(Duration::from_secs(300))
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
 const FULL_LAYERS: u32 = 48;
@@ -76,7 +75,6 @@ async fn assert_chunk_schedules(
         20_000,
         1024 * 1024 * 1024,
     )
-    .with_command_limits(4_096, u64::MAX)
     .with_guest_call_timeout(Duration::from_secs(300))
     .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
     let mut runner = runner_with_limits(test_guests::qwen3_coder(), limits).await?;

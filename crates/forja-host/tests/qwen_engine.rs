@@ -22,7 +22,6 @@ const REPLAY_LIMITS: Limits = Limits::new(
     20_000,
     1024 * 1024 * 1024,
 )
-.with_command_limits(4_096, u64::MAX)
 .with_guest_call_timeout(Duration::from_secs(300))
 .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
 

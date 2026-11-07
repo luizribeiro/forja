@@ -18,6 +18,11 @@ pub use tiling::CostModel;
 
 use crate::{Dispatch, Op, Tensor, matmul_flops, quant_matmul_flops};
 
+/// Default logical work allowance for one validated dispatch.
+pub const DEFAULT_DISPATCH_WORK_LIMIT: u64 = 1 << 49;
+/// Default logical work allowance for one complete submission.
+pub const DEFAULT_SUBMISSION_WORK_LIMIT: u64 = 1 << 55;
+
 /// Checked logical traffic and arithmetic for a validated operation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelCost {

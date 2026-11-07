@@ -530,7 +530,7 @@ impl Default for Limits {
             table_elements: 10_000,
             instances: 10_000,
             dispatches_per_list: Unbounded::Limited(4_096),
-            work_per_dispatch: Unbounded::Unlimited,
+            work_per_dispatch: Unbounded::Limited(forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
             guest_call_timeout: Duration::from_secs(300),
             submission_timeout: Duration::from_secs(60),
             gpu_time_budget: Unbounded::Limited(Duration::from_secs(3_600)),
@@ -617,7 +617,10 @@ mod tests {
         assert_eq!(limits.table_elements, 10_000);
         assert_eq!(limits.instances, 10_000);
         assert_eq!(limits.dispatches_per_list, Unbounded::Limited(4_096));
-        assert_eq!(limits.work_per_dispatch, Unbounded::Unlimited);
+        assert_eq!(
+            limits.work_per_dispatch,
+            Unbounded::Limited(forja_core::DEFAULT_DISPATCH_WORK_LIMIT)
+        );
         assert_eq!(
             limits.guest_call_timeout.get(),
             time::Duration::from_secs(300)

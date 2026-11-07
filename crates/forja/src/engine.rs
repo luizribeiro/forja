@@ -610,7 +610,7 @@ mod tests {
             20_000,
             1024 * 1024 * 1024,
         )
-        .with_command_limits(4_096, u64::MAX)
+        .with_command_limits(4_096, forja_core::DEFAULT_DISPATCH_WORK_LIMIT)
         .with_guest_call_timeout(Duration::from_secs(300))
         .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
         assert_eq!(limits(&ConfigLimits::default()).unwrap(), expected);

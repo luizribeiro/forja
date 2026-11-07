@@ -3329,8 +3329,8 @@ impl Limits {
             guest_memory_bytes: 4 * 1024 * 1024 * 1024,
             table_elements: 10_000,
             instances: 10_000,
-            dispatches_per_list: usize::MAX,
-            work_per_dispatch: u64::MAX,
+            dispatches_per_list: 4_096,
+            work_per_dispatch: forja_core::DEFAULT_DISPATCH_WORK_LIMIT,
             guest_call_timeout: Duration::from_secs(30),
             submission_timeout: Duration::from_secs(10),
             gpu_time_budget: Duration::MAX,
@@ -17315,6 +17315,31 @@ mod tests {
     }
 
     #[test]
+    fn default_work_limit_refuses_large_broadcast_matmul() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let scalar = host.alloc(compute::Dtype::F32, &[1, 1]).unwrap();
+        let left = host
+            .view(
+                &Resource::new_borrow(scalar.rep()),
+                compute::ViewOp::Broadcast(vec![1_048_577, u32::MAX]),
+            )
+            .unwrap();
+        let right = host
+            .view(
+                &Resource::new_borrow(scalar.rep()),
+                compute::ViewOp::Broadcast(vec![u32::MAX, 1]),
+            )
+            .unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1_048_577, 1]).unwrap();
+        let commands = host.command_list().unwrap();
+        assert!(matches!(
+            host.dispatch(&commands, compute::Op::Matmul, &[left, right], &output),
+            Err(compute::Error::Quota(_))
+        ));
+        assert!(host.table.get(&commands).unwrap().commands.is_empty());
+    }
+
+    #[test]
     fn refuses_dispatches_over_the_work_limit() {
         let limits = GENEROUS.with_command_limits(usize::MAX, 13);
         let mut host = Host::new(CpuBackend::new(), limits);
@@ -17414,7 +17439,10 @@ mod tests {
 
     #[test]
     fn dispatch_recording_scales_roughly_linearly() {
-        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let mut host = Host::new(
+            CpuBackend::new(),
+            GENEROUS.with_command_limits(10_000, forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
+        );
         let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
         let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
         let commands = host.command_list().unwrap();

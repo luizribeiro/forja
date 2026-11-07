@@ -26,7 +26,10 @@ pub use backend::{
     KernelProfile, MemoryUsage, ProfileCount, ProfileTensor, ReadonlyImport, Submission,
     SubmissionProfile, ViewOp, automatic_buffer_pool_capacity, automatic_live_bytes,
 };
-pub use cost::{CostModel, KernelCost, quantized_route_index};
+pub use cost::{
+    CostModel, DEFAULT_DISPATCH_WORK_LIMIT, DEFAULT_SUBMISSION_WORK_LIMIT, KernelCost,
+    quantized_route_index,
+};
 pub use forja_mmap::MappedRegion;
 pub use graph::{
     GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,
