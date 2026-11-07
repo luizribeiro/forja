@@ -34,7 +34,7 @@ pub(crate) fn cache_key(identity: &Value) -> String {
     format!(
         "{:x}",
         Sha256::digest(
-            json!({"calibrator_schema": 7, "identity": identity})
+            json!({"calibrator_schema": 8, "identity": identity})
                 .to_string()
                 .as_bytes()
         )

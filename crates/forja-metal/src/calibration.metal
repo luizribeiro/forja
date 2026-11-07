@@ -117,3 +117,14 @@ kernel void calibration_dependent_read(device const uint *input [[buffer(0)]],
     }
     output[0] = checksum;
 }
+
+kernel void calibration_read_serial(device const float *input [[buffer(0)]],
+                                    device float *output [[buffer(1)]],
+                                    uint index [[thread_position_in_grid]]) {
+    if (index != 0) { output[index] = 0; return; }
+    float sum = 0;
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        sum = fma(sum, 0.99999f, input[iteration]);
+    }
+    output[0] = sum;
+}
