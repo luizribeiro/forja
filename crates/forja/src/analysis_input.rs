@@ -67,6 +67,8 @@ pub(crate) struct Dispatch {
     pub(crate) variant: Option<String>,
     pub(crate) alternatives: Vec<String>,
     pub(crate) gpu_time_seconds: f64,
+    #[serde(default)]
+    pub(crate) predicted_gpu_seconds: f64,
     pub(crate) gap_before_seconds: f64,
     pub(crate) physical_dispatches: u64,
     pub(crate) compute_dtype: String,
@@ -77,11 +79,21 @@ pub(crate) struct Dispatch {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub(crate) struct BufferAdmission {
+    pub(crate) predicted_gpu_seconds: f64,
+    pub(crate) reserve_seconds: f64,
+    pub(crate) gpu_time_seconds: f64,
+    pub(crate) backstop_ratio: u32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Submission {
     pub(crate) index: u64,
     pub(crate) phase: Value,
     pub(crate) gpu_time_seconds: f64,
     pub(crate) timeline: Vec<Dispatch>,
+    #[serde(default)]
+    pub(crate) buffer_admission: Vec<BufferAdmission>,
 }
 
 impl Submission {
@@ -173,12 +185,29 @@ impl Profile {
                 return Err("incomplete submission timeline".into());
             }
             positive(submission.gpu_time_seconds)?;
+            for buffer in &submission.buffer_admission {
+                positive(buffer.gpu_time_seconds)?;
+                positive(buffer.predicted_gpu_seconds)?;
+                if !buffer.reserve_seconds.is_finite()
+                    || buffer.reserve_seconds < 0.0
+                    || buffer.reserve_seconds > buffer.predicted_gpu_seconds
+                    || buffer.backstop_ratio == 0
+                {
+                    return Err("invalid command-buffer admission record".into());
+                }
+            }
             for (index, dispatch) in submission.timeline.iter().enumerate() {
                 if dispatch.index != u64::try_from(index)? || dispatch.call_site.is_empty() {
                     return Err("invalid dispatch identity/count".into());
                 }
+                if !dispatch.predicted_gpu_seconds.is_finite()
+                    || dispatch.predicted_gpu_seconds < 0.0
+                {
+                    return Err("invalid dispatch admission forecast".into());
+                }
                 if dispatch.physical_dispatches == 0 {
                     if dispatch.cost != KernelCost::default()
+                        || dispatch.predicted_gpu_seconds != 0.0
                         || dispatch.gpu_time_seconds != 0.0
                         || dispatch.gap_before_seconds != 0.0
                         || dispatch.padded_flops != [0, 0]

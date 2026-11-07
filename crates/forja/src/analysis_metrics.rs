@@ -170,6 +170,7 @@ mod tests {
     #[test]
     fn resource_percentages_and_floor_flags_share_the_raw_interval() {
         let dispatch = Dispatch {
+            predicted_gpu_seconds: 0.0,
             index: 0,
             call_site: "test/dispatch-0".into(),
             scope: None,

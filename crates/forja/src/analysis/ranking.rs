@@ -79,6 +79,7 @@ pub(crate) fn human(report: &Value) -> String {
         report["measured_tokens"]
     );
     let number = |value: &Value| value.as_f64().unwrap_or(0.0);
+    admission_lines(&mut out, report);
     let overall = &report["whole_model"]["overall"];
     let _ = writeln!(
         out,
@@ -179,6 +180,25 @@ fn register_risks(report: &Value) -> String {
         }
     }
     out
+}
+
+fn admission_lines(out: &mut String, report: &Value) {
+    use std::fmt::Write;
+    for buffer in report["buffer_admission"].as_array().into_iter().flatten() {
+        let _ = writeln!(
+            out,
+            "Admission submission {} buffer {}: measured/predicted {:.3}x; backstop {}x{}",
+            buffer["submission"],
+            buffer["buffer"],
+            buffer["measured_predicted_ratio"].as_f64().unwrap_or(0.0),
+            buffer["backstop_ratio"],
+            if buffer["exceeds_backstop"] == true {
+                " [exceeded]"
+            } else {
+                ""
+            }
+        );
+    }
 }
 
 #[cfg(test)]

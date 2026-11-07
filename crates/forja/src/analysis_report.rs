@@ -43,6 +43,11 @@ pub(crate) fn report(
                 dispatch.gap_before_seconds,
                 dispatch.physical_dispatches,
             )?;
+            outer["predicted_gpu_seconds"] = json!(dispatch.predicted_gpu_seconds);
+            outer["measured_predicted_ratio"] = json!(
+                (dispatch.predicted_gpu_seconds > 0.0)
+                    .then(|| dispatch.gpu_time_seconds / dispatch.predicted_gpu_seconds)
+            );
             outer["submission"] = json!(submission.index);
             outer["dispatch"] = json!(dispatch.index);
             outer["phase"] = submission.phase.clone();
@@ -105,10 +110,26 @@ pub(crate) fn report(
             "Persistent f32 carry panels risk register spills; register residency and occupancy require device profiling.",
             "Calibration bound envelopes combine per-probe CI endpoints, not a joint 95% interval; resource flags use raw GPU intervals.",
             "Alternatives preserve the selected reduction class and batch-invariance guarantee; screen before adoption."],
+        "buffer_admission":admission_records(profile)?,
         "whole_model": model::summaries(profile, calibration, scale, target)?,
         "by_kernel": ranking::aggregate(&kernels, "kernel")?, "ranked_call_sites": ranking::aggregate(&dispatches, "site_group")?,
         "unmeasured_kernels": unmeasured, "dispatches": dispatches, "kernels": kernels }),
     )
+}
+
+fn admission_records(profile: &Profile) -> Result<Vec<Value>, Box<dyn Error>> {
+    let mut buffers = Vec::new();
+    for submission in &profile.submissions {
+        for (index, buffer) in submission.buffer_admission.iter().enumerate() {
+            let ratio = buffer.gpu_time_seconds / positive(buffer.predicted_gpu_seconds)?;
+            buffers.push(json!({"submission":submission.index, "buffer":index,
+                "predicted_gpu_seconds":buffer.predicted_gpu_seconds, "reserve_seconds":buffer.reserve_seconds,
+                "measured_gpu_seconds":buffer.gpu_time_seconds, "measured_predicted_ratio":ratio,
+                "backstop_ratio":buffer.backstop_ratio, "exceeds_backstop":ratio > f64::from(buffer.backstop_ratio),
+                "time_basis":"raw command-buffer counters; unscaled"}));
+        }
+    }
+    Ok(buffers)
 }
 
 struct ProfiledTimes {
@@ -159,6 +180,46 @@ pub(super) fn sort(rows: &mut [Value]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_ratios_use_individual_raw_intervals_without_attribution_scaling() {
+        use crate::analysis_input::BufferAdmission;
+        let (mut profile, calibration) = fixture();
+        profile.submissions[0].timeline[0].predicted_gpu_seconds = 2.0;
+        profile.submissions[0].buffer_admission = vec![
+            BufferAdmission {
+                predicted_gpu_seconds: 1.0,
+                reserve_seconds: 0.25,
+                gpu_time_seconds: 5.0,
+                backstop_ratio: 4,
+            },
+            BufferAdmission {
+                predicted_gpu_seconds: 10.0,
+                reserve_seconds: 0.25,
+                gpu_time_seconds: 5.0,
+                backstop_ratio: 4,
+            },
+        ];
+        profile.validate().unwrap();
+        let row = report(&profile, &calibration, 0.8).unwrap();
+        assert_eq!(row["attribution_scale"], 0.5);
+        assert_eq!(row["buffer_admission"][0]["measured_predicted_ratio"], 5.0);
+        assert_eq!(row["buffer_admission"][0]["exceeds_backstop"], true);
+        assert_eq!(row["buffer_admission"][1]["measured_predicted_ratio"], 0.5);
+        let dispatch = row["dispatches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["submission"] == 0 && r["dispatch"] == 0)
+            .unwrap();
+        assert_eq!(dispatch["measured_predicted_ratio"], 2.0);
+        assert!(ranking::human(&row).contains("5.000x"));
+        profile.submissions[0].buffer_admission[0].reserve_seconds = 2.0;
+        assert!(profile.validate().is_err());
+        profile.submissions[0].buffer_admission.clear();
+        profile.submissions[0].timeline[0].predicted_gpu_seconds = f64::NAN;
+        assert!(profile.validate().is_err());
+    }
 
     #[test]
     fn coalesced_dispatches_preserve_totals_and_refuse_hidden_work() {
