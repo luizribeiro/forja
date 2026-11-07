@@ -4203,11 +4203,9 @@ impl MetalBackend {
                     depth: 1,
                 },
                 MTLSize {
-                    width: if q[2] == 256 {
-                        required_thread_count(second.maxTotalThreadsPerThreadgroup(), 1024)?
-                    } else {
-                        second.maxTotalThreadsPerThreadgroup()
-                    },
+                    width: attention_reduction_thread_count(
+                        second.maxTotalThreadsPerThreadgroup(),
+                    )?,
                     height: 1,
                     depth: 1,
                 },
@@ -5758,7 +5756,9 @@ impl MetalBackend {
                     depth: 1,
                 },
                 MTLSize {
-                    width: pipeline.maxTotalThreadsPerThreadgroup(),
+                    width: attention_reduction_thread_count(
+                        pipeline.maxTotalThreadsPerThreadgroup(),
+                    )?,
                     height: 1,
                     depth: 1,
                 },
@@ -5854,11 +5854,7 @@ impl MetalBackend {
                 depth: 1,
             },
             MTLSize {
-                width: if width == 256 {
-                    required_thread_count(second.maxTotalThreadsPerThreadgroup(), 1024)?
-                } else {
-                    second.maxTotalThreadsPerThreadgroup()
-                },
+                width: attention_reduction_thread_count(second.maxTotalThreadsPerThreadgroup())?,
                 height: 1,
                 depth: 1,
             },
@@ -9770,6 +9766,10 @@ fn map_dispatch_geometry(
     ))
 }
 
+fn attention_reduction_thread_count(available: usize) -> Result<usize, BackendError> {
+    required_thread_count(available, 1024)
+}
+
 fn required_thread_count(available: usize, required: usize) -> Result<usize, BackendError> {
     if available < required {
         Err(BackendError::UnsupportedOperation)
@@ -10811,6 +10811,19 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn attention_reductions_refuse_incomplete_simdgroups() {
+        for available in [32, 512, 1023] {
+            assert_eq!(
+                attention_reduction_thread_count(available),
+                Err(BackendError::UnsupportedOperation)
+            );
+        }
+        for available in [1024, 2048] {
+            assert_eq!(attention_reduction_thread_count(available), Ok(1024));
+        }
     }
 
     fn shared_quant_canary(
