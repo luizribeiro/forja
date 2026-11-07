@@ -10462,6 +10462,7 @@ pub(super) struct PipelineCache {
     calibration_sources: Mutex<CalibrationSources>,
     libraries: [Retained<ProtocolObject<dyn MTLLibrary>>; 3],
     pipelines: crate::compile_cache::CompileCache<PipelineKey, ComputePipeline>,
+    program_pipelines: crate::compile_cache::CompileCache<PipelineKey, ComputePipeline>,
     epilogue_libraries: crate::compile_cache::CompileCache<
         epilogue_codegen::SourceKey,
         Retained<ProtocolObject<dyn MTLLibrary>>,
@@ -10626,6 +10627,7 @@ impl PipelineCache {
             calibration_sources: Mutex::new(HashMap::new()),
             libraries: [fast_library, nan_preserving_library, safe_state_library],
             pipelines: crate::compile_cache::CompileCache::default(),
+            program_pipelines: crate::compile_cache::CompileCache::default(),
             epilogue_libraries: crate::compile_cache::CompileCache::default(),
             epilogue_pipelines: crate::compile_cache::CompileCache::default(),
             epilogue_counts: Mutex::new(EpilogueCompileCounts::default()),
@@ -10838,54 +10840,51 @@ impl PipelineCache {
         key: &ProgramPipelineKey,
         source: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        self.charge_pipeline()?;
-        let source = NSString::from_str(source);
-        let options = compile_options(MTLMathMode::Safe);
-        let library = self
-            .compiler
-            .library(&self.device, &source, &options)
-            .map_err(|error| program_compile_error(key.hash, error))?;
         let kernel = if key.row {
             map_codegen::ROW_KERNEL_NAME
         } else {
             map_codegen::KERNEL_NAME
         };
-        let name = NSString::from_str(kernel);
-        let values = MTLFunctionConstantValues::new();
         let constants = key
             .input_dtypes
             .iter()
             .enumerate()
-            .map(|(slot, &dtype)| ([0, 1, 3, 4, 5, 6, 7, 8][slot], dtype))
+            .map(|(slot, &dtype)| ([0, 1, 3, 4, 5, 6, 7, 8][slot], u32::from(dtype)))
             .chain(
                 key.output_dtypes
                     .iter()
                     .enumerate()
-                    .map(|(slot, &dtype)| ([2, 9, 10, 11][slot], dtype)),
+                    .map(|(slot, &dtype)| ([2, 9, 10, 11][slot], u32::from(dtype))),
             )
-            .map(|(index, dtype)| (index, u32::from(dtype)))
             .collect::<Vec<_>>();
-        for &(index, dtype) in &constants {
-            // SAFETY: `dtype` is live for the call, its type matches `MTLDataType::UInt`, and
-            // program dtype constants occupy the declared indices zero through eleven.
-            unsafe {
-                values.setConstantValue_type_atIndex(
-                    NonNull::from(&dtype).cast::<c_void>(),
-                    MTLDataType::UInt,
-                    index,
-                );
-            }
-        }
-        let function = self
-            .compiler
-            .function(&library, &name, &values)
-            .map_err(|error| program_compile_error(key.hash, error))?;
-        let pipeline = self
-            .compiler
-            .pipeline(&self.device, &function)
-            .map_err(|error| program_compile_error(key.hash, error))?;
-        self.validate_pipeline_memory(&pipeline)?;
-        Ok(pipeline)
+        let identity = crate::pipeline_identity::SourceIdentity::new(
+            Arc::from(source),
+            crate::pipeline_identity::MathMode::Safe,
+        );
+        let identity = PipelineKey::new(identity, kernel, &constants, &[key.hash])?;
+        self.program_pipelines.compile(
+            identity,
+            || self.charge_pipeline(),
+            || {
+                let source = NSString::from_str(source);
+                let options = compile_options(MTLMathMode::Safe);
+                let library = self
+                    .compiler
+                    .library(&self.device, &source, &options)
+                    .map_err(|error| program_compile_error(key.hash, error))?;
+                let values = function_constants(&constants)?;
+                let function = self
+                    .compiler
+                    .function(&library, &NSString::from_str(kernel), &values)
+                    .map_err(|error| program_compile_error(key.hash, error))?;
+                let pipeline = self
+                    .compiler
+                    .pipeline(&self.device, &function)
+                    .map_err(|error| program_compile_error(key.hash, error))?;
+                self.validate_pipeline_memory(&pipeline)?;
+                Ok(pipeline)
+            },
+        )
     }
 }
 
@@ -16243,6 +16242,33 @@ mod tests {
     }
 
     #[test]
+    fn program_sources_memoize_success_and_failure_without_aliasing() {
+        let backend = MetalBackend::new().unwrap();
+        let program = row_program(&CpuBackend::new(), 33);
+        let signature = KernelSignature::new(1, vec![DType::F32], vec![DType::F32], 0);
+        let key = ProgramPipelineKey::new(program.program(), &signature, false);
+        let cache = &backend.pipelines;
+        let before = cache.pipeline_budget.load(Ordering::Acquire);
+        for _ in 0..2 {
+            assert!(
+                cache
+                    .compile_program_source(&key, "kernel void broken(")
+                    .is_err()
+            );
+        }
+        assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), before - 1);
+        let source = map_codegen::generate(program.program(), &signature, false, &[]);
+        let first = cache.compile_program_source(&key, &source).unwrap();
+        let second = cache.compile_program_source(&key, &source).unwrap();
+        assert!(std::ptr::eq(&raw const *first, &raw const *second));
+        assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), before - 2);
+        cache
+            .compile_program_source(&key, &format!("{source}\n// distinct source"))
+            .unwrap();
+        assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), before - 3);
+    }
+
+    #[test]
     fn generated_pipeline_paths_refuse_excess_threadgroup_storage() {
         let backend = MetalBackend::new().unwrap();
         let program = row_program(&CpuBackend::new(), 33);
@@ -16258,7 +16284,8 @@ mod tests {
                 .unwrap(),
         );
         assert!(matches!(
-            cache.compile_program_source(&key, &source),
+            cache
+                .compile_program_source(&key, &format!("{source}\n// uncached storage validation")),
             Err(BackendError::UnsupportedOperation)
         ));
 
