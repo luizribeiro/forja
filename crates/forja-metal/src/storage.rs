@@ -1295,7 +1295,9 @@ impl Backend for MetalBackend {
 
     fn prepare_dispatch(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {
         self.compiler.ensure_enabled()?;
-        self.prepare_program_dispatch(dispatch)
+        self.prepare_program_dispatch(dispatch)?;
+        self.prepare_dispatch_epilogues(std::slice::from_ref(dispatch))?;
+        self.prepare_catalog_dispatch(dispatch, false)
     }
 
     fn alloc(&self, dtype: DType, shape: &[u32]) -> Result<Tensor, BackendError> {

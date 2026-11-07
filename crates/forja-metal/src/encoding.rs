@@ -3,6 +3,7 @@ mod alignment_tests;
 mod attention_schedule;
 mod launch_work;
 pub(crate) use attention_schedule::AttentionSchedule;
+mod prewarming;
 pub(super) mod resources;
 mod state;
 pub(crate) use state::block_schedule;
@@ -2613,11 +2614,12 @@ impl MetalBackend {
     ) -> Result<PreparedMetalGraph, BackendError> {
         let fallback_count = self.pipelines.epilogue_counts()?.fallbacks;
         self.prepare_graph_epilogues(graph)?;
-        for (_, _, dispatch) in graph
+        for (_, dynamic, dispatch) in graph
             .backend_dispatch_candidates()
             .map_err(BackendError::from)?
         {
             self.prepare_program_dispatch(&dispatch)?;
+            self.prepare_catalog_dispatch(&dispatch, dynamic)?;
         }
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
             .then(|| self.prepare_encoding_plan(graph))
@@ -2657,24 +2659,61 @@ impl MetalBackend {
         })
     }
 
+    fn expanded_epilogue_requests(
+        &self,
+        dispatch: &Dispatch,
+        dynamic: bool,
+    ) -> Result<Vec<EpiloguePipelineRequest>, BackendError> {
+        let mut requests = Vec::new();
+        let mut seen = HashSet::new();
+        for request in epilogue_pipeline_requests(dispatch, dynamic)? {
+            let base = prewarming::Request {
+                name: request.implementation.to_owned(),
+                constants: request.constants,
+            };
+            for expanded in prewarming::expand(&base, dispatch, dynamic, &self.pipelines.entries) {
+                if expanded.name != request.implementation {
+                    return Err(BackendError::UnsupportedOperation);
+                }
+                let source = epilogue_codegen::SourceKey::new(
+                    request.family,
+                    &request.epilogue,
+                    request.implementation,
+                );
+                if seen.insert(source.pipeline_key(&expanded.constants)?) {
+                    requests.push(EpiloguePipelineRequest {
+                        family: request.family,
+                        epilogue: Arc::clone(&request.epilogue),
+                        implementation: request.implementation,
+                        constants: expanded.constants,
+                    });
+                }
+            }
+        }
+        Ok(requests)
+    }
+
     fn prepare_graph_epilogues(&self, graph: &GraphTemplate) -> Result<(), BackendError> {
         let mut requests = Vec::new();
-        for (_, parameter_dependent, dispatch) in graph
+        for (_, dynamic, dispatch) in graph
             .backend_dispatch_candidates()
-            .map_err(|_| BackendError::InvalidInput)?
+            .map_err(BackendError::from)?
         {
             if dispatch.prepared_epilogue().is_some() {
-                requests.extend(epilogue_pipeline_requests(&dispatch, parameter_dependent)?);
+                requests.extend(self.expanded_epilogue_requests(&dispatch, dynamic)?);
             }
         }
         self.prepare_epilogue_requests(&requests)
     }
 
-    fn prepare_dispatch_epilogues(&self, dispatches: &[Dispatch]) -> Result<(), BackendError> {
+    pub(super) fn prepare_dispatch_epilogues(
+        &self,
+        dispatches: &[Dispatch],
+    ) -> Result<(), BackendError> {
         let mut requests = Vec::new();
         for dispatch in dispatches {
             if dispatch.prepared_epilogue().is_some() {
-                requests.extend(epilogue_pipeline_requests(dispatch, false)?);
+                requests.extend(self.expanded_epilogue_requests(dispatch, false)?);
             }
         }
         self.prepare_epilogue_requests(&requests)
@@ -10463,6 +10502,7 @@ pub(super) struct PipelineCache {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     max_threadgroup_memory_length: AtomicUsize,
     pipeline_budget: AtomicUsize,
+    entries: HashSet<String>,
     sources: [crate::pipeline_identity::SourceIdentity; 3],
     calibration_sources: Mutex<CalibrationSources>,
     libraries: [Retained<ProtocolObject<dyn MTLLibrary>>; 3],
@@ -10623,11 +10663,16 @@ impl PipelineCache {
         let nan_preserving_library = compiler.library(device, &source, &nan_preserving_options)?;
         let safe_options = compile_options(MTLMathMode::Safe);
         let safe_state_library = compiler.library(device, &safe_source, &safe_options)?;
+        let names = fast_library.functionNames();
+        let entries = (0..names.count())
+            .map(|index| names.objectAtIndex(index).to_string())
+            .collect();
         Ok(Self {
             compiler: Arc::new(compiler),
             device: device.clone(),
             max_threadgroup_memory_length: AtomicUsize::new(device.maxThreadgroupMemoryLength()),
             pipeline_budget: AtomicUsize::new(256),
+            entries,
             sources,
             calibration_sources: Mutex::new(HashMap::new()),
             libraries: [fast_library, nan_preserving_library, safe_state_library],
@@ -10658,6 +10703,11 @@ impl PipelineCache {
     ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
         let key = self.key(name, constants)?;
+        prewarming::record(name, &key.constants);
+        if let Some(pipeline) = self.pipelines.get(&key)? {
+            return Ok(pipeline);
+        }
+
         if self
             .calibration_sources
             .lock()
@@ -10784,6 +10834,14 @@ impl PipelineCache {
         let source = epilogue_codegen::SourceKey::new(family, epilogue, name);
         let key = source.pipeline_key(constants)?;
         if let Some(pipeline) = self.epilogue_pipelines.get(&key)? {
+            self.epilogue_hit()?;
+            return Ok(pipeline);
+        }
+        if let Some(generic) = prewarming::generic_constants(name, constants)
+            && let Some(pipeline) = self
+                .epilogue_pipelines
+                .get(&source.pipeline_key(&generic)?)?
+        {
             self.epilogue_hit()?;
             return Ok(pipeline);
         }
@@ -13213,6 +13271,9 @@ mod tests {
         let output = backend.alloc(DType::F32, &[4097]).unwrap();
         let mut commands = CommandList::new();
         commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        backend
+            .prepare_dispatch(commands.last_dispatch().unwrap())
+            .unwrap();
         let submission = if profiled {
             backend.submit_profiled_retained(commands, vec![owner])
         } else {
@@ -13253,6 +13314,9 @@ mod tests {
         let private = backend.alloc(DType::F32, &[1024, 4097]).unwrap();
         let owner = Arc::new(Owner(Arc::clone(&backend), private));
         let retained = Arc::downgrade(&owner);
+        backend
+            .prepare_dispatch(commands.last_dispatch().unwrap())
+            .unwrap();
         let submission = backend
             .submit_retained(commands, vec![forja_core::CompletionResource::new(owner)])
             .unwrap();
@@ -13491,7 +13555,7 @@ mod tests {
         backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
         let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_pipelines.len(), 9);
-        assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 9);
+        assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 11);
         assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 0);
     }
 
@@ -15319,7 +15383,7 @@ mod tests {
         let profile = profiled.profile().unwrap();
         assert_eq!(profile.epilogue_library_compilations, 1);
         assert_eq!(profile.epilogue_pipeline_specializations, 1);
-        assert_eq!(profile.epilogue_cache_hits, 5);
+        assert_eq!(profile.epilogue_cache_hits, 6);
         assert_eq!(profile.epilogue_compile_fallbacks, 0);
         let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_libraries.len(), 1);
