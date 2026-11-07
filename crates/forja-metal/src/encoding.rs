@@ -8798,7 +8798,9 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
         }
         Op::State(forja_core::StateOp::DeltaRule(_)) => match selected_variant(dispatch) {
             Some(MetalVariant::DeltaRuleSteps) => "state_delta_rule_steps",
-            Some(MetalVariant::DeltaRuleLanes) => "state_delta_rule_lanes",
+            Some(MetalVariant::DeltaRuleLanes | MetalVariant::DeltaRuleLinearLanes) => {
+                "state_delta_rule_lanes"
+            }
             _ => "state_delta_rule",
         },
         Op::State(forja_core::StateOp::DeltaRuleBlock(_)) => "state_delta_rule_block",
@@ -9384,6 +9386,7 @@ pub(super) fn variant_supported(
         }
         MetalVariant::PagedSdpaWideTwoPass
         | MetalVariant::DeltaRule
+        | MetalVariant::DeltaRuleLinearLanes
         | MetalVariant::DeltaRuleLanes
         | MetalVariant::DeltaRuleSteps
         | MetalVariant::CausalDepthwiseConvLanes

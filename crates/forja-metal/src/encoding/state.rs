@@ -60,7 +60,7 @@ impl MetalBackend {
         let layouts = arguments.write(&layout_bytes)?;
         let params = arguments.write(&parameter_bytes)?;
         let flag = arguments.write(&error_state())?;
-        let pipeline = self.state_pipeline(kernel, dispatch)?;
+        let pipeline = self.state_pipeline(kernel, std::slice::from_ref(dispatch))?;
         set_pipeline(encoder, &pipeline);
         for (index, tensor) in tensors.iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -83,15 +83,29 @@ impl MetalBackend {
     fn state_pipeline(
         &self,
         kernel: &str,
-        dispatch: &Dispatch,
+        dispatches: &[Dispatch],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        let dispatch = dispatches.first().ok_or(BackendError::InvalidInput)?;
         let input = dispatch.inputs();
+        let linear = matches!(
+            super::selected_variant(dispatch),
+            Some(crate::variants::MetalVariant::DeltaRuleLinearLanes)
+        );
+        let linear_views = linear_view_mask(dispatches)?;
+        let ordinary = input
+            .len()
+            .checked_sub(3)
+            .ok_or(BackendError::InvalidInput)?;
         let constants = [0, 1, 3, 4, 5]
             .into_iter()
             .enumerate()
-            .take(input.len() - 3)
+            .take(ordinary)
             .map(|(i, slot)| (slot, dtype_code(input[i].layout().dtype())))
-            .chain([(2, dtype_code(dispatch.output().layout().dtype()))])
+            .chain([
+                (2, dtype_code(dispatch.output().layout().dtype())),
+                (227, u32::from(linear)),
+                (228, linear_views),
+            ])
             .collect::<Vec<_>>();
         let pipeline = self
             .pipelines
@@ -105,6 +119,41 @@ impl MetalBackend {
     }
 }
 
+fn linear_view_mask(dispatches: &[Dispatch]) -> Result<u32, BackendError> {
+    let first = dispatches.first().ok_or(BackendError::InvalidInput)?;
+    if super::selected_variant(first) != Some(crate::variants::MetalVariant::DeltaRuleLinearLanes) {
+        return Ok(0);
+    }
+    dispatches.iter().try_fold(u32::MAX, |mask, dispatch| {
+        Ok(mask & contiguous_views(dispatch)?)
+    })
+}
+
+fn contiguous_views(dispatch: &Dispatch) -> Result<u32, BackendError> {
+    let inputs = dispatch.inputs();
+    let ordinary = inputs
+        .len()
+        .checked_sub(3)
+        .ok_or(BackendError::InvalidInput)?;
+    inputs
+        .get(..ordinary)
+        .ok_or(BackendError::InvalidInput)?
+        .iter()
+        .chain(dispatch.outputs())
+        .enumerate()
+        .try_fold(0_u32, |mask, (index, tensor)| {
+            let bit = 1_u32
+                .checked_shl(u32::try_from(index).map_err(|_| BackendError::InvalidInput)?)
+                .ok_or(BackendError::InvalidInput)?;
+            Ok(mask
+                | if tensor.layout().is_contiguous() {
+                    bit
+                } else {
+                    0
+                })
+        })
+}
+
 fn state_arguments(
     dispatch: &Dispatch,
     tensors: &[EncoderTensor],
@@ -114,8 +163,14 @@ fn state_arguments(
         return Err(BackendError::InvalidInput);
     };
     let input = dispatch.inputs();
+    let ordinary = input
+        .len()
+        .checked_sub(3)
+        .ok_or(BackendError::InvalidInput)?;
     let mut layouts = Vec::new();
-    for tensor in tensors[..input.len() - 3]
+    for tensor in tensors
+        .get(..ordinary)
+        .ok_or(BackendError::InvalidInput)?
         .iter()
         .chain(&tensors[input.len()..])
     {
@@ -182,6 +237,22 @@ fn state_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_masks_refuse_missing_metadata_and_ignore_nonlinear_layouts() {
+        use forja_core::{CommandList, DType};
+        let cpu = forja_cpu::CpuBackend::new();
+        let input = cpu.alloc(DType::F32, &[7]).unwrap();
+        let output = cpu.alloc(DType::F32, &[7]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(Op::RmsNorm { eps: 1.0e-6 }, &[&input, &input], &output)
+            .unwrap();
+        let dispatch = commands.last_dispatch().unwrap();
+        assert_eq!(contiguous_views(dispatch), Err(BackendError::InvalidInput));
+        assert_eq!(linear_view_mask(commands.dispatches()), Ok(0));
+        assert_eq!(linear_view_mask(&[]), Err(BackendError::InvalidInput));
+    }
 
     #[test]
     fn metal_compiles_delta_block_stages_with_bounded_groups() {

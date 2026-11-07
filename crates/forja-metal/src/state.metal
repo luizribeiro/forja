@@ -1,3 +1,6 @@
+constant uint state_linear_layout [[function_constant(227)]];
+constant uint state_linear_views [[function_constant(228)]];
+
 struct StateAuth {
     uint source;
     uint destination;
@@ -27,6 +30,11 @@ bool authenticate_state(
     return valid;
 }
 
+ulong delta_state_index(constant TensorLayout *layouts, uint slot, uint index) {
+    return state_linear_layout != 0 && (state_linear_views & (1u << slot)) != 0
+        ? layouts[slot].offset + index : physical_index(layouts[slot], index);
+}
+
 void state_delta_rule_compute(
     device const uchar *query, device const uchar *key,
     device const uchar *value, device const uchar *decay,
@@ -43,30 +51,32 @@ void state_delta_rule_compute(
     uint q_head = head / (params.heads / params.q_heads);
     uint per_thread = (params.keys + 31) / 32;
     float prediction = 0.0f;
-    float d = load_float(decay,physical_index(layouts[3],head),program_input3_dtype);
+    float d = load_float(decay,delta_state_index(layouts,3,head),program_input3_dtype);
     for (uint i=0; i<per_thread; ++i) {
         uint k = lane * per_thread + i;
         if (k < params.keys) {
             uint index = (head * params.keys + k) * params.values + column;
-            state[i] = (carried ? state[i] : previous[physical_index(layouts[5],index)]) * d;
-            prediction += state[i] * load_float(key,physical_index(layouts[1],q_head * params.keys+k),input1_dtype);
+            ulong source_index = delta_state_index(layouts,5,index);
+            state[i] = (carried ? state[i] : previous[source_index]) * d;
+            prediction += state[i] * load_float(key,delta_state_index(layouts,1,q_head * params.keys+k),input1_dtype);
         }
     }
     prediction = simd_sum(prediction);
-    float delta = (load_float(value,physical_index(layouts[2],out_index),input2_dtype)-prediction)
-        * load_float(beta,physical_index(layouts[4],head),program_input4_dtype);
+    float delta = (load_float(value,delta_state_index(layouts,2,out_index),input2_dtype)-prediction)
+        * load_float(beta,delta_state_index(layouts,4,head),program_input4_dtype);
     float result = 0.0f;
     for (uint i=0; i<per_thread; ++i) {
         uint k = lane * per_thread + i;
         if (k < params.keys) {
             uint index = (head * params.keys + k) * params.values + column;
-            state[i] += load_float(key,physical_index(layouts[1],q_head*params.keys+k),input1_dtype) * delta;
-            next[physical_index(layouts[7],index)] = state[i];
-            result += state[i] * load_float(query,physical_index(layouts[0],q_head*params.keys+k),input0_dtype);
+            state[i] += load_float(key,delta_state_index(layouts,1,q_head*params.keys+k),input1_dtype) * delta;
+            ulong next_index = delta_state_index(layouts,7,index);
+            next[next_index] = state[i];
+            result += state[i] * load_float(query,delta_state_index(layouts,0,q_head*params.keys+k),input0_dtype);
         }
     }
     result = simd_sum(result);
-    if (lane == 0) { store_float(output,physical_index(layouts[6],out_index),output_dtype,result); }
+    if (lane == 0) { store_float(output,delta_state_index(layouts,6,out_index),output_dtype,result); }
 }
 
 kernel void state_delta_rule(

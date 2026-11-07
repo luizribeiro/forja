@@ -10,9 +10,58 @@ enum Geometry {
 #[derive(Clone, Copy, PartialEq)]
 enum Schedule {
     Lanes,
+    Linear,
+    LinearMixed,
     Steps,
     InactiveStep,
     TypedSteps,
+}
+
+#[test]
+fn metal_linear_delta_uses_a_common_layout_mask_for_mixed_lanes() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        compare_schedule(
+            &backend,
+            Geometry::Delta([48, 16, 128, 128]),
+            dtype,
+            4,
+            false,
+            Schedule::LinearMixed,
+        );
+    }
+}
+
+#[test]
+fn metal_linear_delta_preserves_state_bits_at_grouped_and_odd_shapes() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    for shape in [
+        [48, 16, 128, 128],
+        [6, 2, 7, 33],
+        [6, 2, 33, 7],
+        [1, 1, 1, 1],
+        [1, 1, 7, 4097],
+        [1, 1, 256, 7],
+    ] {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            compare_schedule(
+                &backend,
+                Geometry::Delta(shape),
+                dtype,
+                4,
+                false,
+                Schedule::Linear,
+            );
+        }
+    }
+    compare_schedule(
+        &backend,
+        Geometry::Delta([48, 16, 128, 128]),
+        DType::BF16,
+        4,
+        true,
+        Schedule::Linear,
+    );
 }
 
 #[test]
@@ -132,7 +181,10 @@ fn compare_schedule(
     corrupt: bool,
     schedule: Schedule,
 ) {
-    let chained = schedule != Schedule::Lanes;
+    let chained = !matches!(
+        schedule,
+        Schedule::Lanes | Schedule::Linear | Schedule::LinearMixed
+    );
     let delta = matches!(geometry, Geometry::Delta(_));
     let mut specs = specifications(geometry, dtype);
     if schedule == Schedule::TypedSteps
@@ -143,6 +195,7 @@ fn compare_schedule(
         specs[3] = TensorSpec::contiguous(dtype, &[heads]);
     }
     let name = match schedule {
+        Schedule::Linear | Schedule::LinearMixed => "delta-rule.simd-linear-state-lanes",
         Schedule::Lanes if delta => "delta-rule.simd-lanes",
         Schedule::Lanes => "causal-depthwise-conv.direct-lanes",
         Schedule::Steps | Schedule::InactiveStep | Schedule::TypedSteps => {
@@ -160,6 +213,25 @@ fn compare_schedule(
     for lane in 0..lanes {
         let (access, mut inputs) = lane_inputs(backend, &specs, lane, corrupt);
         let source = inputs.len() - 4;
+        if matches!(schedule, Schedule::Linear | Schedule::LinearMixed) {
+            inputs[source] = offset_state(backend, &inputs[source], 7);
+            if schedule == Schedule::LinearMixed && lane % 2 == 1 {
+                for input in &mut inputs[2..source] {
+                    *input = strided_copy(backend, input);
+                }
+            }
+            if schedule == Schedule::Linear || lane % 2 == 0 {
+                for input in &mut inputs[..2] {
+                    let contiguous = backend
+                        .alloc(input.layout().dtype(), input.layout().shape())
+                        .unwrap();
+                    backend
+                        .write(&contiguous, &backend.read(input).unwrap())
+                        .unwrap();
+                    *input = contiguous;
+                }
+            }
+        }
         if matches!(schedule, Schedule::Steps | Schedule::TypedSteps) {
             backend
                 .write(inputs.last().unwrap(), &1_u32.to_le_bytes())
@@ -180,23 +252,39 @@ fn compare_schedule(
         let state = backend
             .alloc(previous.layout().dtype(), previous.layout().shape())
             .unwrap();
+        write_canary(backend, &state);
+        let state = if matches!(schedule, Schedule::Linear | Schedule::LinearMixed) {
+            offset_state(backend, &state, 33)
+        } else {
+            state
+        };
         let single_output = backend.alloc(dtype, output.layout().shape()).unwrap();
         let single_state = backend
             .alloc(state.layout().dtype(), state.layout().shape())
             .unwrap();
         for tensor in [&output, &state, &single_output, &single_state] {
-            backend
-                .write(
-                    tensor,
-                    &vec![
-                        0x3f;
-                        usize::try_from(
-                            tensor.layout().element_count() * tensor.layout().dtype().byte_size()
-                        )
-                        .unwrap()
-                    ],
-                )
-                .unwrap();
+            if tensor.layout().is_contiguous() {
+                write_canary(backend, tensor);
+            }
+        }
+        if schedule == Schedule::LinearMixed && lane % 2 == 1 {
+            let mut strided = inputs.clone();
+            strided[source] = strided_copy(backend, &inputs[source]);
+            let mut refused = CommandList::new();
+            assert!(
+                refused
+                    .dispatch_many(op, &strided.iter().collect::<Vec<_>>(), &[&output, &state])
+                    .is_err()
+            );
+            assert!(
+                refused
+                    .dispatch_many(
+                        op,
+                        &inputs.iter().collect::<Vec<_>>(),
+                        &[&output, &strided_copy(backend, &state)]
+                    )
+                    .is_err()
+            );
         }
         let mut single_inputs = inputs.clone();
         if chained && let Some(previous) = results.last() {
@@ -370,4 +458,90 @@ fn lane_metadata(lane: usize) -> (forja_core::StateAccess, [TensorSpec; 3]) {
             TensorSpec::initialized(DType::U32, &[1], 1_u32.to_le_bytes().to_vec()),
         ],
     )
+}
+
+fn offset_state(
+    backend: &forja_metal::MetalBackend,
+    tensor: &forja_core::Tensor,
+    prefix: u32,
+) -> forja_core::Tensor {
+    let count = u32::try_from(tensor.layout().element_count()).unwrap();
+    let padded = backend
+        .alloc(
+            tensor.layout().dtype(),
+            &[count.checked_add(prefix).unwrap()],
+        )
+        .unwrap();
+    let slice = backend
+        .view(
+            &padded,
+            forja_core::ViewOp::Slice(vec![forja_core::Slice::new(prefix, count, 1).unwrap()]),
+        )
+        .unwrap();
+    let view = backend
+        .view(
+            &slice,
+            forja_core::ViewOp::Reshape(tensor.layout().shape().to_vec()),
+        )
+        .unwrap();
+    backend
+        .write(&view, &backend.read(tensor).unwrap())
+        .unwrap();
+    view
+}
+
+fn write_canary(backend: &forja_metal::MetalBackend, tensor: &forja_core::Tensor) {
+    backend
+        .write(
+            tensor,
+            &vec![
+                0x3f;
+                usize::try_from(
+                    tensor.layout().element_count() * tensor.layout().dtype().byte_size()
+                )
+                .unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+fn strided_copy(
+    backend: &forja_metal::MetalBackend,
+    tensor: &forja_core::Tensor,
+) -> forja_core::Tensor {
+    let shape = tensor.layout().shape();
+    let mut storage_shape = shape.to_vec();
+    *storage_shape.last_mut().unwrap() *= 2;
+    let storage = backend
+        .alloc(tensor.layout().dtype(), &storage_shape)
+        .unwrap();
+    let size = usize::try_from(tensor.layout().dtype().byte_size()).unwrap();
+    let data = backend.read(tensor).unwrap();
+    let mut interleaved = vec![0x3f; data.len() * 2];
+    for (value, destination) in data
+        .chunks_exact(size)
+        .zip(interleaved.chunks_exact_mut(2 * size))
+    {
+        destination[..size].copy_from_slice(value);
+    }
+    backend.write(&storage, &interleaved).unwrap();
+    backend
+        .view(
+            &storage,
+            forja_core::ViewOp::Slice(
+                shape
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, &length)| {
+                        forja_core::Slice::new(
+                            0,
+                            length,
+                            if axis + 1 == shape.len() { 2 } else { 1 },
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            ),
+        )
+        .unwrap()
 }

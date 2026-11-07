@@ -15,6 +15,7 @@ use crate::matmul::{MatrixLayout, classify};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetalVariant {
     DeltaRule,
+    DeltaRuleLinearLanes,
     DeltaRuleLanes,
     DeltaRuleSteps,
     DeltaBlockWy64,
@@ -1556,6 +1557,13 @@ pub(crate) static REGISTRY: &[VariantDef<MetalImplementation>] = &[
         ]
     ),
     batch_invariant_variant!(@class "delta-rule.simd";
+        "delta-rule.simd-linear-state-lanes", DeltaRule, DeltaRuleLinearLanes,
+        &[value(dim("key width", QUERY, Axis::Index(1)), Relation::Range { min: 1, max: crate::geometry::DELTA_RULE_MAX_KEYS })],
+        &["authenticated independent updates with linear addresses for validated contiguous operands, guarded otherwise."],
+        &["dependent updates or differing lane geometry."],
+        &["Uses linear addresses for validated contiguous operands and guarded indexing otherwise; preserves fixed SIMD reductions across up to eight independent lanes."]
+    ),
+    batch_invariant_variant!(@class "delta-rule.simd";
         "delta-rule.simd-steps", DeltaRule, DeltaRuleSteps,
         &[value(dim("key width", QUERY, Axis::Index(1)), Relation::Range { min: 1, max: crate::geometry::DELTA_RULE_MAX_KEYS })],
         &["adjacent chained state versions with matching scalar types and geometry."],
@@ -2495,6 +2503,7 @@ mod tests {
                 "sample.portable",
                 "sample.parallel",
                 "delta-rule.simd",
+                "delta-rule.simd-linear-state-lanes",
                 "delta-rule.simd-steps",
                 "delta-rule.simd-lanes",
                 "delta-rule-block.wy64-fixed",
@@ -3625,6 +3634,11 @@ mod tests {
             ),
             (
                 "delta-rule.simd-lanes",
+                state_dispatch(forja_core::StateOp::DeltaRule),
+                "state_delta_rule_lanes",
+            ),
+            (
+                "delta-rule.simd-linear-state-lanes",
                 state_dispatch(forja_core::StateOp::DeltaRule),
                 "state_delta_rule_lanes",
             ),

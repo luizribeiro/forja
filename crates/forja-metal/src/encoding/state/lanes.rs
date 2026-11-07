@@ -17,6 +17,7 @@ pub(in crate::encoding) fn lane_variant(dispatch: &Dispatch) -> bool {
         super::super::selected_variant(dispatch),
         Some(
             MetalVariant::DeltaRuleLanes
+                | MetalVariant::DeltaRuleLinearLanes
                 | MetalVariant::CausalDepthwiseConvLanes
                 | MetalVariant::DeltaRuleSteps
         )
@@ -111,7 +112,7 @@ impl MetalBackend {
             layouts.resize(layouts.len() + 8 * 112 - layout.len(), 0);
             params.extend(parameter);
         }
-        let pipeline = self.state_pipeline(kernel, first)?;
+        let pipeline = self.state_pipeline(kernel, dispatches)?;
         let mut buffers = [pointers, layouts, params, error_state().to_vec()]
             .iter()
             .map(|bytes| arguments.write(bytes))
