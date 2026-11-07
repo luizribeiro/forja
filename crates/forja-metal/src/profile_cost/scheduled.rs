@@ -1,7 +1,11 @@
 use forja_core::{Dispatch, KernelCost, Op};
+mod row_program;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     let mut cost = super::of(dispatch)?;
+    if matches!(dispatch.op(), Op::Program(_)) {
+        return row_program::of(dispatch, cost);
+    }
     let model = crate::variants::selected_cost_model(dispatch);
     let [rows, columns, _] = model.tile.map(u64::from);
     if rows == 0 {

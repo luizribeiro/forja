@@ -149,6 +149,28 @@ pub enum Inst {
 }
 
 impl Inst {
+    /// Reports whether evaluation invokes a floating-point special function.
+    #[must_use]
+    pub const fn is_special_function(self) -> bool {
+        matches!(
+            self,
+            Self::Unary(
+                UnOp::Exp
+                    | UnOp::ExpRounded
+                    | UnOp::Log
+                    | UnOp::Log1p
+                    | UnOp::Sqrt
+                    | UnOp::Rsqrt
+                    | UnOp::Sin
+                    | UnOp::Cos
+                    | UnOp::Tanh
+                    | UnOp::Sigmoid
+                    | UnOp::Recip,
+                _
+            ) | Self::Binary(BinOp::Pow, _, _)
+        )
+    }
+
     fn operands(self) -> [Option<u32>; 3] {
         match self {
             Self::Unary(_, a) | Self::Cast(_, a) | Self::Reduce(_, a) => [Some(a), None, None],

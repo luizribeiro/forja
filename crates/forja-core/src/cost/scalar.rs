@@ -1,6 +1,6 @@
 use crate::{
     Dispatch, KernelCost, Op,
-    program::{BinOp, Inst, Program, ProgramKind, UnOp},
+    program::{Inst, Program, ProgramKind},
 };
 
 pub(super) fn program_ops(program: &Program, elements: u64, width: u64) -> Option<u64> {
@@ -44,23 +44,7 @@ fn program_work(program: &Program, elements: u64, width: u64, special_only: bool
             | Inst::Cast(_, _)
             | Inst::Select(_, _, _) => 0,
         };
-        let special = matches!(
-            inst,
-            Inst::Unary(
-                UnOp::Exp
-                    | UnOp::ExpRounded
-                    | UnOp::Log
-                    | UnOp::Log1p
-                    | UnOp::Sqrt
-                    | UnOp::Rsqrt
-                    | UnOp::Sin
-                    | UnOp::Cos
-                    | UnOp::Tanh
-                    | UnOp::Sigmoid
-                    | UnOp::Recip,
-                _
-            ) | Inst::Binary(BinOp::Pow, _, _)
-        );
+        let special = inst.is_special_function();
         if !special_only || special {
             operations = operations.checked_add(count)?;
         }
