@@ -75,6 +75,45 @@ mod tests {
     use forja_cpu::CpuBackend;
 
     #[test]
+    fn scheduled_map_addresses_cover_a_walk_of_every_operand_axis() {
+        let backend = CpuBackend::new();
+        let program = Program {
+            kind: ProgramKind::Map,
+            insts: vec![
+                Inst::Input(0),
+                Inst::Input(1),
+                Inst::Binary(BinOp::Add, 0, 1),
+            ],
+            outputs: vec![(0, 2)],
+        };
+        let prepared = prepare_program(
+            &backend,
+            program.validate().unwrap(),
+            KernelSignature::new(3, vec![DType::F32; 2], vec![DType::F32], 0),
+        )
+        .unwrap();
+        let input = backend.alloc(DType::F32, &[1, 7, 33]).unwrap();
+        let extra = backend.alloc(DType::F32, &[1, 7, 33]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 7, 33]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch_kernel(&prepared, &[&input, &extra], &[&output])
+            .unwrap();
+        let dispatch = commands.last_dispatch().unwrap();
+        let cost = super::super::of(dispatch).unwrap();
+        let mut visited = 0_u64;
+        for _ in 0..output.layout().element_count() {
+            for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
+                for _ in tensor.layout().shape() {
+                    visited += 2;
+                }
+            }
+        }
+        assert!(cost.scalar_ops >= visited);
+        assert!(cost.scalar_ops > output.layout().element_count() * 128);
+    }
+
+    #[test]
     fn scalar_map_work_keeps_rank_zero_index_domain() {
         let backend = CpuBackend::new();
         let program = Program {

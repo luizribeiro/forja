@@ -455,6 +455,8 @@ pub struct DispatchProfile {
     pub cost: crate::KernelCost,
     /// Conservative source-level work from the selected launch schedule, for admission.
     pub scheduled_cost: crate::KernelCost,
+    /// Conservative serial work on the longest invocation or cooperative row.
+    pub critical_path_cost: crate::KernelCost,
     /// Lower and upper executed FLOPs after tile padding.
     pub padded_flops: [u64; 2],
     /// Logical input metadata.

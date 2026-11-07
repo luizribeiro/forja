@@ -16,7 +16,7 @@ pub(super) fn timeline(dispatches: &[DispatchProfile]) -> Result<Vec<Value>, &'s
         Ok(json!({"index": index, "call_site": call_site, "scope": dispatch.scope.as_ref().map(forja_core::ProfileScope::json),
             "op": super::op_name(dispatch.op), "kernel": dispatch.kernel,
             "variant": dispatch.variant, "alternatives": dispatch.alternatives,
-            "shape": super::shape(dispatch), "cost": dispatch.cost.json(), "scheduled_cost": dispatch.scheduled_cost.json(), "padded_flops": dispatch.padded_flops,
+            "shape": super::shape(dispatch), "cost": dispatch.cost.json(), "scheduled_cost": dispatch.scheduled_cost.json(), "critical_path_cost": dispatch.critical_path_cost.json(), "padded_flops": dispatch.padded_flops,
             "physical_dispatches": dispatch.physical_dispatches,
             "register_spill_risk": register_pressure(dispatch, dispatch.kernel),
             "compute_dtype": super::dtype_name(dispatch.compute_dtype),

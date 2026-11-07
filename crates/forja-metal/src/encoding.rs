@@ -8569,6 +8569,8 @@ fn dispatch_profile(
         alternatives,
         cost,
         padded_flops,
+        critical_path_cost: crate::profile_cost::scheduled::critical_path(dispatch)
+            .ok_or(BackendError::InvalidInput)?,
         scheduled_cost: crate::profile_cost::scheduled::of(dispatch)
             .ok_or(BackendError::InvalidInput)?,
         op: dispatch.op(),

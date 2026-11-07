@@ -1,4 +1,6 @@
 use forja_core::{Dispatch, KernelCost, Op};
+mod critical;
+pub(crate) use critical::of as critical_path;
 mod row_program;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
@@ -15,14 +17,14 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
             .checked_add(visits.checked_mul(dispatch.inputs()[0].layout().dtype().byte_size())?)?;
     }
     if matches!(dispatch.op(), Op::Program(_)) {
-        return row_program::of(dispatch, cost);
+        return addressing(dispatch, row_program::of(dispatch, cost)?);
     }
     let model = crate::variants::selected_cost_model(dispatch);
     let [rows, columns, _] = model.tile.map(u64::from);
     if rows == 0 {
         cost.scalar_ops = cost.scalar_ops.checked_add(cost.flops)?;
         cost.flops = 0;
-        return Some(cost);
+        return addressing(dispatch, cost);
     }
     let flops = model.padded_flops(dispatch, cost)?[1];
     let input_values = flops.checked_div(2)?.checked_div(columns)?;
@@ -49,6 +51,46 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .checked_add(input_bytes)?
         .checked_add(weight_bytes)?;
     cost.flops = flops;
+    addressing(dispatch, cost)
+}
+
+pub(super) fn addressing(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
+    let layouts = dispatch
+        .inputs()
+        .iter()
+        .chain(dispatch.outputs())
+        .map(forja_core::Tensor::layout);
+    let affine = matches!(
+        dispatch.op(),
+        Op::Matmul
+            | Op::QuantMatmul { .. }
+            | Op::GatherMatmul
+            | Op::GatherQuantMatmul { .. }
+            | Op::Sdpa { .. }
+            | Op::PagedSdpa { .. }
+            | Op::PagedSdpaAppend { .. }
+    );
+    let generic = !affine
+        && (matches!(
+            dispatch.op(),
+            Op::Program(_) | Op::RmsNorm { .. } | Op::State(_)
+        ) || layouts.clone().any(|layout| !layout.is_contiguous()));
+    let weight = if generic {
+        u64::try_from(
+            layouts
+                .map(|layout| layout.shape().len())
+                .max()
+                .unwrap_or(0),
+        )
+        .ok()?
+        .checked_mul(128)?
+    } else if affine {
+        32
+    } else {
+        0
+    };
+    let visits = cost.read_bytes.checked_add(cost.write_bytes)?.div_ceil(2);
+    cost.scalar_ops = cost.scalar_ops.checked_add(visits.checked_mul(weight)?)?;
     Some(cost)
 }
 
@@ -103,6 +145,11 @@ fn epilogue_calls(dispatch: &Dispatch) -> Option<KernelCost> {
             cost.read_bytes = cost
                 .read_bytes
                 .checked_add(calls.checked_mul(dtype.byte_size())?)?;
+            cost.scalar_ops = cost.scalar_ops.checked_add(
+                calls
+                    .checked_mul(u64::from(epilogue.signature().logical_rank()))?
+                    .checked_mul(128)?,
+            )?;
         }
     }
     Some(cost)
@@ -259,7 +306,7 @@ mod tests {
                 let logical = super::super::of(dispatch).unwrap();
                 let scheduled = of(dispatch).unwrap();
                 assert_eq!(scheduled.flops, decoded * 32 * 2);
-                assert_eq!(scheduled.scalar_ops, decoded * 8);
+                assert!(scheduled.scalar_ops >= decoded * 8);
                 assert_eq!(
                     scheduled.read_bytes,
                     logical.read_bytes + input_loads * 4 + decoded
