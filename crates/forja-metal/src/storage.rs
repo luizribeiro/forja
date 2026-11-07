@@ -565,6 +565,7 @@ pub struct MetalBackend {
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pool: Mutex<BufferPool>,
     pub(super) pipelines: Mutex<PipelineCache>,
+    pub(super) compiler: Arc<crate::compiler::Compiler>,
     pub(super) prepared_programs:
         Mutex<HashMap<(ProgramHash, KernelSignature), Weak<MetalProgram>>>,
     pub(super) program_compile_tokens: Mutex<ProgramCompileTokens>,
@@ -756,10 +757,29 @@ impl MetalBackend {
     /// # Errors
     /// Returns an error for a zero allowance or an unavailable Metal device.
     pub fn with_pipeline_limit(count: usize) -> Result<Self, BackendError> {
+        Self::with_pipeline_compile_limits(count, Duration::from_secs(60))
+    }
+
+    /// Creates a backend with pipeline attempts and cumulative compiler wall time bounded.
+    /// Expiry disables further compilation and GPU submission for this backend.
+    ///
+    /// # Errors
+    /// Refuses zero or unrepresentable limits, unavailable Metal, or compilation failure.
+    pub fn with_pipeline_compile_limits(
+        count: usize,
+        budget: Duration,
+    ) -> Result<Self, BackendError> {
         if count == 0 {
             return Err(BackendError::InvalidInput);
         }
-        let backend = Self::new()?;
+        let compiler = crate::compiler::Compiler::new(budget)?;
+        let backend = Self::with_compiler_configuration(
+            Duration::from_secs(10),
+            Self::automatic_pool_capacity()?,
+            ProgramCompileBudget::default(),
+            MetalGraphReplay::Tier2,
+            compiler,
+        )?;
         backend
             .pipelines
             .lock()
@@ -916,6 +936,22 @@ impl MetalBackend {
         program_compile_budget: ProgramCompileBudget,
         graph_replay: MetalGraphReplay,
     ) -> Result<Self, BackendError> {
+        Self::with_compiler_configuration(
+            gpu_timeout,
+            pool_capacity,
+            program_compile_budget,
+            graph_replay,
+            crate::compiler::Compiler::new(Duration::from_secs(60))?,
+        )
+    }
+
+    fn with_compiler_configuration(
+        gpu_timeout: Duration,
+        pool_capacity: u64,
+        program_compile_budget: ProgramCompileBudget,
+        graph_replay: MetalGraphReplay,
+        compiler: crate::compiler::Compiler,
+    ) -> Result<Self, BackendError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(BackendError::ExecutionFailed)?;
         if !device.supportsFamily(MTLGPUFamily::Metal4) {
             return Err(BackendError::ExecutionFailed);
@@ -929,7 +965,8 @@ impl MetalBackend {
         residency.commit();
         queue.addResidencySet(&residency);
         let source = shader_source();
-        let pipelines = PipelineCache::new(&device, source)?;
+        let pipelines = PipelineCache::with_compiler(&device, source, compiler)?;
+        let compiler = Arc::clone(&pipelines.compiler);
         let shared_event = device
             .newSharedEvent()
             .ok_or(BackendError::ExecutionFailed)?;
@@ -947,6 +984,7 @@ impl MetalBackend {
                 residency: PoolResidency { raw: residency },
             }),
             pipelines: Mutex::new(pipelines),
+            compiler,
             prepared_programs: Mutex::new(HashMap::new()),
             program_compile_tokens: Mutex::new(ProgramCompileTokens::new(program_compile_budget)),
             in_flight: Arc::new(InFlightTracker::new()),
@@ -1225,6 +1263,7 @@ impl Backend for MetalBackend {
         program: &ValidatedProgram,
         signature: &KernelSignature,
     ) -> Result<Self::ProgramHandle, BackendError> {
+        self.compiler.ensure_enabled()?;
         self.prepare_scalar_program(program, signature)
     }
 
@@ -1414,6 +1453,7 @@ impl Backend for MetalBackend {
     }
 
     fn prepare_graph(&self, graph: GraphTemplate) -> Result<PreparedGraph, BackendError> {
+        self.compiler.ensure_enabled()?;
         let state = self.prepare_metal_graph(&graph)?;
         Ok(PreparedGraph::with_backend_state(graph, state))
     }
@@ -1427,6 +1467,7 @@ impl Backend for MetalBackend {
         graph: GraphTemplate,
         plan: GraphMemoryPlan,
     ) -> Result<PreparedGraph, BackendError> {
+        self.compiler.ensure_enabled()?;
         self.prepare_metal_graph_memory(graph, plan)
     }
 

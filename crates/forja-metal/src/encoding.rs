@@ -2893,6 +2893,7 @@ impl MetalBackend {
     ) -> Result<MetalSubmission, BackendError> {
         #[cfg(test)]
         let submit_started = Instant::now();
+        self.compiler.ensure_enabled()?;
         self.in_flight.drain_done();
         let validation_started = PROFILE.then(Instant::now);
         let program_recording = commands.program_recording();
@@ -10436,6 +10437,7 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
 }
 
 pub(super) struct PipelineCache {
+    pub(super) compiler: Arc<crate::compiler::Compiler>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     max_threadgroup_memory_length: usize,
     pipeline_budget: AtomicUsize,
@@ -10463,6 +10465,7 @@ struct EpilogueCompileCounts {
 
 impl PipelineCache {
     fn charge_pipeline(&self) -> Result<(), BackendError> {
+        self.compiler.ensure_enabled()?;
         self.pipeline_budget
             .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
@@ -10491,6 +10494,7 @@ impl PipelineCache {
         name: &str,
         constants: &[(u32, u32)],
     ) -> Result<bool, BackendError> {
+        self.compiler.ensure_enabled()?;
         let key = PipelineKey {
             name: name.to_owned(),
             constants: constants.to_vec(),
@@ -10500,22 +10504,20 @@ impl PipelineCache {
         }
         self.charge_pipeline()?;
         let options = compile_options(MTLMathMode::Fast);
-        let Ok(library) = self
-            .device
-            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
+        let Ok(library) =
+            self.compiler
+                .library(&self.device, &NSString::from_str(source), &options)
         else {
             return Ok(false);
         };
         let values = function_constants(constants)?;
-        let Ok(function) =
-            library.newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
+        let Ok(function) = self
+            .compiler
+            .function(&library, &NSString::from_str(name), &values)
         else {
             return Ok(false);
         };
-        let Ok(pipeline) = self
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-        else {
+        let Ok(pipeline) = self.compiler.pipeline(&self.device, &function) else {
             return Ok(false);
         };
         if self.validate_pipeline_memory(&pipeline).is_err() {
@@ -10531,20 +10533,30 @@ impl PipelineCache {
         self.max_threadgroup_memory_length = bytes;
     }
 
+    #[cfg(test)]
     pub(super) fn new(
         device: &Retained<ProtocolObject<dyn MTLDevice>>,
         source: &str,
     ) -> Result<Self, BackendError> {
+        Self::with_compiler(
+            device,
+            source,
+            crate::compiler::Compiler::new(Duration::from_secs(60))?,
+        )
+    }
+
+    pub(super) fn with_compiler(
+        device: &Retained<ProtocolObject<dyn MTLDevice>>,
+        source: &str,
+        compiler: crate::compiler::Compiler,
+    ) -> Result<Self, BackendError> {
         let source = NSString::from_str(source);
         let fast_options = compile_options(MTLMathMode::Fast);
-        let fast_library = device
-            .newLibraryWithSource_options_error(&source, Some(&fast_options))
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let fast_library = compiler.library(device, &source, &fast_options)?;
         let nan_preserving_options = compile_options(MTLMathMode::Relaxed);
-        let nan_preserving_library = device
-            .newLibraryWithSource_options_error(&source, Some(&nan_preserving_options))
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let nan_preserving_library = compiler.library(device, &source, &nan_preserving_options)?;
         Ok(Self {
+            compiler: Arc::new(compiler),
             device: device.clone(),
             max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),
             pipeline_budget: AtomicUsize::new(256),
@@ -10564,6 +10576,7 @@ impl PipelineCache {
         name: &str,
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        self.compiler.ensure_enabled()?;
         let key = PipelineKey {
             name: name.to_owned(),
             constants: constants.to_vec(),
@@ -10582,13 +10595,8 @@ impl PipelineCache {
             &self.fast_library
         };
         let function_name = NSString::from_str(name);
-        let function = library
-            .newFunctionWithName_constantValues_error(&function_name, &values)
-            .map_err(|_| BackendError::ExecutionFailed)?;
-        let pipeline = self
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let function = self.compiler.function(library, &function_name, &values)?;
+        let pipeline = self.compiler.pipeline(&self.device, &function)?;
         if let Err(error) = self.validate_pipeline_memory(&pipeline) {
             self.unavailable_pipelines.insert(key);
             return Err(error);
@@ -10604,6 +10612,7 @@ impl PipelineCache {
         name: &str,
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+        self.compiler.ensure_enabled()?;
         let source_key = epilogue_codegen::SourceKey::new(family, epilogue);
         let pipeline_key =
             epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants.to_vec());
@@ -10620,9 +10629,9 @@ impl PipelineCache {
             let source = NSString::from_str(&generated);
             let options = compile_options(MTLMathMode::Safe);
             let library = self
-                .device
-                .newLibraryWithSource_options_error(&source, Some(&options))
-                .map_err(|_| program_compile_failed(source_key.hash))?;
+                .compiler
+                .library(&self.device, &source, &options)
+                .map_err(|error| program_compile_error(source_key.hash, error))?;
             self.epilogue_libraries.insert(source_key.clone(), library);
             self.epilogue_counts.libraries = self.epilogue_counts.libraries.saturating_add(1);
         }
@@ -10631,13 +10640,14 @@ impl PipelineCache {
             .get(&source_key)
             .ok_or(BackendError::ExecutionFailed)?;
         let values = function_constants(&pipeline_key.constants)?;
-        let function = library
-            .newFunctionWithName_constantValues_error(&NSString::from_str(name), &values)
-            .map_err(|_| program_compile_failed(source_key.hash))?;
+        let function = self
+            .compiler
+            .function(library, &NSString::from_str(name), &values)
+            .map_err(|error| program_compile_error(source_key.hash, error))?;
         let pipeline = self
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| program_compile_failed(source_key.hash))?;
+            .compiler
+            .pipeline(&self.device, &function)
+            .map_err(|error| program_compile_error(source_key.hash, error))?;
         self.validate_pipeline_memory(&pipeline)?;
         self.epilogue_pipelines
             .insert(pipeline_key, pipeline.clone());
@@ -10719,9 +10729,9 @@ impl PipelineCache {
         let source = NSString::from_str(source);
         let options = compile_options(MTLMathMode::Safe);
         let library = self
-            .device
-            .newLibraryWithSource_options_error(&source, Some(&options))
-            .map_err(|_| program_compile_failed(key.hash))?;
+            .compiler
+            .library(&self.device, &source, &options)
+            .map_err(|error| program_compile_error(key.hash, error))?;
         let kernel = if key.row {
             map_codegen::ROW_KERNEL_NAME
         } else {
@@ -10753,13 +10763,14 @@ impl PipelineCache {
                 );
             }
         }
-        let function = library
-            .newFunctionWithName_constantValues_error(&name, &values)
-            .map_err(|_| program_compile_failed(key.hash))?;
+        let function = self
+            .compiler
+            .function(&library, &name, &values)
+            .map_err(|error| program_compile_error(key.hash, error))?;
         let pipeline = self
-            .device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|_| program_compile_failed(key.hash))?;
+            .compiler
+            .pipeline(&self.device, &function)
+            .map_err(|error| program_compile_error(key.hash, error))?;
         self.validate_pipeline_memory(&pipeline)?;
         Ok(pipeline)
     }
@@ -10822,6 +10833,11 @@ fn compile_options(math_mode: MTLMathMode) -> Retained<MTLCompileOptions> {
     let options = MTLCompileOptions::new();
     options.setMathMode(math_mode);
     options
+}
+
+fn program_compile_error(hash: ProgramHash, error: BackendError) -> BackendError {
+    let _ = program_compile_failed(hash);
+    error
 }
 
 fn program_compile_failed(hash: ProgramHash) -> BackendError {
@@ -16051,6 +16067,44 @@ mod tests {
             Err(BackendError::QuotaExceeded)
         ));
         assert_eq!(cache.pipeline_budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn expired_compile_budget_refuses_retained_graphs_and_cached_pipelines() {
+        assert!(matches!(
+            MetalBackend::with_pipeline_compile_limits(2, Duration::ZERO),
+            Err(BackendError::InvalidInput)
+        ));
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[33]).unwrap();
+        let output = backend.alloc(DType::F32, &[33]).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let mut template = GraphTemplate::new(
+            forja_core::ParamSpace::new(Vec::new()).unwrap(),
+            forja_core::GraphLimits::default(),
+        );
+        template
+            .record_validated(commands.last_dispatch().unwrap().clone())
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        backend.compiler.expire_for_test();
+        assert!(matches!(
+            backend.replay_graph(&graph, Vec::new(), false, None),
+            Err(BackendError::Timeout)
+        ));
+        assert!(matches!(
+            backend.submit(commands),
+            Err(BackendError::Timeout)
+        ));
+        assert!(matches!(
+            backend
+                .pipelines
+                .lock()
+                .unwrap()
+                .get("copy_contiguous", &[(0, 0), (2, 0)]),
+            Err(BackendError::Timeout)
+        ));
     }
 
     #[test]
