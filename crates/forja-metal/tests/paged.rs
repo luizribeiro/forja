@@ -1552,6 +1552,90 @@ fn metal_paged_sdpa_falls_back_after_a_consecutive_prefix() {
 }
 
 #[test]
+fn metal_paged_steel_authenticates_every_page_on_each_replay() {
+    let backend = forja_metal::MetalBackend::new().unwrap();
+    let query = backend.alloc(DType::F32, &[2, 33, 64]).unwrap();
+    let key = backend.alloc(DType::F16, &[65, 64, 1, 64]).unwrap();
+    let value = backend.alloc(DType::F16, &[65, 64, 1, 64]).unwrap();
+    let table = backend.alloc(DType::U32, &[65, 2]).unwrap();
+    let generations = backend.alloc(DType::U32, &[65]).unwrap();
+    let output = backend.alloc(DType::F32, &[2, 33, 64]).unwrap();
+    let entries = (0..65).map(|logical| (64 - logical, 1)).collect::<Vec<_>>();
+    backend.write(&table, &table_bytes(&entries)).unwrap();
+    let zeros = vec![0; 2 * 33 * 64 * 4];
+    backend.write(&query, &zeros).unwrap();
+    backend.write(&key, &vec![0; 65 * 64 * 64 * 2]).unwrap();
+    backend
+        .write(
+            &value,
+            &f16::ONE.to_bits().to_ne_bytes().repeat(65 * 64 * 64),
+        )
+        .unwrap();
+    for variant in ["paged-sdpa.steel", "paged-sdpa.steel-bounded"] {
+        backend.write(&output, &zeros).unwrap();
+        backend
+            .write(&generations, &generation_bytes(&[1; 65]))
+            .unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 0.125,
+                    causal: true,
+                    q_start: 4064,
+                    key_length: 4097,
+                    page_tokens: 64,
+                },
+                &[&query, &key, &value, &table, &generations],
+                &output,
+            )
+            .unwrap();
+        let pick = backend
+            .validate_variant(commands.last_dispatch().unwrap(), variant)
+            .unwrap();
+        assert!(commands.set_last_backend_data(BackendDispatchData::new(pick)));
+        let mut graph =
+            GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+        graph
+            .record_validated(commands.into_dispatches().remove(0))
+            .unwrap();
+        let prepared = backend.prepare_graph(graph).unwrap();
+        backend
+            .replay(&prepared, Vec::new())
+            .unwrap()
+            .wait()
+            .unwrap();
+        forja_testing::assert_outputs_agree(
+            DType::F32,
+            &1_f32.to_ne_bytes().repeat(2 * 33 * 64),
+            &backend.read(&output).unwrap(),
+        )
+        .unwrap();
+        for logical in 0..65 {
+            let mut generation = [1; 65];
+            generation[64 - logical] = 2;
+            backend
+                .write(&generations, &generation_bytes(&generation))
+                .unwrap();
+            backend
+                .write(&output, &17_f32.to_ne_bytes().repeat(2 * 33 * 64))
+                .unwrap();
+            let error = backend
+                .replay(&prepared, Vec::new())
+                .unwrap()
+                .wait()
+                .unwrap_err();
+            assert!(
+                matches!(error, BackendError::DeviceErrorFlag { flag: 1, value, .. }
+                if value == u32::try_from(logical).unwrap()),
+                "{variant} page={logical}: {error:?}"
+            );
+            assert_eq!(failed_output_bytes(&backend, &output).unwrap(), zeros);
+        }
+    }
+}
+
+#[test]
 fn metal_paged_steel_refuses_tiles_crossing_page_boundaries() {
     let metal = forja_metal::MetalBackend::new().unwrap();
     for page_tokens in [24, 40] {
