@@ -16,6 +16,12 @@ enum Tiny {
     Attention(qwen38::Attention),
 }
 
+fn full_config(load: &EngineLoadConfig) -> qwen38::Config {
+    let mut config = qwen38::Config::tiny();
+    config.cpu = load.fixed_variant_picks.is_empty();
+    config
+}
+
 #[export_engine]
 impl Engine for Tiny {
     fn describe() -> EngineInfo {
@@ -43,7 +49,7 @@ impl Engine for Tiny {
         }
     }
     fn load(weights: &Weights<'_>, load: EngineLoadConfig) -> Result<Self> {
-        qwen38::Qwen38::with_config(weights, &load, qwen38::Config::tiny()).map(Self::Full)
+        qwen38::Qwen38::with_config(weights, &load, full_config(&load)).map(Self::Full)
     }
     fn load_paged(
         weights: &Weights<'_>,
@@ -54,7 +60,7 @@ impl Engine for Tiny {
             return Self::load(weights, load);
         };
         if load.tunings.is_empty() {
-            return qwen38::Qwen38::with_paged_config(weights, &load, qwen38::Config::tiny(), pool)
+            return qwen38::Qwen38::with_paged_config(weights, &load, full_config(&load), pool)
                 .map(Self::Full);
         }
         if load.tunings.iter().any(|name| name == "attention-fixture") {

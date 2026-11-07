@@ -51,6 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tiny_target,
         &[],
     )?;
+    let tiny_metal_target = main_target_dir.join("qwen38-tiny-metal-build");
+    forja_build::build_component(
+        &repository.join("support/guests/qwen38-tiny/Cargo.toml"),
+        &tiny_metal_target,
+        &["--features", "metal-variants"],
+    )?;
     let chat_format_manifest = repository.join("support/guests/chat-format-smoke/Cargo.toml");
     forja_build::build_core_module(&chat_format_manifest, &pure_guest_target_dir, &[])?;
     let chat_format = forja_build::encode_component(&fs::read(
@@ -130,6 +136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_guest_path(
         "QWEN38_TINY_COMPONENT",
         &tiny_target.join("wasm32-wasip2/release/qwen38_tiny.wasm"),
+    );
+    emit_guest_path(
+        "QWEN38_TINY_METAL_COMPONENT",
+        &tiny_metal_target.join("wasm32-wasip2/release/qwen38_tiny.wasm"),
     );
     emit_guest_path(
         "ENGINE_SDK_SMOKE_COMPONENT",

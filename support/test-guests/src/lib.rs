@@ -147,6 +147,12 @@ pub fn qwen38_tiny() -> &'static Path {
     Path::new(env!("QWEN38_TINY_COMPONENT"))
 }
 
+/// Returns the small hybrid component with explicit Metal variant support.
+#[must_use]
+pub fn qwen38_tiny_metal() -> &'static Path {
+    Path::new(env!("QWEN38_TINY_METAL_COMPONENT"))
+}
+
 /// Returns the eager text-only Qwen3.8 engine component.
 #[must_use]
 pub fn qwen38() -> &'static Path {

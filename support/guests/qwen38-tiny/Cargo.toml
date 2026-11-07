@@ -7,6 +7,9 @@ version.workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+metal-variants = ["qwen38/metal-variants"]
+
 [dependencies]
 forja-sdk.workspace = true
 qwen38 = { path = "../../../engines/qwen38", default-features = false }

@@ -1,4 +1,6 @@
 mod batch_prefix;
+#[cfg(all(test, target_os = "macos"))]
+mod paged_tests;
 #[cfg(target_os = "macos")]
 mod prefix;
 #[cfg(target_os = "macos")]
@@ -1504,10 +1506,7 @@ async fn measure_record_prefill(
     prime: bool,
 ) -> Result<Sample, Box<dyn Error>> {
     let started = Instant::now();
-    if runners.retains() || runners.prefill_step.is_some() {
-        runner.prepare_paged_request(None, 0)?;
-        prepare_benchmark_runner(runner, prompt.len())?;
-    }
+    prepare_benchmark_runner(runner, prompt.len())?;
     let setup = started.elapsed();
     let sample = if let Some(limit) = runners.prefill_step {
         measure_prefill_chunks(runner, prompt, 0, limit).await?
