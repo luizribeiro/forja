@@ -11111,6 +11111,127 @@ mod tests {
     }
 
     #[test]
+    fn rebound_static_variants_recheck_original_alignment_predicates() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1, 1024]).unwrap();
+        let packed = backend.alloc(DType::U32, &[33, 256]).unwrap();
+        let scales = backend.alloc(DType::BF16, &[33, 16]).unwrap();
+        let biases = backend.alloc(DType::BF16, &[33, 16]).unwrap();
+        let output = backend.alloc(DType::F32, &[1, 33]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::QuantMatmul {
+                    bits: 8,
+                    group_size: 64,
+                },
+                &[&input, &packed, &scales, &biases],
+                &output,
+            )
+            .unwrap();
+        let variant = backend
+            .validate_variant(
+                commands.last_dispatch().unwrap(),
+                "quant-matmul.q8-fast-gemv",
+            )
+            .unwrap();
+        assert!(commands.set_last_backend_data(forja_core::BackendDispatchData::new(variant)));
+        let mut template = GraphTemplate::new(
+            forja_core::ParamSpace::new(Vec::new()).unwrap(),
+            forja_core::GraphLimits::default(),
+        );
+        template
+            .record_validated(commands.last_dispatch().unwrap().clone())
+            .unwrap();
+        let graph = backend.prepare_graph(template).unwrap();
+        let storage = backend.alloc(DType::F32, &[1028]).unwrap();
+        for start in [1, 4] {
+            let shifted = backend
+                .view(
+                    &storage,
+                    ViewOp::Slice(vec![Slice::new(start, 1024, 1).unwrap()]),
+                )
+                .unwrap();
+            let shifted = backend
+                .view(&shifted, ViewOp::Reshape(vec![1, 1024]))
+                .unwrap();
+            let mut bindings = forja_core::ReplayBindings::default();
+            bindings.view_revalidated(input.clone(), shifted).unwrap();
+            let rebound = bindings.apply(commands.clone()).unwrap();
+            let validation = backend.validate_variant(
+                rebound.last_dispatch().unwrap(),
+                "quant-matmul.q8-fast-gemv",
+            );
+            if start == 1 {
+                assert!(
+                    matches!(validation, Err(crate::VariantError::Constraint { constraint, .. })
+                    if constraint == "input element offset is aligned to 4")
+                );
+                assert!(matches!(
+                    backend.replay_graph(&graph, Vec::new(), false, Some(&bindings)),
+                    Err(BackendError::InvalidInput)
+                ));
+            } else {
+                validation.unwrap();
+                backend
+                    .replay_graph(&graph, Vec::new(), false, Some(&bindings))
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rebound_copy_and_argmax_select_scalar_loads() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[1, 4096]).unwrap();
+        let storage = backend.alloc(DType::F32, &[4097]).unwrap();
+        let values = (0..4097_u16)
+            .flat_map(|v| f32::from(v).to_le_bytes())
+            .collect::<Vec<_>>();
+        backend.write(&storage, &values).unwrap();
+        let shifted = backend
+            .view(
+                &storage,
+                ViewOp::Slice(vec![Slice::new(1, 4096, 1).unwrap()]),
+            )
+            .unwrap();
+        let shifted = backend
+            .view(&shifted, ViewOp::Reshape(vec![1, 4096]))
+            .unwrap();
+        for (op, dtype, shape, kernel) in [
+            (Op::Copy, DType::F32, vec![1, 4096], "copy_contiguous"),
+            (argmax_op(), DType::U32, vec![1], "argmax_partials+finalize"),
+        ] {
+            let output = backend.alloc(dtype, &shape).unwrap();
+            let mut commands = CommandList::new();
+            commands.dispatch(op, &[&input], &output).unwrap();
+            let mut template =
+                GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
+            template
+                .record_validated(commands.last_dispatch().unwrap().clone())
+                .unwrap();
+            let graph = backend.prepare_graph(template).unwrap();
+            let mut bindings = forja_core::ReplayBindings::default();
+            bindings
+                .view_revalidated(input.clone(), shifted.clone())
+                .unwrap();
+            let submission = backend
+                .replay_graph(&graph, Vec::new(), true, Some(&bindings))
+                .unwrap();
+            submission.wait().unwrap();
+            assert_eq!(submission.profile().unwrap().per_dispatch[0].kernel, kernel);
+            let expected = if dtype == DType::F32 {
+                values[4..].to_vec()
+            } else {
+                4095_u32.to_le_bytes().to_vec()
+            };
+            assert_eq!(backend.read(&output).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn head_views_classify_the_full_address_without_double_offsetting() {
         let backend = MetalBackend::new().unwrap();
         let tensor = backend.alloc(DType::F32, &[16, 7, 33]).unwrap();
