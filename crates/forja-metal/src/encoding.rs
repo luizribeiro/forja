@@ -10445,7 +10445,10 @@ impl PipelineCache {
                 let values = function_constants(constants)?;
                 let library = if matches!(
                     name,
-                    "state_causal_conv" | "state_causal_conv_lanes" | "calibration_read_serial"
+                    "state_causal_conv"
+                        | "state_causal_conv_lanes"
+                        | "calibration_read_serial"
+                        | "calibration_read_group"
                 ) {
                     &self.safe_state_library
                 } else if nan_preserving_kernel(name) {

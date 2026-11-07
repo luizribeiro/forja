@@ -91,19 +91,19 @@ kernel void calibration_gather(device const float *input [[buffer(0)]],
     output[index] = input[address];
 }
 
-#define calibration_serial_kernel(name, expression) \
+#define calibration_serial_kernel(name, expression, lanes) \
 kernel void name(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], \
                  uint index [[thread_position_in_grid]]) { \
     float value = input[index]; \
-    if (index == 0) { \
+    if (index < lanes) { \
         for (uint iteration = 0; iteration < calibration_iterations; ++iteration) { \
             value = expression; \
         } \
     } \
     output[index] = value; \
 }
-calibration_serial_kernel(calibration_scalar_serial, fma(value, 0.9999999f, 0.0000001f))
-calibration_serial_kernel(calibration_sfu_serial, fast::exp(-value))
+calibration_serial_kernel(calibration_scalar_serial, fma(value, 0.9999999f, 0.0000001f), 1)
+calibration_serial_kernel(calibration_sfu_serial, fast::exp(-value), 1)
 
 kernel void calibration_dependent_read(device const uint *input [[buffer(0)]],
                                        device uint *output [[buffer(1)]],
@@ -127,4 +127,31 @@ kernel void calibration_read_serial(device const float *input [[buffer(0)]],
         sum = fma(sum, 0.99999f, input[iteration]);
     }
     output[0] = sum;
+}
+
+calibration_serial_kernel(calibration_scalar_group, fma(value, 0.9999999f, 0.0000001f), 32)
+calibration_serial_kernel(calibration_sfu_group, fast::exp(-value), 32)
+
+kernel void calibration_read_group(device const float *input [[buffer(0)]],
+                                   device float *output [[buffer(1)]],
+                                   uint index [[thread_position_in_grid]]) {
+    if (index >= 32) { output[index] = 0; return; }
+    float sum = 0;
+    for (uint iteration = index; iteration < calibration_iterations; iteration += 32) {
+        sum = fma(sum, 0.99999f, input[iteration]);
+    }
+    output[index] = sum;
+}
+
+kernel void calibration_gather_group(device const uint *input [[buffer(0)]],
+                                     device uint *output [[buffer(1)]],
+                                     uint index [[thread_position_in_grid]]) {
+    if (index >= 32) { output[index] = 0; return; }
+    uint cursor = index;
+    uint sum = 0;
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        cursor = input[cursor];
+        sum += cursor;
+    }
+    output[index] = sum;
 }

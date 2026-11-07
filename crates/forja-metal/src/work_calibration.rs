@@ -17,9 +17,27 @@ pub(super) enum WorkProbe {
     SfuSerial,
     DependentRead,
     ReadSerial,
+    ScalarGroup,
+    SfuGroup,
+    ReadGroup,
+    GatherGroup,
 }
 
 impl WorkProbe {
+    const ALL: [Self; 11] = [
+        Self::Scalar,
+        Self::Sfu,
+        Self::Gather,
+        Self::ScalarSerial,
+        Self::SfuSerial,
+        Self::DependentRead,
+        Self::ReadSerial,
+        Self::ScalarGroup,
+        Self::SfuGroup,
+        Self::ReadGroup,
+        Self::GatherGroup,
+    ];
+
     pub(super) const fn kernel(self) -> &'static str {
         match self {
             Self::Scalar => "calibration_scalar",
@@ -29,14 +47,23 @@ impl WorkProbe {
             Self::SfuSerial => "calibration_sfu_serial",
             Self::DependentRead => "calibration_dependent_read",
             Self::ReadSerial => "calibration_read_serial",
+            Self::ScalarGroup => "calibration_scalar_group",
+            Self::SfuGroup => "calibration_sfu_group",
+            Self::ReadGroup => "calibration_read_group",
+            Self::GatherGroup => "calibration_gather_group",
         }
     }
 
     pub(super) const fn constants(self) -> [(u32, u32); 2] {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
-            Self::ReadSerial => SERIAL_READ_ELEMENTS,
-            Self::ScalarSerial | Self::SfuSerial | Self::DependentRead => SERIAL_ITERATIONS,
+            Self::ReadSerial | Self::ReadGroup => SERIAL_READ_ELEMENTS,
+            Self::ScalarSerial
+            | Self::SfuSerial
+            | Self::DependentRead
+            | Self::ScalarGroup
+            | Self::SfuGroup
+            | Self::GatherGroup => SERIAL_ITERATIONS,
             _ => crate::calibration::ITERATIONS,
         };
         [(220, iterations), (221, 0)]
@@ -45,10 +72,20 @@ impl WorkProbe {
     const fn elements(self) -> u32 {
         match self {
             Self::Gather => GATHER_ELEMENTS,
-            Self::ScalarSerial | Self::SfuSerial => crate::calibration::THREADS,
+            Self::ScalarSerial | Self::SfuSerial | Self::ScalarGroup | Self::SfuGroup => {
+                crate::calibration::THREADS
+            }
             Self::DependentRead => DEPENDENT_ELEMENTS,
-            Self::ReadSerial => SERIAL_READ_ELEMENTS,
+            Self::ReadSerial | Self::ReadGroup | Self::GatherGroup => SERIAL_READ_ELEMENTS,
             _ => ELEMENTS,
+        }
+    }
+
+    fn dependent_lanes(self) -> Option<u32> {
+        match self {
+            Self::DependentRead => Some(1),
+            Self::GatherGroup => Some(32),
+            _ => None,
         }
     }
 
@@ -57,7 +94,10 @@ impl WorkProbe {
             Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
             Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
             Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),
-            Self::ReadSerial => return Some(u64::from(SERIAL_READ_ELEMENTS) * 4),
+            Self::ReadSerial | Self::ReadGroup => return Some(u64::from(SERIAL_READ_ELEMENTS) * 4),
+            Self::ScalarGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32 * 2),
+            Self::SfuGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32),
+            Self::GatherGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32 * 4),
             _ => {}
         }
         u64::from(self.elements()).checked_mul(match self {
@@ -66,6 +106,67 @@ impl WorkProbe {
             Self::Gather => 8,
             _ => 0,
         })
+    }
+    fn verify(
+        self,
+        backend: &MetalBackend,
+        output: &forja_core::Tensor,
+    ) -> Result<(), BackendError> {
+        if matches!(self, Self::Gather) {
+            return Ok(());
+        }
+        let probe = self;
+        let bytes = backend.read(output)?;
+        if matches!(probe, WorkProbe::ReadSerial | WorkProbe::ReadGroup) {
+            let lanes = if matches!(probe, WorkProbe::ReadGroup) {
+                32
+            } else {
+                1
+            };
+            let values = bytes
+                .as_chunks::<4>()
+                .0
+                .get(..lanes)
+                .ok_or(BackendError::ExecutionFailed)?;
+            if values
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .any(|v| !v.is_finite() || !(1_000.0..1_000_000.0).contains(&v))
+            {
+                return Err(BackendError::ExecutionFailed);
+            }
+        }
+        if let Some(lanes) = probe.dependent_lanes() {
+            let expected = (0..lanes)
+                .flat_map(|start| {
+                    let mut cursor = start;
+                    let mut sum = 0_u32;
+                    for _ in 0..SERIAL_ITERATIONS {
+                        cursor = cursor.wrapping_mul(0x9e37_79b9).wrapping_add(1)
+                            & (probe.elements() - 1);
+                        sum = sum.wrapping_add(cursor);
+                    }
+                    sum.to_le_bytes()
+                })
+                .collect::<Vec<_>>();
+            if bytes.get(..expected.len()) != Some(expected.as_slice()) {
+                return Err(BackendError::ExecutionFailed);
+            }
+        }
+        if !matches!(
+            probe,
+            WorkProbe::Gather
+                | WorkProbe::DependentRead
+                | WorkProbe::ReadSerial
+                | WorkProbe::ReadGroup
+                | WorkProbe::GatherGroup
+        ) && bytes.as_chunks::<4>().0.iter().any(|bytes| {
+            let value = f32::from_le_bytes(*bytes);
+            !value.is_finite() || !(0.5..=1.01).contains(&value)
+        }) {
+            return Err(BackendError::ExecutionFailed);
+        }
+        Ok(())
     }
 }
 
@@ -84,15 +185,7 @@ impl MetalBackend {
             return Err(BackendError::InvalidInput);
         }
         let mut samples = Vec::new();
-        for probe in [
-            WorkProbe::Scalar,
-            WorkProbe::Sfu,
-            WorkProbe::Gather,
-            WorkProbe::ScalarSerial,
-            WorkProbe::SfuSerial,
-            WorkProbe::DependentRead,
-            WorkProbe::ReadSerial,
-        ] {
+        for probe in WorkProbe::ALL {
             let input = self.alloc(DType::F32, &[probe.elements()])?;
             let output = match self.alloc(DType::F32, &[probe.elements()]) {
                 Ok(output) => output,
@@ -101,11 +194,11 @@ impl MetalBackend {
                     return Err(error);
                 }
             };
-            let result = (|| {
-                if matches!(probe, WorkProbe::DependentRead) {
-                    let cycle = (0..DEPENDENT_ELEMENTS)
+            let result: Result<_, BackendError> = (|| {
+                if probe.dependent_lanes().is_some() {
+                    let cycle = (0..probe.elements())
                         .flat_map(|i| {
-                            (i.wrapping_mul(0x9e37_79b9).wrapping_add(1) & (DEPENDENT_ELEMENTS - 1))
+                            (i.wrapping_mul(0x9e37_79b9).wrapping_add(1) & (probe.elements() - 1))
                                 .to_le_bytes()
                         })
                         .collect::<Vec<_>>();
@@ -139,37 +232,7 @@ impl MetalBackend {
                         Ok(commands)
                     },
                 )?;
-                if matches!(probe, WorkProbe::ReadSerial) {
-                    let bytes = self.read(&output)?;
-                    let value = bytes
-                        .as_chunks::<4>()
-                        .0
-                        .first()
-                        .copied()
-                        .map(f32::from_le_bytes)
-                        .ok_or(BackendError::ExecutionFailed)?;
-                    if !value.is_finite() || !(1.0..1_000_000.0).contains(&value) {
-                        return Err(BackendError::ExecutionFailed);
-                    }
-                }
-                if matches!(probe, WorkProbe::DependentRead) {
-                    let checksum = u32::try_from(
-                        u64::from(SERIAL_ITERATIONS) * u64::from(DEPENDENT_ELEMENTS - 1) / 2,
-                    )
-                    .map_err(|_| BackendError::InvalidInput)?;
-                    if self.read(&output)?.get(..4) != Some(checksum.to_le_bytes().as_slice()) {
-                        return Err(BackendError::ExecutionFailed);
-                    }
-                }
-                if !matches!(
-                    probe,
-                    WorkProbe::Gather | WorkProbe::DependentRead | WorkProbe::ReadSerial
-                ) && self.read(&output)?.as_chunks::<4>().0.iter().any(|bytes| {
-                    let value = f32::from_le_bytes(*bytes);
-                    !value.is_finite() || !(0.5..=1.01).contains(&value)
-                }) {
-                    return Err(BackendError::ExecutionFailed);
-                }
+                probe.verify(self, &output)?;
                 Ok(observations)
             })();
             self.release(&input)?;
@@ -213,16 +276,8 @@ mod tests {
     fn metal_work_probes_execute_observable_arithmetic_and_reads() {
         let backend = MetalBackend::new().unwrap();
         let samples = backend.calibrate_work(0, 1).unwrap();
-        assert_eq!(samples.len(), 7);
-        for (sample, probe) in samples.iter().zip([
-            WorkProbe::Scalar,
-            WorkProbe::Sfu,
-            WorkProbe::Gather,
-            WorkProbe::ScalarSerial,
-            WorkProbe::SfuSerial,
-            WorkProbe::DependentRead,
-            WorkProbe::ReadSerial,
-        ]) {
+        assert_eq!(samples.len(), WorkProbe::ALL.len());
+        for (sample, probe) in samples.iter().zip(WorkProbe::ALL) {
             assert_eq!(sample.name, probe.kernel());
             assert_eq!(Some(sample.units), probe.units());
             assert!(!sample.gpu.is_zero());
