@@ -211,7 +211,7 @@ impl<B: Backend + 'static> Host<B> {
             let entry = crate::recovery::finish(entry, self.drop_tensor(loan))
                 .map_err(crate::recovery::RecoveryError::into_compute)?;
             bindings
-                .view(site.destination.clone(), entry.tensor.clone())
+                .view_revalidated(site.destination.clone(), entry.tensor.clone())
                 .map_err(crate::guest_error)?;
             retained.push(entry);
             writes.push(FeedbackWrite { usage, transaction });

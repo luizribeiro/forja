@@ -2,6 +2,8 @@ use crate::{BufferId, CommandList, Op, OpError, StateAccess, StateOp, Tensor};
 
 /// Trusted per-replay replacements for protected views and authentication identities.
 /// Bindings do not add parameters to a guest's graph parameter space.
+/// Backends must revalidate bound variants and encode changed operands afresh.
+/// Relative alignment checks additionally require aligned allocation origins.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayBindings {
     views: Vec<(Tensor, Tensor)>,
@@ -17,6 +19,12 @@ struct StateBinding {
 }
 
 fn compatible(old: &Tensor, new: &Tensor) -> bool {
+    compatible_geometry(old, new)
+        && crate::ByteAlignment::of(old.layout().byte_span().start)
+            == crate::ByteAlignment::of(new.layout().byte_span().start)
+}
+
+fn compatible_geometry(old: &Tensor, new: &Tensor) -> bool {
     old.layout().dtype() == new.layout().dtype()
         && old.layout().shape() == new.layout().shape()
         && old.layout().strides() == new.layout().strides()
@@ -24,12 +32,26 @@ fn compatible(old: &Tensor, new: &Tensor) -> bool {
 }
 
 impl ReplayBindings {
-    /// Replaces one protected view without changing its scalar geometry or access rights.
+    /// Replaces one protected view without changing its geometry, alignment or access rights.
     ///
     /// # Errors
     /// Refuses incompatible geometry or ambiguous replacements.
     pub fn view(&mut self, old: Tensor, new: Tensor) -> Result<(), OpError> {
         if !compatible(&old, &new) || self.views.iter().any(|(existing, _)| existing == &old) {
+            return Err(OpError::InvalidKernelParameter);
+        }
+        self.views.push((old, new));
+        Ok(())
+    }
+
+    /// Replaces a view whose alignment may change, requiring fresh backend validation.
+    ///
+    /// # Errors
+    /// Refuses incompatible geometry or ambiguous replacements.
+    pub fn view_revalidated(&mut self, old: Tensor, new: Tensor) -> Result<(), OpError> {
+        if !compatible_geometry(&old, &new)
+            || self.views.iter().any(|(existing, _)| existing == &old)
+        {
             return Err(OpError::InvalidKernelParameter);
         }
         self.views.push((old, new));
@@ -51,6 +73,7 @@ impl ReplayBindings {
     }
 
     /// Rebinds one lane's state operands by its captured authentication table.
+    /// State dispatches are revalidated and re-encoded after slot rebinding.
     ///
     /// # Errors
     /// Refuses incompatible views or ambiguous table/operand replacements.
@@ -64,7 +87,8 @@ impl ReplayBindings {
             || table.layout().shape() != [2, 2]
             || self.states.iter().any(|state| state.table == table)
             || views.iter().enumerate().any(|(index, (old, new))| {
-                !compatible(old, new) || views[..index].iter().any(|(existing, _)| existing == old)
+                !compatible_geometry(old, new)
+                    || views[..index].iter().any(|(existing, _)| existing == old)
             })
         {
             return Err(OpError::InvalidKernelParameter);
@@ -84,7 +108,10 @@ impl ReplayBindings {
     pub fn extend(&mut self, other: Self) -> Result<(), OpError> {
         let mut combined = self.clone();
         for (old, new) in other.views {
-            combined.view(old, new)?;
+            if combined.views.iter().any(|(existing, _)| existing == &old) {
+                return Err(OpError::InvalidKernelParameter);
+            }
+            combined.views.push((old, new));
         }
         for (old, new) in other.buffers {
             combined.buffer(old, new)?;
@@ -194,6 +221,33 @@ mod tests {
             Err(OpError::Aliasing { .. })
         ));
         assert!(ReplayBindings::default().view(a, tensor(4, 7)).is_err());
+    }
+
+    #[test]
+    fn rebinding_preserves_vector_alignment_for_offset_views() {
+        for extent in [1, 7, 33] {
+            let view = |id, offset| {
+                Tensor::from_allocation(
+                    BufferId::new(id, 1, 1024),
+                    Layout::contiguous(DType::F32, offset, vec![extent], 1024).unwrap(),
+                    true,
+                )
+                .unwrap()
+            };
+            for (old, new, accepted) in [(0, 4, true), (0, 1, false), (1, 2, false), (1, 3, true)] {
+                assert_eq!(
+                    ReplayBindings::default()
+                        .view(view(1, old), view(2, new))
+                        .is_ok(),
+                    accepted,
+                );
+                assert!(
+                    ReplayBindings::default()
+                        .view_revalidated(view(1, old), view(2, new))
+                        .is_ok()
+                );
+            }
+        }
     }
     #[test]
     fn lane_tables_disambiguate_identical_captured_state_views() {

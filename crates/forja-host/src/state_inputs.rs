@@ -166,7 +166,7 @@ impl<B: Backend + 'static> Host<B> {
                 .read_only();
             fresh.symbolic = None;
             bindings
-                .view(old, fresh.tensor.clone())
+                .view_revalidated(old, fresh.tensor.clone())
                 .map_err(crate::guest_error)?;
             retained.push(fresh);
         }

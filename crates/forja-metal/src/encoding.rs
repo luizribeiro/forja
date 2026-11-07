@@ -2828,6 +2828,14 @@ impl MetalBackend {
                 .map_err(|_| BackendError::InvalidInput)?,
             None => commands,
         };
+        if rebound {
+            for dispatch in commands.dispatches() {
+                if let Some(&variant) = dispatch.backend_data::<crate::ValidatedVariant>() {
+                    self.validate_variant(dispatch, variant.name())
+                        .map_err(|_| BackendError::InvalidInput)?;
+                }
+            }
+        }
         let encoding = (!rebound).then_some(state);
         let submission = if profile {
             self.submit_commands_inner::<true>(
