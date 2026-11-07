@@ -1,5 +1,7 @@
 """Tests for shared serving benchmark statistics."""
 
+import unittest
+
 from bench_stats import stats, summary
 
 
@@ -20,3 +22,24 @@ def test_empty_samples_are_rejected() -> None:
         assert str(error) == "cannot summarize an empty sample"
     else:
         raise AssertionError("empty sample was accepted")
+
+
+class PooledRatioTests(unittest.TestCase):
+    def test_streams_are_independent_units(self):
+        from bench_stats import pooled_ratio
+        result = pooled_ratio([(1, 2), (3, 2)])
+        self.assertEqual(result, {"ratio": 1.0, "standard_error": 0.5})
+        self.assertEqual(result, pooled_ratio([(100, 200), (300, 200)]))
+
+    def test_unequal_lengths_pool_counts(self):
+        from bench_stats import pooled_ratio
+        result = pooled_ratio([(2, 1), (2, 2)])
+        self.assertAlmostEqual(result['ratio'], 4 / 3)
+        self.assertAlmostEqual(result['standard_error'], 4 / 9)
+
+    def test_invalid_clusters(self):
+        from bench_stats import pooled_ratio
+        for clusters in [[], [(1, 1)], [(1, 0), (2, 1)],
+                         [(float('nan'), 1), (1, 1)]]:
+            with self.assertRaises(ValueError):
+                pooled_ratio(clusters)

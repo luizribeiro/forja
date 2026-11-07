@@ -42,3 +42,26 @@ def summary(tokens: int, times: list[float]) -> dict[str, object]:
         "tokens_per_second": stats([tokens / elapsed for elapsed in times]),
         "latency_seconds": stats(times),
     }
+
+
+def pooled_ratio(clusters: list[tuple[float, float]]) -> dict[str, float]:
+    """Pool numerator/denominator pairs with a whole-cluster delta-method SE.
+
+    Each pair must represent an independent stream or measurement block. The
+    residual sandwich keeps unequal stream lengths without treating tokens as
+    independent observations. This SE is descriptive, not a calibrated gate.
+    """
+    import math
+
+    if len(clusters) < 2:
+        raise ValueError("at least two independent clusters are required")
+    if any(not math.isfinite(x) or not math.isfinite(y) or x < 0 or y <= 0
+           for x, y in clusters):
+        raise ValueError("ratios need finite nonnegative numerators and positive denominators")
+    numerator = math.fsum(x for x, _ in clusters)
+    denominator = math.fsum(y for _, y in clusters)
+    ratio = numerator / denominator
+    residuals = math.fsum((x - ratio * y) ** 2 for x, y in clusters)
+    count = len(clusters)
+    se = math.sqrt(count / (count - 1) * residuals) / denominator
+    return {"ratio": ratio, "standard_error": se}
