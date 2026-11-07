@@ -6505,14 +6505,13 @@ impl MetalBackend {
     ) -> Result<Vec<BufferBinding>, BackendError> {
         use objc2_metal::MTLSize;
 
-        let vectorized = vectorized_copy(&input.layout, &output.layout);
-        let kernel = if vectorized {
-            "copy_contiguous_f32x4"
-        } else if input.layout.is_contiguous() && output.layout.is_contiguous() {
-            "copy_contiguous"
-        } else {
-            "copy_strided"
-        };
+        let kernel = copy_kernel(
+            &input.layout,
+            &output.layout,
+            input.buffer.address,
+            output.buffer.address,
+        );
+        let vectorized = kernel == "copy_contiguous_f32x4";
         let constants = [
             (0, dtype_code(input.layout.dtype())),
             (2, dtype_code(output.layout.dtype())),
@@ -8547,14 +8546,26 @@ fn supported_dispatch(dispatch: &Dispatch) -> bool {
     }
 }
 
-fn vectorized_copy(input: &Layout, output: &Layout) -> bool {
-    input.is_contiguous()
+fn copy_kernel(
+    input: &Layout,
+    output: &Layout,
+    input_origin: u64,
+    output_origin: u64,
+) -> &'static str {
+    if input.is_contiguous()
         && output.is_contiguous()
         && input.dtype() == DType::F32
         && output.dtype() == DType::F32
-        && input.offset().is_multiple_of(4)
-        && output.offset().is_multiple_of(4)
+        && input_origin.is_multiple_of(16)
+        && output_origin.is_multiple_of(16)
         && output.element_count().is_multiple_of(4)
+    {
+        "copy_contiguous_f32x4"
+    } else if input.is_contiguous() && output.is_contiguous() {
+        "copy_contiguous"
+    } else {
+        "copy_strided"
+    }
 }
 
 fn vectorized_argmax(input: &Layout, width: u32, chunk_width: u32) -> bool {
@@ -8766,13 +8777,13 @@ pub(super) fn dispatch_kernel(dispatch: &Dispatch) -> Result<&'static str, Backe
             let [input] = dispatch.inputs() else {
                 return Err(BackendError::InvalidInput);
             };
-            if vectorized_copy(input.layout(), dispatch.output().layout()) {
-                "copy_contiguous_f32x4"
-            } else if input.layout().is_contiguous() && dispatch.output().layout().is_contiguous() {
-                "copy_contiguous"
-            } else {
-                "copy_strided"
-            }
+            // Allocation origins, including copied imports, are aligned to 16 bytes.
+            copy_kernel(
+                input.layout(),
+                dispatch.output().layout(),
+                input.layout().byte_span().start,
+                dispatch.output().layout().byte_span().start,
+            )
         }
         Op::State(forja_core::StateOp::DeltaRule(_)) => match selected_variant(dispatch) {
             Some(MetalVariant::DeltaRuleSteps) => "state_delta_rule_steps",
@@ -10730,6 +10741,38 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn copy_vectorization_checks_the_bound_address() {
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[12]).unwrap();
+        let output = backend.alloc(DType::F32, &[12]).unwrap();
+        for i in [0, 1, 4] {
+            for o in [0, 1, 4] {
+                let input = backend
+                    .view(&input, ViewOp::Slice(vec![Slice::new(i, 8, 1).unwrap()]))
+                    .unwrap();
+                let output = backend
+                    .view(&output, ViewOp::Slice(vec![Slice::new(o, 8, 1).unwrap()]))
+                    .unwrap();
+                let encoded_input = backend.encoder_tensor(&input).unwrap();
+                let encoded_output = backend.encoder_tensor(&output).unwrap();
+                let actual = copy_kernel(
+                    &encoded_input.layout,
+                    &encoded_output.layout,
+                    encoded_input.buffer.address,
+                    encoded_output.buffer.address,
+                );
+                let mut commands = CommandList::new();
+                commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+                assert_eq!(
+                    actual,
+                    dispatch_kernel(commands.last_dispatch().unwrap()).unwrap()
+                );
+                assert_eq!(actual == "copy_contiguous_f32x4", i % 4 == 0 && o % 4 == 0);
+            }
+        }
+    }
 
     fn shared_quant_canary(
         variant_name: &str,
