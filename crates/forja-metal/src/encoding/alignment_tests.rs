@@ -26,7 +26,7 @@ fn assert_variant(
     canary: Canary<'_>,
     skew_operand: Option<usize>,
 ) {
-    let backend = MetalBackend::new().unwrap();
+    let mut backend = MetalBackend::new().unwrap();
     let source = crate::storage::shader_source().replace(
         canary.load,
         &format!(
@@ -39,7 +39,7 @@ fn assert_variant(
         crate::storage::shader_source(),
         "{name:?}: missing canary site"
     );
-    *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+    backend.pipelines = std::sync::Arc::new(PipelineCache::new(&backend.device, &source).unwrap());
     forja_testing::assert_backends_agree_many_selected_with(
         &CpuBackend::new(),
         &backend,

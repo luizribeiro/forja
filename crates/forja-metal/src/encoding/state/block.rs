@@ -105,11 +105,7 @@ impl MetalBackend {
                 super::super::encode_dispatch_barrier(encoder);
                 super::super::write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
             }
-            let pipeline = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get(name, &constants)?;
+            let pipeline = self.pipelines.get(name, &constants)?;
             let (groups, threads) = stage_geometry(
                 stage,
                 scratch,

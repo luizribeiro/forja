@@ -997,11 +997,7 @@ impl MetalProgram {
             fallback.resident,
             &layouts,
         );
-        let state = backend
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .compile_program_source(&key, &source)?;
+        let state = backend.pipelines.compile_program_source(&key, &source)?;
         let width = dispatch
             .output()
             .layout()
@@ -1069,8 +1065,6 @@ impl MetalProgram {
                 }
                 let pipeline = backend
                     .pipelines
-                    .lock()
-                    .map_err(|_| BackendError::ExecutionFailed)?
                     .compile_program_source(&resident.key, &resident.source)?;
                 resident
                     .state
@@ -2539,8 +2533,6 @@ impl MetalBackend {
         let rereading_source = map_codegen::generate(program, signature, false, &[]);
         let rereading = self
             .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
             .compile_program_source(&rereading_key, &rereading_source)?;
         // The bound row width is unavailable at preparation. The rereading pipeline works for
         // every width; the resident candidate is compiled only when a dispatch can select it.
@@ -2600,22 +2592,12 @@ impl MetalBackend {
         &self,
         graph: &GraphTemplate,
     ) -> Result<PreparedMetalGraph, BackendError> {
-        let fallback_count = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .epilogue_counts()?
-            .fallbacks;
+        let fallback_count = self.pipelines.epilogue_counts()?.fallbacks;
         self.prepare_graph_epilogues(graph)?;
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
             .then(|| self.prepare_encoding_plan(graph))
             .transpose();
-        let fallback_count_after = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .epilogue_counts()?
-            .fallbacks;
+        let fallback_count_after = self.pipelines.epilogue_counts()?.fallbacks;
         if fallback_count_after != fallback_count {
             return Err(BackendError::ExecutionFailed);
         }
@@ -2680,21 +2662,14 @@ impl MetalBackend {
         if requests.is_empty() {
             return Ok(());
         }
-        let required = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .missing_epilogue_pipelines(requests)?;
+        let required = self.pipelines.missing_epilogue_pipelines(requests)?;
         self.program_compile_tokens
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
             .consume(required)
             .then_some(())
             .ok_or(BackendError::QuotaExceeded)?;
-        self.pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .prepare_epilogue_pipelines(requests)
+        self.pipelines.prepare_epilogue_pipelines(requests)
     }
 
     pub(super) fn prepare_metal_graph_memory(
@@ -3007,11 +2982,7 @@ impl MetalBackend {
         )?;
         argument_writer.validate_capacity(argument_capacity, dispatches.is_empty())?;
         let internal_profiles = if let Some(profile) = &mut profile {
-            let epilogue = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .take_epilogue_counts()?;
+            let epilogue = self.pipelines.take_epilogue_counts()?;
             profile.metadata_buffers = temporary_profile.finish();
             profile.program_encoding = encoded.program_encoding;
             profile.program_compile_fallbacks = encoded.program_compile_fallbacks;
@@ -3559,11 +3530,7 @@ impl MetalBackend {
         let input = self.encoder_tensor(input)?;
         let output = self.encoder_tensor(dispatch.output())?;
         if let Some(probe) = dispatch.backend_data::<crate::calibration::Probe>() {
-            let pipeline = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get(probe.kernel(), &probe.constants())?;
+            let pipeline = self.pipelines.get(probe.kernel(), &probe.constants())?;
             let layouts = vec![
                 Self::layout_buffer(&input.layout, arguments)?,
                 Self::layout_buffer(&output.layout, arguments)?,
@@ -3677,18 +3644,14 @@ impl MetalBackend {
             .as_ref()
             .map_or_else(|| default_activity.as_ref(), |tensor| Some(&tensor.buffer))
             .ok_or(BackendError::ExecutionFailed)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                "paged_copy",
-                &[
-                    (0, dtype_code(ordinary.layout.dtype())),
-                    (1, dtype_code(pool.layout.dtype())),
-                    (216, u32::from(has_activity)),
-                ],
-            )?;
+        let pipeline = self.pipelines.get(
+            "paged_copy",
+            &[
+                (0, dtype_code(ordinary.layout.dtype())),
+                (1, dtype_code(pool.layout.dtype())),
+                (216, u32::from(has_activity)),
+            ],
+        )?;
 
         for (index, tensor) in [&ordinary, &pool, &page_table, &generations]
             .into_iter()
@@ -3763,18 +3726,14 @@ impl MetalBackend {
         }
         let params = arguments.write(&raw_params)?;
         let ordinary_layout = Self::layout_buffer(&ordinary.layout, arguments)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                "paged_copy",
-                &[
-                    (0, dtype_code(ordinary.layout.dtype())),
-                    (1, dtype_code(pool.layout.dtype())),
-                    (216, 1),
-                ],
-            )?;
+        let pipeline = self.pipelines.get(
+            "paged_copy",
+            &[
+                (0, dtype_code(ordinary.layout.dtype())),
+                (1, dtype_code(pool.layout.dtype())),
+                (216, 1),
+            ],
+        )?;
 
         for (index, tensor) in [ordinary, pool, page_table, generations]
             .into_iter()
@@ -3957,8 +3916,6 @@ impl MetalBackend {
         ];
         let validation = self
             .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
             .get("paged_sdpa_validate", &[(216, u32::from(has_activity))])?;
 
         for (index, tensor) in [&page_table, &generations].into_iter().enumerate() {
@@ -4096,8 +4053,6 @@ impl MetalBackend {
             ]);
             let pipeline = self
                 .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
                 .get(paged_sdpa_kernel(dispatch, q[2])?, &steel_constants);
             match pipeline {
                 Ok(pipeline) => {
@@ -4150,11 +4105,7 @@ impl MetalBackend {
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
-            let first = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get(first_kernel, &constants)?;
+            let first = self.pipelines.get(first_kernel, &constants)?;
 
             for (index, tensor) in [
                 &query,
@@ -4212,8 +4163,6 @@ impl MetalBackend {
             write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
             let second = self
                 .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
                 .get(paged_gqa_second_pass(q[2])?, &constants)?;
 
             for (index, tensor) in [&partials, &sums, &maxs, &output].into_iter().enumerate() {
@@ -4254,11 +4203,7 @@ impl MetalBackend {
             128 => "paged_sdpa_128",
             _ => return Err(BackendError::UnsupportedOperation),
         };
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
+        let pipeline = self.pipelines.get(kernel, &constants)?;
         if pipeline.maxTotalThreadsPerThreadgroup() < 1_024 {
             return Err(BackendError::UnsupportedOperation);
         }
@@ -4465,18 +4410,14 @@ impl MetalBackend {
         let mut error_state = [0_u8; 8];
         error_state[4..].copy_from_slice(&u32::MAX.to_ne_bytes());
         let error_flag = arguments.write(&error_state)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                "gather_gemv",
-                &[
-                    (0, dtype_code(input.layout.dtype())),
-                    (1, dtype_code(weights.layout.dtype())),
-                    (2, dtype_code(output.layout.dtype())),
-                ],
-            )?;
+        let pipeline = self.pipelines.get(
+            "gather_gemv",
+            &[
+                (0, dtype_code(input.layout.dtype())),
+                (1, dtype_code(weights.layout.dtype())),
+                (2, dtype_code(output.layout.dtype())),
+            ],
+        )?;
 
         for (index, tensor) in [&input, &weights, &indices, &output]
             .into_iter()
@@ -4535,10 +4476,7 @@ impl MetalBackend {
         let params = arguments.write(&params)?;
         let kernel = quant_matmul_kernel(dispatch)?;
         let constants = resources::quant_constants(dispatch)?;
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::Quant,
@@ -4549,7 +4487,6 @@ impl MetalBackend {
         } else {
             pipelines.get(kernel, &constants)?
         };
-        drop(pipelines);
 
         for (index, tensor) in [&input, &packed, &scales, &biases, &output]
             .into_iter()
@@ -4745,10 +4682,7 @@ impl MetalBackend {
             (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::GatherQuant,
@@ -4759,7 +4693,6 @@ impl MetalBackend {
         } else {
             pipelines.get("gather_quantized_gemv", &constants)?
         };
-        drop(pipelines);
 
         for (index, tensor) in [&input, &packed, &scales, &biases, &indices, &output]
             .into_iter()
@@ -4838,18 +4771,14 @@ impl MetalBackend {
             (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .lookup_epilogue(
-                epilogue_codegen::FamilySourceTag::GatherQuant,
-                dispatch
-                    .prepared_epilogue()
-                    .ok_or(BackendError::InvalidInput)?,
-                schedule.implementation,
-                &constants,
-            )?;
+        let pipeline = self.pipelines.lookup_epilogue(
+            epilogue_codegen::FamilySourceTag::GatherQuant,
+            dispatch
+                .prepared_epilogue()
+                .ok_or(BackendError::InvalidInput)?,
+            schedule.implementation,
+            &constants,
+        )?;
 
         for (index, tensor) in tensors.into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -5016,16 +4945,12 @@ impl MetalBackend {
         let epilogue = dispatch
             .prepared_epilogue()
             .ok_or(BackendError::InvalidInput)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .lookup_epilogue(
-                epilogue_codegen::FamilySourceTag::GatherQuant,
-                epilogue,
-                "gather_quantized_pair",
-                &constants,
-            )?;
+        let pipeline = self.pipelines.lookup_epilogue(
+            epilogue_codegen::FamilySourceTag::GatherQuant,
+            epilogue,
+            "gather_quantized_pair",
+            &constants,
+        )?;
 
         for (index, tensor) in [
             &input,
@@ -5224,18 +5149,14 @@ impl MetalBackend {
             (224, qmv_vector_config(dispatch)[2]),
             (225, qmv_vector_config(dispatch)[3]),
         ];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .lookup_epilogue(
-                epilogue_codegen::FamilySourceTag::GatherQuant,
-                dispatch
-                    .prepared_epilogue()
-                    .ok_or(BackendError::InvalidInput)?,
-                "grouped_quantized_pair_32x32_2x2_blocked",
-                &constants,
-            )?;
+        let pipeline = self.pipelines.lookup_epilogue(
+            epilogue_codegen::FamilySourceTag::GatherQuant,
+            dispatch
+                .prepared_epilogue()
+                .ok_or(BackendError::InvalidInput)?,
+            "grouped_quantized_pair_32x32_2x2_blocked",
+            &constants,
+        )?;
 
         for (index, tensor) in [
             input,
@@ -5397,18 +5318,14 @@ impl MetalBackend {
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
         let constants = [(2, dtype_code(output.layout.dtype()))];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .lookup_epilogue(
-                epilogue_codegen::FamilySourceTag::GatherQuant,
-                dispatch
-                    .prepared_epilogue()
-                    .ok_or(BackendError::InvalidInput)?,
-                "gathered_pair_from_projections",
-                &constants,
-            )?;
+        let pipeline = self.pipelines.lookup_epilogue(
+            epilogue_codegen::FamilySourceTag::GatherQuant,
+            dispatch
+                .prepared_epilogue()
+                .ok_or(BackendError::InvalidInput)?,
+            "gathered_pair_from_projections",
+            &constants,
+        )?;
 
         for (index, tensor) in [&gate, &up, indices, output].into_iter().enumerate() {
             bindings.bind(table, index, &tensor.buffer);
@@ -5467,14 +5384,10 @@ impl MetalBackend {
         internal_timestamp: &mut usize,
         bindings: &mut ArgumentBindings,
     ) -> Result<(), BackendError> {
-        let count_pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                "count_expert_routes",
-                &[(2, dtype_code(output.layout.dtype()))],
-            )?;
+        let count_pipeline = self.pipelines.get(
+            "count_expert_routes",
+            &[(2, dtype_code(output.layout.dtype()))],
+        )?;
 
         bindings.bind(table, 0, &indices.buffer);
         bindings.bind(table, 1, &offsets.buffer);
@@ -5500,8 +5413,6 @@ impl MetalBackend {
         encode_dispatch_barrier(encoder);
         let plan_pipeline = self
             .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
             .get("plan_expert_routes", &[(16, block_rows)])?;
 
         bindings.bind(table, 0, &indices.buffer);
@@ -5526,11 +5437,7 @@ impl MetalBackend {
         )?;
         write_internal_timestamp(encoder, timestamps, internal_timestamp)?;
         encode_dispatch_barrier(encoder);
-        let arrange_pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("arrange_expert_routes", &[])?;
+        let arrange_pipeline = self.pipelines.get("arrange_expert_routes", &[])?;
 
         set_argument_table(encoder, table);
         dispatch_threadgroups(
@@ -5585,10 +5492,7 @@ impl MetalBackend {
             (225, qmv_vector_config(dispatch)[3]),
             (16, block_rows),
         ];
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = if let Some(epilogue) = epilogue {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::GatherQuant,
@@ -5599,7 +5503,6 @@ impl MetalBackend {
         } else {
             pipelines.get(kernel, &constants)?
         };
-        drop(pipelines);
 
         for (index, tensor) in [input, packed, scales, biases, sorted, blocks, output]
             .into_iter()
@@ -5711,12 +5614,7 @@ impl MetalBackend {
             ),
             SdpaKernel::Decomposed => return Ok(kernel),
         };
-        match self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(name, &constants)
-        {
+        match self.pipelines.get(name, &constants) {
             Ok(_) => Ok(kernel),
             Err(BackendError::UnsupportedOperation) if width == 256 => {
                 Err(BackendError::UnsupportedOperation)
@@ -5766,21 +5664,17 @@ impl MetalBackend {
         ];
         let mut temporaries = vec![params.clone()];
         if two_pass_blocks.is_none() {
-            let pipeline = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?
-                .get(
-                    vector_kernel(
-                        if fast_f32 {
-                            "mlx_sdpa_vector_f32"
-                        } else {
-                            "mlx_sdpa_vector"
-                        },
-                        width,
-                    )?,
-                    &constants,
-                )?;
+            let pipeline = self.pipelines.get(
+                vector_kernel(
+                    if fast_f32 {
+                        "mlx_sdpa_vector_f32"
+                    } else {
+                        "mlx_sdpa_vector"
+                    },
+                    width,
+                )?,
+                &constants,
+            )?;
 
             for (index, tensor) in [&query, &key, &value, &output].into_iter().enumerate() {
                 bindings.bind(table, index, &tensor.buffer);
@@ -5813,23 +5707,19 @@ impl MetalBackend {
         )?;
         let sums = self.scratch_tensor(DType::F32, &[query_heads, query_length, blocks])?;
         let maxs = self.scratch_tensor(DType::F32, &[query_heads, query_length, blocks])?;
-        let first = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                vector_kernel(
-                    if kernel == SdpaKernel::VectorGqa {
-                        "mlx_sdpa_vector_2pass_1_gqa"
-                    } else if fast_f32 {
-                        "mlx_sdpa_vector_2pass_1_f32"
-                    } else {
-                        "mlx_sdpa_vector_2pass_1"
-                    },
-                    width,
-                )?,
-                &constants,
-            )?;
+        let first = self.pipelines.get(
+            vector_kernel(
+                if kernel == SdpaKernel::VectorGqa {
+                    "mlx_sdpa_vector_2pass_1_gqa"
+                } else if fast_f32 {
+                    "mlx_sdpa_vector_2pass_1_f32"
+                } else {
+                    "mlx_sdpa_vector_2pass_1"
+                },
+                width,
+            )?,
+            &constants,
+        )?;
 
         for (index, tensor) in [&query, &key, &value, &intermediate, &sums, &maxs]
             .into_iter()
@@ -5864,21 +5754,17 @@ impl MetalBackend {
             },
         )?;
         encode_dispatch_barrier(encoder);
-        let second = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                vector_kernel(
-                    if fast_f32 {
-                        "mlx_sdpa_vector_2pass_2_f32"
-                    } else {
-                        "mlx_sdpa_vector_2pass_2"
-                    },
-                    width,
-                )?,
-                &constants,
-            )?;
+        let second = self.pipelines.get(
+            vector_kernel(
+                if fast_f32 {
+                    "mlx_sdpa_vector_2pass_2_f32"
+                } else {
+                    "mlx_sdpa_vector_2pass_2"
+                },
+                width,
+            )?,
+            &constants,
+        )?;
 
         for (index, tensor) in [&intermediate, &sums, &maxs, &output]
             .into_iter()
@@ -5933,8 +5819,6 @@ impl MetalBackend {
         let constants = steel_attention_constants(dispatch, kernel)?;
         let pipeline = self
             .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
             .get(steel_attention_kernel(kernel, width)?, &constants)?;
         let params = Self::sdpa_params(
             &query, &key, &value, &output, scale, causal, q_start, 1, arguments,
@@ -6249,11 +6133,7 @@ impl MetalBackend {
         use objc2_metal::MTLSize;
 
         let [_, query_length, key_length] = shape3(&scores.layout)?;
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("sdpa_scale_mask", &[])?;
+        let pipeline = self.pipelines.get("sdpa_scale_mask", &[])?;
         let score_count =
             u32::try_from(scores.layout.element_count()).map_err(|_| BackendError::InvalidInput)?;
         let mut params = Vec::with_capacity(24);
@@ -6513,10 +6393,7 @@ impl MetalBackend {
                     constants,
                 )
             };
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = if let Some(epilogue) = epilogue {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::Dense,
@@ -6560,8 +6437,6 @@ impl MetalBackend {
         ];
         let pipeline = self
             .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
             .get(kernel, if vectorized { &[] } else { &constants })?;
 
         let layouts = vec![
@@ -6705,11 +6580,7 @@ impl MetalBackend {
             (0, dtype_code(input.layout().dtype())),
             (2, dtype_code(output.layout().dtype())),
         ];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("rope", &constants)?;
+        let pipeline = self.pipelines.get("rope", &constants)?;
 
         let mut params = [0_u8; 12];
         params[..4].copy_from_slice(&heads.to_ne_bytes());
@@ -6784,11 +6655,7 @@ impl MetalBackend {
             (0, dtype_code(embeddings.layout().dtype())),
             (2, dtype_code(output.layout().dtype())),
         ];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get("embed", &constants)?;
+        let pipeline = self.pipelines.get("embed", &constants)?;
 
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&vocab.to_ne_bytes());
@@ -6852,22 +6719,18 @@ impl MetalBackend {
         let output = dispatch.output();
         let vocab = packed.layout().shape()[0];
         let width = output.layout().shape()[1];
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(
-                "quant_embed",
-                &[
-                    (1, dtype_code(scales.layout().dtype())),
-                    (2, dtype_code(output.layout().dtype())),
-                    (12, u32::from(bits)),
-                    (13, group_size),
-                    (222, 0),
-                    (223, 2),
-                    (224, 0),
-                ],
-            )?;
+        let pipeline = self.pipelines.get(
+            "quant_embed",
+            &[
+                (1, dtype_code(scales.layout().dtype())),
+                (2, dtype_code(output.layout().dtype())),
+                (12, u32::from(bits)),
+                (13, group_size),
+                (222, 0),
+                (223, 2),
+                (224, 0),
+            ],
+        )?;
 
         let mut params = [0_u8; 8];
         params[..4].copy_from_slice(&vocab.to_ne_bytes());
@@ -7059,10 +6922,7 @@ impl MetalBackend {
         width: u32,
         chunk_width: u32,
     ) -> Result<(ComputePipeline, ComputePipeline), BackendError> {
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let partials = if vectorized_argmax(&input.layout, input.alignment, width, chunk_width) {
             pipelines.get(
                 "argmax_partials_f32x4",
@@ -7098,11 +6958,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, constants)?;
+        let pipeline = self.pipelines.get(kernel, constants)?;
         let temporaries = vec![
             Self::layout_buffer(&input.layout, arguments)?,
             Self::layout_buffer(&values.layout, arguments)?,
@@ -7220,10 +7076,7 @@ impl MetalBackend {
             (REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width),
         ];
         let (partials_pipeline, finalize_pipeline) = {
-            let pipelines = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
+            let pipelines = &self.pipelines;
             (
                 pipelines.get("topk_partials", &partial_constants)?,
                 pipelines.get("topk_finalize", &constants)?,
@@ -7377,10 +7230,7 @@ impl MetalBackend {
             partials_pipeline,
             reduce_finalize_pipeline,
         ) = {
-            let pipelines = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
+            let pipelines = &self.pipelines;
             (
                 pipelines.get("sample_prepare", &constants)?,
                 pipelines.get("sample_rejection_proposal_partials", &constants)?,
@@ -7651,10 +7501,7 @@ impl MetalBackend {
             .ok_or(BackendError::InvalidInput)?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, partial_words])?;
         let (partials_pipeline, finalize_pipeline) = {
-            let pipelines = self
-                .pipelines
-                .lock()
-                .map_err(|_| BackendError::ExecutionFailed)?;
+            let pipelines = &self.pipelines;
             let mut constants = params
                 .function_constants(dtype_code(logits.layout().dtype()))
                 .to_vec();
@@ -7840,10 +7687,7 @@ impl MetalBackend {
         width: u32,
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = pipelines.get(single, constants)?;
         let rounded_width = usize::try_from(width)
             .map_err(|_| BackendError::ExecutionFailed)?
@@ -10961,7 +10805,7 @@ mod tests {
 
     #[test]
     fn sampling_matches_cpu_with_poisoned_top_merge_storage() {
-        let backend = MetalBackend::new().unwrap();
+        let mut backend = MetalBackend::new().unwrap();
         let declaration = "threadgroup ulong simd_top[fast_top_slots];";
         assert_eq!(
             crate::storage::shader_source().matches(declaration).count(),
@@ -10974,7 +10818,8 @@ mod tests {
             for (uint poison = lane; poison < 256; poison += group_width) simd_top[poison] = ~0ul;
             threadgroup_barrier(mem_flags::mem_threadgroup);",
         );
-        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        backend.pipelines =
+            std::sync::Arc::new(PipelineCache::new(&backend.device, &source).unwrap());
         let _rounds = SampleRoundsOverride::set(0);
         for top_k in 1..=20 {
             for variant in ["sample.portable", "sample.parallel"] {
@@ -11012,7 +10857,7 @@ mod tests {
 
     #[test]
     fn fast_top_merge_ignores_poisoned_unwritten_candidates() {
-        let backend = MetalBackend::new().unwrap();
+        let mut backend = MetalBackend::new().unwrap();
         let source = format!(
             "{}{}",
             crate::storage::shader_source(),
@@ -11035,13 +10880,14 @@ mod tests {
             }
         "
         );
-        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        backend.pipelines =
+            std::sync::Arc::new(PipelineCache::new(&backend.device, &source).unwrap());
         for top_k in 1..=20 {
             let expected = (0_u32..256)
                 .map(|index| if index < 8 * top_k { index + 1 } else { 0 })
                 .flat_map(u32::to_ne_bytes)
                 .collect();
-            let pipelines = backend.pipelines.lock().unwrap();
+            let pipelines = &backend.pipelines;
             let pipeline = pipelines
                 .get(
                     "fast_top_merge_canary",
@@ -11055,7 +10901,6 @@ mod tests {
                 },
                 pipeline,
             );
-            drop(pipelines);
             assert_backends_agree(
                 &CpuBackend::new(),
                 &backend,
@@ -11318,14 +11163,15 @@ mod tests {
 
     #[test]
     fn q4_packed_loads_do_not_take_misaligned_vector_branches() {
-        let backend = MetalBackend::new().unwrap();
+        let mut backend = MetalBackend::new().unwrap();
         let load = "*(device const uint2 *)(packed + index * sizeof(uint))";
         let source = crate::storage::shader_source().replace(
             load,
             &format!("(ulong(packed + index * sizeof(uint)) % 8 == 0 ? {load} : uint2(0))"),
         );
         assert_ne!(source, crate::storage::shader_source());
-        *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, &source).unwrap();
+        backend.pipelines =
+            std::sync::Arc::new(PipelineCache::new(&backend.device, &source).unwrap());
         forja_testing::assert_backends_agree_many_selected_with(
             &CpuBackend::new(),
             &backend,
@@ -11688,8 +11534,6 @@ mod tests {
         let backend = MetalBackend::new().unwrap();
         backend
             .pipelines
-            .lock()
-            .unwrap()
             .get(
                 "paged_steel_attention_half_128_96x16",
                 &[(0, 0), (1, 1), (2, 0), (3, 1)],
@@ -12381,7 +12225,7 @@ mod tests {
         let cpu = CpuBackend::new();
         let program = identity_program(&cpu, DType::F32, DType::F32, &[7], false);
         let backend = MetalBackend::new().unwrap();
-        let cache = backend.pipelines.lock().unwrap();
+        let cache = &backend.pipelines;
         let key = program_pipeline_key(&program, false);
         assert!(matches!(
             cache.compile_program_source(&key, "kernel void broken("),
@@ -13321,7 +13165,7 @@ mod tests {
             .prepare_graph(dynamic_epilogue_variant_graph(&backend))
             .unwrap();
         {
-            let pipelines = backend.pipelines.lock().unwrap();
+            let pipelines = &backend.pipelines;
             assert_eq!(pipelines.epilogue_libraries.len(), 1);
             assert_eq!(pipelines.epilogue_pipelines.len(), 9);
             assert_eq!(pipelines.epilogue_counts().unwrap().libraries, 1);
@@ -13330,7 +13174,7 @@ mod tests {
 
         backend.replay(&graph, vec![1]).unwrap().wait().unwrap();
         backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_pipelines.len(), 9);
         assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 10);
         assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 0);
@@ -13344,7 +13188,7 @@ mod tests {
             backend.prepare_graph(dynamic_epilogue_variant_graph(&backend)),
             Err(BackendError::QuotaExceeded)
         ));
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_libraries.len(), 0);
         assert_eq!(pipelines.epilogue_pipelines.len(), 0);
     }
@@ -13363,7 +13207,7 @@ mod tests {
             EpilogueSignature::new(1, 2, vec![], DType::F32),
         )
         .unwrap();
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         assert!(matches!(
             pipelines.lookup_prepared_epilogue(
                 epilogue_codegen::FamilySourceTag::Dense,
@@ -13500,7 +13344,7 @@ mod tests {
         }
         push_grouped_epilogue_requests(&mut requests, &epilogue, &gather_constants);
 
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         pipelines.prepare_epilogue_pipelines(&requests).unwrap();
         let preparation_hits = pipelines.epilogue_counts().unwrap().cache_hits;
         for request in &requests {
@@ -15132,7 +14976,7 @@ mod tests {
             .unwrap();
         let graph = backend.prepare_graph(template).unwrap();
         {
-            let pipelines = backend.pipelines.lock().unwrap();
+            let pipelines = &backend.pipelines;
             assert_eq!(pipelines.epilogue_libraries.len(), 1);
             assert_eq!(pipelines.epilogue_pipelines.len(), 1);
         }
@@ -15162,7 +15006,7 @@ mod tests {
         assert_eq!(profile.epilogue_pipeline_specializations, 1);
         assert_eq!(profile.epilogue_cache_hits, 5);
         assert_eq!(profile.epilogue_compile_fallbacks, 0);
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         assert_eq!(pipelines.epilogue_libraries.len(), 1);
         assert_eq!(pipelines.epilogue_pipelines.len(), 1);
         assert_eq!(
@@ -15861,7 +15705,7 @@ mod tests {
             "steel_attention_256",
             &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)],
         ));
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         assert!(matches!(
             pipelines.get(
                 "steel_attention_256",
@@ -16076,7 +15920,7 @@ mod tests {
     fn scalar_catalog_pipelines_refuse_excess_threadgroup_storage() {
         let backend = MetalBackend::new().unwrap();
         backend.set_pipeline_threadgroup_memory_limit_for_test(1);
-        let cache = backend.pipelines.lock().unwrap();
+        let cache = &backend.pipelines;
         for kernel in ["rms_norm_single", "rms_norm_looped"] {
             for _ in 0..2 {
                 assert!(matches!(
@@ -16095,7 +15939,7 @@ mod tests {
             Err(BackendError::InvalidInput)
         ));
         let backend = MetalBackend::with_pipeline_limit(2).unwrap();
-        let cache = backend.pipelines.lock().unwrap();
+        let cache = &backend.pipelines;
         assert!(matches!(
             cache.get("missing_kernel", &[]),
             Err(BackendError::ExecutionFailed)
@@ -16138,11 +15982,7 @@ mod tests {
             Err(BackendError::Timeout)
         ));
         assert!(matches!(
-            backend
-                .pipelines
-                .lock()
-                .unwrap()
-                .get("copy_contiguous", &[(0, 0), (2, 0)]),
+            backend.pipelines.get("copy_contiguous", &[(0, 0), (2, 0)]),
             Err(BackendError::Timeout)
         ));
     }

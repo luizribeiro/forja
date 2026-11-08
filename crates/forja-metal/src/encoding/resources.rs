@@ -31,10 +31,7 @@ impl MetalBackend {
         }
         let kernel = quant_matmul_kernel(dispatch)?;
         let constants = quant_constants(dispatch)?;
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let pipeline = if let Some(epilogue) = dispatch.prepared_epilogue() {
             pipelines.lookup_epilogue(
                 epilogue_codegen::FamilySourceTag::Quant,

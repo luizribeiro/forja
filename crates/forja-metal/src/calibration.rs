@@ -167,10 +167,7 @@ impl MetalBackend {
     }
 
     fn prepare_calibration_probe(&self, probe: Probe) -> Result<PreparedProbe, BackendError> {
-        let pipelines = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?;
+        let pipelines = &self.pipelines;
         let probe = if let Probe::Mma(DType::BF16, chains) = probe {
             let native = Probe::NativeBf16(chains);
             let source = format!(

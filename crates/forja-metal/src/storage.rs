@@ -564,7 +564,7 @@ pub struct MetalBackend {
     pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
     pub(super) buffers: Mutex<AllocationRegistry<MetalBuffer>>,
     pool: Mutex<BufferPool>,
-    pub(super) pipelines: Mutex<PipelineCache>,
+    pub(super) pipelines: Arc<PipelineCache>,
     pub(super) compiler: Arc<crate::compiler::Compiler>,
     pub(super) prepared_programs:
         Mutex<HashMap<(ProgramHash, KernelSignature), Weak<MetalProgram>>>,
@@ -629,10 +629,7 @@ impl Drop for MetalBackend {
 impl MetalBackend {
     #[cfg(test)]
     pub(crate) fn set_pipeline_threadgroup_memory_limit_for_test(&self, bytes: usize) {
-        self.pipelines
-            .lock()
-            .unwrap()
-            .set_threadgroup_memory_limit(bytes);
+        self.pipelines.set_threadgroup_memory_limit(bytes);
     }
 
     /// Returns the fixed compatibility variant for a portable core operation.
@@ -780,11 +777,7 @@ impl MetalBackend {
             MetalGraphReplay::Tier2,
             compiler,
         )?;
-        backend
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .set_initial_pipeline_budget(count);
+        backend.pipelines.set_initial_pipeline_budget(count);
         Ok(backend)
     }
 
@@ -983,7 +976,7 @@ impl MetalBackend {
                 capacity: pool_capacity,
                 residency: PoolResidency { raw: residency },
             }),
-            pipelines: Mutex::new(pipelines),
+            pipelines: Arc::new(pipelines),
             compiler,
             prepared_programs: Mutex::new(HashMap::new()),
             program_compile_tokens: Mutex::new(ProgramCompileTokens::new(program_compile_budget)),
@@ -1236,10 +1229,7 @@ impl Backend for MetalBackend {
 
     fn device_info(&self) -> Result<DeviceInfo, BackendError> {
         let bandwidth = self.measure_memory_bandwidth()?;
-        let simd_width = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
+        let simd_width = std::sync::Arc::clone(&self.pipelines)
             .get("copy_contiguous", &[])?
             .threadExecutionWidth();
         Ok(DeviceInfo {

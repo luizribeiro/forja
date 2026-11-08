@@ -4,8 +4,8 @@ use super::*;
 use forja_core::{BackendDispatchData, Op, Submission};
 
 fn dense_result(source: &str) -> Vec<u8> {
-    let backend = MetalBackend::new().unwrap();
-    *backend.pipelines.lock().unwrap() = PipelineCache::new(&backend.device, source).unwrap();
+    let mut backend = MetalBackend::new().unwrap();
+    backend.pipelines = std::sync::Arc::new(PipelineCache::new(&backend.device, source).unwrap());
     let input = backend.alloc(DType::F32, &[64, 96]).unwrap();
     let weights = backend.alloc(DType::F32, &[96, 32]).unwrap();
     for (tensor, modulus) in [(&input, 251_u16), (&weights, 127)] {

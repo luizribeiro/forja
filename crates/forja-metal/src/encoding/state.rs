@@ -107,11 +107,7 @@ impl MetalBackend {
                 (228, linear_views),
             ])
             .collect::<Vec<_>>();
-        let pipeline = self
-            .pipelines
-            .lock()
-            .map_err(|_| BackendError::ExecutionFailed)?
-            .get(kernel, &constants)?;
+        let pipeline = self.pipelines.get(kernel, &constants)?;
         if pipeline.maxTotalThreadsPerThreadgroup() < 128 {
             return Err(BackendError::UnsupportedOperation);
         }
@@ -257,7 +253,7 @@ mod tests {
     #[test]
     fn metal_compiles_delta_block_stages_with_bounded_groups() {
         let backend = MetalBackend::new().unwrap();
-        let pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = &backend.pipelines;
         for name in [
             "state_block_gram",
             "state_block_gram_mma",
