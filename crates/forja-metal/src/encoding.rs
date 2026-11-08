@@ -2506,6 +2506,7 @@ pub struct MetalSubmission {
     timeout: Duration,
     deadline: Instant,
     prefixes: Vec<MetalSubmission>,
+    failure: Option<BackendError>,
     profile: Option<Mutex<SubmissionProfile>>,
     dispatch_profiles: Vec<DispatchProfile>,
     internal_profiles: Vec<InternalDispatchProfile>,
@@ -2602,7 +2603,7 @@ impl MetalSubmission {
             profile.wait = started.elapsed();
             profile.gpu_time = self.completion.gpu_time().unwrap_or_default();
         }
-        result
+        result.and(self.failure.map_or(Ok(()), Err))
     }
 
     /// Returns feedback and shared-event callback latency from queue commit after a successful wait.
@@ -8696,6 +8697,7 @@ impl MetalBackend {
                 .checked_add(self.command_timeout())
                 .ok_or(BackendError::InvalidInput)?,
             prefixes: Vec::new(),
+            failure: None,
             profile: None,
             dispatch_profiles: Vec::new(),
             internal_profiles: Vec::new(),

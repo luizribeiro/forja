@@ -270,43 +270,56 @@ impl MetalBackend {
             for (index, ((chunk, graph), forecast)) in
                 chunks.into_iter().zip(predictions).enumerate()
             {
-                let mut prepared = self.prepare_commands::<PROFILE>(
-                    chunk,
-                    graph.as_ref(),
-                    graph_arena,
-                    granularity,
-                )?;
-                let actual = prepared
-                    .predictions
-                    .iter()
-                    .try_fold(prepared.reserve, |sum, &p| {
-                        sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
-                    })?;
-                if actual > forecast || Instant::now() >= deadline {
-                    return Err(BackendError::QuotaExceeded);
-                }
-                if index == 0
-                    && let Some(profile) = &mut prepared.profile
-                {
-                    profile.validation += overhead;
-                    profile.program_recording = recording;
-                }
-                let mut submission = prepared.submit(self, deadline)?;
+                let committed = (|| {
+                    let mut prepared = self.prepare_commands::<PROFILE>(
+                        chunk,
+                        graph.as_ref(),
+                        graph_arena,
+                        granularity,
+                    )?;
+                    let actual = prepared
+                        .predictions
+                        .iter()
+                        .try_fold(prepared.reserve, |sum, &p| {
+                            sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
+                        })?;
+                    if actual > forecast || Instant::now() >= deadline {
+                        return Err(BackendError::QuotaExceeded);
+                    }
+                    if index == 0
+                        && let Some(profile) = &mut prepared.profile
+                    {
+                        profile.validation += overhead;
+                        profile.program_recording = recording;
+                    }
+                    prepared.submit(self, deadline)
+                })();
+                let mut submission = match committed {
+                    Ok(submission) => submission,
+                    Err(error) => return retain_prefix_error(prefixes, error),
+                };
                 if index == last {
                     submission.prefixes = prefixes;
                     return Ok(submission);
                 }
-                submission.wait_timeout(deadline.saturating_duration_since(Instant::now()))?;
-                if let Some(work) = submission.completion.work.get()
-                    && work.prediction_failed()
-                {
-                    return Err(BackendError::GpuPredictionExceeded {
-                        predicted: work.prediction(),
-                        measured: submission.completion.gpu_time(),
-                        ratio: work.ratio(),
-                    });
-                }
+                let result =
+                    submission.wait_timeout(deadline.saturating_duration_since(Instant::now()));
+                let result = result.and_then(|()| {
+                    if let Some(work) = submission.completion.work.get()
+                        && work.prediction_failed()
+                    {
+                        return Err(BackendError::GpuPredictionExceeded {
+                            predicted: work.prediction(),
+                            measured: submission.completion.gpu_time(),
+                            ratio: work.ratio(),
+                        });
+                    }
+                    Ok(())
+                });
                 prefixes.push(submission);
+                if let Err(error) = result {
+                    return retain_prefix_error(prefixes, error);
+                }
             }
             Err(BackendError::ExecutionFailed)
         };
@@ -314,6 +327,18 @@ impl MetalBackend {
         store_duration(&LAST_SUBMIT_NANOS, started.elapsed());
         result
     }
+}
+
+fn retain_prefix_error(
+    mut prefixes: Vec<MetalSubmission>,
+    error: BackendError,
+) -> Result<MetalSubmission, BackendError> {
+    let Some(mut submission) = prefixes.pop() else {
+        return Err(error);
+    };
+    submission.failure = Some(error);
+    submission.prefixes = prefixes;
+    Ok(submission)
 }
 
 pub(super) fn merge_profiles(
@@ -611,10 +636,12 @@ mod tests {
         )
         .unwrap();
         let serial = *backend.next_event_value.lock().unwrap();
+        let submission = backend.submit_commands(commands).unwrap();
         assert!(matches!(
-            backend.submit_commands(commands),
+            submission.wait(),
             Err(BackendError::DeviceErrorFlag { value: 99, .. })
         ));
+        assert!(!submission.gpu_time().unwrap().is_zero());
         assert_eq!(*backend.next_event_value.lock().unwrap(), serial + 1);
         assert_eq!(backend.read(&target).unwrap(), sentinel);
     }
