@@ -69,7 +69,9 @@ async fn metal_host_exposes_variant_recording() -> wasmtime::Result<()> {
     let mut linker = Linker::new(&engine);
     add_metal_to_linker(&mut linker)?;
     let backend = forja_metal::MetalBackend::new().map_err(wasmtime::Error::msg)?;
-    let mut store = Host::new_store(&engine, backend, LIMITS);
+    // Counter heaps used by completion checks also count against device memory.
+    let limits = Limits::new(512 * 1024, 8, 16 * 1024, 8, 64 * 1024);
+    let mut store = Host::new_store(&engine, backend, limits);
     Host::configure_component_mode(&mut store, &engine, &component);
     let instance = linker.instantiate_async(&mut store, &component).await?;
     let run = instance.get_typed_func::<(), (Result<(), String>,)>(&mut store, "run")?;

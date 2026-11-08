@@ -558,7 +558,7 @@ impl ProgramCompileTokens {
 /// and allocation counts cover live logical tensors; released buffers instead count toward this
 /// backend's separately capped pool using their page-rounded Metal allocation sizes.
 /// A submission may compile at most four cache-missing scalar programs, and cache misses also
-/// consume this backend's configurable cumulative compile budget.
+/// consume this backend's configurable per-load compile budget.
 pub struct MetalBackend {
     pub(super) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(super) queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
@@ -575,6 +575,7 @@ pub struct MetalBackend {
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
     pub(super) work_limits: forja_core::GpuWorkLimits,
+    pub(super) work_faults: Arc<crate::work_admission::WorkFaults>,
     pub(super) graph_replay: MetalGraphReplay,
     graph_arenas: Mutex<GraphArenaPool>,
     allocation_limit: AtomicU64,
@@ -758,7 +759,7 @@ impl MetalBackend {
         Self::with_pipeline_compile_limits(count, Duration::from_secs(60))
     }
 
-    /// Creates a backend with pipeline attempts and cumulative compiler wall time bounded.
+    /// Creates a backend with pipeline attempts and per-load compiler wall time bounded.
     /// Expiry disables further compilation and GPU submission for this backend.
     ///
     /// # Errors
@@ -1014,6 +1015,7 @@ impl MetalBackend {
             event_listener,
             gpu_timeout,
             work_limits: forja_core::GpuWorkLimits::for_timeout(gpu_timeout)?,
+            work_faults: Arc::default(),
             graph_replay,
             graph_arenas: Mutex::new(GraphArenaPool::default()),
             allocation_limit: AtomicU64::new(u64::MAX),
@@ -1287,7 +1289,8 @@ impl Backend for MetalBackend {
     }
 
     fn begin_load(&self) -> Result<(), BackendError> {
-        self.compiler.begin_load()
+        self.compiler.begin_load()?;
+        self.work_faults.begin_load()
     }
 
     fn prepare_dispatch(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {

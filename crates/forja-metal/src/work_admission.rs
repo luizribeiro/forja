@@ -26,9 +26,45 @@ pub(super) fn calibrating() -> bool {
     CALIBRATING.get()
 }
 
+#[cfg(test)]
+thread_local! { static TEST_CALIBRATION: std::cell::RefCell<Option<Arc<WorkCalibration>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) struct TestCalibration(Option<Arc<WorkCalibration>>);
+#[cfg(test)]
+impl TestCalibration {
+    pub(crate) fn fast() -> Self {
+        let rates = WorkRates::new(1e15, 1e15, 1e15, 1e15, 1e15, 1e15, 1e-9).unwrap();
+        let rates = WorkCalibration::new(
+            [rates; 3],
+            1e-15,
+            128,
+            1e15,
+            vec![WorkObservation {
+                name: "mock".into(),
+                kernel: "mock".into(),
+                units: 1,
+                gpu: Duration::from_nanos(1),
+            }],
+        )
+        .unwrap();
+        Self(TEST_CALIBRATION.replace(Some(Arc::new(rates))))
+    }
+}
+#[cfg(test)]
+impl Drop for TestCalibration {
+    fn drop(&mut self) {
+        TEST_CALIBRATION.set(self.0.take());
+    }
+}
+
 static CALIBRATION: OnceLock<Result<(u64, Arc<WorkCalibration>), BackendError>> = OnceLock::new();
 
 pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>, BackendError> {
+    #[cfg(test)]
+    if let Some(rates) = TEST_CALIBRATION.with_borrow(Clone::clone) {
+        return Ok(rates);
+    }
+
     let (device, rates) = CALIBRATION
         .get_or_init(|| {
             let cache = cache::Cache::new(backend);
@@ -220,6 +256,9 @@ pub(super) fn predict(
         .ok_or(BackendError::InvalidInput)
 }
 
+pub(super) type WorkFaults = forja_core::GpuWorkTracker<Arc<[usize]>>;
+pub(super) type Backstop = forja_core::GpuWorkTicket<Arc<[usize]>>;
+
 pub(super) fn admit(
     predictions: &[Duration],
     limits: forja_core::GpuWorkLimits,
@@ -250,7 +289,14 @@ mod tests {
     use super::*;
     #[test]
     fn admission_sums_buffer_costs_and_refuses_single_reductions() {
-        let limits = forja_core::GpuWorkLimits::for_timeout(Duration::from_secs(10)).unwrap();
+        let limits = forja_core::GpuWorkLimits::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(8),
+            Duration::from_secs(10),
+            4,
+        )
+        .unwrap();
         assert_eq!(
             admit(
                 &[Duration::from_millis(600), Duration::from_millis(401)],

@@ -8,6 +8,7 @@ mod state;
 pub(crate) use state::block_schedule;
 #[cfg(test)]
 mod state_cache_tests;
+mod work_identity;
 
 use std::{
     cell::{Cell, RefCell},
@@ -1302,6 +1303,7 @@ pub(super) struct InFlightResidency {
 }
 
 struct CommitResidency {
+    work: Option<crate::work_admission::Backstop>,
     sets: Vec<Retained<ProtocolObject<dyn MTLResidencySet>>>,
     order_on_queue: bool,
 }
@@ -1584,6 +1586,7 @@ unsafe impl Send for PreparedMetalGraph {}
 unsafe impl Sync for PreparedMetalGraph {}
 
 pub(super) struct Completion {
+    work: OnceLock<crate::work_admission::Backstop>,
     pub(super) outcome: Arc<OnceLock<Result<(), BackendError>>>,
     timeout: Duration,
     pub(super) successful: Arc<AtomicBool>,
@@ -1668,6 +1671,7 @@ impl Completion {
                 options.addFeedbackHandler(RcBlock::as_ptr(&handler));
             }
             Self {
+                work: OnceLock::new(),
                 outcome: Arc::new(OnceLock::new()),
                 timeout,
                 state: Mutex::new(CompletionState {
@@ -1748,6 +1752,11 @@ impl Completion {
                 self.resolve_timestamps();
                 if result.is_ok() {
                     result = self.check_error_flags();
+                    if result.is_ok()
+                        && let Some(check) = self.work.get()
+                    {
+                        result = check.complete(self.gpu_time());
+                    }
                 }
                 let dependencies = std::mem::take(
                     &mut *self
@@ -2462,6 +2471,11 @@ impl MetalSubmission {
     fn wait_profiled(&self, timeout: Duration) -> Result<(), BackendError> {
         let started = Instant::now();
         let result = self.completion.wait(timeout);
+        if result == Err(BackendError::Timeout)
+            && let Some(work) = self.completion.work.get()
+        {
+            work.timed_out()?;
+        }
         #[cfg(test)]
         store_duration(&LAST_WAIT_NANOS, started.elapsed());
         if result.is_ok()
@@ -2870,6 +2884,8 @@ impl MetalBackend {
         #[cfg(test)]
         let submit_started = Instant::now();
         self.compiler.ensure_enabled()?;
+        self.in_flight.drain_done();
+        self.work_faults.check_backend()?;
         let work_calibration = if !crate::work_admission::calibrating()
             && !commands
                 .dispatches()
@@ -2973,6 +2989,7 @@ impl MetalBackend {
         if let Some(encoding) = graph.and_then(|graph| graph.encoding.as_ref()) {
             argument_writer.copy_image(&encoding.arena)?;
         }
+        let identity = work_identity::Scope::enter();
         let mut encoded = self.encode_dispatches(
             &command_buffer,
             objects.argument_table()?,
@@ -3007,6 +3024,7 @@ impl MetalBackend {
         } else {
             Vec::new()
         };
+        let composition = identity.finish();
         let physical_counts = std::mem::take(&mut encoded.physical_counts);
         let launch_work = std::mem::take(&mut encoded.launch_work);
         debug_assert_eq!(launch_work.len(), dispatches.len());
@@ -3074,7 +3092,7 @@ impl MetalBackend {
             Vec::new()
         };
         if let Some(profile) = &mut profile {
-            profile.work_calibration = work_calibration;
+            profile.work_calibration.clone_from(&work_calibration);
             profile.command_buffers = 1;
             profile.predicted_gpu = predicted;
         }
@@ -3087,6 +3105,15 @@ impl MetalBackend {
             &accesses,
             resources,
             CommitResidency {
+                work: work_calibration
+                    .map(|_| {
+                        self.work_faults.track(
+                            composition,
+                            predicted,
+                            self.work_limits.backstop_ratio(),
+                        )
+                    })
+                    .transpose()?,
                 sets: graph.map_or_else(
                     || vec![residency.clone()],
                     |graph| vec![residency.clone(), graph.residency.clone()],
@@ -3285,7 +3312,10 @@ impl MetalBackend {
 
         for call in &plan.calls {
             match call {
-                PlanCall::Pipeline(pipeline) => encoder.setComputePipelineState(pipeline),
+                PlanCall::Pipeline(pipeline) => {
+                    record_work_pipeline(pipeline);
+                    encoder.setComputePipelineState(pipeline);
+                }
                 PlanCall::Bind { index, range } => {
                     let range = match range {
                         PlannedRange::Fixed(range) => *range,
@@ -8455,6 +8485,9 @@ impl MetalBackend {
         timestamps: GpuTimestamps,
         objects: &mut SubmissionObjects,
     ) -> Result<MetalSubmission, BackendError> {
+        if let Some(work) = &residency.work {
+            work.check_admission()?;
+        }
         let mut next_event_value = self
             .next_event_value
             .lock()
@@ -8471,6 +8504,9 @@ impl MetalBackend {
             timestamps,
             residency.order_on_queue,
         )?;
+        if let Some(work) = residency.work {
+            let _ = completion.work.set(work);
+        }
         let registration = self
             .in_flight
             .track(&completion, &self.event_listener, objects)?;
@@ -9617,6 +9653,10 @@ fn head_matrix(
     EncoderTensor::new(tensor.buffer.clone(), layout)
 }
 
+fn record_work_pipeline(pipeline: &ComputePipeline) {
+    work_identity::record(std::ptr::from_ref(&**pipeline).cast::<()>().addr());
+}
+
 fn record_pipeline_launch(
     pipeline: &ComputePipeline,
     threads_per_threadgroup: MTLSize,
@@ -9625,6 +9665,7 @@ fn record_pipeline_launch(
         pipeline.maxTotalThreadsPerThreadgroup(),
         threads_per_threadgroup,
     )?;
+    record_work_pipeline(pipeline);
     record_plan_call(PlanCall::Pipeline(pipeline.clone()));
     Ok(())
 }
@@ -14203,6 +14244,7 @@ mod tests {
                 ],
                 resources,
                 CommitResidency {
+                    work: None,
                     sets: vec![residency],
                     order_on_queue: false,
                 },
@@ -17503,5 +17545,31 @@ mod tests {
         );
     }
 
-
+    #[test]
+    fn waiter_free_overrun_quarantines_its_signature_and_keeps_unrelated_work_usable() {
+        use forja_core::Backend;
+        let _rates = crate::work_admission::TestCalibration::fast();
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[33]).unwrap();
+        let output = backend.alloc(DType::F32, &[33]).unwrap();
+        let bytes = [1.0_f32.to_ne_bytes(); 33].concat();
+        backend.write(&input, &bytes).unwrap();
+        let mut copy = CommandList::new();
+        copy.dispatch(Op::Copy, &[&input], &output).unwrap();
+        drop(backend.submit(copy.clone()).unwrap());
+        backend.in_flight.drain(Duration::from_secs(10));
+        assert_eq!(backend.read(&output).unwrap(), bytes);
+        let serial = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.submit(copy),
+            Err(BackendError::GpuPredictionExceeded { .. })
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial);
+        let mut different = CommandList::new();
+        different
+            .dispatch(Op::RmsNorm { eps: 1e-5 }, &[&input, &input], &output)
+            .unwrap();
+        backend.submit(different).unwrap().wait().unwrap();
+        backend.work_faults.check_backend().unwrap();
+    }
 }
