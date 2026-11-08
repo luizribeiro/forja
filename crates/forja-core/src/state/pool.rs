@@ -12,6 +12,8 @@ use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence,
 mod chain_tests;
 mod checkpoint;
 pub use checkpoint::{ReleasedStateCheckpoint, StateCheckpoint};
+mod capacity;
+use capacity::CapacityLease;
 
 /// Allocator for opaque sequence state with [`Self::VERSIONS`] versions per sequence.
 #[derive(Clone)]
@@ -19,6 +21,9 @@ pub struct StatePool {
     layout: Arc<StateLayout>,
     pages: PagePool,
     completed: Arc<AtomicU64>,
+    sequences: u32,
+    reserved: Arc<AtomicU32>,
+    maximum_versions: u32,
 }
 
 impl StatePool {
@@ -40,8 +45,17 @@ impl StatePool {
     /// # Errors
     /// Returns overflow when the record count cannot be represented by the allocator.
     pub fn record_count(sequences: u32) -> Result<u32, PagePoolError> {
+        Self::record_count_with_spares(sequences, 0)
+    }
+
+    /// Checked physical record count, including one engine-wide spare budget.
+    ///
+    /// # Errors
+    /// Returns overflow when the enlarged pool cannot be represented by the allocator.
+    pub fn record_count_with_spares(sequences: u32, spares: u32) -> Result<u32, PagePoolError> {
         u64::from(sequences)
             .checked_mul(u64::from(Self::VERSIONS))
+            .and_then(|records| records.checked_add(u64::from(spares)))
             .and_then(|records| u32::try_from(records).ok())
             .ok_or(PagePoolError::ArithmeticOverflow)
     }
@@ -55,12 +69,34 @@ impl StatePool {
         sequences: u32,
         byte_limit: u64,
     ) -> Result<Self, PagePoolError> {
-        let records = Self::record_count(sequences)?;
+        Self::with_spares(layout, sequences, 0, byte_limit)
+    }
+
+    /// Reserves backing for ordinary sequences plus one shared spare-record budget.
+    ///
+    /// # Errors
+    /// Returns a quota, overflow or empty-capacity refusal without allocation changes.
+    pub fn with_spares(
+        layout: StateLayout,
+        sequences: u32,
+        spare_records: u32,
+        byte_limit: u64,
+    ) -> Result<Self, PagePoolError> {
+        if sequences == 0 {
+            return Err(PagePoolError::EmptySlab);
+        }
+        let records = Self::record_count_with_spares(sequences, spare_records)?;
+        let maximum_versions = Self::VERSIONS
+            .checked_add(spare_records)
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
         let pages = PagePool::new_fixed(layout.storage_layout().clone(), records, byte_limit)?;
         Ok(Self {
             layout: Arc::new(layout),
             pages,
             completed: Arc::new(AtomicU64::new(0)),
+            sequences,
+            reserved: Arc::default(),
+            maximum_versions,
         })
     }
 
@@ -70,14 +106,22 @@ impl StatePool {
         &self.layout
     }
 
+    /// Maximum versions available to the sequence holding the shared spare records.
+    #[must_use]
+    pub const fn maximum_versions(&self) -> u32 {
+        self.maximum_versions
+    }
+
     /// Allocates all versions and their hidden allocation table atomically.
     ///
     /// # Errors
     /// Returns a quota error without a partial sequence when capacity is exhausted.
     pub fn reserve(&self) -> Result<StateSequence, PagePoolError> {
+        let capacity = CapacityLease::reserve(&self.reserved, self.sequences)?;
         Ok(StateSequence {
             pool: self.clone(),
             storage: self.pages.reserve(u64::from(Self::VERSIONS))?,
+            _capacity: capacity,
             identity: Arc::new(()),
             committed: 0,
             pins: (0..Self::VERSIONS).map(|_| AtomicU32::new(0)).collect(),
@@ -129,6 +173,7 @@ impl StatePool {
 pub struct StateSequence {
     pool: StatePool,
     storage: PagedSequence,
+    _capacity: CapacityLease,
     identity: Arc<()>,
     committed: u32,
     pins: Arc<[AtomicU32]>,
