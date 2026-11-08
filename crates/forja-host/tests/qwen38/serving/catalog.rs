@@ -92,6 +92,7 @@ async fn prompt_forward_reuses_capture_without_exposing_combined_feedback()
         let expected = match phase {
             BatchPhase::Prompt => native.forward(&token, 64, false)?,
             BatchPhase::Decode => native.decode_token(&token, 64, false)?,
+            BatchPhase::Verify => return Err("verify is unsupported".into()),
         };
         let logits = runner
             .begin_decode(forja_host::EngineBeginDecode {

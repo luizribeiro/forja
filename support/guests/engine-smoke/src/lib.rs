@@ -78,6 +78,7 @@ impl Guest for Component {
     }
 
     async fn step(input: StepIn) -> Result<StepOut, Error> {
+        require_supported_phase(input.phase)?;
         let mode = input.tokens.first().copied().unwrap_or_default();
         if mode == u32::MAX {
             loop {
@@ -133,6 +134,7 @@ impl Guest for Component {
             match phase {
                 BatchPhase::Prompt => "prompt forward",
                 BatchPhase::Decode => "decode forward",
+                BatchPhase::Verify => "verify is unsupported",
             }
             .to_owned(),
         ))
@@ -187,6 +189,7 @@ impl Guest for Component {
         _logits: &Tensor,
         input: exports::l9o::gpu::engine::BatchSelectIn,
     ) -> Result<exports::l9o::gpu::engine::BatchOut, Error> {
+        require_supported_phase(input.shape.phase)?;
         let bucket = input.shape.bucket;
         let tokens = input
             .lanes
@@ -208,6 +211,7 @@ async fn touch_paged_slot(
     slot: &l9o::gpu::paged_storage::BatchSlot,
     input: &BatchIn,
 ) -> Result<(), Error> {
+    require_supported_phase(input.shape.phase)?;
     let commands = CommandList::new();
     let mut values = Vec::new();
     for lane in input.lanes.iter().flatten() {
@@ -310,3 +314,10 @@ fn u32_tensor(shape: &[u32], values: &[u32]) -> Result<Tensor, Error> {
 }
 
 export!(Component);
+
+fn require_supported_phase(phase: BatchPhase) -> Result<(), Error> {
+    if phase == BatchPhase::Verify {
+        return Err(Error::OpSignature("verify is unsupported".to_owned()));
+    }
+    Ok(())
+}

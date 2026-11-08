@@ -37,6 +37,7 @@ fn native_forward(
     let output = match phase {
         forja_host::BatchPhase::Prompt => model.forward(&tokens, start, taps)?,
         forja_host::BatchPhase::Decode => model.decode_token(&tokens, start, taps)?,
+        forja_host::BatchPhase::Verify => return Err("verify is unsupported".into()),
     };
     Ok(Output {
         logits: output.logits.to_vec()?,

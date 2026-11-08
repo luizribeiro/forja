@@ -13,6 +13,7 @@ interface engine {
   enum batch-phase {
     prompt,
     decode,
+    verify,
   }
 
   enum batch-selection {

@@ -196,6 +196,8 @@ pub enum BatchPhase {
     Prompt,
     /// Single-token generation.
     Decode,
+    /// Target evaluation of host-staged speculative rows.
+    Verify,
 }
 
 impl From<BatchPhase> for engine_bindings::exports::l9o::gpu::engine::BatchPhase {
@@ -203,6 +205,7 @@ impl From<BatchPhase> for engine_bindings::exports::l9o::gpu::engine::BatchPhase
         match value {
             BatchPhase::Prompt => Self::Prompt,
             BatchPhase::Decode => Self::Decode,
+            BatchPhase::Verify => Self::Verify,
         }
     }
 }
@@ -916,6 +919,11 @@ fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
                     "decode batch shapes must contain one token per lane".to_owned(),
                 ));
             }
+            BatchPhase::Verify => {
+                return Err(compute::Error::OpSignature(
+                    "verify is unsupported".to_owned(),
+                ));
+            }
             BatchPhase::Prompt | BatchPhase::Decode => {}
         }
         if serving.batch_shapes[..index].contains(shape) {
@@ -977,6 +985,7 @@ pub fn validate_batch_lanes(
         };
         let valid_tokens = match shape.phase {
             BatchPhase::Decode => tokens == 1,
+            BatchPhase::Verify => tokens == shape.tokens,
             BatchPhase::Prompt => (1..=shape.tokens).contains(&tokens),
         };
         if !valid_tokens
@@ -1068,6 +1077,7 @@ impl From<EngineBatch> for engine_bindings::exports::l9o::gpu::engine::BatchIn {
                 phase: match input.shape.phase {
                     BatchPhase::Prompt => WitPhase::Prompt,
                     BatchPhase::Decode => WitPhase::Decode,
+                    BatchPhase::Verify => WitPhase::Verify,
                 },
                 bucket: input.shape.bucket,
                 tokens: input.shape.tokens,
@@ -1109,6 +1119,7 @@ impl From<EngineBatchSelect> for engine_bindings::exports::l9o::gpu::engine::Bat
                 phase: match input.shape.phase {
                     BatchPhase::Prompt => WitPhase::Prompt,
                     BatchPhase::Decode => WitPhase::Decode,
+                    BatchPhase::Verify => WitPhase::Verify,
                 },
                 bucket: input.shape.bucket,
                 tokens: input.shape.tokens,
@@ -1285,6 +1296,9 @@ where
                             }
                             engine_bindings::exports::l9o::gpu::engine::BatchPhase::Decode => {
                                 BatchPhase::Decode
+                            }
+                            engine_bindings::exports::l9o::gpu::engine::BatchPhase::Verify => {
+                                BatchPhase::Verify
                             }
                         },
                         bucket: shape.bucket,

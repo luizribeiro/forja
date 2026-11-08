@@ -357,6 +357,7 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             Ok(match value {
                 bindings::exports::l9o::gpu::engine::BatchPhase::Prompt => ::forja_sdk::BatchPhase::Prompt,
                 bindings::exports::l9o::gpu::engine::BatchPhase::Decode => ::forja_sdk::BatchPhase::Decode,
+                bindings::exports::l9o::gpu::engine::BatchPhase::Verify => return Err(compute::Error::OpSignature("verify is unsupported".into())),
             })
         }
 

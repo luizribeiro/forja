@@ -46,6 +46,28 @@ async fn constrained_forward_preserves_the_explicit_phase() -> wasmtime::Result<
 }
 
 #[tokio::test]
+async fn guests_refuse_unsupported_verify_phase() -> wasmtime::Result<()> {
+    let weights = weight_file("unsupported-verify")?;
+    for component in [test_guests::engine_smoke(), test_guests::engine_sdk_smoke()] {
+        let mut runner =
+            EngineRunner::new(component, CpuBackend::new(), LIMITS, weights.path()).await?;
+        runner.load().await??;
+        let result = runner
+            .step(EngineStep {
+                phase: BatchPhase::Verify,
+                tokens: vec![1, 2],
+                start_pos: 0,
+                taps: false,
+            })
+            .await?;
+        assert!(
+            matches!(result, Err(Error::OpSignature(value)) if value == "verify is unsupported")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn runs_an_engine_and_reads_its_logits() -> wasmtime::Result<()> {
     run_engine(test_guests::engine_smoke(), false, "engine").await
 }
