@@ -120,9 +120,8 @@ impl<B: Backend> StateStorage<B> {
         layout: StateLayout,
         sequences: u32,
     ) -> Result<Arc<Self>, compute::Error> {
-        let records = sequences
-            .checked_mul(3)
-            .ok_or_else(|| quota("state record count overflow"))?;
+        let records =
+            StatePool::record_count(sequences).map_err(|_| quota("state record count overflow"))?;
         if usize::try_from(records).map_or(true, |count| count > limits.table_elements) {
             return Err(quota("state records exceed the table limit"));
         }

@@ -11,9 +11,7 @@ use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence,
 mod checkpoint;
 pub use checkpoint::{ReleasedStateCheckpoint, StateCheckpoint};
 
-const VERSIONS: u64 = 3;
-
-/// Allocator for opaque sequence state, including two speculative descendants.
+/// Allocator for opaque sequence state with [`Self::VERSIONS`] versions per sequence.
 #[derive(Clone)]
 pub struct StatePool {
     layout: Arc<StateLayout>,
@@ -22,6 +20,20 @@ pub struct StatePool {
 }
 
 impl StatePool {
+    /// Records reserved for each sequence, including speculative descendants.
+    pub const VERSIONS: u32 = 3;
+
+    /// Checked physical record count for the pool's concurrent sequences.
+    ///
+    /// # Errors
+    /// Returns overflow when the record count cannot be represented by the allocator.
+    pub fn record_count(sequences: u32) -> Result<u32, PagePoolError> {
+        u64::from(sequences)
+            .checked_mul(u64::from(Self::VERSIONS))
+            .and_then(|records| u32::try_from(records).ok())
+            .ok_or(PagePoolError::ArithmeticOverflow)
+    }
+
     /// Reserves bounded backing for `sequences` concurrent sequences.
     ///
     /// # Errors
@@ -31,9 +43,7 @@ impl StatePool {
         sequences: u32,
         byte_limit: u64,
     ) -> Result<Self, PagePoolError> {
-        let records = sequences
-            .checked_mul(3)
-            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        let records = Self::record_count(sequences)?;
         let pages = PagePool::new_fixed(layout.storage_layout().clone(), records, byte_limit)?;
         Ok(Self {
             layout: Arc::new(layout),
@@ -55,10 +65,10 @@ impl StatePool {
     pub fn reserve(&self) -> Result<StateSequence, PagePoolError> {
         Ok(StateSequence {
             pool: self.clone(),
-            storage: self.pages.reserve(VERSIONS)?,
+            storage: self.pages.reserve(u64::from(Self::VERSIONS))?,
             identity: Arc::new(()),
             committed: 0,
-            pins: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
+            pins: (0..Self::VERSIONS).map(|_| AtomicU32::new(0)).collect(),
             latest_serial: 0,
             latest_submission: 0,
             pending: VecDeque::new(),
@@ -109,7 +119,7 @@ pub struct StateSequence {
     storage: PagedSequence,
     identity: Arc<()>,
     committed: u32,
-    pins: Arc<[AtomicU32; 3]>,
+    pins: Arc<[AtomicU32]>,
     latest_serial: u64,
     latest_submission: u64,
     pending: VecDeque<StateTransaction>,
@@ -158,12 +168,13 @@ impl StateSequence {
         if serial <= self.latest_serial {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if self.pending.len() == 2 || self.pool.completed.load(Ordering::Acquire) < self.drain_until
+        if self.pending.len() >= self.pins.len() - 1
+            || self.pool.completed.load(Ordering::Acquire) < self.drain_until
         {
             return Err(PagePoolError::BankInFlight);
         }
         let input = self.pending.back().map_or(self.committed, |tx| tx.output);
-        let output = (0..3)
+        let output = (0..StatePool::VERSIONS)
             .find(|&version| {
                 version != self.committed
                     && version != input
@@ -400,6 +411,31 @@ impl StateSlot {
 mod tests {
     use super::*;
     use crate::{DType, StatePlane};
+
+    #[test]
+    fn record_capacity_matches_reserved_versions() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 1024).unwrap();
+        let a = pool.reserve().unwrap();
+        let b = pool.reserve().unwrap();
+        assert_eq!(StatePool::VERSIONS, 3);
+        assert_eq!(StatePool::record_count(2), Ok(6));
+        assert_eq!(StatePool::record_count(0), Ok(0));
+        assert_eq!(a.pins.len(), 3);
+        assert_eq!(a.allocation_table().unwrap().entries().len(), 3);
+        assert_eq!(b.allocation_table().unwrap().entries().len(), 3);
+        assert!(pool.reserve().is_err());
+        let maximum = u32::MAX / StatePool::VERSIONS;
+        assert_eq!(StatePool::record_count(maximum), Ok(maximum * 3));
+        assert_eq!(
+            StatePool::record_count(maximum + 1),
+            Err(PagePoolError::ArithmeticOverflow)
+        );
+        assert!(matches!(
+            StatePool::new(pool.layout().clone(), maximum + 1, u64::MAX),
+            Err(PagePoolError::ArithmeticOverflow)
+        ));
+    }
 
     #[test]
     fn versions_publish_in_order_and_failed_descendants_must_drain() {

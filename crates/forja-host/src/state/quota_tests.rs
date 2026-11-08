@@ -39,6 +39,37 @@ fn state_plane_rank_is_validated_before_backing_allocation() {
     assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn state_record_limits_refuse_backing_before_charging() {
+    let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+    for (sequences, table_elements, tensor_elements) in
+        [(2, 5, 4096), (2, 6, 41), (u32::MAX, 6, 4096)]
+    {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, tensor_elements, 128, 4096).with_store_limits(
+                4096,
+                table_elements,
+                128,
+            ),
+        );
+        assert!(
+            host.create_state_storage(layout.clone(), sequences)
+                .is_err()
+        );
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+    }
+    let host = Host::new(
+        forja_cpu::CpuBackend::new(),
+        Limits::new(65536, 8, 42, 128, 4096).with_store_limits(4096, 6, 128),
+    );
+    let storage = host.create_state_storage(layout, 2).unwrap();
+    assert_eq!(storage.planes[0].layout().shape(), [6, 7]);
+    let _first = storage.reserve().unwrap();
+    let _second = storage.reserve().unwrap();
+    assert!(storage.reserve().is_err());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_state_reservation_reclaims_completed_charges_after_caller_timeout() {

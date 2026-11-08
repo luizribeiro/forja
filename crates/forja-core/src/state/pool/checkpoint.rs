@@ -1,7 +1,7 @@
 use super::{Arc, AtomicBool, AtomicU32, Ordering, PagePoolError, StateSequence, StateTransaction};
 
 struct VersionPin {
-    counts: Arc<[AtomicU32; 3]>,
+    counts: Arc<[AtomicU32]>,
     version: u32,
 }
 
