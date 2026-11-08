@@ -163,6 +163,21 @@ impl StateSequence {
         self.pin(transaction.input)
     }
 
+    /// Pins every output in order, restorable only after successful completion.
+    ///
+    /// # Errors
+    /// Refuses foreign/retired transactions or exhausted checkpoint reference counts.
+    pub fn checkpoint_outputs(
+        &self,
+        transaction: &StateTransaction,
+    ) -> Result<Vec<StateCheckpoint>, PagePoolError> {
+        self.pending_index(transaction)?;
+        transaction
+            .output_versions()
+            .map(|version| self.pin(version))
+            .collect()
+    }
+
     fn pin(&self, version: u32) -> Result<StateCheckpoint, PagePoolError> {
         self.pins[version as usize]
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -174,7 +189,11 @@ impl StateSequence {
             published: self
                 .pending
                 .iter()
-                .find(|transaction| transaction.output_version() == version)
+                .find(|transaction| {
+                    transaction
+                        .output_versions()
+                        .any(|output| output == version)
+                })
                 .map(|transaction| Arc::clone(&transaction.published)),
             pin: Arc::new(VersionPin {
                 counts: Arc::clone(&self.pins),
@@ -239,6 +258,46 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn output_checkpoints_require_the_complete_chain_to_succeed() {
+        for spares in [0, 1] {
+            let pool = StatePool::with_spares(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+                2,
+                spares,
+                65536,
+            )
+            .unwrap();
+            for outcome in 0..3 {
+                let mut sequence = pool.reserve().unwrap();
+                sequence.reserve_spares().unwrap();
+                let chain = sequence.begin_chain(1, 2 + spares).unwrap();
+                let outputs = sequence.checkpoint_outputs(&chain).unwrap();
+                assert_eq!(
+                    outputs
+                        .iter()
+                        .map(StateCheckpoint::version)
+                        .collect::<Vec<_>>(),
+                    chain.output_versions().collect::<Vec<_>>()
+                );
+                let foreign = pool.reserve().unwrap();
+                assert!(foreign.checkpoint_outputs(&chain).is_err());
+                if outcome == 0 {
+                    sequence.cancel_unsubmitted(&chain).unwrap();
+                } else {
+                    sequence.mark_submitted(&chain).unwrap();
+                    assert!(sequence.rewind(&outputs[0]).is_err());
+                    pool.observe_completion(1).unwrap();
+                    sequence.finish(&chain, outcome == 2).unwrap();
+                }
+                assert!(sequence.checkpoint_outputs(&chain).is_err());
+                for checkpoint in outputs {
+                    assert_eq!(sequence.rewind(&checkpoint).is_ok(), outcome == 2);
+                }
+            }
+        }
+    }
 
     #[test]
     fn chain_admission_preserves_pins_on_refusal_and_cancellation() {
