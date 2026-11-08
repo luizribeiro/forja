@@ -548,7 +548,9 @@ impl StateJournal {
             .find(|entry| entry.serial == transaction.serial())
             .ok_or(PagePoolError::InvalidCheckpoint)?;
         let input = &pending.predecessor;
-        let source = if input.phase == SelectionPhase::Ready {
+        let source = if input.phase == SelectionPhase::Ready
+            && pending.phase != SelectionPhase::AwaitingAcceptance
+        {
             Some(
                 input
                     .feedback

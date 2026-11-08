@@ -163,7 +163,8 @@ impl<B: Backend> StateSequenceHandle<B> {
 
     /// Publishes protected carry and cursors for accepted row `accepted` of a completed verify.
     ///
-    /// The row is zero-based: zero publishes the pending input token's state.
+    /// The row is zero-based: zero publishes the pending input token's state. The next
+    /// plain step requires a host-supplied token because verify publishes no feedback.
     ///
     /// # Errors
     /// Refuses incomplete, foreign or retired transactions and out-of-range rows.
