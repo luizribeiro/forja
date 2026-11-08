@@ -25,6 +25,16 @@ impl StatePool {
     /// Records reserved for each sequence, including speculative descendants.
     pub const VERSIONS: u32 = 3;
 
+    fn validate_output_count(output_count: u32) -> Result<usize, PagePoolError> {
+        if output_count == 0 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        if output_count > Self::VERSIONS {
+            return Err(PagePoolError::BankInFlight);
+        }
+        usize::try_from(output_count).map_err(|_| PagePoolError::ArithmeticOverflow)
+    }
+
     /// Checked physical record count for the pool's concurrent sequences.
     ///
     /// # Errors
@@ -197,9 +207,7 @@ impl StateSequence {
         if serial <= self.latest_serial {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if output_count == 0 {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
+        let output_count = StatePool::validate_output_count(output_count)?;
         if self.pool.completed.load(Ordering::Acquire) < self.drain_until {
             return Err(PagePoolError::BankInFlight);
         }
@@ -207,8 +215,6 @@ impl StateSequence {
             .pending
             .back()
             .map_or(self.committed, StateTransaction::output_version);
-        let output_count =
-            usize::try_from(output_count).map_err(|_| PagePoolError::ArithmeticOverflow)?;
         let mut outputs: Vec<_> = (0..StatePool::VERSIONS)
             .filter(|&version| {
                 version != self.committed
@@ -432,14 +438,10 @@ impl StateSlot {
     /// A padding lane with impossible generations and no authorized state access.
     ///
     /// # Errors
-    /// Refuses an empty chain or an unrepresentable table extent.
+    /// Refuses an empty chain or a request beyond the pool version capacity.
     pub fn poisoned(output_count: u32) -> Result<Self, PagePoolError> {
-        if output_count == 0 {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
-        let records = output_count
+        let records = StatePool::validate_output_count(output_count)?
             .checked_add(1)
-            .and_then(|count| usize::try_from(count).ok())
             .ok_or(PagePoolError::ArithmeticOverflow)?;
         Ok(Self {
             table: PageTable::poisoned(records),
@@ -500,7 +502,7 @@ mod tests {
 
     #[test]
     fn poisoned_slots_size_the_whole_chain() {
-        for count in [1, 2] {
+        for count in 1..=StatePool::VERSIONS {
             let slot = StateSlot::poisoned(count).unwrap();
             assert_eq!(
                 slot.table().entries().len(),
@@ -514,6 +516,28 @@ mod tests {
         }
         assert!(StateSlot::poisoned(0).is_err());
         assert!(StateSlot::poisoned(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn oversized_chains_are_refused_before_allocating_padding() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 4096).unwrap();
+        let mut lane = pool.reserve().unwrap();
+        for count in [StatePool::VERSIONS + 1, u32::MAX - 1, u32::MAX] {
+            assert_eq!(
+                StateSlot::poisoned(count).err(),
+                Some(PagePoolError::BankInFlight)
+            );
+            assert_eq!(
+                lane.begin_chain(1, count).err(),
+                Some(PagePoolError::BankInFlight)
+            );
+        }
+        let tx = lane.begin_chain(1, StatePool::VERSIONS - 1).unwrap();
+        assert_eq!(
+            tx.output_versions().count(),
+            usize::try_from(StatePool::VERSIONS - 1).unwrap()
+        );
     }
 
     #[test]
