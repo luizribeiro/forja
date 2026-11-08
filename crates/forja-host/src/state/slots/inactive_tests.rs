@@ -145,15 +145,22 @@ fn metal_inactive_commands_touch_no_state_and_hold_no_lane_lease() {
 
 #[test]
 fn recording_quota_refusal_keeps_the_retained_predecessor() {
-    quota_refusal_keeps_predecessor(false);
+    quota_refusal_keeps_predecessor(false, None);
 }
 
 #[test]
 fn staging_quota_refusal_restores_a_recycled_predecessor() {
-    quota_refusal_keeps_predecessor(true);
+    quota_refusal_keeps_predecessor(true, None);
 }
 
-fn quota_refusal_keeps_predecessor(after_reservation: bool) {
+#[test]
+fn verify_quota_refusal_keeps_the_retained_predecessor() {
+    for after_reservation in [false, true] {
+        quota_refusal_keeps_predecessor(after_reservation, Some(crate::StateAction::Verify));
+    }
+}
+
+fn quota_refusal_keeps_predecessor(after_reservation: bool, action: Option<crate::StateAction>) {
     let host = Host::new(
         forja_cpu::CpuBackend::new(),
         Limits::new(65536, 8, 4096, 128, 4096),
@@ -184,7 +191,7 @@ fn quota_refusal_keeps_predecessor(after_reservation: bool) {
     slots.take_batch(0).unwrap().submit_and_finish().unwrap();
     let sequence = slots.sequence_handle(0).unwrap().unwrap();
     let checkpoint = sequence.checkpoint_latest().unwrap();
-    refuse_next_recording(&host, &mut slots, position, after_reservation);
+    refuse_next_recording(&host, &mut slots, position, after_reservation, action);
     assert_eq!(slots.position(0).unwrap(), checkpoint.position());
     assert_eq!(slots.lanes[0].serial, if after_reservation { 2 } else { 1 });
     sequence.rewind(0).unwrap();
@@ -213,15 +220,20 @@ fn refuse_next_recording(
     slots: &mut StateSlots<forja_cpu::CpuBackend>,
     position: LanePosition,
     after_reservation: bool,
+    action: Option<crate::StateAction>,
 ) {
     use std::sync::atomic::Ordering;
     let before = host.live_bytes.load(Ordering::Acquire);
     let next = LanePosition {
-        tokens: 2,
+        tokens: if matches!(action, Some(crate::StateAction::Verify)) {
+            3
+        } else {
+            2
+        },
         ..position
     };
     if after_reservation {
-        slots.begin(1, 0, next).unwrap();
+        slots.begin_action(1, 0, next, action).unwrap();
     }
     let live = host.live_bytes.load(Ordering::Acquire);
     let budget = super::super::StateCharge::reserve(
@@ -244,7 +256,7 @@ fn refuse_next_recording(
         slots.cancel_unsubmitted_bank(1).unwrap();
     } else {
         assert!(matches!(
-            slots.begin(1, 0, next),
+            slots.begin_action(1, 0, next, action),
             Err(crate::compute::Error::Quota(_))
         ));
     }

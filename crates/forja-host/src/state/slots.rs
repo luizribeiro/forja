@@ -6,6 +6,8 @@ use selection::SelectionFrame;
 
 #[cfg(test)]
 mod inactive_tests;
+#[cfg(test)]
+mod verify_tests;
 
 use super::{
     LanePosition, StateBatch, StateCommands, StateRecording, StateSequenceHandle, StateStorage,
@@ -39,7 +41,15 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses metadata or backend allocation beyond the existing storage budget.
     pub fn trace(&self) -> Result<super::StateTrace<B>, compute::Error> {
-        super::StateTrace::new(&self.storage, &self.inactive_access, self.lanes.len())
+        self.trace_chain(1)
+    }
+
+    /// Allocates poisoned trace bindings with one destination per row.
+    ///
+    /// # Errors
+    /// Refuses unavailable chain geometry, metadata or backend allocation.
+    pub fn trace_chain(&self, rows: u32) -> Result<super::StateTrace<B>, compute::Error> {
+        super::StateTrace::new(&self.storage, &self.chain_access(rows)?, self.lanes.len())
     }
 
     pub(crate) fn plane_count(&self) -> usize {
@@ -97,7 +107,31 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses quota or metadata allocation failure.
     pub fn inactive(&self) -> Result<StateCommands<B>, compute::Error> {
-        self.storage.inactive_commands(self.inactive_access.clone())
+        self.inactive_chain(1)
+    }
+
+    /// Creates poisoned padding commands with one destination per row.
+    ///
+    /// # Errors
+    /// Refuses unavailable chain geometry, quota or metadata allocation failure.
+    pub fn inactive_chain(&self, rows: u32) -> Result<StateCommands<B>, compute::Error> {
+        self.storage.inactive_commands(self.chain_access(rows)?)
+    }
+
+    fn chain_access(&self, rows: u32) -> Result<StateAccess, compute::Error> {
+        if rows == 1 {
+            return Ok(self.inactive_access.clone());
+        }
+        if rows >= self.storage.pool.maximum_versions() {
+            return Err(invalid_handle("state chain exceeds storage capacity"));
+        }
+        let capacity = self
+            .storage
+            .pool
+            .maximum_versions()
+            .checked_sub(1)
+            .ok_or_else(|| invalid_handle("state version capacity underflow"))?;
+        StateAccess::poisoned(rows, capacity).map_err(pool_error)
     }
 
     /// Reserves and zeroes all three versions before admitting a new request.
@@ -188,9 +222,31 @@ impl<B: Backend> StateSlots<B> {
                 "state bank is occupied or its cursor exceeds capacity",
             ));
         }
+        let rows = if let Some(action @ super::StateAction::Verify) = action {
+            let start = self.lanes[lane]
+                .sequence
+                .as_ref()
+                .map_or(Ok(0), |sequence| {
+                    sequence.latest_position().map(|position| position.tokens)
+                })
+                .map_err(pool_error)?;
+            action
+                .output_count(start, position.tokens)
+                .map_err(pool_error)?
+        } else {
+            1
+        };
+        let chain_len = usize::try_from(rows).map_err(invalid_handle)?;
+        if self.banks[bank]
+            .iter()
+            .flatten()
+            .any(|record| record.access.chain_len() != chain_len)
+        {
+            return Err(invalid_handle("state bank has incompatible chain lengths"));
+        }
         let prepared = self
             .storage
-            .prepare_record_metadata(self.inactive_access.clone())?;
+            .prepare_record_metadata(self.chain_access(rows)?)?;
         let fresh = self.lanes[lane].sequence.is_none();
         if fresh {
             self.admit_reserved(lane, position.reserved_tokens)?;
@@ -352,8 +408,17 @@ impl<B: Backend> StateSlots<B> {
         if active {
             return self.recording(bank, lane).map(|record| &mut **record);
         }
-        if self.padding[bank][lane].is_none() {
-            self.padding[bank][lane] = Some(self.inactive()?);
+        let rows = self.banks[bank]
+            .iter()
+            .flatten()
+            .next()
+            .map_or(1, |record| record.access.chain_len());
+        if self.padding[bank][lane]
+            .as_ref()
+            .is_none_or(|padding| padding.access.chain_len() != rows)
+        {
+            self.padding[bank][lane] =
+                Some(self.inactive_chain(u32::try_from(rows).map_err(invalid_handle)?)?);
         }
         self.padding[bank][lane]
             .as_mut()
