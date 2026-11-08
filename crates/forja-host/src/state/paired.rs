@@ -19,6 +19,23 @@ impl PagedInput {
         self.checkpoint.logical_len()
     }
 
+    pub(super) fn truncate(&self, end: u64, tokens: u64) -> Result<(), PagePoolError> {
+        let mut sequence = self
+            .sequence
+            .lock()
+            .map_err(|_| PagePoolError::CorruptState)?;
+        if sequence.logical_len() != end || tokens <= self.tokens() || tokens > end {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        if tokens < end {
+            sequence.rewind_private(tokens)?;
+            for dirty in &self.dirty {
+                dirty.store(true, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn restore(self) -> Result<(), PagePoolError> {
         for dirty in &self.dirty {
             dirty.store(true, Ordering::Release);

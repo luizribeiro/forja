@@ -34,7 +34,13 @@ impl StateJournal {
             parser: tokens,
             reserved_tokens: acceptance.position.reserved_tokens,
         };
-        self.sequence.rewind(output)?;
+        let paged = self.retained_paged.as_ref();
+        self.sequence.rewind_with(output, || {
+            if let Some(paged) = paged {
+                paged.truncate(acceptance.position.tokens, tokens)?;
+            }
+            Ok(())
+        })?;
         self.position = position;
         self.phase = SelectionPhase::External;
         self.canonical = CanonicalPosition::Recurrent;

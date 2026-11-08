@@ -161,13 +161,14 @@ impl<B: Backend> StateSequenceHandle<B> {
             .begin_action(serial, Some(position), Some(action))
     }
 
-    /// Publishes protected carry and cursors for accepted row `accepted` of a completed verify.
+    /// Publishes protected carry, paired KV length and cursors for an accepted verify row.
     ///
     /// The row is zero-based: zero publishes the pending input token's state. The next
     /// plain step requires a host-supplied token because verify publishes no feedback.
     ///
     /// # Errors
-    /// Refuses incomplete, foreign or retired transactions and out-of-range rows.
+    /// Refuses incomplete, foreign or retired transactions, out-of-range rows,
+    /// mismatched KV boundaries or shared rejected pages without publishing.
     pub fn publish_accepted(
         &self,
         transaction: &StateTransaction,
