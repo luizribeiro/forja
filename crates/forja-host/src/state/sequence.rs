@@ -149,7 +149,8 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Reserves state and the requested selection boundary in one construction operation.
     ///
     /// # Errors
-    /// Refuses invalid capacity or an unavailable version.
+    /// Refuses invalid capacity or an unavailable version. Verify reserves one output per
+    /// token beyond the current boundary, requires at least two rows, and runs after drain.
     pub fn begin_action_at(
         &self,
         serial: u64,
@@ -202,7 +203,7 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Returns the newest declared cursor boundary, including a pending forward operation.
     ///
     /// # Errors
-    /// Refuses exhausted checkpoint reference counts.
+    /// Refuses exhausted checkpoint reference counts or verify boundaries awaiting acceptance.
     pub fn latest_position(&self) -> Result<LanePosition, PagePoolError> {
         Ok(self.lock().checkpoint_latest()?.position)
     }
@@ -216,7 +217,7 @@ impl<B: Backend> StateSequenceHandle<B> {
     /// Pins the latest declared boundary, which must succeed before it can be restored.
     ///
     /// # Errors
-    /// Refuses exhausted checkpoint counts or a forward boundary awaiting selection.
+    /// Refuses exhausted checkpoint counts or boundaries awaiting selection or acceptance.
     pub fn checkpoint_latest(&self) -> Result<StateLaneCheckpoint, PagePoolError> {
         let checkpoint = self.lock().checkpoint_latest()?;
         if checkpoint.phase == super::journal::SelectionPhase::Awaiting {

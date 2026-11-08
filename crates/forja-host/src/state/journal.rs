@@ -7,6 +7,9 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+#[cfg(test)]
+mod verify_tests;
+
 /// Publication requested by a stateful engine entry point.
 #[derive(Clone, Copy, Debug)]
 pub enum StateAction {
@@ -16,6 +19,8 @@ pub enum StateAction {
     Combined,
     /// Advances carry and awaits a separate token selection.
     Forward,
+    /// Advances a row chain and awaits host acceptance before publishing carry.
+    Verify,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -24,6 +29,7 @@ pub(super) enum SelectionPhase {
     External,
     Ready,
     Awaiting,
+    AwaitingAcceptance,
 }
 
 impl StateAction {
@@ -32,7 +38,21 @@ impl StateAction {
             Self::Step => SelectionPhase::External,
             Self::Combined => SelectionPhase::Ready,
             Self::Forward => SelectionPhase::Awaiting,
+            Self::Verify => SelectionPhase::AwaitingAcceptance,
         }
+    }
+
+    pub(super) fn output_count(self, input: u64, end: u64) -> Result<u32, PagePoolError> {
+        if !matches!(self, Self::Verify) {
+            return Ok(1);
+        }
+        let rows = end
+            .checked_sub(input)
+            .ok_or(PagePoolError::InvalidCheckpoint)?;
+        if rows < 2 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        u32::try_from(rows).map_err(|_| PagePoolError::ArithmeticOverflow)
     }
 }
 
@@ -115,7 +135,10 @@ impl StateJournal {
 
     pub(super) fn ensure_snapshot_idle(&self) -> Result<(), PagePoolError> {
         self.sequence.ensure_idle()?;
-        if !self.pending.is_empty() || self.selection.upgrade().is_some() {
+        if !self.pending.is_empty()
+            || self.phase == SelectionPhase::AwaitingAcceptance
+            || self.selection.upgrade().is_some()
+        {
             return Err(PagePoolError::BankInFlight);
         }
         Ok(())
@@ -148,6 +171,9 @@ impl StateJournal {
         reserved_tokens: u64,
         action: StateAction,
     ) -> Result<StateTransaction, PagePoolError> {
+        if matches!(action, StateAction::Verify) {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
         let input = self.checkpoint_latest()?;
         if u64::try_from(prompt.tokens.len()).map_err(|_| PagePoolError::ArithmeticOverflow)?
             > reserved_tokens
@@ -229,9 +255,7 @@ impl StateJournal {
         position: Option<LanePosition>,
         action: Option<StateAction>,
     ) -> Result<StateTransaction, PagePoolError> {
-        if self.selection.upgrade().is_some() {
-            return Err(PagePoolError::BankInFlight);
-        }
+        self.ensure_action_admissible(action)?;
         self.restore_paged_if_drained()?;
         if self.rollback_paged.is_some() {
             return Err(PagePoolError::BankInFlight);
@@ -259,6 +283,9 @@ impl StateJournal {
         if position.tokens > position.reserved_tokens {
             return Err(PagePoolError::InvalidCheckpoint);
         }
+        let outputs = action.map_or(Ok(1), |action| {
+            action.output_count(input.tokens, position.tokens)
+        })?;
         let checkpoint = self.checkpoint_latest()?;
         let (mut retained, boundary_before) =
             self.retained.take().map_or((None, None), |checkpoint| {
@@ -272,26 +299,27 @@ impl StateJournal {
                     )),
                 )
             });
-        let (transaction, released) = match self
-            .sequence
-            .begin_preserving_checkpoint(serial, &mut retained)
-        {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                self.retained = retained.zip(boundary_before).map(
-                    |(version, (position, feedback, phase, canonical))| {
-                        super::StateLaneCheckpoint {
-                            version,
-                            canonical,
-                            position,
-                            feedback,
-                            phase,
-                        }
-                    },
-                );
-                return Err(error);
-            }
-        };
+        let (transaction, released) =
+            match self
+                .sequence
+                .begin_chain_preserving_checkpoint(serial, outputs, &mut retained)
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.retained = retained.zip(boundary_before).map(
+                        |(version, (position, feedback, phase, canonical))| {
+                            super::StateLaneCheckpoint {
+                                version,
+                                canonical,
+                                position,
+                                feedback,
+                                phase,
+                            }
+                        },
+                    );
+                    return Err(error);
+                }
+            };
         let retired = released.zip(boundary_before).map(
             |(version, (position, feedback, phase, canonical))| RetainedBoundary {
                 version: Some(version),
@@ -503,6 +531,14 @@ impl StateJournal {
     }
 
     pub(super) fn checkpoint_latest(&self) -> Result<super::StateLaneCheckpoint, PagePoolError> {
+        if self.phase == SelectionPhase::AwaitingAcceptance
+            || self
+                .pending
+                .back()
+                .is_some_and(|entry| entry.phase == SelectionPhase::AwaitingAcceptance)
+        {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
         let version = self.sequence.checkpoint_latest()?;
         let feedback = self
             .feedback
@@ -534,7 +570,7 @@ impl StateJournal {
     ) -> Result<super::StateLaneCheckpoint, PagePoolError> {
         if !self.pending.is_empty()
             || self.selection.upgrade().is_some()
-            || self.phase == SelectionPhase::External
+            || !matches!(self.phase, SelectionPhase::Ready | SelectionPhase::Awaiting)
             || start.checked_add(1) != Some(self.position.tokens)
         {
             return Err(PagePoolError::InvalidCheckpoint);
@@ -656,6 +692,25 @@ impl StateJournal {
         self.phase = checkpoint.phase;
         self.canonical = checkpoint.canonical.clone();
         self.retained = None;
+        Ok(())
+    }
+
+    fn ensure_action_admissible(&self, action: Option<StateAction>) -> Result<(), PagePoolError> {
+        if self.selection.upgrade().is_some()
+            || self.phase == SelectionPhase::AwaitingAcceptance
+            || self
+                .pending
+                .iter()
+                .any(|entry| entry.phase == SelectionPhase::AwaitingAcceptance)
+        {
+            return Err(PagePoolError::BankInFlight);
+        }
+        if matches!(action, Some(StateAction::Verify)) {
+            self.ensure_snapshot_idle()?;
+            if self.phase == SelectionPhase::Awaiting {
+                return Err(PagePoolError::InvalidCheckpoint);
+            }
+        }
         Ok(())
     }
 }
