@@ -4,6 +4,7 @@ pub(crate) use attention::costs as attention_cost;
 mod critical;
 pub(crate) use critical::of as critical_path;
 mod row_program;
+mod sampling;
 mod state;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
@@ -18,12 +19,7 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         return state::costs(dispatch).map(|(total, _)| total);
     }
     if matches!(dispatch.op(), Op::Sample { .. } | Op::SampleMasked { .. }) {
-        let visits = dispatch.work()?;
-        cost.scalar_ops = cost.scalar_ops.max(visits.checked_mul(32)?);
-        cost.sfu_ops = cost.sfu_ops.max(visits.checked_mul(4)?);
-        cost.read_bytes = cost
-            .read_bytes
-            .checked_add(visits.checked_mul(dispatch.inputs()[0].layout().dtype().byte_size())?)?;
+        return addressing(dispatch, sampling::of(dispatch, cost)?);
     }
     if matches!(dispatch.op(), Op::Program(_)) {
         return addressing(dispatch, row_program::of(dispatch, cost)?);

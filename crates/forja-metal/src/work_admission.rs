@@ -180,6 +180,8 @@ pub(super) fn predict(
             || matches!(
                 d.op(),
                 Op::RmsNorm { .. }
+                    | Op::Sample { .. }
+                    | Op::SampleMasked { .. }
                     | Op::Matmul
                     | Op::QuantMatmul { .. }
                     | Op::State(StateOp::DeltaRule(_) | StateOp::DeltaRuleBlock(_))
