@@ -8,6 +8,8 @@ use std::{
 
 use crate::{PagePool, PagePoolError, PageTable, PagedMemoryUsage, PagedSequence, StateLayout};
 
+#[cfg(test)]
+mod chain_tests;
 mod checkpoint;
 pub use checkpoint::{ReleasedStateCheckpoint, StateCheckpoint};
 
@@ -178,33 +180,57 @@ impl StateSequence {
     /// Reserves an update from the newest declared predecessor.
     ///
     /// # Errors
-    /// Refuses unordered serials, a third descendant, or reuse before failure drain.
+    /// Refuses unordered serials, exhausted versions, or reuse before failure drain.
     pub fn begin(&mut self, serial: u64) -> Result<StateTransaction, PagePoolError> {
+        self.begin_chain(serial, 1)
+    }
+
+    /// Atomically reserves a nonempty output chain from the newest predecessor.
+    ///
+    /// # Errors
+    /// Refuses empty chains, unordered serials, pinned or pending versions, and failure drain.
+    pub fn begin_chain(
+        &mut self,
+        serial: u64,
+        output_count: u32,
+    ) -> Result<StateTransaction, PagePoolError> {
         if serial <= self.latest_serial {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if self.pending.len() >= self.pins.len() - 1
-            || self.pool.completed.load(Ordering::Acquire) < self.drain_until
-        {
+        if output_count == 0 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        if self.pool.completed.load(Ordering::Acquire) < self.drain_until {
             return Err(PagePoolError::BankInFlight);
         }
         let input = self
             .pending
             .back()
             .map_or(self.committed, StateTransaction::output_version);
-        let output = (0..StatePool::VERSIONS)
-            .find(|&version| {
+        let output_count =
+            usize::try_from(output_count).map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        let mut outputs: Vec<_> = (0..StatePool::VERSIONS)
+            .filter(|&version| {
                 version != self.committed
                     && version != input
                     && self.pins[version as usize].load(Ordering::Acquire) == 0
+                    && !self
+                        .pending
+                        .iter()
+                        .any(|tx| tx.output_versions().any(|output| output == version))
             })
-            .ok_or(PagePoolError::BankInFlight)?;
+            .take(output_count)
+            .collect();
+        if outputs.len() != output_count {
+            return Err(PagePoolError::BankInFlight);
+        }
+        let final_output = outputs.pop().ok_or(PagePoolError::BankInFlight)?;
         let transaction = StateTransaction {
             identity: Arc::clone(&self.identity),
             serial,
             input,
-            preceding_outputs: Vec::new(),
-            final_output: output,
+            preceding_outputs: outputs,
+            final_output,
             submitted: Arc::new(AtomicU64::new(0)),
             bound: Arc::new(AtomicBool::new(false)),
             published: Arc::new(AtomicBool::new(false)),
@@ -372,9 +398,12 @@ impl StateSequence {
     /// Builds the slot-bound input/output allocation table for a live transaction.
     ///
     /// # Errors
-    /// Refuses foreign, retired or already bound transaction capabilities.
+    /// Refuses foreign, retired, multi-output or already bound transaction capabilities.
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
         self.pending_index(transaction)?;
+        if !transaction.preceding_outputs.is_empty() {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
         let table = self.storage.table()?;
         let entries = [transaction.input, transaction.output_version()]
             .iter()
@@ -430,6 +459,37 @@ impl StateSlot {
 mod tests {
     use super::*;
     use crate::{DType, StatePlane};
+
+    #[test]
+    fn chains_reserve_distinct_versions_atomically() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 1, 1024).unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        for (count, error) in [
+            (0, PagePoolError::InvalidCheckpoint),
+            (3, PagePoolError::BankInFlight),
+            (u32::MAX, PagePoolError::BankInFlight),
+        ] {
+            assert_eq!(sequence.begin_chain(1, count).err(), Some(error));
+        }
+        let chain = sequence.begin_chain(1, 2).unwrap();
+        assert_eq!(chain.input_version(), 0);
+        assert_eq!(chain.output_versions().collect::<Vec<_>>(), &[1, 2]);
+        assert!(matches!(
+            sequence.bind(&chain),
+            Err(PagePoolError::InvalidCheckpoint)
+        ));
+        assert_eq!(sequence.begin(2).err(), Some(PagePoolError::BankInFlight));
+        sequence.cancel_unsubmitted(&chain).unwrap();
+        let first = sequence.begin(2).unwrap();
+        assert_eq!(
+            sequence.begin_chain(3, 2).err(),
+            Some(PagePoolError::BankInFlight)
+        );
+        let second = sequence.begin(3).unwrap();
+        assert_eq!(second.input_version(), first.output_version());
+        assert_eq!(second.output_versions().collect::<Vec<_>>(), &[2]);
+    }
 
     #[test]
     fn record_capacity_matches_reserved_versions() {
