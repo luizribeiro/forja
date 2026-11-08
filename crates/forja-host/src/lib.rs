@@ -12547,15 +12547,12 @@ mod tests {
         }
     }
 
-    fn verify_input_fixture(
+    fn verify_input_fixture<B: Backend + 'static>(
+        backend: B,
         rows: u32,
         lanes: u32,
-    ) -> (
-        Host<CpuBackend>,
-        Resource<PagePoolEntry>,
-        Resource<BatchSlotEntry>,
-    ) {
-        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+    ) -> (Host<B>, Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
+        let mut host = Host::new(backend, GENEROUS);
         host.limits.live_tensor_handles = 128;
         let pool = insert_test_pool(&mut host, 2, 33);
         let entry = host.table.get_mut(&pool).unwrap();
@@ -12592,10 +12589,81 @@ mod tests {
         (host, pool, slot)
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_verify_capture_checks_concrete_variant_row_extents() {
+        let (mut host, _pool, slot) =
+            verify_input_fixture(forja_metal::MetalBackend::new().unwrap(), 2, 1);
+        let left = host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks[0]
+            .verify
+            .as_ref()
+            .unwrap()
+            .logits;
+        let weights = host.alloc(compute::Dtype::F32, &[33, 7]).unwrap();
+        let right = host
+            .view(&weights, compute::ViewOp::Permute(vec![1, 0]))
+            .unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[2, 33]).unwrap();
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        let pick = "matmul.gemv-transposed";
+        let error = host
+            .record_metal_variant(
+                &commands,
+                compute::Op::Matmul,
+                &[
+                    Resource::new_borrow(left),
+                    Resource::new_borrow(right.rep()),
+                ],
+                &[Resource::new_borrow(output.rep())],
+                pick,
+            )
+            .unwrap_err();
+        assert!(matches!(error, compute::Error::OpSignature(message)
+            if message.contains("constraint 'm = 1' failed (m was 2)")));
+        assert!(host.table.get(&commands).unwrap().recorded.is_empty());
+        for row in 0..2 {
+            let slice = |width| {
+                compute::ViewOp::Slice(vec![
+                    compute::SliceSpec {
+                        start: row,
+                        len: 1,
+                        step: 1,
+                    },
+                    compute::SliceSpec {
+                        start: 0,
+                        len: width,
+                        step: 1,
+                    },
+                ])
+            };
+            let input_row = host.view(&Resource::new_borrow(left), slice(7)).unwrap();
+            let output_row = host.view(&output, slice(33)).unwrap();
+            host.record_metal_variant(
+                &commands,
+                compute::Op::Matmul,
+                &[input_row, Resource::new_borrow(right.rep())],
+                &[output_row],
+                pick,
+            )
+            .unwrap();
+        }
+        assert_eq!(host.table.get(&commands).unwrap().recorded.len(), 2);
+        host.create_graph(commands).unwrap();
+        assert_eq!(host.engine_metrics().live_graphs, 1);
+    }
+
     #[test]
     fn declared_verify_rows_size_state_and_feedback_spares() {
         for rows in [0_u32, 2, 3, 8] {
-            let (host, _pool, slot) = verify_input_fixture(rows, 1);
+            let (host, _pool, slot) = verify_input_fixture(CpuBackend::new(), rows, 1);
             let inputs = host.table.get(&slot).unwrap().inputs.as_ref().unwrap();
             assert_eq!(
                 inputs.feedback.len(),
@@ -12788,7 +12856,7 @@ mod tests {
 
     #[test]
     fn verify_tokens_stage_by_row_without_touching_peer_buffers() {
-        let (mut host, pool, slot) = verify_input_fixture(3, 8);
+        let (mut host, pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 8);
         let inputs = host.table.get(&slot).unwrap().inputs.as_ref().unwrap();
         let rows = inputs.banks[0].verify.as_ref().unwrap().tokens;
         let untouched = [
@@ -12849,7 +12917,7 @@ mod tests {
 
     #[test]
     fn verify_staging_refusals_preserve_row_storage() {
-        let (mut host, pool, slot) = verify_input_fixture(3, 8);
+        let (mut host, pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 8);
         let rows = host
             .table
             .get(&slot)
