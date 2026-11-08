@@ -17487,4 +17487,21 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_new_load_allows_embed_misses_without_replenishing_pipeline_quota() {
+        use forja_core::Backend;
+        let backend = MetalBackend::with_pipeline_limit(2).unwrap();
+        backend.begin_load().unwrap();
+        backend.pipelines.get("embed", &[(0, 2), (2, 2)]).unwrap();
+        backend.compiler.expire_for_test();
+        backend.begin_load().unwrap();
+        backend.pipelines.get("embed", &[(0, 2), (2, 2)]).unwrap();
+        backend.pipelines.get("copy_contiguous_f32x4", &[]).unwrap();
+        assert_eq!(
+            backend.pipelines.get("rope", &[(0, 0), (2, 0)]).err(),
+            Some(BackendError::QuotaExceeded)
+        );
+    }
+
+
 }

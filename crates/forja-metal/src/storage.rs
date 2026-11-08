@@ -1286,6 +1286,10 @@ impl Backend for MetalBackend {
         self.prepare_scalar_program(program, signature)
     }
 
+    fn begin_load(&self) -> Result<(), BackendError> {
+        self.compiler.begin_load()
+    }
+
     fn prepare_dispatch(&self, dispatch: &forja_core::Dispatch) -> Result<(), BackendError> {
         self.compiler.ensure_enabled()?;
         self.prepare_program_dispatch(dispatch)

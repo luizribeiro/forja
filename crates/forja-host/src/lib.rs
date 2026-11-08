@@ -1358,6 +1358,9 @@ where
             .data_mut()
             .open_weights("engine")
             .map_err(wasmtime::Error::msg)?;
+        if let Err(error) = self.store.data().backend.begin_load() {
+            return Ok(Err(guest_error(error)));
+        }
         let engine = self.instance.l9o_gpu_engine();
         let result = match self
             .store

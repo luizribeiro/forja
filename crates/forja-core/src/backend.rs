@@ -607,6 +607,15 @@ pub trait Submission {
 pub trait Backend {
     /// The completion handle produced by this backend.
     type Submission: Submission;
+
+    /// Starts a host-authorized load with a fresh compiler wall-time allowance.
+    /// Existing pipeline quotas and cached artifacts remain in force.
+    /// # Errors
+    /// Returns an error when the backend cannot start another load.
+    fn begin_load(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Backend state retained by a prepared scalar program.
     type ProgramHandle: Send + Sync + 'static;
 

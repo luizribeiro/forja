@@ -29,6 +29,7 @@ unsafe impl Send for Artifact {}
 pub(super) struct Compiler {
     gate: Mutex<()>,
     remaining: Mutex<Duration>,
+    allowance: Duration,
     disabled: AtomicBool,
 }
 
@@ -40,8 +41,22 @@ impl Compiler {
         Ok(Self {
             gate: Mutex::new(()),
             remaining: Mutex::new(budget),
+            allowance: budget,
             disabled: AtomicBool::new(false),
         })
+    }
+
+    pub(super) fn begin_load(&self) -> Result<(), BackendError> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        *self
+            .remaining
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)? = self.allowance;
+        self.disabled.store(false, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn ensure_enabled(&self) -> Result<(), BackendError> {
@@ -202,6 +217,23 @@ mod tests {
             Err(BackendError::Timeout)
         );
         drop(retained_sender);
+    }
+
+    #[test]
+    fn a_new_load_recovers_its_wall_time_allowance() {
+        let compiler = Compiler::new(Duration::from_secs(60)).unwrap();
+        *compiler.remaining.lock().unwrap() = Duration::ZERO;
+        assert_eq!(
+            compiler.wait::<u8>(|_| panic!("exhausted job started")),
+            Err(BackendError::Timeout)
+        );
+        compiler.begin_load().unwrap();
+        assert_eq!(
+            compiler.wait(|sender| {
+                sender.try_send(Ok(7_u8)).unwrap();
+            }),
+            Ok(7)
+        );
     }
 
     #[test]
