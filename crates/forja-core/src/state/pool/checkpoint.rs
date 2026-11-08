@@ -78,6 +78,19 @@ impl StateSequence {
         serial: u64,
         checkpoint: &mut Option<StateCheckpoint>,
     ) -> Result<(StateTransaction, Option<ReleasedStateCheckpoint>), PagePoolError> {
+        self.begin_chain_preserving_checkpoint(serial, 1, checkpoint)
+    }
+
+    /// Reserves a chain while preserving cancellation rights to its recycled predecessor.
+    ///
+    /// # Errors
+    /// Refuses foreign checkpoints or invalid/unavailable chains without losing the pin.
+    pub fn begin_chain_preserving_checkpoint(
+        &mut self,
+        serial: u64,
+        output_count: u32,
+        checkpoint: &mut Option<StateCheckpoint>,
+    ) -> Result<(StateTransaction, Option<ReleasedStateCheckpoint>), PagePoolError> {
         if checkpoint
             .as_ref()
             .is_some_and(|checkpoint| !Arc::ptr_eq(&self.identity, &checkpoint.identity))
@@ -91,7 +104,7 @@ impl StateSequence {
             serial,
         };
         let mut previous = checkpoint.take().map(release);
-        match self.begin(serial) {
+        match self.begin_chain(serial, output_count) {
             Ok(transaction) => Ok((transaction, previous)),
             Err(error) => {
                 if let Some(previous) = previous.take() {
@@ -226,6 +239,49 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn chain_admission_preserves_pins_on_refusal_and_cancellation() {
+        for spares in [0, 1] {
+            let pool = StatePool::with_spares(
+                StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+                1,
+                spares,
+                65536,
+            )
+            .unwrap();
+            let mut sequence = pool.reserve().unwrap();
+            sequence.reserve_spares().unwrap();
+            let mut retained = Some(sequence.checkpoint().unwrap());
+            let caller = retained.clone();
+            let first = sequence.begin(1).unwrap();
+            sequence.mark_submitted(&first).unwrap();
+            pool.observe_completion(1).unwrap();
+            sequence.finish(&first, true).unwrap();
+            for count in [0, 2 + spares] {
+                assert!(
+                    sequence
+                        .begin_chain_preserving_checkpoint(2, count, &mut retained)
+                        .is_err()
+                );
+                assert_eq!(
+                    retained.as_ref().unwrap().version(),
+                    caller.as_ref().unwrap().version()
+                );
+            }
+            drop(caller);
+            let (chain, mut released) = sequence
+                .begin_chain_preserving_checkpoint(2, 2 + spares, &mut retained)
+                .unwrap();
+            assert!(retained.is_none());
+            let restored = sequence
+                .cancel_preserving_checkpoint(&chain, &mut released)
+                .unwrap()
+                .unwrap();
+            sequence.rewind(&restored).unwrap();
+            assert_eq!(sequence.checkpoint().unwrap().version(), 0);
+        }
+    }
 
     #[test]
     fn idle_check_requires_reservations_and_quarantined_work_to_drain() {
