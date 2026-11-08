@@ -11260,6 +11260,12 @@ mod tests {
         assert_eq!(host.state_slots[&slot.rep()].position(0).unwrap().tokens, 0);
     }
 
+    fn read_input_tensor(host: &Host<CpuBackend>, handle: u32) -> Vec<u8> {
+        host.backend
+            .read(&host.entry(&Resource::new_borrow(handle)).unwrap().tensor)
+            .unwrap()
+    }
+
     fn assert_input_allow_mask(
         host: &Host<CpuBackend>,
         slot: &Resource<super::BatchSlotEntry>,
@@ -11328,11 +11334,7 @@ mod tests {
                 .banks[0];
             (bank.sampling, bank.prompt)
         };
-        let read = |host: &Host<CpuBackend>, handle| {
-            host.backend
-                .read(&host.entry(&Resource::new_borrow(handle)).unwrap().tensor)
-                .unwrap()
-        };
+        let read = read_input_tensor;
         assert_eq!(
             read(&host, prompt),
             [1_u32, 7, 3, 0, 0, 0, 0].map(u32::to_ne_bytes).concat()
