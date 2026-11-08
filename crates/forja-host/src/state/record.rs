@@ -1,5 +1,9 @@
 #[cfg(test)]
+mod metadata_tests;
+#[cfg(test)]
 mod plumbing_tests;
+#[cfg(test)]
+mod test_support;
 
 use super::{StateCharge, StateSequenceHandle, StateStorage, pool_error};
 use crate::{Limits, compute, guest_error, invalid_handle, quota};
@@ -91,7 +95,7 @@ impl<B: Backend> StateStorage<B> {
         transaction: StateTransaction,
         limits: Limits,
     ) -> Result<StateRecording<B>, compute::Error> {
-        let charge = self.command_charge(limits)?;
+        let charge = self.command_charge(limits, transaction.output_versions().count())?;
         self.record_body(sequence, transaction, |access| {
             Ok(StateCommands::empty(self, access, charge, limits))
         })
@@ -104,8 +108,10 @@ impl<B: Backend> StateStorage<B> {
         mut body: StateCommands<B>,
     ) -> Result<StateRecording<B>, compute::Error> {
         let result = self.record_body(sequence, transaction, |access| {
-            if !Arc::ptr_eq(self, &body.storage) {
-                return Err(invalid_handle("state metadata belongs to another storage"));
+            if !Arc::ptr_eq(self, &body.storage) || body.access.chain_len() != access.chain_len() {
+                return Err(invalid_handle(
+                    "state metadata has incompatible storage or chain length",
+                ));
             }
             body.access = access;
             Ok(body)
@@ -140,12 +146,6 @@ impl<B: Backend> StateStorage<B> {
         if access.chain_len() != 1 {
             return Err(invalid_handle("state recording requires a single update"));
         }
-        let table = slot
-            .table()
-            .entries()
-            .iter()
-            .flat_map(|entry| [entry.page(), entry.generation()])
-            .collect::<Vec<_>>();
         let mut body = prepare(access.clone())?;
         body.feedback = sequence
             .lock()
@@ -163,7 +163,7 @@ impl<B: Backend> StateStorage<B> {
             predecessor,
             _drain: sequence.recording_guard().map_err(guest_error)?,
         };
-        recording.initialize_metadata(table, slot.table().generations().to_vec(), true)?;
+        recording.initialize_slot(&slot)?;
         Ok(recording)
     }
     pub(super) fn prepare_record_metadata(
@@ -171,11 +171,8 @@ impl<B: Backend> StateStorage<B> {
         access: StateAccess,
     ) -> Result<StateCommands<B>, compute::Error> {
         self.check_usable()?;
-        if access.chain_len() != 1 {
-            return Err(invalid_handle("state metadata requires a single update"));
-        }
-        let mut commands =
-            StateCommands::empty(self, access, self.command_charge(self.limits)?, self.limits);
+        let charge = self.command_charge(self.limits, access.chain_len())?;
+        let mut commands = StateCommands::empty(self, access, charge, self.limits);
         commands.allocate_metadata()?;
         Ok(commands)
     }
@@ -187,15 +184,28 @@ impl<B: Backend> StateStorage<B> {
         let mut commands = self.prepare_record_metadata(access.inactive())?;
         let records = usize::try_from(self.planes[0].layout().shape()[0])
             .map_err(|_| quota("state metadata exceeds addressable memory"))?;
-        commands.initialize_metadata(vec![u32::MAX; 4], vec![u32::MAX; records], false)?;
+        commands.initialize_metadata(
+            vec![u32::MAX; commands.table_elements()?],
+            vec![u32::MAX; records],
+            false,
+        )?;
         Ok(commands)
     }
 
-    fn command_charge(&self, limits: Limits) -> Result<Arc<StateCharge>, compute::Error> {
+    fn command_charge(
+        &self,
+        limits: Limits,
+        chain_len: usize,
+    ) -> Result<Arc<StateCharge>, compute::Error> {
         let records = self.planes[0].layout().shape()[0];
+        let chain_bytes = u64::try_from(chain_len)
+            .ok()
+            .and_then(|len| len.checked_mul(32))
+            .ok_or_else(|| quota("state chain metadata overflow"))?;
         let bytes = u64::from(records)
             .checked_mul(8)
             .and_then(|n| n.checked_add(1024))
+            .and_then(|n| n.checked_add(chain_bytes))
             .and_then(|n| n.checked_add(super::feedback::FEEDBACK_USE_BYTES))
             .and_then(|n| n.checked_add(u64::try_from(self.planes.len()).ok()?.checked_mul(2048)?))
             .ok_or_else(|| quota("state recording size overflow"))?;
@@ -242,7 +252,11 @@ impl<B: Backend> StateCommands<B> {
             return Err(invalid_handle("incomplete state metadata"));
         }
         let records = self.storage.planes[0].layout().shape()[0];
-        for shape in [vec![2, 2], vec![records], vec![1]] {
+        let rows = u32::try_from(self.access.chain_len())
+            .ok()
+            .and_then(|len| len.checked_mul(2))
+            .ok_or_else(|| quota("state authentication table overflow"))?;
+        for shape in [vec![rows, 2], vec![records], vec![1]] {
             let tensor = self
                 .storage
                 .backend
@@ -263,7 +277,9 @@ impl<B: Backend> StateCommands<B> {
         active: bool,
     ) -> Result<(), compute::Error> {
         let records = self.storage.planes[0].layout().shape()[0];
-        if table.len() != 4 || u32::try_from(generations.len()).ok() != Some(records) {
+        if table.len() != self.table_elements()?
+            || u32::try_from(generations.len()).ok() != Some(records)
+        {
             return Err(invalid_handle(
                 "state authentication metadata has invalid extents",
             ));
@@ -284,6 +300,27 @@ impl<B: Backend> StateCommands<B> {
                 .map_err(guest_error)?;
         }
         Ok(())
+    }
+
+    fn initialize_slot(&mut self, slot: &forja_core::StateSlot) -> Result<(), compute::Error> {
+        let table = slot
+            .table()
+            .entries()
+            .windows(2)
+            .flat_map(|pair| {
+                pair.iter()
+                    .flat_map(|entry| [entry.page(), entry.generation()])
+            })
+            .collect();
+        self.initialize_metadata(table, slot.table().generations().to_vec(), slot.is_active())
+    }
+
+    fn table_elements(&self) -> Result<usize, compute::Error> {
+        u64::try_from(self.access.chain_len())
+            .ok()
+            .and_then(|len| len.checked_mul(4))
+            .and_then(|elements| usize::try_from(elements).ok())
+            .ok_or_else(|| quota("state table size overflow"))
     }
 
     pub(crate) fn release_graph_scratch(&mut self) {
@@ -429,6 +466,9 @@ impl<B: Backend> StateCommands<B> {
         output: &Tensor,
         scratch: Option<&Tensor>,
     ) -> Result<forja_core::Dispatch, compute::Error> {
+        if self.access.chain_len() != 1 {
+            return Err(invalid_handle("state update requires a single destination"));
+        }
         if self.updated.get(plane).copied() != Some(false) {
             return Err(invalid_handle("state plane is unknown or already updated"));
         }
