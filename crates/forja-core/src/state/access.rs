@@ -57,6 +57,30 @@ pub struct StateAccess {
 }
 
 impl StateAccess {
+    /// Builds inactive chain operands for poisoned metadata and graph tracing.
+    ///
+    /// The caller must provide backing for records `0..=output_count`.
+    ///
+    /// # Errors
+    /// Refuses empty chains or chains beyond the padding slot capacity.
+    pub fn poisoned(output_count: u32, output_capacity: u32) -> Result<Self, PagePoolError> {
+        let slot = StateSlot::poisoned(output_count, output_capacity)?;
+        let final_destination = u32::try_from(
+            slot.table()
+                .entries()
+                .len()
+                .checked_sub(1)
+                .ok_or(PagePoolError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| PagePoolError::ArithmeticOverflow)?;
+        Ok(Self {
+            active: false,
+            source: 0,
+            preceding_destinations: (1..final_destination).collect(),
+            final_destination,
+        })
+    }
+
     /// Resolves every allocation generation and requires a nonempty disjoint chain.
     ///
     /// # Errors
@@ -157,5 +181,26 @@ impl StateAccess {
             source,
             destination,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_chains_have_only_inactive_steps() {
+        for count in 1..=7 {
+            let access = StateAccess::poisoned(count, 7).unwrap();
+            assert_eq!(access.chain_len(), count as usize);
+            for index in 0..count as usize {
+                let step = access.step(index).unwrap();
+                assert!(!step.is_active());
+                assert_ne!(step.source(), step.destination());
+            }
+            assert!(access.step(count as usize).is_err());
+        }
+        assert!(StateAccess::poisoned(0, 7).is_err());
+        assert!(StateAccess::poisoned(u32::MAX, 7).is_err());
     }
 }
