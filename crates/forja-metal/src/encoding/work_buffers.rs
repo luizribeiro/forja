@@ -364,6 +364,110 @@ pub(super) fn merge_profiles(
 mod tests {
     use super::*;
     #[test]
+    fn default_limits_admit_real_attention_chunks_after_query_splitting() {
+        let backend = MetalBackend::new().unwrap();
+        for (heads, width, dtype, queries, keys, variant) in [
+            (
+                16_u32,
+                128,
+                DType::F16,
+                4096,
+                4096_u32,
+                "paged-sdpa.steel-half",
+            ),
+            (16, 128, DType::F16, 4096, 16384, "paged-sdpa.steel-half"),
+            (
+                16,
+                128,
+                DType::F16,
+                4096,
+                262_144,
+                "paged-sdpa.steel-bounded",
+            ),
+            (
+                16,
+                128,
+                DType::F16,
+                1,
+                262_144,
+                "paged-sdpa.vector-gqa-two-pass-1024",
+            ),
+            (24, 128, DType::F32, 1, 262_144, "paged-sdpa.steel-bounded"),
+            (
+                24,
+                256,
+                DType::F32,
+                1,
+                262_144,
+                "paged-sdpa.steel-bounded-256",
+            ),
+        ] {
+            assert_attention_admitted(&backend, (heads, width, dtype, queries, keys, variant));
+        }
+    }
+    fn assert_attention_admitted(backend: &MetalBackend, case: (u32, u32, DType, u32, u32, &str)) {
+        use forja_core::{Backend, BackendDispatchData};
+        let (heads, width, dtype, queries, keys, variant) = case;
+        let pages = keys.div_ceil(128);
+        let input = [
+            backend.alloc(DType::F32, &[heads, queries, width]).unwrap(),
+            backend.alloc(dtype, &[pages, 128, 8, width]).unwrap(),
+            backend.alloc(dtype, &[pages, 128, 8, width]).unwrap(),
+            backend.alloc(DType::U32, &[pages, 2]).unwrap(),
+            backend.alloc(DType::U32, &[pages]).unwrap(),
+        ];
+        let output = backend.alloc(DType::F32, &[heads, queries, width]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::PagedSdpa {
+                    scale: 1.0,
+                    causal: true,
+                    q_start: keys - queries,
+                    key_length: keys,
+                    page_tokens: 128,
+                },
+                &input.iter().collect::<Vec<_>>(),
+                &output,
+            )
+            .unwrap();
+        let selection = backend
+            .validate_variant(commands.last_dispatch().unwrap(), variant)
+            .unwrap();
+        commands.set_last_backend_data(BackendDispatchData::new(selection));
+        let buffers = loop {
+            let prepared = backend
+                .prepare_commands::<false>(
+                    commands.clone(),
+                    None,
+                    None,
+                    ProfileTimestampGranularity::Precise,
+                )
+                .unwrap();
+            if let Some(split) = backend
+                .split_oversized_outputs(
+                    &commands,
+                    &prepared.predictions,
+                    prepared.reserve,
+                    backend.work_limits,
+                )
+                .unwrap()
+            {
+                commands = split;
+            } else {
+                break partition(&prepared.predictions, backend.work_limits, prepared.reserve)
+                    .unwrap()
+                    .len();
+            }
+        };
+        assert!(buffers > 0);
+        drop(commands);
+        for tensor in input.iter().chain(std::iter::once(&output)) {
+            backend.release(tensor).unwrap();
+        }
+    }
+
+    #[test]
     fn partition_checks_dispatch_buffer_and_submission_limits() {
         let limits = forja_core::GpuWorkLimits::new(
             Duration::from_secs(1),
