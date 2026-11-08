@@ -123,12 +123,13 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 fn engine_step_impl() -> proc_macro2::TokenStream {
     quote! {
             async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
+                let phase = phase(input.phase)?;
                 let tokens = token_tensor(&input.tokens)?;
                 let output = with_engine(|engine| {
                     <ExportedEngine as ::forja_sdk::Engine>::step(
                         engine,
                         ::forja_sdk::StepInput {
-                            phase: phase(input.phase),
+                            phase,
                             tokens,
                             start_pos: input.start_pos,
                             taps: input.taps,
@@ -191,12 +192,13 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
             #step
 
             async fn decode(input: DecodeIn) -> ::std::result::Result<DecodeOut, compute::Error> {
+                let phase = phase(input.phase)?;
                 let tokens = input.tokens.as_deref().map(token_tensor).transpose()?;
                 let output = with_engine(|engine| {
                     <ExportedEngine as ::forja_sdk::Engine>::decode(
                         engine,
                         ::forja_sdk::DecodeInput {
-                            phase: phase(input.phase),
+                            phase,
                             tokens,
                             start_pos: input.start_pos,
                             sampling: sampling(input.sampling),
@@ -276,7 +278,7 @@ fn engine_batch_exports() -> proc_macro2::TokenStream {
             input: BatchSelectIn,
         ) -> ::std::result::Result<BatchOut, compute::Error> {
             let vocab = <ExportedEngine as ::forja_sdk::Engine>::describe().vocab;
-            let shape = batch_shape(input.shape);
+            let shape = batch_shape(input.shape)?;
             let dimensions = vec![shape.bucket, vocab];
             let elements = u64::from(shape.bucket).checked_mul(u64::from(vocab))
                 .ok_or_else(|| compute::Error::Layout("batch logits element count overflowed".into()))?;
@@ -324,6 +326,7 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             slot: &'a ::forja_sdk::__private::paged_storage::BatchSlot,
             input: BatchIn,
         ) -> ::std::result::Result<::forja_sdk::BatchInput<'a>, compute::Error> {
+            let shape = batch_shape(input.shape)?;
             let lanes = input.lanes.into_iter().map(|lane| lane.map(|lane| {
                 Ok(::forja_sdk::BatchLane {
                     slot: lane.slot,
@@ -334,7 +337,7 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             }).transpose()).collect::<::std::result::Result<Vec<_>, compute::Error>>()?;
             Ok(::forja_sdk::BatchInput {
                 slot: ::forja_sdk::PagedSlot::from_guest(slot),
-                shape: batch_shape(input.shape),
+                shape,
                 lanes,
             })
         }
@@ -350,18 +353,18 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             }
         }
 
-        fn phase(value: bindings::exports::l9o::gpu::engine::BatchPhase) -> ::forja_sdk::BatchPhase {
-            match value {
+        fn phase(value: bindings::exports::l9o::gpu::engine::BatchPhase) -> ::std::result::Result<::forja_sdk::BatchPhase, compute::Error> {
+            Ok(match value {
                 bindings::exports::l9o::gpu::engine::BatchPhase::Prompt => ::forja_sdk::BatchPhase::Prompt,
                 bindings::exports::l9o::gpu::engine::BatchPhase::Decode => ::forja_sdk::BatchPhase::Decode,
-            }
+            })
         }
 
         fn batch_shape(
             value: bindings::exports::l9o::gpu::engine::BatchShape,
-        ) -> ::forja_sdk::BatchShape {
-            ::forja_sdk::BatchShape {
-                phase: phase(value.phase),
+        ) -> ::std::result::Result<::forja_sdk::BatchShape, compute::Error> {
+            Ok(::forja_sdk::BatchShape {
+                phase: phase(value.phase)?,
                 bucket: value.bucket,
                 tokens: value.tokens,
                 selection: match value.selection {
@@ -369,7 +372,7 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
                     bindings::exports::l9o::gpu::engine::BatchSelection::Forward => ::forja_sdk::BatchSelection::Forward,
                     bindings::exports::l9o::gpu::engine::BatchSelection::Masked => ::forja_sdk::BatchSelection::Masked,
                 },
-            }
+            })
         }
     }
 }
@@ -410,11 +413,12 @@ fn engine_decode_phases() -> proc_macro2::TokenStream {
             start_pos: u32,
             phase_value: bindings::exports::l9o::gpu::engine::BatchPhase,
         ) -> ::std::result::Result<compute::Tensor, compute::Error> {
+            let phase = phase(phase_value)?;
             let tokens = tokens.as_deref().map(token_tensor).transpose()?;
             let logits = with_engine(|engine| {
                 <ExportedEngine as ::forja_sdk::Engine>::begin_decode(
                     engine,
-                    ::forja_sdk::BeginDecodeInput { tokens, start_pos, phase: phase(phase_value) },
+                    ::forja_sdk::BeginDecodeInput { tokens, start_pos, phase },
                 )
             })?;
             ::forja_sdk::eval().map_err(wit_error)?;
