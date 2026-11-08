@@ -866,7 +866,7 @@ impl PagedSequence {
             return Err(PagePoolError::InvalidCheckpoint);
         }
         let page_tokens = u64::from(self.pool.layout().page_tokens());
-        let first = usize::try_from(logical_len.div_ceil(page_tokens))
+        let first = usize::try_from(logical_len / page_tokens)
             .map_err(|_| PagePoolError::ArithmeticOverflow)?;
         let last = usize::try_from(self.logical_len.div_ceil(page_tokens))
             .map_err(|_| PagePoolError::ArithmeticOverflow)?;
@@ -1596,6 +1596,21 @@ mod tests {
 
         assert_eq!(sequence.logical_len(), 12);
         assert_eq!(sequence.reserved_tokens(), 12);
+    }
+
+    #[test]
+    fn private_rewind_refuses_shared_rejected_rows_within_a_page() {
+        for (end, cut) in [(7, 5), (7, 4), (8, 7), (9, 7)] {
+            let pool = pool(4_096);
+            let mut sequence = pool.reserve(12).unwrap();
+            sequence.commit_write(end).unwrap();
+            let sibling = sequence.fork(end).unwrap();
+            let before = sequence.table().unwrap();
+            assert_eq!(sequence.rewind_private(cut), Err(PagePoolError::SharedTail));
+            assert_eq!(sequence.logical_len(), end);
+            assert_eq!(sequence.table().unwrap(), before);
+            assert_eq!(sibling.logical_len(), end);
+        }
     }
 
     #[test]
