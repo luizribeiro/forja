@@ -236,6 +236,16 @@ pub struct BatchShape {
     pub selection: BatchSelection,
 }
 
+impl BatchShape {
+    fn output_rows(self) -> u32 {
+        if self.phase == BatchPhase::Verify {
+            self.tokens
+        } else {
+            self.bucket
+        }
+    }
+}
+
 /// One cache plane whose dtype is selected by the engine load profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachePlane {
@@ -1087,22 +1097,22 @@ pub fn validate_batch_lanes(
     Ok(appended)
 }
 
-/// Validates the two bucket-shaped tensors returned by a batch export.
+/// Validates lane- or verify-row-shaped tensors returned by a batch export.
 #[doc(hidden)]
 pub fn validate_batch_output_layouts(
     logits: (DType, &[u32]),
     tokens: (DType, &[u32]),
-    bucket: u32,
+    rows: u32,
     vocab: u32,
 ) -> Result<(), compute::Error> {
-    if logits.0 != DType::F32 || logits.1 != [bucket, vocab] {
+    if logits.0 != DType::F32 || logits.1 != [rows, vocab] {
         return Err(compute::Error::Layout(format!(
-            "batch logits must be f32 [{bucket}, {vocab}]"
+            "batch logits must be f32 [{rows}, {vocab}]"
         )));
     }
-    if tokens.0 != DType::U32 || tokens.1 != [bucket] {
+    if tokens.0 != DType::U32 || tokens.1 != [rows] {
         return Err(compute::Error::Layout(format!(
-            "batch tokens must be u32 [{bucket}]"
+            "batch tokens must be u32 [{rows}]"
         )));
     }
     Ok(())
@@ -2228,7 +2238,7 @@ where
             self.rollback_batch_appends(pool, &mut checkpoints)?;
             return Ok(Err(error));
         }
-        let bucket = input.shape.bucket;
+        let rows = input.shape.output_rows();
         let wit_input = input.into();
         self.set_guest_deadline();
         let engine = self.instance.l9o_gpu_engine();
@@ -2258,7 +2268,7 @@ where
             }
         };
         let handles = vec![logits.rep(), tokens.rep()];
-        if let Err(error) = self.validate_batch_output(&info, bucket, &logits, &tokens) {
+        if let Err(error) = self.validate_batch_output(&info, rows, &logits, &tokens) {
             self.rollback_batch_appends(pool, &mut checkpoints)?;
             let error = self.release_handles(handles).err().unwrap_or(error);
             return Ok(Err(error));
@@ -3275,7 +3285,7 @@ where
     fn validate_batch_output(
         &self,
         info: &EngineInfo,
-        bucket: u32,
+        rows: u32,
         logits: &Resource<TensorEntry>,
         tokens: &Resource<TensorEntry>,
     ) -> Result<(), compute::Error> {
@@ -3289,7 +3299,7 @@ where
             tokens.tensor.layout().dtype(),
             tokens.tensor.layout().shape(),
         );
-        validate_batch_output_layouts(logits, tokens, bucket, info.vocab)
+        validate_batch_output_layouts(logits, tokens, rows, info.vocab)
     }
 
     fn validate_batch_logits(
@@ -13083,6 +13093,38 @@ mod tests {
             );
         }
         assert!(validate(Some(EngineBatchLane { slot: 8, ..lane })).is_err());
+    }
+
+    #[test]
+    fn verify_outputs_use_verification_rows() {
+        let shape = BatchShape {
+            phase: BatchPhase::Verify,
+            bucket: 1,
+            tokens: 3,
+            selection: BatchSelection::Combined,
+        };
+        assert_eq!(shape.output_rows(), 3);
+        assert_eq!(
+            BatchShape {
+                phase: BatchPhase::Decode,
+                bucket: 2,
+                tokens: 1,
+                ..shape
+            }
+            .output_rows(),
+            2
+        );
+        assert!(
+            validate_batch_output_layouts((DType::F32, &[3, 4]), (DType::U32, &[3]), 3, 4).is_ok()
+        );
+        for (logits, tokens) in [
+            ((DType::F32, &[1, 4][..]), (DType::U32, &[3][..])),
+            ((DType::F32, &[3, 4][..]), (DType::U32, &[1][..])),
+            ((DType::F16, &[3, 4][..]), (DType::U32, &[3][..])),
+            ((DType::F32, &[3, 4][..]), (DType::F32, &[3][..])),
+        ] {
+            assert!(validate_batch_output_layouts(logits, tokens, 3, 4).is_err());
+        }
     }
 
     #[test]
