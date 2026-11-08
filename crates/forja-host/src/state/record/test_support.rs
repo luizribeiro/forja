@@ -103,6 +103,16 @@ impl<B: Backend + 'static> Fixture<B> {
             .unwrap();
     }
 
+    pub(super) fn corrupt_word(&self, tensor: &Tensor, index: usize) {
+        let mut bytes = self.host.backend.read(tensor).unwrap();
+        let start = index.checked_mul(size_of::<u32>()).unwrap();
+        let end = start.checked_add(size_of::<u32>()).unwrap();
+        let word = bytes.get_mut(start..end).unwrap();
+        let generation = u32::from_le_bytes((&*word).try_into().unwrap()) ^ 1;
+        word.copy_from_slice(&generation.to_le_bytes());
+        self.host.backend.write(tensor, &bytes).unwrap();
+    }
+
     pub(super) fn read_outputs(&self) -> Vec<Vec<Vec<u8>>> {
         self.outputs
             .iter()

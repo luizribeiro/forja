@@ -585,6 +585,40 @@ mod tests {
     }
 
     #[test]
+    fn access_refuses_stale_generation_at_each_chain_position() {
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 4096).unwrap();
+        let _other = pool.reserve().unwrap();
+        let mut lane = pool.reserve().unwrap();
+        let tx = lane.begin_chain(1, 2).unwrap();
+        let slot = lane.bind(&tx).unwrap();
+        for index in 0..slot.table().entries().len() {
+            let mut stale = slot.clone();
+            let mut entries = slot.table().entries().to_vec();
+            entries[index] = crate::PageTableEntry::new(0, crate::paged::POISON_GENERATION);
+            stale.table =
+                PageTable::from_padded(entries, slot.table().generations().to_vec()).unwrap();
+            for logical in 0..3 {
+                if usize::try_from(logical).unwrap() == index {
+                    assert_eq!(
+                        stale.table().resolve(logical),
+                        Err(crate::PageTableError::StaleGeneration)
+                    );
+                } else {
+                    assert_eq!(
+                        stale.table().resolve(logical),
+                        slot.table().resolve(logical)
+                    );
+                }
+            }
+            assert_eq!(
+                crate::StateAccess::from_slot(&stale),
+                Err(PagePoolError::CorruptState)
+            );
+        }
+    }
+
+    #[test]
     fn record_capacity_matches_reserved_versions() {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
         let pool = StatePool::new(layout, 2, 1024).unwrap();

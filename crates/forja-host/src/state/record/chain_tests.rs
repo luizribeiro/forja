@@ -136,39 +136,49 @@ fn submissions_require_exactly_the_chain_length_on_every_plane() {
 }
 
 fn corrupted_link<B: Backend + 'static>(backend: impl Fn() -> B) {
-    for table in [false, true] {
+    enum Corruption {
+        Generation(usize),
+        Table,
+    }
+    for corruption in [
+        Corruption::Generation(0),
+        Corruption::Generation(1),
+        Corruption::Generation(2),
+        Corruption::Table,
+    ] {
         let f = Fixture::new(backend());
         let mut lane = f.reserve();
         let mut chain = f.commands(&mut lane, 1, 2);
         f.update(&mut chain, 0);
         f.update(&mut chain, 1);
-        if table {
-            let first = f.host.backend.read(&chain.table_view(0).unwrap()).unwrap();
-            f.host
-                .backend
-                .write(&chain.table_view(1).unwrap(), &first)
-                .unwrap();
-        } else {
-            let mut generations = f.host.backend.read(&chain.metadata[1]).unwrap();
-            let offset = usize::try_from(chain.access.destination()).unwrap() * 4;
-            generations[offset..offset + 4].fill(0);
-            f.host
-                .backend
-                .write(&chain.metadata[1], &generations)
-                .unwrap();
+        match corruption {
+            Corruption::Table => {
+                let first = f.host.backend.read(&chain.table_view(0).unwrap()).unwrap();
+                f.host
+                    .backend
+                    .write(&chain.table_view(1).unwrap(), &first)
+                    .unwrap();
+            }
+            Corruption::Generation(index) => {
+                let record = std::iter::once(chain.access.source())
+                    .chain(chain.access.destinations())
+                    .nth(index)
+                    .unwrap();
+                f.corrupt_word(&chain.metadata[1], usize::try_from(record).unwrap());
+            }
         }
         assert!(f.execute_result(chain).is_err());
     }
 }
 
 #[test]
-fn chained_updates_refuse_corrupt_later_authentication() {
+fn chained_updates_refuse_corrupt_authentication_at_every_link() {
     corrupted_link(forja_cpu::CpuBackend::new);
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn metal_chained_updates_refuse_corrupt_later_authentication() {
+fn metal_chained_updates_refuse_corrupt_authentication_at_every_link() {
     corrupted_link(|| forja_metal::MetalBackend::new().unwrap());
 }
 

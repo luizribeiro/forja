@@ -47,3 +47,31 @@ fn captured_chains_rebind_every_link_without_double_counting() {
 fn metal_captured_chains_rebind_every_link_without_double_counting() {
     rebind_chain(forja_metal::MetalBackend::new().unwrap());
 }
+
+fn stale_middle_link<B: Backend + Send + Sync + 'static>(backend: B) {
+    let f = Fixture::new(backend);
+    let mut original_lane = f.reserve();
+    let mut original = f.commands(&mut original_lane, 1, 2);
+    f.update(&mut original, 0);
+    f.update(&mut original, 1);
+    let capture = original.capture().unwrap();
+    let mut rebound_lane = f.reserve();
+    let mut rebound = f.commands(&mut rebound_lane, 1, 2);
+    let bindings = capture.bind(&mut rebound).unwrap();
+    f.corrupt_word(&rebound.table_view(1).unwrap(), 1);
+    rebound.commands = bindings
+        .apply(std::mem::take(&mut original.commands))
+        .unwrap();
+    assert!(f.execute_result(rebound).is_err());
+}
+
+#[test]
+fn rebound_middle_link_refuses_a_stale_source_generation() {
+    stale_middle_link(forja_cpu::CpuBackend::new());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_rebound_middle_link_refuses_a_stale_source_generation() {
+    stale_middle_link(forja_metal::MetalBackend::new().unwrap());
+}
