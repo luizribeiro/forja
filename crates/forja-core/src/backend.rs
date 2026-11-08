@@ -449,6 +449,10 @@ pub struct DispatchProfile {
     pub alternatives: Vec<&'static str>,
     /// Actual encoded GPU launches, including composite internals.
     pub physical_dispatches: u64,
+    /// Encoded workgroups, including bounded indirect grids.
+    pub physical_threadgroups: u64,
+    /// Calibrated admission forecast for this dispatch.
+    pub predicted_gpu: Duration,
     /// Arithmetic type used by the backend, independently of tensor storage types.
     pub compute_dtype: crate::DType,
     /// Logical operation cost, independent of tile padding.
@@ -495,6 +499,12 @@ pub struct KernelProfile {
 /// Host phases and device timings from one profiled submission.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SubmissionProfile {
+    /// Raw calibration and conservative rates used for admission.
+    pub work_calibration: Option<Arc<crate::WorkCalibration>>,
+    /// Summed admission forecast across all command buffers.
+    pub predicted_gpu: Duration,
+    /// Number of sequential command buffers.
+    pub command_buffers: u64,
     /// Scalar-program dispatch recording on the submitting thread.
     pub program_recording: ProfileCount,
     /// Scalar-program dispatch encoding on the submitting thread.

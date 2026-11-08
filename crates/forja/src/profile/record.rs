@@ -17,7 +17,9 @@ pub(super) fn timeline(dispatches: &[DispatchProfile]) -> Result<Vec<Value>, &'s
             "op": super::op_name(dispatch.op), "kernel": dispatch.kernel,
             "variant": dispatch.variant, "alternatives": dispatch.alternatives,
             "shape": super::shape(dispatch), "cost": dispatch.cost.json(), "scheduled_cost": dispatch.scheduled_cost.json(), "critical_path_cost": dispatch.critical_path_cost.json(), "padded_flops": dispatch.padded_flops,
-            "physical_dispatches": dispatch.physical_dispatches,
+            "physical_dispatches": dispatch.physical_dispatches, "physical_threadgroups": dispatch.physical_threadgroups,
+            "predicted_gpu_seconds": dispatch.predicted_gpu.as_secs_f64(),
+            "measured_predicted_ratio": (!dispatch.predicted_gpu.is_zero()).then(|| dispatch.gpu_time.as_secs_f64()/dispatch.predicted_gpu.as_secs_f64()),
             "register_spill_risk": register_pressure(dispatch, dispatch.kernel),
             "compute_dtype": super::dtype_name(dispatch.compute_dtype),
             "start_seconds": dispatch.gpu_start.as_secs_f64(), "end_seconds": dispatch.gpu_end.as_secs_f64(),
@@ -46,6 +48,8 @@ pub(super) fn submissions(
         }
         Ok(json!({"index": index, "phase": {"mode": super::mode_name(mode), "context": context, "query_tokens": queries},
             "gpu_time_seconds": submission.gpu_time.as_secs_f64(),
+            "admission_calibration": submission.work_calibration.as_ref().map(|c| c.json()),
+            "predicted_gpu_seconds": submission.predicted_gpu.as_secs_f64(), "command_buffers": submission.command_buffers,
             "host_phases": {
                 "validation_seconds": submission.validation.as_secs_f64(),
                 "encoding_seconds": submission.encoding.as_secs_f64(),

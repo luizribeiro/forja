@@ -154,6 +154,17 @@ pub(in crate::encoding) fn fold_profiles(
                 .checked_add(profiles[member].cost)
                 .ok_or(BackendError::InvalidInput)?;
             profiles[member].cost = forja_core::KernelCost::default();
+            profiles[index].scheduled_cost = profiles[index]
+                .scheduled_cost
+                .checked_add(profiles[member].scheduled_cost)
+                .ok_or(BackendError::InvalidInput)?;
+            profiles[index].predicted_gpu = profiles[index]
+                .predicted_gpu
+                .checked_add(profiles[member].predicted_gpu)
+                .ok_or(BackendError::InvalidInput)?;
+            profiles[member].scheduled_cost = forja_core::KernelCost::default();
+            profiles[member].critical_path_cost = forja_core::KernelCost::default();
+            profiles[member].predicted_gpu = std::time::Duration::ZERO;
             for bound in 0..2 {
                 profiles[index].padded_flops[bound] = profiles[index].padded_flops[bound]
                     .checked_add(profiles[member].padded_flops[bound])
@@ -200,6 +211,44 @@ mod tests {
         .unwrap();
         commands.set_last_backend_data(BackendDispatchData::new(variant));
         commands.into_dispatches().remove(0)
+    }
+
+    #[test]
+    fn coalesced_lane_profiles_preserve_forecasts_without_hidden_work() {
+        let backend = forja_cpu::CpuBackend::new();
+        let dispatches = [convolution(&backend, 33), convolution(&backend, 33)];
+        let mut profiles = dispatches
+            .iter()
+            .enumerate()
+            .map(|(index, dispatch)| {
+                let mut profile =
+                    crate::encoding::dispatch_profile(dispatch, false, u64::from(index == 0))
+                        .unwrap();
+                profile.predicted_gpu = std::time::Duration::from_millis(7);
+                profile
+            })
+            .collect::<Vec<_>>();
+        let expected = profiles[0]
+            .scheduled_cost
+            .checked_add(profiles[1].scheduled_cost)
+            .unwrap();
+        let critical = profiles[0].critical_path_cost;
+        fold_profiles(&dispatches, &mut profiles).unwrap();
+        assert_eq!(profiles[0].scheduled_cost, expected);
+        assert_eq!(profiles[0].critical_path_cost, critical);
+        assert_eq!(
+            profiles[0].predicted_gpu,
+            std::time::Duration::from_millis(14)
+        );
+        assert_eq!(
+            profiles[1].scheduled_cost,
+            forja_core::KernelCost::default()
+        );
+        assert_eq!(
+            profiles[1].critical_path_cost,
+            forja_core::KernelCost::default()
+        );
+        assert_eq!(profiles[1].predicted_gpu, std::time::Duration::ZERO);
     }
 
     #[test]

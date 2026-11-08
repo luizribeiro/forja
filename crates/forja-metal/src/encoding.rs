@@ -2865,6 +2865,17 @@ impl MetalBackend {
         #[cfg(test)]
         let submit_started = Instant::now();
         self.compiler.ensure_enabled()?;
+        let work_calibration = if PROFILE
+            && !crate::work_admission::calibrating()
+            && !commands
+                .dispatches()
+                .iter()
+                .all(crate::work_admission::trusted_probe)
+        {
+            Some(crate::work_admission::calibration(self)?)
+        } else {
+            None
+        };
         self.in_flight.drain_done();
         let validation_started = PROFILE.then(Instant::now);
         let program_recording = commands.program_recording();
@@ -2993,7 +3004,8 @@ impl MetalBackend {
             Vec::new()
         };
         let physical_counts = std::mem::take(&mut encoded.physical_counts);
-        debug_assert_eq!(encoded.launch_work.len(), dispatches.len());
+        let launch_work = std::mem::take(&mut encoded.launch_work);
+        debug_assert_eq!(launch_work.len(), dispatches.len());
         let resources =
             self.command_resources(&tensors, encoded, graph.map(|prepared| &prepared.buffers))?;
         objects.programs = prepared_programs;
@@ -3014,8 +3026,19 @@ impl MetalBackend {
                 .iter()
                 .zip(&barriers)
                 .zip(&physical_counts)
-                .map(|((dispatch, &barrier), &count)| {
+                .zip(&launch_work)
+                .map(|(((dispatch, &barrier), &count), work)| {
                     let mut profile = dispatch_profile(dispatch, barrier, count)?;
+                    profile.physical_threadgroups = work.groups;
+                    if let Some(rates) = &work_calibration {
+                        profile.predicted_gpu = crate::work_admission::predict(
+                            rates,
+                            dispatch,
+                            work.launches,
+                            work.groups,
+                            work.threads,
+                        )?;
+                    }
                     facts
                         .refine(dispatch, &mut profile.cost)
                         .ok_or(BackendError::InvalidInput)?;
@@ -3025,6 +3048,17 @@ impl MetalBackend {
         } else {
             Vec::new()
         };
+        if let Some(profile) = &mut profile {
+            profile.work_calibration = work_calibration;
+            profile.command_buffers = 1;
+            profile.predicted_gpu =
+                dispatch_profiles
+                    .iter()
+                    .try_fold(Duration::ZERO, |sum, p| {
+                        sum.checked_add(p.predicted_gpu)
+                            .ok_or(BackendError::InvalidInput)
+                    })?;
+        }
         if PROFILE {
             state::fold_profiles(&dispatches, &mut dispatch_profiles)?;
         }
@@ -8579,6 +8613,8 @@ fn dispatch_profile(
     Ok(DispatchProfile {
         compute_dtype,
         physical_dispatches,
+        physical_threadgroups: 0,
+        predicted_gpu: Duration::ZERO,
         scope: dispatch.profile_scope().map(|scope| scope.as_ref().clone()),
         variant,
         alternatives,

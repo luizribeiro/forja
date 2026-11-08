@@ -297,6 +297,7 @@ impl MetalBackend {
         repetitions: u32,
         mut commands: impl FnMut() -> Result<CommandList, BackendError>,
     ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let _scope = crate::work_admission::CalibrationScope::enter();
         if repetitions == 0 {
             return Err(BackendError::InvalidInput);
         }

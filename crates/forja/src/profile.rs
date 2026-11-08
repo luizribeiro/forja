@@ -506,6 +506,8 @@ mod tests {
             kernel: "test",
             compute_dtype: DType::F32,
             physical_dispatches: 1,
+            physical_threadgroups: 0,
+            predicted_gpu: Duration::ZERO,
             variant: None,
             alternatives: Vec::new(),
             cost: forja_core::KernelCost::default(),
