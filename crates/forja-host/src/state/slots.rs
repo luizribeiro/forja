@@ -12,7 +12,7 @@ use super::{
     pool_error,
 };
 use crate::{compute, invalid_handle};
-use forja_core::{Backend, StateStep};
+use forja_core::{Backend, StateAccess};
 use std::sync::Arc;
 
 struct Lane<B: Backend> {
@@ -26,7 +26,7 @@ struct Lane<B: Backend> {
 pub struct StateSlots<B: Backend> {
     storage: Arc<StateStorage<B>>,
     feedback: Option<super::feedback::FeedbackBinding>,
-    inactive_access: StateStep,
+    inactive_access: StateAccess,
     lanes: Vec<Lane<B>>,
     banks: [Vec<Option<StateRecording<B>>>; 2],
     padding: [Vec<Option<StateCommands<B>>>; 2],
@@ -39,7 +39,7 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses metadata or backend allocation beyond the existing storage budget.
     pub fn trace(&self) -> Result<super::StateTrace<B>, compute::Error> {
-        super::StateTrace::new(&self.storage, self.inactive_access, self.lanes.len())
+        super::StateTrace::new(&self.storage, &self.inactive_access, self.lanes.len())
     }
 
     pub(crate) fn plane_count(&self) -> usize {
@@ -59,7 +59,7 @@ impl<B: Backend> StateSlots<B> {
             .collect::<Result<Vec<_>, _>>()?;
         let transaction = reserved[0].begin(1).map_err(pool_error)?;
         let inactive_access =
-            StateStep::from_slot(&reserved[0].bind(&transaction).map_err(pool_error)?)
+            StateAccess::from_slot(&reserved[0].bind(&transaction).map_err(pool_error)?)
                 .map_err(pool_error)?;
         reserved[0]
             .cancel_unsubmitted(&transaction)
@@ -97,7 +97,7 @@ impl<B: Backend> StateSlots<B> {
     /// # Errors
     /// Refuses quota or metadata allocation failure.
     pub fn inactive(&self) -> Result<StateCommands<B>, compute::Error> {
-        self.storage.inactive_commands(self.inactive_access)
+        self.storage.inactive_commands(self.inactive_access.clone())
     }
 
     /// Reserves and zeroes all three versions before admitting a new request.
@@ -188,7 +188,9 @@ impl<B: Backend> StateSlots<B> {
                 "state bank is occupied or its cursor exceeds capacity",
             ));
         }
-        let prepared = self.storage.prepare_record_metadata(self.inactive_access)?;
+        let prepared = self
+            .storage
+            .prepare_record_metadata(self.inactive_access.clone())?;
         let fresh = self.lanes[lane].sequence.is_none();
         if fresh {
             self.admit_reserved(lane, position.reserved_tokens)?;

@@ -1,6 +1,6 @@
 use super::{StateCharge, StateCommands, StateStorage};
 use crate::{compute, invalid_handle};
-use forja_core::{Backend, StateStep};
+use forja_core::{Backend, StateAccess};
 use std::{
     any::Any,
     sync::{Arc, Mutex, MutexGuard},
@@ -58,7 +58,7 @@ impl SharedStateTrace {
 impl<B: Backend> StateTrace<B> {
     pub(super) fn new(
         storage: &Arc<StateStorage<B>>,
-        access: StateStep,
+        access: &StateAccess,
         lanes: usize,
     ) -> Result<Self, compute::Error> {
         if lanes == 0 {
@@ -76,7 +76,7 @@ impl<B: Backend> StateTrace<B> {
             bytes,
         )?;
         let lanes = (0..lanes)
-            .map(|_| storage.inactive_commands(access))
+            .map(|_| storage.inactive_commands(access.clone()))
             .collect::<Result<_, _>>()?;
         Ok(Self {
             lanes,
@@ -143,7 +143,7 @@ mod tests {
         let mut slots = StateSlots::new(Arc::clone(&storage), 1).unwrap();
         let before = host.live_bytes.load(std::sync::atomic::Ordering::Acquire);
         let mut first = slots.trace().unwrap();
-        assert!(StateTrace::new(&storage, first.lane(0).unwrap().access, usize::MAX).is_err());
+        assert!(StateTrace::new(&storage, &first.lane(0).unwrap().access, usize::MAX).is_err());
         let mut second = slots.trace().unwrap();
         let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
         let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();

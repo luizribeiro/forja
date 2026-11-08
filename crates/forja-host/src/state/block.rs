@@ -54,7 +54,7 @@ impl<B: Backend + 'static> StateCommands<B> {
         let scratch = self.block_workspace(layout.elements())?;
         let mut dispatch = self.prepare_update(
             plane,
-            StateOp::DeltaRuleBlock(self.access),
+            StateOp::DeltaRuleBlock(self.access.step(0).map_err(super::pool_error)?),
             &inputs,
             output,
             Some(&scratch.tensor),

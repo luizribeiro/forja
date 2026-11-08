@@ -1,12 +1,12 @@
 use super::StateCommands;
 use crate::{compute, invalid_handle};
-use forja_core::{Backend, CompletionResource, ReplayBindings, StateStep, Tensor};
+use forja_core::{Backend, CompletionResource, ReplayBindings, StateAccess, Tensor};
 use std::sync::Arc;
 
 /// Protected graph bindings whose ownership excludes a request's sequence reservation.
 #[derive(Clone)]
 pub struct StateCapture {
-    access: StateStep,
+    access: StateAccess,
     planes: Vec<[Tensor; 2]>,
     metadata: Vec<Tensor>,
     updated: Vec<bool>,
@@ -31,6 +31,9 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
     /// # Errors
     /// Returns an error if any protected plane view cannot be constructed.
     pub fn capture(&self) -> Result<StateCapture, compute::Error> {
+        if self.access.chain_len() != 1 {
+            return Err(invalid_handle("captured state requires a single update"));
+        }
         let planes = (0..self.updated.len())
             .map(|plane| {
                 Ok([
@@ -41,7 +44,7 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
             })
             .collect::<Result<_, compute::Error>>()?;
         Ok(StateCapture {
-            access: self.access,
+            access: self.access.clone(),
             planes,
             metadata: self.metadata.to_vec(),
             updated: self.updated.clone(),
@@ -89,7 +92,8 @@ impl StateCapture {
         recording: &mut StateCommands<B>,
     ) -> Result<ReplayBindings, compute::Error> {
         let same_recording = self.metadata.as_slice() == &**recording.metadata;
-        if self.planes.len() != recording.updated.len()
+        if recording.access.chain_len() != 1
+            || self.planes.len() != recording.updated.len()
             || self.metadata.len() != recording.metadata.len()
             || (!same_recording
                 && self
@@ -113,7 +117,11 @@ impl StateCapture {
             }
         }
         bindings
-            .state_table(self.metadata[0].clone(), recording.access, views)
+            .state_table(
+                self.metadata[0].clone(),
+                recording.access.step(0).map_err(super::pool_error)?,
+                views,
+            )
             .map_err(invalid_handle)?;
         for (old, new) in self.metadata.iter().zip(recording.metadata.iter()) {
             bindings
