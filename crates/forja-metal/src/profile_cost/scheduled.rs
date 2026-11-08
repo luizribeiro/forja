@@ -41,6 +41,9 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         cost.flops = 0;
         return scalar_issue_work(dispatch, addressing(dispatch, cost)?);
     }
+    let address_base = addressing(dispatch, cost)?
+        .scalar_ops
+        .checked_sub(cost.scalar_ops)?;
     let flops = *model.padded_flops(dispatch, cost)?.get(1)?;
     let input_values = flops.checked_div(2)?.checked_div(columns)?;
     let weight_values = flops.checked_div(2)?.checked_div(rows)?;
@@ -66,7 +69,53 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .checked_add(input_bytes)?
         .checked_add(weight_bytes)?;
     cost.flops = flops;
+    if matches!(
+        crate::encoding::selected_variant(dispatch),
+        Some(
+            crate::variants::MetalVariant::QuantMatmulTiled
+                | crate::variants::MetalVariant::QuantMatmulTiledK64
+        )
+    ) {
+        cost.scalar_ops =
+            cost.scalar_ops
+                .checked_add(address_base)?
+                .checked_add(quantized_loader_addresses(
+                    dispatch,
+                    model.tile,
+                    input_values,
+                    weight_values,
+                )?)?;
+        return Some(cost);
+    }
     scalar_issue_work(dispatch, addressing(dispatch, cost)?)
+}
+
+fn quantized_loader_addresses(
+    dispatch: &Dispatch,
+    tile: [u32; 3],
+    inputs: u64,
+    weights: u64,
+) -> Option<u64> {
+    let Op::QuantMatmul { bits, .. } = dispatch.op() else {
+        return None;
+    };
+    let layout = dispatch.inputs().first()?.layout();
+    let shape = layout.shape();
+    let rows = u64::from(*shape.first()?);
+    let inner = u64::from(*shape.get(1)?);
+    let vector = 16_u64.checked_div(layout.dtype().byte_size())?;
+    let wide = rows.checked_rem(u64::from(tile[0]))? == 0
+        && inner.checked_rem(u64::from(tile[2]))? == 0
+        && forja_core::ByteAlignment::of(layout.byte_span().start).supports(16)
+        && layout.strides().first()?.checked_rem(vector)? == 0
+        && *layout.strides().get(1)? == 1;
+    let input_groups = inputs.div_ceil(if wide { vector } else { 1 });
+    let words = weights.div_ceil(32_u64.checked_div(u64::from(bits))?);
+    // Each packed word loads three affine addresses before decoding its values.
+    input_groups
+        .checked_add(words.checked_mul(3)?)?
+        .checked_add(dispatch.output().layout().element_count())?
+        .checked_mul(32)
 }
 
 fn scalar_issue_work(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
@@ -372,9 +421,66 @@ mod tests {
     }
 
     #[test]
+    fn tiled_loader_prices_guarded_scalar_accesses_for_shifted_or_strided_views() {
+        use forja_core::{Slice, ViewOp};
+        let cpu = CpuBackend::new();
+        for (dtype, padding, shift) in [
+            (DType::F32, 0_u32, 0_u32),
+            (DType::BF16, 0, 0),
+            (DType::F32, 1, 0),
+            (DType::BF16, 1, 1),
+        ] {
+            let storage = cpu.alloc(dtype, &[32, 1024 + padding]).unwrap();
+            let input = cpu
+                .view(
+                    &storage,
+                    ViewOp::Slice(vec![
+                        Slice::new(0, 32, 1).unwrap(),
+                        Slice::new(shift, 1024, 1).unwrap(),
+                    ]),
+                )
+                .unwrap();
+            let packed = cpu.alloc(DType::U32, &[33, 128]).unwrap();
+            let scale = cpu.alloc(DType::BF16, &[33, 16]).unwrap();
+            let output = cpu.alloc(dtype, &[32, 33]).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    Op::QuantMatmul {
+                        bits: 4,
+                        group_size: 64,
+                    },
+                    &[&input, &packed, &scale, &scale],
+                    &output,
+                )
+                .unwrap();
+            let dispatch = commands.last_dispatch().unwrap();
+            let mut calls = 0;
+            for _ in 0..2 {
+                for _ in 0..16 {
+                    for _ in 0..128 {
+                        let values = 16;
+                        calls += if padding == 0 {
+                            values / (16 / dtype.byte_size())
+                        } else {
+                            values
+                        };
+                        calls += 32 * 64 / 8 / 128 * 3;
+                    }
+                }
+            }
+            calls += 32 * 33;
+            assert_eq!(
+                quantized_loader_addresses(dispatch, [32, 32, 64], 2 * 32 * 1024, 2 * 32 * 1024),
+                Some(calls * 32)
+            );
+        }
+    }
+
+    #[test]
     fn quantized_schedule_counts_decode_calls_per_tile_and_trip() {
         let backend = CpuBackend::new();
-        for rows in [16, 33, 65] {
+        for rows in [16, 32, 33, 64, 65] {
             for columns in [1, 7, 33] {
                 let input = backend.alloc(DType::F32, &[rows, 1024]).unwrap();
                 let packed = backend.alloc(DType::U32, &[columns, 128]).unwrap();
@@ -414,6 +520,18 @@ mod tests {
                         }
                     }
                 }
+                let expected_addresses = (input_loads / if rows % 32 == 0 { 4 } else { 1 }
+                    + decoded / 8 * 3
+                    + u64::from(rows) * u64::from(columns))
+                    * 32;
+                assert_eq!(
+                    quantized_loader_addresses(dispatch, [32, 32, 32], input_loads, decoded),
+                    Some(expected_addresses)
+                );
+                assert!(
+                    quantized_loader_addresses(dispatch, [0, 32, 32], input_loads, decoded)
+                        .is_none()
+                );
                 let logical = super::super::of(dispatch).unwrap();
                 let scheduled = of(dispatch).unwrap();
                 assert_eq!(scheduled.flops, decoded * 32 * 2);
