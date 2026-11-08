@@ -39,7 +39,7 @@ pub use cost::{
 };
 pub use forja_mmap::MappedRegion;
 pub use graph::{
-    GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, TemplateOp,
+    GraphError, GraphLimits, GraphMemoryPlan, GraphTemplate, PreparedGraph, RuleKey, TemplateOp,
     TemplateTensor,
 };
 mod written_ranges;

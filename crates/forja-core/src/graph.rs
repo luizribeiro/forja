@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
+    ops::RangeInclusive,
     sync::{Arc, Mutex},
 };
 
@@ -885,6 +886,41 @@ impl DynamicDispatch {
     }
 }
 
+/// A variant-rule key evaluated as a replay parameter plus a row offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuleKey {
+    /// The index of the replay parameter.
+    pub parameter: u8,
+    /// The nonnegative offset added before selecting an inclusive rule arm.
+    pub row_offset: u32,
+}
+
+impl RuleKey {
+    fn evaluate(self, value: u32) -> Result<u32, ParamError> {
+        u64::from(value)
+            .checked_add(u64::from(self.row_offset))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(ParamError::ArithmeticOverflow)
+    }
+
+    fn range(self, space: &ParamSpace) -> Result<RangeInclusive<u32>, GraphError> {
+        let range = space
+            .ranges()
+            .get(usize::from(self.parameter))
+            .ok_or(GraphError::ParameterSpaceMismatch)?;
+        Ok(self.evaluate(*range.start())?..=self.evaluate(*range.end())?)
+    }
+}
+
+impl From<u8> for RuleKey {
+    fn from(parameter: u8) -> Self {
+        Self {
+            parameter,
+            row_offset: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum TemplateDispatch {
     Static(Box<Dispatch>),
@@ -894,7 +930,7 @@ enum TemplateDispatch {
     },
     Rule {
         dispatch: DynamicDispatch,
-        parameter: u8,
+        key: RuleKey,
         arms: Vec<(u32, BackendDispatchData)>,
     },
 }
@@ -959,11 +995,11 @@ impl TemplateDispatch {
             },
             Self::Rule {
                 dispatch,
-                parameter,
+                key,
                 arms,
             } => Self::Rule {
                 dispatch: dynamic(dispatch)?,
-                parameter: *parameter,
+                key: *key,
                 arms: arms.clone(),
             },
         })
@@ -1274,7 +1310,7 @@ impl GraphTemplate {
             })
     }
 
-    /// Instantiates one backend-preparation candidate for every fixed selection and rule arm.
+    /// Instantiates a backend-preparation candidate for each fixed selection and reachable rule arm.
     #[doc(hidden)]
     pub fn backend_dispatch_candidates(&self) -> Result<Vec<(usize, bool, Dispatch)>, GraphError> {
         let lower = self.space.values(
@@ -1305,22 +1341,28 @@ impl GraphTemplate {
                 }
                 TemplateDispatch::Rule {
                     dispatch,
-                    parameter,
+                    key,
                     arms,
                 } => {
-                    let slot = usize::from(*parameter);
+                    let slot = usize::from(key.parameter);
                     let mut values = lower.as_slice().to_vec();
-                    let mut lo = *self.space.ranges()[slot].start();
+                    let range = key.range(&self.space)?;
+                    let mut lo = *range.start();
                     for (hi, data) in arms {
-                        if lo > *hi || !self.space.ranges()[slot].contains(&lo) {
-                            return Err(GraphError::ParameterSpaceMismatch);
+                        if lo > *hi {
+                            continue;
                         }
-                        values[slot] = lo;
+                        values[slot] = lo
+                            .checked_sub(key.row_offset)
+                            .ok_or(ParamError::ArithmeticOverflow)?;
                         let concrete = dispatch
                             .instantiate_checked(&self.space.values(values.clone())?, self.limits)?
                             .with_backend_data(data.clone());
                         candidates.push((index, true, concrete));
-                        lo = hi.saturating_add(1);
+                        if *hi >= *range.end() {
+                            break;
+                        }
+                        lo = hi.checked_add(1).ok_or(ParamError::ArithmeticOverflow)?;
                     }
                 }
             }
@@ -1393,14 +1435,17 @@ impl GraphTemplate {
         )
     }
 
-    /// Validates and records an operation selected by replay parameter intervals.
+    /// Validates and records an operation selected by affine replay-key intervals.
+    ///
+    /// A parameter index alone selects a zero-offset key. Arm bounds apply to the key value.
+    /// Bounds must strictly increase and cover the shifted range; addition must fit `u32`.
     #[doc(hidden)]
     pub fn dispatch_variant_rule_many(
         &mut self,
         op: impl Into<TemplateOp>,
         inputs: &[&TemplateTensor],
         outputs: &[&TemplateTensor],
-        parameter: u8,
+        key: impl Into<RuleKey>,
         arms: Vec<(u32, BackendDispatchData)>,
     ) -> Result<(), GraphError> {
         self.record_rule(
@@ -1409,7 +1454,7 @@ impl GraphTemplate {
                 inputs: inputs.iter().map(|tensor| (*tensor).clone()).collect(),
                 outputs: outputs.iter().map(|tensor| (*tensor).clone()).collect(),
             },
-            parameter,
+            key.into(),
             arms,
         )
     }
@@ -1466,7 +1511,9 @@ impl GraphTemplate {
         self.record_epilogue(op, inputs, output, epilogue, extras, Some(data))
     }
 
-    /// Records an epilogue-bearing primitive selected by replay parameter intervals.
+    /// Records an epilogue-bearing primitive selected by affine replay-key intervals.
+    ///
+    /// Keys and arm bounds follow [`Self::dispatch_variant_rule_many`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_epilogue_variant_rule(
@@ -1476,11 +1523,11 @@ impl GraphTemplate {
         output: &TemplateTensor,
         epilogue: &Arc<PreparedEpilogue>,
         extras: &[&TemplateTensor],
-        parameter: u8,
+        key: impl Into<RuleKey>,
         arms: Vec<(u32, BackendDispatchData)>,
     ) -> Result<(), GraphError> {
         let dispatch = epilogue_dispatch(op, inputs, output, epilogue, extras);
-        self.record_rule(dispatch, parameter, arms)
+        self.record_rule(dispatch, key.into(), arms)
     }
 
     fn record_epilogue(
@@ -1543,16 +1590,17 @@ impl GraphTemplate {
                 }
                 TemplateDispatch::Rule {
                     dispatch,
-                    parameter,
+                    key,
                     arms,
                 } => {
                     let value = values
                         .as_slice()
-                        .get(usize::from(*parameter))
+                        .get(usize::from(key.parameter))
                         .ok_or(GraphError::ParameterSpaceMismatch)?;
+                    let value = key.evaluate(*value)?;
                     let data = arms
                         .iter()
-                        .find(|(hi, _)| value <= hi)
+                        .find(|(hi, _)| value <= *hi)
                         .map(|(_, data)| data.clone())
                         .ok_or(GraphError::ParameterSpaceMismatch)?;
                     dispatch.instantiate(values)?.with_backend_data(data)
@@ -1619,16 +1667,17 @@ impl GraphTemplate {
     fn record_rule(
         &mut self,
         dispatch: DynamicDispatch,
-        parameter: u8,
+        key: RuleKey,
         arms: Vec<(u32, BackendDispatchData)>,
     ) -> Result<(), GraphError> {
         self.work_cache = Arc::new(Mutex::new(work::WorkCache::default()));
         if self.dispatches.len() >= self.limits.dispatches {
             return Err(GraphError::DispatchLimit);
         }
-        if arms.is_empty()
+        let range = key.range(&self.space)?;
+        if arms.last().is_none_or(|(hi, _)| *hi < *range.end())
+            || arms.windows(2).any(|pair| pair[0].0 >= pair[1].0)
             || !dispatch.uses_only(&self.space)
-            || usize::from(parameter) >= self.space.ranges().len()
         {
             return Err(GraphError::ParameterSpaceMismatch);
         }
@@ -1645,7 +1694,7 @@ impl GraphTemplate {
         }
         self.dispatches.push(TemplateDispatch::Rule {
             dispatch,
-            parameter,
+            key,
             arms,
         });
         self.record_accesses(accesses, hull_accesses);
@@ -1921,7 +1970,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        GraphError, GraphLimits, GraphTemplate, TemplateDispatch, TemplateOp, TemplateTensor,
+        GraphError, GraphLimits, GraphTemplate, RuleKey, TemplateDispatch, TemplateOp,
+        TemplateTensor,
     };
     use crate::{
         Affine, BackendDispatchData, BufferId, CommandList, DType, Dispatch, Layout, Op, OpError,
@@ -2138,6 +2188,155 @@ mod tests {
         );
     }
 
+    fn record_copy_rule(
+        graph: &mut GraphTemplate,
+        key: RuleKey,
+        bounds: &[u32],
+    ) -> Result<(), GraphError> {
+        graph.dispatch_variant_rule_many(
+            Op::Copy,
+            &[&tensor(1, &[7, 33]).into()],
+            &[&tensor(2, &[7, 33]).into()],
+            key,
+            bounds
+                .iter()
+                .map(|&hi| (hi, BackendDispatchData::new(hi)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn affine_rules_match_zero_offset_selection_across_boundaries() {
+        let space = ParamSpace::new(vec![7..=7, 1..=4097]).unwrap();
+        let bounds = [510, 1022, 3071, 4099];
+        let mut plain = GraphTemplate::new(space.clone(), GraphLimits::default());
+        record_copy_rule(&mut plain, 1.into(), &bounds).unwrap();
+        for row_offset in 0..=2 {
+            let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+            record_copy_rule(
+                &mut graph,
+                RuleKey {
+                    parameter: 1,
+                    row_offset,
+                },
+                &bounds,
+            )
+            .unwrap();
+            for start in [
+                1, 509, 510, 511, 512, 1021, 1022, 1023, 1024, 3070, 3071, 3072, 3073,
+            ] {
+                let shifted = graph
+                    .instantiate(&space.values(vec![7, start]).unwrap())
+                    .unwrap();
+                let plain = plain
+                    .instantiate(&space.values(vec![7, start + row_offset]).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    shifted.dispatches()[0].backend_data::<u32>(),
+                    plain.dispatches()[0].backend_data::<u32>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn affine_rule_keys_refuse_invalid_recordings() {
+        let mismatch = GraphError::ParameterSpaceMismatch;
+        let overflow = GraphError::Parameter(ParamError::ArithmeticOverflow);
+        for (range, parameter, row_offset, bounds, expected) in [
+            (1..=7, 1, 0, &[7][..], mismatch.clone()),
+            (1..=u32::MAX, 0, 1, &[u32::MAX][..], overflow.clone()),
+            (1..=7, 0, u32::MAX, &[u32::MAX][..], overflow),
+            (1..=7, 0, 1, &[7][..], mismatch.clone()),
+            (1..=7, 0, 0, &[][..], mismatch.clone()),
+            (1..=7, 0, 0, &[7, 7][..], mismatch.clone()),
+            (1..=7, 0, 0, &[7, 6, 8][..], mismatch),
+        ] {
+            let space = ParamSpace::new(vec![range]).unwrap();
+            let mut graph = GraphTemplate::new(space, GraphLimits::default());
+            let key = RuleKey {
+                parameter,
+                row_offset,
+            };
+            assert_eq!(record_copy_rule(&mut graph, key, bounds), Err(expected));
+            assert!(graph.is_empty());
+            assert_eq!(graph.required_barriers(), [false; 0]);
+        }
+    }
+
+    #[test]
+    fn affine_rule_candidates_use_unshifted_layout_parameters() {
+        let space = ParamSpace::new(std::iter::once(509..=512).collect()).unwrap();
+        let rows = Affine::parameter(0, 0, 1);
+        let input = symbolic_prefix(1, &[512, 7], space.clone(), rows);
+        let output = symbolic_prefix(2, &[512, 7], space.clone(), rows);
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+        graph
+            .dispatch_variant_rule_many(
+                Op::Copy,
+                &[&input],
+                &[&output],
+                RuleKey {
+                    parameter: 0,
+                    row_offset: 2,
+                },
+                [510, 511, 513, 1022, 4097]
+                    .into_iter()
+                    .map(|hi| (hi, BackendDispatchData::new(hi)))
+                    .collect(),
+            )
+            .unwrap();
+        let candidates = graph.backend_dispatch_candidates().unwrap();
+        let actual = candidates
+            .iter()
+            .map(|(site, dynamic, dispatch)| {
+                assert_eq!((*site, *dynamic), (0, true));
+                (
+                    *dispatch.backend_data::<u32>().unwrap(),
+                    dispatch.outputs()[0].layout().shape()[0],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, [(511, 509), (513, 510), (1022, 512)]);
+    }
+
+    #[test]
+    fn affine_rules_preserve_maximum_keys_when_rebound() {
+        let space = ParamSpace::new(std::iter::once(0..=1).collect()).unwrap();
+        let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
+        record_copy_rule(
+            &mut graph,
+            RuleKey {
+                parameter: 0,
+                row_offset: u32::MAX - 1,
+            },
+            &[u32::MAX - 1, u32::MAX],
+        )
+        .unwrap();
+        graph
+            .dispatch(
+                Op::Copy,
+                &[&tensor(2, &[7, 33]).into()],
+                &tensor(3, &[7, 33]).into(),
+            )
+            .unwrap();
+        let plan = graph.plan_memory(&HashSet::new()).unwrap();
+        assert!(plan.offset(tensor(2, &[7, 33]).buffer()).is_some());
+        let arena = tensor(4, &[u32::try_from(plan.arena_bytes() / 4).unwrap()]);
+        let rebound = graph.bind_memory(&plan, &arena).unwrap();
+        assert_eq!(rebound.backend_dispatch_candidates().unwrap().len(), 3);
+        for value in 0..=1 {
+            let replay = rebound
+                .instantiate(&space.values(vec![value]).unwrap())
+                .unwrap();
+            assert_eq!(
+                replay.dispatches()[0].backend_data::<u32>(),
+                Some(&(u32::MAX - 1 + value))
+            );
+            assert_eq!(replay.dispatches()[0].outputs()[0].buffer(), arena.buffer());
+        }
+    }
+
     fn symbolic_prefix(
         buffer: u64,
         shape: &[u32],
@@ -2232,15 +2431,18 @@ mod tests {
                 &output,
                 &epilogue,
                 &[&extra],
-                0,
+                RuleKey {
+                    parameter: 0,
+                    row_offset: 1,
+                },
                 vec![
-                    (1, BackendDispatchData::new("single")),
-                    (7, BackendDispatchData::new("batch")),
+                    (2, BackendDispatchData::new("single")),
+                    (8, BackendDispatchData::new("batch")),
                 ],
             )
             .unwrap();
 
-        for (rows, expected) in [(1, "single"), (7, "batch")] {
+        for (rows, expected) in [(1, "single"), (2, "batch"), (7, "batch")] {
             let replay = graph
                 .instantiate(&space.values(vec![rows]).unwrap())
                 .unwrap();
