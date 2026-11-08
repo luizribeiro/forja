@@ -1,3 +1,4 @@
+mod journal_tests;
 mod replay_tests;
 
 use super::{test_support::Fixture, *};

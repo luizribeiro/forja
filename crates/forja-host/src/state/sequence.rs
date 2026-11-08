@@ -161,6 +161,20 @@ impl<B: Backend> StateSequenceHandle<B> {
             .begin_action(serial, Some(position), Some(action))
     }
 
+    /// Publishes protected carry and cursors for accepted row `accepted` of a completed verify.
+    ///
+    /// The row is zero-based: zero publishes the pending input token's state.
+    ///
+    /// # Errors
+    /// Refuses incomplete, foreign or retired transactions and out-of-range rows.
+    pub fn publish_accepted(
+        &self,
+        transaction: &StateTransaction,
+        accepted: u32,
+    ) -> Result<(), PagePoolError> {
+        self.lock().publish_accepted(transaction, accepted)
+    }
+
     /// Whether this sequence still represents its initial, unmodified state.
     ///
     /// # Errors

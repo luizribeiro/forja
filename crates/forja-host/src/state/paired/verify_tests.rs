@@ -5,7 +5,7 @@ use forja_core::{DType, PagePool, PagedLayout, PagedPlane, StateLayout, StatePla
 #[test]
 fn unpublished_verify_restores_paired_state_and_paged_input() {
     for rows in [2_u32, 3] {
-        for outcome in [0, 1, 2, 3, 5] {
+        for outcome in 0..6 {
             let pool = StatePool::with_spares(
                 StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
                 1,
@@ -79,10 +79,15 @@ fn unpublished_verify_restores_paired_state_and_paged_input() {
                     } else {
                         assert_eq!(kv.lock().unwrap().logical_len(), u64::from(rows));
                         match outcome {
+                            2 => journal.cancel_unsubmitted(&tx).unwrap(),
                             3 => journal
                                 .restore_with(&input, || kv.lock().unwrap().rollback(caller))
                                 .unwrap(),
-                            _ => journal.cancel_unsubmitted(&tx).unwrap(),
+                            _ => {
+                                journal.publish_accepted(&tx, rows - 1).unwrap();
+                                assert_eq!(journal.position.tokens, u64::from(rows));
+                                journal.rewind(0).unwrap();
+                            }
                         }
                     }
                 }
@@ -92,6 +97,7 @@ fn unpublished_verify_restores_paired_state_and_paged_input() {
             if outcome != 3 {
                 assert!(dirty.iter().all(|flag| flag.load(Ordering::Acquire)));
             }
+            assert!(journal.publish_accepted(&tx, 0).is_err());
             assert_eq!(
                 journal.checkpoint_latest().unwrap().version.version(),
                 input.version.version()

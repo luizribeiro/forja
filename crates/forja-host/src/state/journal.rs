@@ -7,6 +7,7 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+mod verify;
 #[cfg(test)]
 mod verify_tests;
 
@@ -94,8 +95,8 @@ struct Pending {
 
 struct Acceptance {
     transaction: StateTransaction,
-    _outputs: Vec<forja_core::StateCheckpoint>,
-    _position: LanePosition,
+    outputs: Vec<forja_core::StateCheckpoint>,
+    position: LanePosition,
     outcome: Arc<StateOutcome>,
 }
 
@@ -456,8 +457,8 @@ impl StateJournal {
                 if let Some(outputs) = outputs {
                     self.acceptance = Some(Acceptance {
                         transaction: transaction.clone(),
-                        _outputs: outputs,
-                        _position: entry.position,
+                        outputs,
+                        position: entry.position,
                         outcome: entry.outcome,
                     });
                 } else {

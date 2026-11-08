@@ -165,3 +165,88 @@ fn verify_execution_failure_preserves_source_after_physical_drain() {
         }
     }
 }
+
+#[test]
+fn verify_waits_for_acceptance_and_publishes_every_cut_atomically() {
+    for rows in [2, 3] {
+        for accepted in 0..rows {
+            let (pool, mut journal) = fixture(rows);
+            let input = journal.checkpoint_latest().unwrap();
+            let chain = verify(&mut journal, 2, rows);
+            let output = chain
+                .output_versions()
+                .nth(usize::try_from(accepted).unwrap())
+                .unwrap();
+            assert!(journal.publish_accepted(&chain, accepted).is_err());
+            assert!(journal.checkpoint_latest().is_err());
+            assert!(journal.begin(3, None).is_err());
+            journal.mark_submitted(&chain).unwrap();
+            assert!(journal.finish(&chain, true).is_err());
+            pool.observe_completion(2).unwrap();
+            journal.finish(&chain, true).unwrap();
+            assert_eq!(journal.position, input.position);
+            assert_eq!(journal.phase, SelectionPhase::AwaitingAcceptance);
+            assert!(journal.checkpoint_latest().is_err());
+            assert!(journal.ensure_quiescent().is_err());
+            assert!(journal.canonical_boundary().is_err());
+            assert!(journal.reserve_selection(32, &Arc::new(())).is_err());
+            assert!(journal.begin(3, None).is_err());
+            assert!(journal.publish_accepted(&chain, rows).is_err());
+            let foreign = pool.reserve().unwrap().begin(2).unwrap();
+            assert!(journal.publish_accepted(&foreign, accepted).is_err());
+            journal.publish_accepted(&chain, accepted).unwrap();
+            let tokens = 34 + u64::from(accepted);
+            assert_eq!(
+                journal.position,
+                LanePosition {
+                    tokens,
+                    sampler: tokens.checked_sub(1).unwrap(),
+                    grammar: tokens,
+                    parser: tokens,
+                    ..position(tokens)
+                }
+            );
+            assert_eq!(
+                journal.checkpoint_latest().unwrap().version.version(),
+                output
+            );
+            assert_eq!(journal.phase, SelectionPhase::External);
+            assert!(journal.canonical_boundary().unwrap().is_none());
+            assert!(journal.publish_accepted(&chain, accepted).is_err());
+            journal.rewind(33).unwrap();
+            assert_eq!(journal.position, input.position);
+            assert_eq!(journal.phase, input.phase);
+        }
+    }
+}
+
+#[test]
+fn failed_restore_preserves_acceptance_and_repeated_rounds_retire_unused_rows() {
+    for rows in [2, 3] {
+        let (pool, mut journal) = fixture(rows);
+        let input = journal.checkpoint_latest().unwrap();
+        let chain = verify(&mut journal, 2, rows);
+        journal.mark_submitted(&chain).unwrap();
+        pool.observe_completion(2).unwrap();
+        journal.finish(&chain, true).unwrap();
+        assert!(
+            journal
+                .restore_with(&input, || Err(PagePoolError::InvalidCheckpoint))
+                .is_err()
+        );
+        assert_eq!(journal.position, input.position);
+        assert!(journal.checkpoint_latest().is_err());
+        journal.publish_accepted(&chain, 0).unwrap();
+        drop(input);
+        for serial in 3..=9 {
+            let start = journal.position.tokens;
+            let chain = verify(&mut journal, serial, rows);
+            journal.mark_submitted(&chain).unwrap();
+            pool.observe_completion(serial).unwrap();
+            journal.finish(&chain, true).unwrap();
+            let accepted = u32::try_from(serial).unwrap() % rows;
+            journal.publish_accepted(&chain, accepted).unwrap();
+            assert_eq!(journal.position.tokens, start + u64::from(accepted) + 1);
+        }
+    }
+}
