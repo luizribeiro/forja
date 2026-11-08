@@ -129,6 +129,17 @@ pub(super) struct FeedbackBoundary {
 }
 
 impl LaneFeedback {
+    pub(super) fn without_spares(&self) -> Result<Self, PagePoolError> {
+        let records = self
+            .records
+            .get(..StatePool::VERSIONS as usize)
+            .ok_or(PagePoolError::CorruptState)?;
+        Ok(Self {
+            binding: self.binding.clone(),
+            records: records.into(),
+        })
+    }
+
     pub(super) fn rebind(&mut self, sequence: &StateSequence) -> Result<(), PagePoolError> {
         *self = Self::new(self.binding.clone(), sequence)?;
         Ok(())

@@ -201,6 +201,20 @@ impl StateJournal {
         Ok(())
     }
 
+    pub(super) fn release_spares_with_feedback(&mut self) -> Result<(), PagePoolError> {
+        let feedback = self
+            .feedback
+            .as_ref()
+            .map(super::feedback::LaneFeedback::without_spares)
+            .transpose()?;
+        let previous = std::mem::replace(&mut self.feedback, feedback);
+        if let Err(error) = self.sequence.release_spares() {
+            self.feedback = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn begin(
         &mut self,
         serial: u64,
@@ -650,6 +664,67 @@ impl StateJournal {
 mod tests {
     use super::*;
     use forja_core::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn failed_feedback_refresh_never_leaves_released_records_in_the_lane_map() {
+        use crate::{Host, Limits, state::feedback::FeedbackBinding};
+        for release in [false, true] {
+            let host = Host::new(
+                forja_cpu::CpuBackend::new(),
+                Limits::new(65536, 8, 4096, 128, 4096),
+            );
+            let storage = host
+                .create_state_storage_with_spares(
+                    StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap(),
+                    2,
+                    1,
+                )
+                .unwrap();
+            let sequence = storage.reserve().unwrap();
+            let waiting = storage.reserve().unwrap();
+            let binding = FeedbackBinding::with_spares(&host, 2, 1).unwrap();
+            sequence.lock().attach_feedback(binding.clone()).unwrap();
+            if release {
+                assert!(sequence.try_reserve_spares().unwrap());
+            }
+            assert!(
+                std::panic::catch_unwind(|| {
+                    let _guard = binding.versions.lock().unwrap();
+                    panic!("injected feedback failure");
+                })
+                .is_err()
+            );
+            assert_eq!(
+                sequence.lock().refresh_feedback(),
+                Err(PagePoolError::CorruptState)
+            );
+            let result = if release {
+                sequence.try_release_spares()
+            } else {
+                sequence.try_reserve_spares()
+            };
+            assert_eq!(result.is_ok(), release);
+            binding.versions.clear_poison();
+            {
+                let journal = sequence.lock();
+                assert_eq!(journal.version_count(), StatePool::VERSIONS);
+                let table = journal.allocation_table().unwrap();
+                let feedback = journal.feedback.as_ref().unwrap();
+                for version in 0..StatePool::VERSIONS {
+                    let record = feedback.checkpoint(version).unwrap();
+                    assert_eq!(
+                        record.checkpoint.scalar().index(),
+                        table.entries()[version as usize].page()
+                    );
+                }
+                assert!(matches!(
+                    feedback.checkpoint(StatePool::VERSIONS),
+                    Err(PagePoolError::InvalidCheckpoint)
+                ));
+            }
+            assert!(waiting.try_reserve_spares().unwrap());
+        }
+    }
 
     #[test]
     fn failed_recovery_rewind_retains_the_action_failure() {
