@@ -133,6 +133,70 @@ mod tests {
     }
 
     #[test]
+    fn calibration_prices_critical_metadata_and_group_overhead() {
+        let rate = WorkRates::new(100.0, 200.0, 10.0, 1000.0, 100.0, 10.0, 0.01).unwrap();
+        let observation = WorkObservation {
+            name: "probe".into(),
+            kernel: "probe".into(),
+            units: 1,
+            gpu: Duration::from_secs(1),
+        };
+        assert!(
+            WorkCalibration::new([rate; 3], 0.0, 128, 1.0, vec![observation.clone()]).is_none()
+        );
+        assert!(
+            WorkCalibration::new([rate; 3], 1.0, 128, f64::NAN, vec![observation.clone()])
+                .is_none()
+        );
+        assert!(WorkCalibration::new([rate; 3], 1.0, 128, 1.0, vec![]).is_none());
+        let rates = WorkCalibration::new([rate; 3], 0.1, 128, 1.0, vec![observation]).unwrap();
+        let critical = KernelCost {
+            read_bytes: 2,
+            metadata_read_bytes: 2,
+            ..KernelCost::default()
+        };
+        assert_eq!(
+            rates.predict(
+                KernelCost::default(),
+                critical,
+                false,
+                1,
+                (7, 7 * 128),
+                MemoryAccess::Coalesced
+            ),
+            Some(Duration::from_secs_f64(2.71))
+        );
+        assert_eq!(
+            rates.predict(
+                KernelCost::default(),
+                critical,
+                false,
+                1,
+                (1, 4096),
+                MemoryAccess::Coalesced
+            ),
+            Some(Duration::from_secs_f64(5.21))
+        );
+        assert!(WorkCalibration::new([rate; 3], 0.1, 0, 1.0, rates.observations.clone()).is_none());
+        let invalid = KernelCost {
+            metadata_read_bytes: 3,
+            ..critical
+        };
+        assert!(
+            rates
+                .predict(
+                    critical,
+                    invalid,
+                    false,
+                    1,
+                    (1, 128),
+                    MemoryAccess::Coalesced
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
     fn rates_refuse_nonfinite_and_unrepresentable_predictions() {
         for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             for index in 0..7 {
@@ -155,5 +219,93 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+}
+
+/// One host-controlled observation retained with admission predictions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkObservation {
+    /// Source probe and executed arithmetic configuration.
+    pub name: String,
+    /// Exact shader entry point.
+    pub kernel: String,
+    /// Executed units, excluding inactive lanes.
+    pub units: u64,
+    /// Observed device duration.
+    pub gpu: Duration,
+}
+
+/// Immutable calibration supporting aggregate, serial and cooperative estimates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkCalibration {
+    rates: [WorkRates; 3],
+    group_seconds: f64,
+    group_threads: u64,
+    dependent_read: f64,
+    observations: Vec<WorkObservation>,
+}
+impl WorkCalibration {
+    /// Validates rates for scheduling groups and pointer-dependent metadata reads.
+    #[must_use]
+    pub fn new(
+        rates: [WorkRates; 3],
+        group_seconds: f64,
+        group_threads: u64,
+        dependent_read: f64,
+        observations: Vec<WorkObservation>,
+    ) -> Option<Self> {
+        (group_seconds.is_finite()
+            && group_seconds > 0.0
+            && group_threads > 0
+            && dependent_read.is_finite()
+            && dependent_read > 0.0
+            && !observations.is_empty()
+            && observations.iter().all(|s| s.units > 0 && !s.gpu.is_zero()))
+        .then_some(Self {
+            rates,
+            group_seconds,
+            group_threads,
+            dependent_read,
+            observations,
+        })
+    }
+    /// Prices aggregate work and the longest serial/cooperative path independently.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn predict(
+        &self,
+        total: KernelCost,
+        mut critical: KernelCost,
+        cooperative: bool,
+        launches: u64,
+        geometry: (u64, u64),
+        access: MemoryAccess,
+    ) -> Option<Duration> {
+        let aggregate = self.rates[0].predict(total, launches.max(1), access)?;
+        critical.read_bytes = critical
+            .read_bytes
+            .checked_sub(critical.metadata_read_bytes)?;
+        let metadata = critical.metadata_read_bytes as f64 / self.dependent_read;
+        let critical = self.rates[if cooperative { 2 } else { 1 }].predict(
+            critical,
+            launches.max(1),
+            access,
+        )?;
+        let (groups, threads) = geometry;
+        let units = groups.max(threads.div_ceil(self.group_threads));
+        let groups = Duration::try_from_secs_f64(units as f64 * self.group_seconds).ok()?;
+        let critical = critical.checked_add(Duration::try_from_secs_f64(metadata).ok()?)?;
+        aggregate.max(critical).checked_add(groups)
+    }
+    /// Retains rates, safety factors and raw observations in diagnostic records.
+    #[must_use]
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"kind":"admission calibration, not model throughput",
+            "rate_policy":"half the slowest independent observation; twice launch/group latency",
+            "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
+            "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
+            "dependent_read_bytes_per_second":self.dependent_read,
+            "observations": self.observations.iter().map(|s| serde_json::json!({"name":s.name,
+                "kernel":s.kernel,"units":s.units,"gpu_seconds":s.gpu.as_secs_f64()})).collect::<Vec<_>>()})
     }
 }
