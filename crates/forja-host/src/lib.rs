@@ -72,6 +72,8 @@ const MAX_VARIANT_NAME_BYTES: usize = 64;
 const MAX_VARIANT_RULE_ARMS: usize = 64;
 /// Preserves one live-graph slot for an exact prompt tail.
 const MAX_RETAINED_BATCH_SHAPES: usize = 15;
+const MAX_VERIFY_SHAPES: usize = 3;
+const MAX_VERIFY_ROWS: u32 = 8;
 
 pub use native::NativeState;
 pub use native::{NativeCommandList, NativeEpilogue, NativeHost, NativeKernel, NativeTensor};
@@ -890,7 +892,18 @@ fn expected_layer_outputs(layers: &[u32], loaded: Option<u32>, requested: bool) 
 }
 
 fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
-    if serving.batch_shapes.len() > MAX_RETAINED_BATCH_SHAPES {
+    if serving.batch_shapes.len() > MAX_RETAINED_BATCH_SHAPES + MAX_VERIFY_SHAPES {
+        return Err(quota(
+            "serving batch shape catalog exceeds the graph budget",
+        ));
+    }
+    let verify = serving
+        .batch_shapes
+        .iter()
+        .filter(|shape| shape.phase == BatchPhase::Verify)
+        .count();
+    if verify > MAX_VERIFY_SHAPES || serving.batch_shapes.len() - verify > MAX_RETAINED_BATCH_SHAPES
+    {
         return Err(quota(
             "serving batch shape catalog exceeds the graph budget",
         ));
@@ -919,12 +932,16 @@ fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
                     "decode batch shapes must contain one token per lane".to_owned(),
                 ));
             }
-            BatchPhase::Verify => {
-                return Err(compute::Error::OpSignature(
-                    "verify is unsupported".to_owned(),
+            BatchPhase::Verify
+                if shape.bucket != 1
+                    || shape.selection != BatchSelection::Combined
+                    || !(2..=MAX_VERIFY_ROWS).contains(&shape.tokens) =>
+            {
+                return Err(compute::Error::Layout(
+                    "verify requires one lane, combined selection and bounded rows".to_owned(),
                 ));
             }
-            BatchPhase::Prompt | BatchPhase::Decode => {}
+            BatchPhase::Prompt | BatchPhase::Decode | BatchPhase::Verify => {}
         }
         if serving.batch_shapes[..index].contains(shape) {
             return Err(compute::Error::Layout(
@@ -1465,7 +1482,7 @@ where
                 "paged serving ceilings are invalid".to_owned(),
             ));
         }
-        validate_batch_shapes(serving)?;
+        self.store.data_mut().register_batch_shapes(serving)?;
         let dtype = match kv_cache {
             KvCacheFormat::F16 => DType::F16,
             KvCacheFormat::Bf16 => DType::BF16,
@@ -3349,7 +3366,7 @@ impl Limits {
             tensor_elements: max_tensor_elements,
             live_tensor_handles: max_live_tensor_handles,
             live_kernels: 64,
-            live_graphs: 16,
+            live_graphs: MAX_RETAINED_BATCH_SHAPES + 1,
             read_bytes: max_read_bytes,
             guest_memory_bytes: 4 * 1024 * 1024 * 1024,
             table_elements: 10_000,
@@ -3976,6 +3993,7 @@ pub struct Host<B: Backend> {
     live_handles: usize,
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
+    verify_graph_budget: usize,
     prepared_graphs: AtomicU64,
     graph_replays: AtomicU64,
     graph_preparation_time_ns: AtomicU64,
@@ -4021,6 +4039,7 @@ impl<B: Backend + 'static> Host<B> {
             live_handles: 0,
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
+            verify_graph_budget: 0,
             prepared_graphs: AtomicU64::new(0),
             graph_replays: AtomicU64::new(0),
             graph_preparation_time_ns: AtomicU64::new(0),
@@ -6663,6 +6682,43 @@ impl<B: Backend + 'static> Host<B> {
         Ok(prepared)
     }
 
+    fn graph_limit(&self) -> Result<usize, compute::Error> {
+        self.limits
+            .live_graphs
+            .checked_add(self.verify_graph_budget)
+            .ok_or_else(|| quota("live graph limit overflowed"))
+    }
+
+    fn register_batch_shapes(&mut self, serving: &ServingInfo) -> Result<(), compute::Error> {
+        validate_batch_shapes(serving)?;
+        let verify = serving
+            .batch_shapes
+            .iter()
+            .filter(|shape| shape.phase == BatchPhase::Verify)
+            .count();
+        let budget = if verify == 0 { 0 } else { MAX_VERIFY_SHAPES };
+        let total = self
+            .limits
+            .live_graphs
+            .checked_add(budget)
+            .ok_or_else(|| quota("live graph limit overflowed"))?;
+        if (serving.batch_shapes.len() - verify)
+            .checked_add(1)
+            .is_none_or(|graphs| graphs > self.limits.live_graphs)
+            || serving
+                .batch_shapes
+                .len()
+                .checked_add(1)
+                .is_none_or(|graphs| graphs > total)
+        {
+            return Err(quota(
+                "serving shapes and prompt tail exceed the live graph limit",
+            ));
+        }
+        self.verify_graph_budget = budget;
+        Ok(())
+    }
+
     fn create_graph(
         &mut self,
         resource: Resource<CommandListEntry>,
@@ -6718,14 +6774,13 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(error);
             }
         };
-        let lease =
-            match GraphLease::acquire(Arc::clone(&self.live_graphs), self.limits.live_graphs) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    self.release_retained(entry.retained)?;
-                    return Err(error);
-                }
-            };
+        let lease = match GraphLease::acquire(Arc::clone(&self.live_graphs), self.graph_limit()?) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.release_retained(entry.retained)?;
+                return Err(error);
+            }
+        };
         let graph_entry = GraphEntry {
             captured_feedback: entry.captured_feedback,
             captured_selections: entry.captured_selections,
@@ -12728,6 +12783,126 @@ mod tests {
             }])),
             Err(compute::Error::Layout(_))
         ));
+    }
+
+    #[test]
+    fn verify_graph_budget_is_granted_only_to_declaring_engines() {
+        for verify in [false, true] {
+            let mut host = Host::new(CpuBackend::new(), GENEROUS);
+            let serving = ServingInfo {
+                page_tokens: 4,
+                planes: Vec::new(),
+                active_lanes: 1,
+                max_context: 33,
+                prefill_chunk_multiple: None,
+                batch_shapes: vec![BatchShape {
+                    phase: if verify {
+                        BatchPhase::Verify
+                    } else {
+                        BatchPhase::Decode
+                    },
+                    bucket: 1,
+                    tokens: if verify { 2 } else { 1 },
+                    selection: BatchSelection::Combined,
+                }],
+            };
+            host.register_batch_shapes(&serving).unwrap();
+            host.register_batch_shapes(&serving).unwrap();
+            let limit = if verify { 19 } else { 16 };
+            assert_eq!(host.limits.live_graphs, 16);
+            assert_eq!(host.graph_limit().unwrap(), limit);
+            for _ in 0..limit {
+                let commands = host.command_list().unwrap();
+                host.create_graph(commands).unwrap();
+            }
+            let commands = host.command_list().unwrap();
+            assert!(matches!(
+                host.create_graph(commands),
+                Err(compute::Error::Quota(_))
+            ));
+            assert_eq!(host.engine_metrics().live_graphs, limit);
+            host.limits.live_graphs = 0;
+            assert!(host.register_batch_shapes(&serving).is_err());
+        }
+    }
+
+    #[test]
+    fn verify_catalog_has_separate_shape_and_row_limits() {
+        let verify = BatchShape {
+            phase: BatchPhase::Verify,
+            bucket: 1,
+            tokens: 2,
+            selection: BatchSelection::Combined,
+        };
+        let mut serving = ServingInfo {
+            page_tokens: 4,
+            planes: Vec::new(),
+            active_lanes: 8,
+            max_context: 32,
+            prefill_chunk_multiple: None,
+            batch_shapes: (1..=15)
+                .map(|tokens| BatchShape {
+                    phase: BatchPhase::Prompt,
+                    tokens,
+                    ..verify
+                })
+                .collect(),
+        };
+        serving
+            .batch_shapes
+            .extend((2..=4).map(|tokens| BatchShape { tokens, ..verify }));
+        assert!(validate_batch_shapes(&serving).is_ok());
+        serving.batch_shapes.push(BatchShape {
+            tokens: 5,
+            ..verify
+        });
+        assert!(matches!(
+            validate_batch_shapes(&serving),
+            Err(compute::Error::Quota(_))
+        ));
+        serving.batch_shapes.truncate(15);
+        serving.batch_shapes.push(BatchShape {
+            phase: BatchPhase::Prompt,
+            tokens: 16,
+            ..verify
+        });
+        assert!(matches!(
+            validate_batch_shapes(&serving),
+            Err(compute::Error::Quota(_))
+        ));
+        for shape in [
+            BatchShape {
+                bucket: 2,
+                ..verify
+            },
+            BatchShape {
+                tokens: 1,
+                ..verify
+            },
+            BatchShape {
+                tokens: 9,
+                ..verify
+            },
+            BatchShape {
+                selection: BatchSelection::Forward,
+                ..verify
+            },
+            BatchShape {
+                selection: BatchSelection::Masked,
+                ..verify
+            },
+        ] {
+            serving.batch_shapes = vec![shape];
+            assert!(matches!(
+                validate_batch_shapes(&serving),
+                Err(compute::Error::Layout(_))
+            ));
+        }
+        serving.batch_shapes = vec![BatchShape {
+            tokens: 8,
+            ..verify
+        }];
+        assert!(validate_batch_shapes(&serving).is_ok());
     }
 
     #[test]
