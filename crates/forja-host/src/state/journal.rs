@@ -194,6 +194,13 @@ impl StateJournal {
         Ok(())
     }
 
+    pub(super) fn refresh_feedback(&mut self) -> Result<(), PagePoolError> {
+        if let Some(feedback) = &mut self.feedback {
+            feedback.rebind(&self.sequence)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn begin(
         &mut self,
         serial: u64,

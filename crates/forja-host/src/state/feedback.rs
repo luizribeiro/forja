@@ -129,6 +129,11 @@ pub(super) struct FeedbackBoundary {
 }
 
 impl LaneFeedback {
+    pub(super) fn rebind(&mut self, sequence: &StateSequence) -> Result<(), PagePoolError> {
+        *self = Self::new(self.binding.clone(), sequence)?;
+        Ok(())
+    }
+
     pub(super) fn new(
         binding: FeedbackBinding,
         sequence: &StateSequence,

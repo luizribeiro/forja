@@ -1,4 +1,5 @@
 use super::{LanePosition, StateStorage, journal::StateJournal};
+mod spare;
 use forja_core::{
     Backend, BackendError, PagePoolError, StateCheckpoint, StateSequence, StateTransaction,
 };
