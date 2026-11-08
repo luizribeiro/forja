@@ -28,6 +28,23 @@ impl StateSequence {
         self.spare = Some((storage, owner));
         Ok(())
     }
+
+    /// Returns spare records after their writers and retained boundaries have drained.
+    ///
+    /// # Errors
+    /// Refuses outstanding work or a spare still used as committed state or by a checkpoint.
+    pub fn release_spares(&mut self) -> Result<(), PagePoolError> {
+        self.ensure_idle()?;
+        if self.committed >= StatePool::VERSIONS
+            || self.pins[StatePool::VERSIONS as usize..]
+                .iter()
+                .any(|pin| pin.load(super::Ordering::Acquire) != 0)
+        {
+            return Err(PagePoolError::BankInFlight);
+        }
+        self.spare = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +127,71 @@ mod tests {
         pool.observe_completion(1).unwrap();
         second.reserve_spares().unwrap();
         assert_eq!(second.version_count(), 4);
+    }
+
+    #[test]
+    fn spare_release_preserves_committed_state_and_retained_boundaries() {
+        let pool = pool();
+        let mut owner = pool.reserve().unwrap();
+        let mut waiting = pool.reserve().unwrap();
+        owner.reserve_spares().unwrap();
+        let chain = owner.begin_chain(1, 3).unwrap();
+        let boundary = owner.checkpoint_latest().unwrap();
+        assert_eq!(owner.release_spares(), Err(PagePoolError::BankInFlight));
+        owner.mark_submitted(&chain).unwrap();
+        pool.observe_completion(1).unwrap();
+        owner.finish(&chain, true).unwrap();
+        assert_eq!(owner.release_spares(), Err(PagePoolError::BankInFlight));
+        let plain = owner.begin(2).unwrap();
+        assert!(plain.output_version() < StatePool::VERSIONS);
+        owner.mark_submitted(&plain).unwrap();
+        pool.observe_completion(2).unwrap();
+        owner.finish(&plain, true).unwrap();
+        assert_eq!(owner.release_spares(), Err(PagePoolError::BankInFlight));
+        drop(boundary);
+        owner.release_spares().unwrap();
+        owner.release_spares().unwrap();
+        assert_eq!(owner.version_count(), StatePool::VERSIONS);
+        assert_eq!(
+            owner.begin_chain(3, 3).err(),
+            Some(PagePoolError::BankInFlight)
+        );
+        waiting.reserve_spares().unwrap();
+        let next = owner.begin(3).unwrap();
+        owner.cancel_unsubmitted(&next).unwrap();
+    }
+
+    #[test]
+    fn cancelled_failed_and_abandoned_spares_preserve_pins_and_drain() {
+        for outcome in 0..3 {
+            let pool = pool();
+            let mut owner = pool.reserve().unwrap();
+            let mut waiting = pool.reserve().unwrap();
+            owner.reserve_spares().unwrap();
+            let chain = owner.begin_chain(1, 3).unwrap();
+            let boundary = owner.checkpoint_latest().unwrap();
+            if outcome == 0 {
+                owner.cancel_unsubmitted(&chain).unwrap();
+            } else {
+                owner.mark_submitted(&chain).unwrap();
+                if outcome == 1 {
+                    pool.observe_completion(1).unwrap();
+                    owner.finish(&chain, false).unwrap();
+                } else {
+                    owner.abandon(&chain).unwrap();
+                    assert_eq!(owner.release_spares(), Err(PagePoolError::BankInFlight));
+                    pool.observe_completion(1).unwrap();
+                }
+            }
+            assert_eq!(owner.release_spares(), Err(PagePoolError::BankInFlight));
+            assert_eq!(
+                owner.rewind(&boundary),
+                Err(PagePoolError::InvalidCheckpoint)
+            );
+            drop(boundary);
+            owner.release_spares().unwrap();
+            waiting.reserve_spares().unwrap();
+            assert_eq!(owner.checkpoint().unwrap().version(), 0);
+        }
     }
 }
