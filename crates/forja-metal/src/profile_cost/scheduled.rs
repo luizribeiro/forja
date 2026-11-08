@@ -24,7 +24,7 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     if rows == 0 {
         cost.scalar_ops = cost.scalar_ops.checked_add(cost.flops)?;
         cost.flops = 0;
-        return addressing(dispatch, cost);
+        return scalar_issue_work(dispatch, addressing(dispatch, cost)?);
     }
     let flops = model.padded_flops(dispatch, cost)?[1];
     let input_values = flops.checked_div(2)?.checked_div(columns)?;
@@ -51,7 +51,46 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .checked_add(input_bytes)?
         .checked_add(weight_bytes)?;
     cost.flops = flops;
-    addressing(dispatch, cost)
+    scalar_issue_work(dispatch, addressing(dispatch, cost)?)
+}
+
+fn scalar_issue_work(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
+    if let Some(groups) = scalar_matrix_groups(dispatch) {
+        let groups = groups.max(1);
+        let slots = groups.div_ceil(32).checked_mul(32)?;
+        cost.scalar_ops = cost
+            .scalar_ops
+            .checked_add(cost.flops)?
+            .checked_mul(slots)?
+            .div_ceil(groups);
+        cost.sfu_ops = cost.sfu_ops.checked_mul(slots)?.div_ceil(groups);
+        let shape = dispatch.output().layout().shape();
+        let grid = u64::from(shape[0])
+            .div_ceil(8)
+            .checked_mul(u64::from(shape[1]).div_ceil(8))?;
+        cost.scalar_ops = cost
+            .scalar_ops
+            .checked_add(grid.checked_mul(8 * 8 * 32 * 32)?)?;
+        cost.flops = 0;
+    }
+    Some(cost)
+}
+
+pub(crate) fn scalar_matrix_groups(dispatch: &Dispatch) -> Option<u64> {
+    let Op::QuantMatmul { group_size, .. } = dispatch.op() else {
+        return None;
+    };
+    if !matches!(
+        crate::encoding::selected_variant(dispatch),
+        Some(
+            crate::variants::MetalVariant::QuantMatmulSmallM
+                | crate::variants::MetalVariant::QuantMatmulPortable
+        )
+    ) {
+        return None;
+    }
+    u64::from(*dispatch.inputs().first()?.layout().shape().last()?)
+        .checked_div(u64::from(group_size))
 }
 
 pub(super) fn addressing(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
@@ -258,6 +297,48 @@ mod tests {
             crate::scalar_codegen::instruction_work(Inst::Binary(BinOp::Div, 0, 1)).0
                 > crate::scalar_codegen::instruction_work(Inst::Binary(BinOp::Add, 0, 1)).0
         );
+    }
+
+    #[test]
+    fn scalar_matrix_work_covers_the_padded_simd_issue_walk() {
+        let backend = CpuBackend::new();
+        for groups in [1, 3, 7, 31, 32, 33, 65] {
+            let inner = groups * 64;
+            let input = backend.alloc(DType::F32, &[8, inner]).unwrap();
+            let packed = backend.alloc(DType::U32, &[8, inner / 8]).unwrap();
+            let scales = backend.alloc(DType::BF16, &[8, groups]).unwrap();
+            let biases = backend.alloc(DType::BF16, &[8, groups]).unwrap();
+            let output = backend.alloc(DType::F32, &[8, 8]).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(
+                    Op::QuantMatmul {
+                        bits: 4,
+                        group_size: 64,
+                    },
+                    &[&input, &packed, &scales, &biases],
+                    &output,
+                )
+                .unwrap();
+            let selected = crate::variants::resolve(
+                commands.last_dispatch().unwrap(),
+                "quant-matmul.small-m",
+                &[DeviceCapability::Metal4],
+            )
+            .unwrap();
+            commands.set_last_backend_data(BackendDispatchData::new(selected));
+            let dispatch = commands.last_dispatch().unwrap();
+            let mut issue_slots = 0_u64;
+            for _ in (0..groups).step_by(32) {
+                for _ in 0..32 {
+                    issue_slots += 1;
+                }
+            }
+            let cost = of(dispatch).unwrap();
+            assert_eq!(cost.flops, 0);
+            assert_eq!(scalar_matrix_groups(dispatch), Some(u64::from(groups)));
+            assert!(cost.scalar_ops >= issue_slots * 8 * 8 * 64 * 2);
+        }
     }
 
     #[test]

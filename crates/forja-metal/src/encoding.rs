@@ -9263,7 +9263,7 @@ fn bounded_attention(dispatch: &Dispatch) -> bool {
         .is_some_and(|variant| variant.uses_bounded_attention())
 }
 
-fn selected_variant(dispatch: &Dispatch) -> Option<MetalVariant> {
+pub(super) fn selected_variant(dispatch: &Dispatch) -> Option<MetalVariant> {
     pinned_variant(dispatch).or_else(|| {
         crate::variants::portable_implementation(forja_core::OperationKind::of(dispatch.op()))
     })
