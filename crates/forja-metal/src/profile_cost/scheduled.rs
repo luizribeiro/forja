@@ -2,12 +2,19 @@ use forja_core::{Dispatch, KernelCost, Op};
 mod critical;
 pub(crate) use critical::of as critical_path;
 mod row_program;
+mod state;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     let mut cost = super::of(dispatch)?;
     cost = cost
         .checked_add(route_setup(dispatch)?)?
         .checked_add(epilogue_calls(dispatch)?)?;
+    if matches!(
+        dispatch.op(),
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_))
+    ) {
+        return state::costs(dispatch).map(|(total, _)| total);
+    }
     if matches!(dispatch.op(), Op::Sample { .. } | Op::SampleMasked { .. }) {
         let visits = dispatch.work()?;
         cost.scalar_ops = cost.scalar_ops.max(visits.checked_mul(32)?);
@@ -128,8 +135,17 @@ pub(super) fn addressing(dispatch: &Dispatch, mut cost: KernelCost) -> Option<Ke
     } else {
         0
     };
-    let visits = cost.read_bytes.checked_add(cost.write_bytes)?.div_ceil(2);
-    cost.scalar_ops = cost.scalar_ops.checked_add(visits.checked_mul(weight)?)?;
+    let scratch = cost
+        .scratch_read_bytes
+        .checked_add(cost.scratch_write_bytes)?;
+    let bytes = cost
+        .read_bytes
+        .checked_add(cost.write_bytes)?
+        .checked_sub(scratch)?;
+    cost.scalar_ops = cost
+        .scalar_ops
+        .checked_add(bytes.div_ceil(2).checked_mul(weight)?)?
+        .checked_add(scratch.div_ceil(2).checked_mul(weight.min(32))?)?;
     Some(cost)
 }
 

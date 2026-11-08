@@ -7,6 +7,7 @@ use super::{
 };
 
 mod block;
+pub(crate) use block::block_schedule;
 mod lanes;
 mod steps;
 pub(super) use lanes::{fold_profiles, lane_group, lane_variant, steps_variant};

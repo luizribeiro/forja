@@ -1,6 +1,9 @@
 use forja_core::{Dispatch, KernelCost, Op, StateOp, program::ProgramKind};
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
+    if matches!(dispatch.op(), Op::State(StateOp::DeltaRuleBlock(_))) {
+        return super::state::costs(dispatch).map(|(_, critical)| critical);
+    }
     let total = super::of(dispatch)?;
     let output = dispatch.output().layout();
     let width = u64::from(output.shape().last().copied().unwrap_or(1)).max(1);
@@ -166,33 +169,10 @@ mod tests {
     #[test]
     fn state_prefix_work_is_not_averaged_across_value_columns() {
         let cpu = CpuBackend::new();
-        let access = forja_testing::state_test_metadata().unwrap().0;
         let mut previous = KernelCost::default();
         for values in [1, 7, 33] {
-            let inputs = [
-                (DType::F32, vec![64, 1, 7]),
-                (DType::F32, vec![64, 1, 7]),
-                (DType::F32, vec![64, 1, values]),
-                (DType::F32, vec![64, 1]),
-                (DType::F32, vec![64, 1]),
-                (DType::F32, vec![1, 7, values]),
-                (DType::U32, vec![2, 2]),
-                (DType::U32, vec![3]),
-                (DType::U32, vec![1]),
-            ]
-            .map(|(dtype, shape)| cpu.alloc(dtype, &shape).unwrap());
-            let scratch = forja_core::DeltaBlockScratch::new(64, 1, 7, values).unwrap();
-            let output = cpu.alloc(DType::F32, &[64, 1, values]).unwrap();
-            let next = cpu.alloc(DType::F32, &[1, 7, values]).unwrap();
-            let scratch = cpu.alloc(DType::F32, &[scratch.elements()]).unwrap();
-            let mut list = CommandList::new();
-            list.dispatch_many(
-                Op::State(StateOp::DeltaRuleBlock(access)),
-                &inputs.iter().collect::<Vec<_>>(),
-                &[&output, &next, &scratch],
-            )
-            .unwrap();
-            let cost = of(list.last_dispatch().unwrap()).unwrap();
+            let dispatch = super::super::state::test_dispatch(&cpu, 64, 7, values);
+            let cost = of(&dispatch).unwrap();
             assert!(cost.scalar_ops >= previous.scalar_ops);
             assert!(cost.read_bytes >= previous.read_bytes);
             previous = cost;

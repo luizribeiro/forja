@@ -22,13 +22,10 @@ fn across(tokens: u64, heads: u64, f: impl Fn(u64) -> Option<u64>) -> Option<u64
 pub(super) fn stages(dispatch: &Dispatch, panel: u32) -> Option<[KernelCost; 4]> {
     let mut costs = KernelCost::delta_block_stages(dispatch)?;
     let inputs = dispatch.primitive_inputs();
-    let shape = inputs[5].layout().shape();
-    let [heads, keys, values] = [
-        u64::from(shape[0]),
-        u64::from(shape[1]),
-        u64::from(shape[2]),
-    ];
-    let tokens = u64::from(inputs[0].layout().shape()[0]);
+    let [heads, keys, values] = <[u32; 3]>::try_from(inputs.get(5)?.layout().shape())
+        .ok()?
+        .map(u64::from);
+    let tokens = u64::from(*inputs.first()?.layout().shape().first()?);
     let blocks = tokens.div_ceil(64);
     let rows = mul(&[tokens, heads])?;
     let block_heads = mul(&[blocks, heads])?;
@@ -40,8 +37,8 @@ pub(super) fn stages(dispatch: &Dispatch, panel: u32) -> Option<[KernelCost; 4]>
     let value_panels = values.div_ceil(u64::from(panel));
     let output_panels = values.div_ceil(32);
     let rhs_panels = keys.checked_add(values)?.div_ceil(32);
-    let value_bytes = inputs[2].layout().dtype().byte_size();
-    let beta_bytes = inputs[4].layout().dtype().byte_size();
+    let value_bytes = inputs.get(2)?.layout().dtype().byte_size();
+    let beta_bytes = inputs.get(4)?.layout().dtype().byte_size();
     let auth = |threads| mul(&[threads, 28]);
     costs[0].metadata_read_bytes = auth(mul(&[512, block_heads])?)?;
     costs[1].metadata_read_bytes = auth(mul(&[128, block_heads, rhs_panels])?)?;
@@ -105,16 +102,13 @@ pub(crate) fn composite(dispatch: &Dispatch) -> Option<KernelCost> {
         .try_fold(KernelCost::default(), |sum, cost| sum.checked_add(*cost))
 }
 
-pub(crate) fn padded_flops(dispatch: &Dispatch) -> Option<[u64; 2]> {
-    let panel = u64::from(crate::encoding::delta_block_mma_panel(dispatch)?);
+pub(crate) fn padded_stages(dispatch: &Dispatch, panel: u32) -> Option<[u64; 4]> {
+    let panel = u64::from(panel);
     let inputs = dispatch.primitive_inputs();
-    let shape = inputs[5].layout().shape();
-    let [heads, keys, values] = [
-        u64::from(shape[0]),
-        u64::from(shape[1]),
-        u64::from(shape[2]),
-    ];
-    let tokens = u64::from(inputs[0].layout().shape()[0]);
+    let [heads, keys, values] = <[u32; 3]>::try_from(inputs.get(5)?.layout().shape())
+        .ok()?
+        .map(u64::from);
+    let tokens = u64::from(*inputs.first()?.layout().shape().first()?);
     let block_heads = mul(&[tokens.div_ceil(64), heads])?;
     let rows = mul(&[tokens, heads])?;
     let pairs = across(tokens, heads, triangle)?;
@@ -159,5 +153,10 @@ pub(crate) fn padded_flops(dispatch: &Dispatch) -> Option<[u64; 2]> {
         mul(&[diagonal, values])?,
         mul(&[9, rows, values])?,
     ])?;
-    Some([add(&[gram, solve, carry, output])?; 2])
+    Some([gram, solve, carry, output])
+}
+
+pub(crate) fn padded_flops(dispatch: &Dispatch) -> Option<[u64; 2]> {
+    let panel = crate::encoding::delta_block_mma_panel(dispatch)?;
+    Some([add(&padded_stages(dispatch, panel)?)?; 2])
 }

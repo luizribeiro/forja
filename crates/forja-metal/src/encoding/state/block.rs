@@ -14,6 +14,51 @@ pub(super) struct StageTest {
     pub(super) panel: Option<u32>,
 }
 
+fn selected_panel(dispatch: &Dispatch) -> Option<u32> {
+    #[cfg(test)]
+    if let Some(test) = dispatch.backend_data::<StageTest>() {
+        return test.panel;
+    }
+    super::super::delta_block_mma_panel(dispatch)
+}
+
+pub(crate) fn block_schedule(dispatch: &Dispatch) -> Option<(Option<u32>, [u64; 4])> {
+    let inputs = dispatch.primitive_inputs();
+    let query = inputs.first()?.layout().shape();
+    let state = inputs.get(5)?.layout().shape();
+    let scratch = DeltaBlockScratch::new(
+        *query.first()?,
+        *state.first()?,
+        *state.get(1)?,
+        *state.get(2)?,
+    )
+    .ok()?;
+    let panel = selected_panel(dispatch);
+    let mut groups = [0_u64; 4];
+    for (stage, count) in groups.iter_mut().enumerate() {
+        #[cfg(test)]
+        if dispatch
+            .backend_data::<StageTest>()
+            .is_some_and(|test| test.stage != stage)
+        {
+            continue;
+        }
+        let (grid, _) = stage_geometry(
+            stage,
+            scratch,
+            state,
+            dispatch.output().layout().element_count(),
+            panel,
+        )
+        .ok()?;
+        *count = u64::try_from(grid.width)
+            .ok()?
+            .checked_mul(u64::try_from(grid.height).ok()?)?
+            .checked_mul(u64::try_from(grid.depth).ok()?)?;
+    }
+    Some((panel, groups))
+}
+
 impl MetalBackend {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_delta_block(
@@ -34,11 +79,9 @@ impl MetalBackend {
         }
         let scratch = DeltaBlockScratch::new(query[0], state[0], state[1], state[2])
             .map_err(|_| BackendError::InvalidInput)?;
-        let panel = super::super::delta_block_mma_panel(dispatch);
+        let panel = selected_panel(dispatch);
         #[cfg(test)]
         let test = dispatch.backend_data::<StageTest>();
-        #[cfg(test)]
-        let panel = test.map_or(panel, |test| test.panel);
         let tensors = input
             .iter()
             .chain(dispatch.outputs())
@@ -137,26 +180,41 @@ fn stage_geometry(
             depth: usize::try_from(depth).map_err(|_| BackendError::InvalidInput)?,
         })
     };
+    let [heads, keys, values]: [u32; 3] = dimensions
+        .try_into()
+        .map_err(|_| BackendError::InvalidInput)?;
     let mut threads = 128;
     let groups = if let Some(panel) = panel {
-        let heads = u64::from(dimensions[0]);
+        let heads = u64::from(heads);
         let blocks = u64::from(scratch.blocks());
         match stage {
-            0 => size(2, 2, blocks * heads)?,
+            0 => size(
+                2,
+                2,
+                blocks
+                    .checked_mul(heads)
+                    .ok_or(BackendError::InvalidInput)?,
+            )?,
             1 => size(
-                (u64::from(dimensions[1]) + u64::from(dimensions[2])).div_ceil(32),
+                (u64::from(keys) + u64::from(values)).div_ceil(32),
                 heads,
                 blocks,
             )?,
             2 => {
                 threads = u64::from(panel / 8 * 32);
-                size(u64::from(dimensions[2].div_ceil(panel)), heads, 1)?
+                size(u64::from(values.div_ceil(panel)), heads, 1)?
             }
-            _ => size(u64::from(dimensions[2].div_ceil(32)), 2, blocks * heads)?,
+            _ => size(
+                u64::from(values.div_ceil(32)),
+                2,
+                blocks
+                    .checked_mul(heads)
+                    .ok_or(BackendError::InvalidInput)?,
+            )?,
         }
     } else {
         size(
-            stage_work(stage, scratch, dimensions, output).div_ceil(128),
+            stage_work(stage, scratch, dimensions, output)?.div_ceil(128),
             1,
             1,
         )?
@@ -164,15 +222,26 @@ fn stage_geometry(
     Ok((groups, size(threads, 1, 1)?))
 }
 
-fn stage_work(stage: usize, scratch: DeltaBlockScratch, dimensions: &[u32], output: u64) -> u64 {
+fn stage_work(
+    stage: usize,
+    scratch: DeltaBlockScratch,
+    dimensions: &[u32],
+    output: u64,
+) -> Result<u64, BackendError> {
+    let [heads, keys, values]: [u32; 3] = dimensions
+        .try_into()
+        .map_err(|_| BackendError::InvalidInput)?;
+    let block = u64::try_from(DeltaBlockScratch::TOKENS).map_err(|_| BackendError::InvalidInput)?;
     match stage {
-        0 => u64::from(scratch.blocks()) * u64::from(dimensions[0]) * 64 * 64,
-        1 => {
-            u64::from(scratch.blocks())
-                * u64::from(dimensions[0])
-                * (u64::from(dimensions[1]) + u64::from(dimensions[2]))
-        }
-        2 => u64::from(dimensions[0]) * u64::from(dimensions[2]),
-        _ => output,
+        0 => u64::from(scratch.blocks())
+            .checked_mul(u64::from(heads))
+            .and_then(|n| n.checked_mul(block))
+            .and_then(|n| n.checked_mul(block)),
+        1 => u64::from(scratch.blocks())
+            .checked_mul(u64::from(heads))
+            .and_then(|n| n.checked_mul(u64::from(keys).checked_add(u64::from(values))?)),
+        2 => u64::from(heads).checked_mul(u64::from(values)),
+        _ => Some(output),
     }
+    .ok_or(BackendError::InvalidInput)
 }

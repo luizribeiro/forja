@@ -3,6 +3,7 @@ mod alignment_tests;
 mod launch_work;
 pub(super) mod resources;
 mod state;
+pub(crate) use state::block_schedule;
 #[cfg(test)]
 mod state_cache_tests;
 
