@@ -3,6 +3,7 @@ use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct LaunchWork {
+    pub(super) attention: Option<super::AttentionSchedule>,
     pub(super) groups: u64,
     pub(super) threads: u64,
     pub(super) launches: u64,
@@ -59,6 +60,15 @@ pub(super) fn record(groups: MTLSize, threads: MTLSize) -> Result<(), BackendErr
     })
 }
 
+pub(super) fn attention(schedule: super::AttentionSchedule) {
+    CURRENT.with(|current| {
+        if let Some(mut work) = current.get() {
+            work.attention = Some(schedule);
+            current.set(Some(work));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +108,7 @@ mod tests {
         assert_eq!(
             outer.finish(),
             LaunchWork {
+                attention: None,
                 groups: 462,
                 threads: 59136,
                 launches: 1

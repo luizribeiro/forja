@@ -1,6 +1,16 @@
 use forja_core::{Dispatch, KernelCost, Op, StateOp, program::ProgramKind};
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
+    if matches!(
+        dispatch.op(),
+        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+    ) {
+        return super::attention::costs(
+            dispatch,
+            crate::encoding::AttentionSchedule::selected(dispatch)?,
+        )
+        .map(|(_, critical)| critical);
+    }
     if matches!(dispatch.op(), Op::State(StateOp::DeltaRuleBlock(_))) {
         return super::state::costs(dispatch).map(|(_, critical)| critical);
     }

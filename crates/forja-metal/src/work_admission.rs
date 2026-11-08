@@ -149,28 +149,29 @@ pub(super) fn predict(
     launches: u64,
     groups: u64,
     threads: u64,
+    schedule: Option<crate::encoding::AttentionSchedule>,
 ) -> Result<Duration, BackendError> {
-    let total = crate::profile_cost::scheduled::of(d).ok_or(BackendError::InvalidInput)?;
-    let mut critical =
-        crate::profile_cost::scheduled::critical_path(d).ok_or(BackendError::InvalidInput)?;
-    let attention = matches!(
-        d.op(),
-        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
-    );
-    if attention {
-        // A SIMD lane can carry four GQA heads; softmax work is replicated across lanes.
-        critical.scalar_ops = critical
-            .scalar_ops
-            .checked_mul(8)
-            .ok_or(BackendError::InvalidInput)?;
-        critical.read_bytes = critical
-            .read_bytes
-            .checked_mul(4)
-            .ok_or(BackendError::InvalidInput)?;
-        critical.sfu_ops = critical
-            .sfu_ops
-            .checked_mul(256)
-            .ok_or(BackendError::InvalidInput)?;
+    let (mut total, mut critical) = if let Some(schedule) = schedule {
+        crate::profile_cost::scheduled::attention_cost(d, schedule)
+            .ok_or(BackendError::InvalidInput)?
+    } else {
+        (
+            crate::profile_cost::scheduled::of(d).ok_or(BackendError::InvalidInput)?,
+            crate::profile_cost::scheduled::critical_path(d).ok_or(BackendError::InvalidInput)?,
+        )
+    };
+    let attention = schedule.is_some();
+    if matches!(
+        schedule,
+        Some(crate::encoding::AttentionSchedule::Vector { .. })
+    ) {
+        for cost in [&mut total, &mut critical] {
+            cost.scalar_ops = cost
+                .scalar_ops
+                .checked_add(cost.flops)
+                .ok_or(BackendError::InvalidInput)?;
+            cost.flops = 0;
+        }
     }
     let sparse_scalar =
         crate::profile_cost::scheduled::scalar_matrix_groups(d).is_some_and(|groups| groups < 32);
@@ -186,7 +187,12 @@ pub(super) fn predict(
             || d.bound_program()
                 .is_some_and(|p| p.program().program().kind == ProgramKind::Row));
     let scattered = matches!(d.op(), Op::GatherMatmul | Op::GatherQuantMatmul { .. })
-        || d.inputs().iter().any(|t| !t.layout().is_contiguous());
+        || d.inputs().iter().any(|t| {
+            t.layout()
+                .strides()
+                .last()
+                .is_some_and(|&stride| stride != 1)
+        });
     rates
         .predict(
             total,

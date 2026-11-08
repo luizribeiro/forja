@@ -1,4 +1,6 @@
 use forja_core::{Dispatch, KernelCost, Op};
+mod attention;
+pub(crate) use attention::costs as attention_cost;
 mod critical;
 pub(crate) use critical::of as critical_path;
 mod row_program;
@@ -25,6 +27,16 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     }
     if matches!(dispatch.op(), Op::Program(_)) {
         return addressing(dispatch, row_program::of(dispatch, cost)?);
+    }
+    if matches!(
+        dispatch.op(),
+        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. }
+    ) {
+        return attention::costs(
+            dispatch,
+            crate::encoding::AttentionSchedule::selected(dispatch)?,
+        )
+        .map(|(total, _)| total);
     }
     let model = crate::variants::selected_cost_model(dispatch);
     let [rows, columns, _] = model.tile.map(u64::from);

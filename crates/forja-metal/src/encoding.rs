@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod alignment_tests;
+mod attention_schedule;
 mod launch_work;
+pub(crate) use attention_schedule::AttentionSchedule;
 pub(super) mod resources;
 mod state;
 pub(crate) use state::block_schedule;
@@ -695,6 +697,7 @@ enum PlanCall {
     },
     Barrier,
     InternalBoundary,
+    Attention(AttentionSchedule),
 }
 
 fn physical_dispatch_count(calls: &[PlanCall]) -> Result<u64, BackendError> {
@@ -1567,7 +1570,8 @@ fn dedupe_pipeline_calls(plans: &mut [Option<StaticEncodingPlan>]) {
             | PlanCall::Dispatch { .. }
             | PlanCall::IndirectDispatch { .. }
             | PlanCall::Barrier
-            | PlanCall::InternalBoundary => true,
+            | PlanCall::InternalBoundary
+            | PlanCall::Attention(_) => true,
         });
     }
 }
@@ -3030,6 +3034,13 @@ impl MetalBackend {
                 .zip(&launch_work)
                 .map(|(((dispatch, &barrier), &count), work)| {
                     let mut profile = dispatch_profile(dispatch, barrier, count)?;
+                    if let Some(schedule) = work.attention {
+                        let (total, critical) =
+                            crate::profile_cost::scheduled::attention_cost(dispatch, schedule)
+                                .ok_or(BackendError::InvalidInput)?;
+                        profile.scheduled_cost = total;
+                        profile.critical_path_cost = critical;
+                    }
                     profile.physical_threadgroups = work.groups;
                     if let Some(rates) = &work_calibration {
                         profile.predicted_gpu = crate::work_admission::predict(
@@ -3038,6 +3049,7 @@ impl MetalBackend {
                             work.launches,
                             work.groups,
                             work.threads,
+                            work.attention,
                         )?;
                     }
                     facts
@@ -3316,6 +3328,7 @@ impl MetalBackend {
                     }
                     bindings.ranges.insert(range);
                 }
+                PlanCall::Attention(schedule) => launch_work::attention(*schedule),
                 PlanCall::ArgumentTable => encoder.setArgumentTable(Some(table)),
                 PlanCall::Dispatch {
                     threadgroups,
@@ -4012,6 +4025,7 @@ impl MetalBackend {
             }
         }
         if selected_variant(dispatch) == Some(MetalVariant::PagedSdpaDecomposed) {
+            record_attention(AttentionSchedule::Decomposed);
             let key_scratch = self.scratch_tensor(key.layout.dtype(), &[key_length, k[2], k[3]])?;
             let value_scratch =
                 self.scratch_tensor(value.layout.dtype(), &[key_length, v[2], v[3]])?;
@@ -4121,6 +4135,10 @@ impl MetalBackend {
                 .get(paged_sdpa_kernel(dispatch, q[2])?, &steel_constants);
             match pipeline {
                 Ok(pipeline) => {
+                    record_attention(AttentionSchedule::Tiled {
+                        query: block_query,
+                        key: block_key,
+                    });
                     for (index, tensor) in
                         [&query, &key, &value, &page_table, &generations, &output]
                             .into_iter()
@@ -4167,6 +4185,13 @@ impl MetalBackend {
                 let (kernel, threads, kv_per_group) = paged_gqa_first_pass(q[0], k[2])?;
                 (kernel, threads, k[2] / kv_per_group)
             };
+            record_attention(AttentionSchedule::Vector {
+                blocks: gqa_blocks,
+                heads_per_group: q[0]
+                    .checked_div(head_groups)
+                    .ok_or(BackendError::InvalidInput)?,
+                reuse: 1,
+            });
             let partials = self.scratch_tensor(query.layout.dtype(), &[q[0], gqa_blocks, v[3]])?;
             let sums = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
             let maxs = self.scratch_tensor(DType::F32, &[q[0], gqa_blocks])?;
@@ -4263,6 +4288,11 @@ impl MetalBackend {
             temporaries.extend(default_activity.clone());
             return Ok((temporaries, error_flag));
         }
+        record_attention(AttentionSchedule::Vector {
+            blocks: 1,
+            heads_per_group: 1,
+            reuse: 1,
+        });
         let kernel = match q[2] {
             64 => "paged_sdpa_64",
             128 => "paged_sdpa_128",
@@ -5714,6 +5744,9 @@ impl MetalBackend {
         let [query_heads, query_length, width] = shape3(&query.layout)?;
         let [kv_heads, _, _] = shape3(&key.layout)?;
         let [_, _, value_width] = shape3(&value.layout)?;
+        record_attention(
+            AttentionSchedule::contiguous(dispatch, kernel).ok_or(BackendError::InvalidInput)?,
+        );
         let fast_f32 = vector_f32_supported(dispatch);
         let heads_per_group = query_heads / kv_heads;
         let two_pass_blocks = vector_two_pass_blocks(dispatch);
@@ -5880,6 +5913,9 @@ impl MetalBackend {
         let value = self.encoder_tensor(value_tensor)?;
         let output = self.encoder_tensor(dispatch.output())?;
         let [query_heads, query_length, width] = shape3(&query.layout)?;
+        record_attention(
+            AttentionSchedule::contiguous(dispatch, kernel).ok_or(BackendError::InvalidInput)?,
+        );
         let (block_query, _) = steel_attention_tile(kernel, width)?;
         let constants = steel_attention_constants(dispatch, kernel)?;
         let pipeline = self
@@ -5972,6 +6008,7 @@ impl MetalBackend {
         bindings: &mut ArgumentBindings,
         arguments: &mut ArgumentWriter,
     ) -> Result<Vec<BufferBinding>, BackendError> {
+        record_attention(AttentionSchedule::Decomposed);
         let [query, key, value] = dispatch.inputs() else {
             return Err(BackendError::InvalidInput);
         };
@@ -10868,6 +10905,11 @@ fn completion_accesses(dispatch: &Dispatch) -> impl Iterator<Item = CompletionAc
                     CompletionAccess::write(tensor, definite && (!inactive || index == 0))
                 }),
         )
+}
+
+fn record_attention(schedule: AttentionSchedule) {
+    launch_work::attention(schedule);
+    record_plan_call(PlanCall::Attention(schedule));
 }
 
 #[cfg(test)]
