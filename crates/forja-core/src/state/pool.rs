@@ -398,16 +398,13 @@ impl StateSequence {
     /// Builds the slot-bound input/output allocation table for a live transaction.
     ///
     /// # Errors
-    /// Refuses foreign, retired, multi-output or already bound transaction capabilities.
+    /// Refuses foreign, retired or already bound transaction capabilities.
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
         self.pending_index(transaction)?;
-        if !transaction.preceding_outputs.is_empty() {
-            return Err(PagePoolError::InvalidCheckpoint);
-        }
         let table = self.storage.table()?;
-        let entries = [transaction.input, transaction.output_version()]
-            .iter()
-            .map(|&index| table.entries()[index as usize])
+        let entries = std::iter::once(transaction.input)
+            .chain(transaction.output_versions())
+            .map(|index| table.entries()[index as usize])
             .collect();
         let slot = StateSlot {
             table: PageTable::new(entries, table.generations().to_vec())
@@ -475,10 +472,11 @@ mod tests {
         let chain = sequence.begin_chain(1, 2).unwrap();
         assert_eq!(chain.input_version(), 0);
         assert_eq!(chain.output_versions().collect::<Vec<_>>(), &[1, 2]);
-        assert!(matches!(
-            sequence.bind(&chain),
-            Err(PagePoolError::InvalidCheckpoint)
-        ));
+        let slot = sequence.bind(&chain).unwrap();
+        pool.validate_slot(&slot).unwrap();
+        let allocated = sequence.allocation_table().unwrap();
+        assert_eq!(slot.table().entries(), allocated.entries());
+        assert!(sequence.bind(&chain).is_err());
         assert_eq!(sequence.begin(2).err(), Some(PagePoolError::BankInFlight));
         sequence.cancel_unsubmitted(&chain).unwrap();
         let first = sequence.begin(2).unwrap();
@@ -489,6 +487,50 @@ mod tests {
         let second = sequence.begin(3).unwrap();
         assert_eq!(second.input_version(), first.output_version());
         assert_eq!(second.output_versions().collect::<Vec<_>>(), &[2]);
+    }
+
+    #[test]
+    fn access_authenticates_every_chain_link() {
+        use crate::{StateAccess, StateStep};
+        let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+        let pool = StatePool::new(layout, 2, 4096).unwrap();
+        let _other = pool.reserve().unwrap();
+        let mut lane = pool.reserve().unwrap();
+        let tx = lane.begin_chain(1, 2).unwrap();
+        let slot = lane.bind(&tx).unwrap();
+        let access = StateAccess::from_slot(&slot).unwrap();
+        let records = (0..3)
+            .map(|i| slot.table().resolve(i).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(access.source(), records[0]);
+        assert_eq!(access.destination(), records[2]);
+        assert_eq!(access.destinations().collect::<Vec<_>>(), records[1..]);
+        assert_eq!(access.chain_len(), 2);
+        for i in 0..2 {
+            let step = access.step(i).unwrap();
+            assert!(step.is_active());
+            assert_eq!(
+                (step.source(), step.destination()),
+                (records[i], records[i + 1])
+            );
+            assert!(!access.clone().inactive().step(i).unwrap().is_active());
+        }
+        assert!(access.step(2).is_err());
+        assert!(access.step(usize::MAX).is_err());
+        assert!(StateStep::from_slot(&slot).is_err());
+        assert!(StateAccess::from_slot(&StateSlot::poisoned()).is_err());
+        for indices in [vec![], vec![0], vec![0, 0], vec![0, 1, 1], vec![0, 1, 0]] {
+            let mut invalid = slot.clone();
+            invalid.table = PageTable::new(
+                indices.iter().map(|&i| slot.table().entries()[i]).collect(),
+                slot.table().generations().to_vec(),
+            )
+            .unwrap();
+            assert!(StateAccess::from_slot(&invalid).is_err());
+        }
+        let mut stale = slot;
+        stale.table = PageTable::poisoned(3);
+        assert!(StateAccess::from_slot(&stale).is_err());
     }
 
     #[test]
