@@ -2211,6 +2211,25 @@ mod tests {
         let bounds = [510, 1022, 3071, 4099];
         let mut plain = GraphTemplate::new(space.clone(), GraphLimits::default());
         record_copy_rule(&mut plain, 1.into(), &bounds).unwrap();
+        for (key, expected) in [
+            (509, 510),
+            (510, 510),
+            (511, 1022),
+            (512, 1022),
+            (1021, 1022),
+            (1022, 1022),
+            (1023, 3071),
+            (1024, 3071),
+            (3070, 3071),
+            (3071, 3071),
+            (3072, 4099),
+            (3073, 4099),
+        ] {
+            let graph = plain
+                .instantiate(&space.values(vec![7, key]).unwrap())
+                .unwrap();
+            assert_eq!(graph.dispatches()[0].backend_data::<u32>(), Some(&expected));
+        }
         for row_offset in 0..=2 {
             let mut graph = GraphTemplate::new(space.clone(), GraphLimits::default());
             record_copy_rule(
