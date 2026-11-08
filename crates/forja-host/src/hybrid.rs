@@ -15,6 +15,9 @@ impl<B: Backend + 'static> Host<B> {
         if inputs.vocab == 0
             || inputs.prompt_tokens == 0
             || inputs.prompt_tokens > entry.max_context
+            || inputs.verify_rows != entry.verify_rows
+            || (inputs.verify_rows != 0
+                && !(2..=crate::MAX_VERIFY_ROWS).contains(&inputs.verify_rows))
         {
             return Err(invalid_handle("invalid state input layout"));
         }
@@ -31,9 +34,14 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(invalid_handle)?,
         )
         .map_err(invalid_handle)?;
-        let storage = self.create_state_storage(layout, lanes)?;
+        let spares = inputs
+            .verify_rows
+            .checked_add(1)
+            .ok_or_else(|| invalid_handle("verify versions overflowed"))?
+            .saturating_sub(forja_core::StatePool::VERSIONS);
+        let storage = self.create_state_storage_with_spares(layout, lanes, spares)?;
         let state = StateSlots::new(storage, lanes)?;
-        let backing = self.allocate_state_inputs(lanes, inputs)?;
+        let backing = self.allocate_state_inputs_with_spares(lanes, inputs, spares)?;
         let state = state.with_feedback(backing.feedback_versions.clone());
         let slot = match self.open_paged_slot(pool, planes) {
             Ok(slot) => slot,

@@ -102,6 +102,7 @@ impl Engine for ConstantEngine {
                     forja_sdk::PagedInputLayout {
                         vocab: 4,
                         prompt_tokens,
+                        verify_rows: 0,
                     },
                 )
             })

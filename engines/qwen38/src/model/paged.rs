@@ -26,6 +26,7 @@ impl PagedModel {
             PagedInputLayout {
                 vocab: config.vocab,
                 prompt_tokens: context.min(2048),
+                verify_rows: 0,
             },
         )?);
         let choice = |site| {

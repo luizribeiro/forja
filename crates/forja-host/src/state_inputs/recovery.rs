@@ -67,6 +67,7 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
+                    verify_rows: 0,
                 },
             )
             .unwrap();

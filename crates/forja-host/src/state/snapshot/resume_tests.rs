@@ -94,6 +94,7 @@ fn cache_image<B: Backend + Send + Sync + 'static>(
     let resource = host
         .table
         .push(crate::PagePoolEntry {
+            verify_rows: 0,
             pool,
             active_lanes: 11,
             max_context: 257,

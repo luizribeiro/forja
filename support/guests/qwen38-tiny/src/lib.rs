@@ -82,6 +82,7 @@ impl Engine for Tiny {
             forja_sdk::PagedInputLayout {
                 vocab: 33,
                 prompt_tokens,
+                verify_rows: 0,
             },
         )?);
         if load.tunings.iter().any(|name| name == "decoder-fixture") {

@@ -39,6 +39,7 @@ fn hybrid_fixture(limit: u64) -> HybridFixture {
     let resource = host
         .table
         .push(crate::PagePoolEntry {
+            verify_rows: 0,
             pool: pool.clone(),
             active_lanes: 11,
             max_context: 257,

@@ -34,6 +34,8 @@ pub struct PagedInputLayout {
     pub vocab: u32,
     /// Largest prompt piece accepted by the slot.
     pub prompt_tokens: u32,
+    /// Largest declared verify row count, or zero when verification is unsupported.
+    pub verify_rows: u32,
 }
 
 /// Host-filled lane metadata used by serving graphs.
@@ -248,6 +250,7 @@ impl PagedPool<'_> {
                 crate::sys::guest::paged_storage::StateInputLayout {
                     vocab: inputs.vocab,
                     prompt_tokens: inputs.prompt_tokens,
+                    verify_rows: inputs.verify_rows,
                 },
             )
         }

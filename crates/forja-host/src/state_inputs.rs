@@ -357,6 +357,7 @@ impl<B: Backend + 'static> Host<B> {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_state_inputs(
         &mut self,
         lanes: u32,
@@ -443,6 +444,7 @@ mod tests {
         let layout = paged_storage::StateInputLayout {
             vocab: 33,
             prompt_tokens: 7,
+            verify_rows: 0,
         };
         let inputs = host.allocate_state_inputs(2, layout).unwrap();
         let bytes = host.live_bytes.load(Ordering::Acquire);
@@ -468,6 +470,7 @@ mod tests {
         let layout = paged_storage::StateInputLayout {
             vocab: 33,
             prompt_tokens: 7,
+            verify_rows: 0,
         };
         let inputs = host
             .allocate_state_inputs_with_spares(2, layout, 1)
@@ -495,6 +498,7 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
+                    verify_rows: 0,
                 },
             )
             .unwrap();
@@ -527,7 +531,8 @@ mod tests {
                 33,
                 paged_storage::StateInputLayout {
                     vocab: 1,
-                    prompt_tokens: 7
+                    prompt_tokens: 7,
+                    verify_rows: 0,
                 }
             ),
             Err(compute::Error::Quota(_))

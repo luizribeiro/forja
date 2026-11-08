@@ -191,6 +191,17 @@ pub struct ServingInfo {
     pub batch_shapes: Vec<BatchShape>,
 }
 
+impl ServingInfo {
+    fn verify_rows(&self) -> u32 {
+        self.batch_shapes
+            .iter()
+            .filter(|shape| shape.phase == BatchPhase::Verify)
+            .map(|shape| shape.tokens)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// One phase in the finite serving graph catalog.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchPhase {
@@ -1606,6 +1617,7 @@ where
         let pool = PagePool::new_fixed(layout, physical_pages, byte_limit)
             .map_err(|error| compute::Error::Quota(error.to_string()))?;
         let entry = PagePoolEntry {
+            verify_rows: serving.verify_rows(),
             pool,
             active_lanes: serving.active_lanes,
             max_context,
@@ -3655,6 +3667,7 @@ pub struct PagePoolEntry {
     active_lanes: u32,
     max_context: u32,
     plane_count: u32,
+    verify_rows: u32,
     slot_banks: Option<Arc<PagedSlotBanks>>,
     slot: Option<u32>,
     charge: Arc<PagePoolCharge>,
@@ -10258,6 +10271,7 @@ mod tests {
                 active_lanes: 1,
                 max_context,
                 plane_count,
+                verify_rows: 0,
                 slot_banks: None,
                 slot: None,
                 charge: crate::PagePoolCharge::shared(charged_bytes, Arc::clone(&host.live_bytes)),
@@ -10306,6 +10320,7 @@ mod tests {
                 super::paged_storage::StateInputLayout {
                     vocab: 7,
                     prompt_tokens: 8,
+                    verify_rows: 0,
                 },
             )
             .unwrap();
@@ -10862,6 +10877,7 @@ mod tests {
         let inputs = || super::paged_storage::StateInputLayout {
             vocab: 7,
             prompt_tokens: 8,
+            verify_rows: 0,
         };
         for bad in [
             super::paged_storage::StateInputLayout {
@@ -10870,10 +10886,12 @@ mod tests {
             },
             super::paged_storage::StateInputLayout {
                 prompt_tokens: 0,
+                verify_rows: 0,
                 ..inputs()
             },
             super::paged_storage::StateInputLayout {
                 prompt_tokens: 9,
+                verify_rows: 0,
                 ..inputs()
             },
         ] {
@@ -10924,6 +10942,7 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
+                    verify_rows: 0,
                 },
             )
             .unwrap();
@@ -11300,6 +11319,7 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
+                    verify_rows: 0,
                 },
             )
             .unwrap();
@@ -11397,6 +11417,7 @@ mod tests {
             paged_storage::StateInputLayout {
                 vocab: 33,
                 prompt_tokens: 7,
+                verify_rows: 0,
             },
         )
         .unwrap();
@@ -12513,6 +12534,81 @@ mod tests {
     }
 
     #[test]
+    fn declared_verify_rows_size_state_and_feedback_spares() {
+        for rows in [0_u32, 2, 3, 8] {
+            let mut host = Host::new(CpuBackend::new(), GENEROUS);
+            host.limits.live_tensor_handles = 64;
+            let pool = insert_test_pool(&mut host, 2, 33);
+            host.table.get_mut(&pool).unwrap().verify_rows = rows;
+            let inputs = paged_storage::StateInputLayout {
+                vocab: 7,
+                prompt_tokens: 1,
+                verify_rows: rows,
+            };
+            assert!(
+                host.open_state_slot(
+                    &pool,
+                    2,
+                    vec![],
+                    paged_storage::StateInputLayout {
+                        verify_rows: 1,
+                        ..inputs
+                    }
+                )
+                .is_err()
+            );
+            let slot = host
+                .open_state_slot(
+                    &pool,
+                    2,
+                    vec![paged_storage::StatePlaneDescriptor {
+                        dtype: compute::Dtype::F32,
+                        shape: vec![7],
+                    }],
+                    inputs,
+                )
+                .unwrap();
+            let inputs = host.table.get(&slot).unwrap().inputs.as_ref().unwrap();
+            assert_eq!(
+                inputs.feedback.len(),
+                5 + usize::try_from((rows + 1).saturating_sub(3)).unwrap()
+            );
+            let state = &host.state_slots[&slot.rep()];
+            assert!(state.trace_chain(rows.max(1)).is_ok());
+            assert!(state.trace_chain(rows.max(2) + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn hybrid_open_refuses_invalid_or_undeclared_verify_rows() {
+        for (declared, registered) in [(1, 1), (9, 9), (3, 0)] {
+            let mut host = Host::new(CpuBackend::new(), GENEROUS);
+            let pool = insert_test_pool(&mut host, 2, 33);
+            host.table.get_mut(&pool).unwrap().verify_rows = registered;
+            let before = host.live_bytes.load(Ordering::Acquire);
+            let result = host.open_state_slot(
+                &pool,
+                2,
+                vec![paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![1],
+                }],
+                paged_storage::StateInputLayout {
+                    vocab: 7,
+                    prompt_tokens: 1,
+                    verify_rows: declared,
+                },
+            );
+            assert!(
+                matches!(result, Err(compute::Error::InvalidHandle(_))),
+                "declared={declared}, registered={registered}"
+            );
+            assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+            assert_eq!(host.live_handles, 0);
+        }
+    }
+
+    #[test]
     fn state_token_loans_are_read_only_banked_and_quota_checked() {
         let (mut host, _pool, slot) = convolution_slot_host();
         host.state_slots
@@ -12586,6 +12682,7 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
+                    verify_rows: 0,
                 },
             )
             .unwrap();
@@ -13294,6 +13391,7 @@ mod tests {
                 active_lanes: 2,
                 max_context: 4,
                 plane_count: 1,
+                verify_rows: 0,
                 slot_banks: None,
                 slot: None,
                 charge: crate::PagePoolCharge::shared(charged_bytes, Arc::clone(&host.live_bytes)),

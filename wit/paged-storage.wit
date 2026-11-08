@@ -39,6 +39,7 @@ interface paged-storage {
   record state-input-layout {
     vocab: u32,
     prompt-tokens: u32,
+    verify-rows: u32,
   }
   resource page-pool {
     open-slot: func(planes: u32) -> result<batch-slot, error>;
