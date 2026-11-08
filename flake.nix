@@ -152,6 +152,7 @@
                 fi
               fi
 
+              status=0
               run_everything=false
               run_non_metal=false
               run_metal=false
@@ -185,16 +186,17 @@
 
               if $run_everything || { $run_non_metal && $run_metal; }; then
                 if [[ "''${FORJA_NO_GPU:-}" == "1" ]]; then
-                  CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                  CARGO_INCREMENTAL=1 cargo nextest run --no-fail-fast --profile ci --release --workspace --all-features --locked --no-tests pass || status=$?
                 else
-                  CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
-                  CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
+                  CARGO_INCREMENTAL=1 cargo nextest run --no-fail-fast --profile ci --release --workspace --all-features --locked --no-tests pass || status=$?
+                  CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --no-fail-fast --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)' || status=$?
                 fi
               elif $run_non_metal; then
-                CARGO_INCREMENTAL=1 cargo nextest run --profile ci --release --workspace --all-features --locked --no-tests pass
+                CARGO_INCREMENTAL=1 cargo nextest run --no-fail-fast --profile ci --release --workspace --all-features --locked --no-tests pass || status=$?
               elif $run_metal && [[ "''${FORJA_NO_GPU:-}" != "1" ]]; then
-                CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)'
+                CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=target/non-incremental cargo nextest run --no-fail-fast --release --workspace --all-features --locked --no-tests pass -E 'package(forja-metal) or test(/^native_metal::/) or test(/^kernel_ui::/) or test(/(^|::)metal_/)' || status=$?
               fi
+              exit "$status"
             '';
           };
           guest-reproducibility = cargoHook {
@@ -245,14 +247,16 @@
                 export FORJA_MODELS="''${FORJA_MODELS:-$HOME/.cache/forja/models}"
                 export CARGO_INCREMENTAL=0
                 export CARGO_TARGET_DIR=target/non-incremental
-                cargo nextest run --release -p forja-host --test host -E 'test(qwen_weights::)' --run-ignored only
-                cargo nextest run --release -p forja-sdk --features native-metal --test sdk -E 'test(qwen_moe::)' --run-ignored only
-                cargo nextest run --release -p forja-host --test host -E 'test(qwen_engine::)' --run-ignored only
-                cargo nextest run --release -p forja-host --test host -E 'test(qwen3_coder_engine::)' --run-ignored only
-                cargo nextest run --release -p forja-host --test host -E 'test(qwen38::real::)' --run-ignored only --success-output immediate
-                cargo nextest run --release -p golden-fixtures --test fixtures -E 'test(qwen_fixtures::)' --run-ignored only
-                cargo nextest run --release -p golden-fixtures --test fixtures -E 'test(mixture_fixtures::)' --run-ignored only
-                cargo nextest run --release -p forja --bin forja --run-ignored only
+                status=0
+                cargo nextest run --no-fail-fast --release -p forja-host --test host -E 'test(qwen_weights::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p forja-sdk --features native-metal --test sdk -E 'test(qwen_moe::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p forja-host --test host -E 'test(qwen_engine::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p forja-host --test host -E 'test(qwen3_coder_engine::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p forja-host --test host -E 'test(qwen38::real::)' --run-ignored only --success-output immediate || status=$?
+                cargo nextest run --no-fail-fast --release -p golden-fixtures --test fixtures -E 'test(qwen_fixtures::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p golden-fixtures --test fixtures -E 'test(mixture_fixtures::)' --run-ignored only || status=$?
+                cargo nextest run --no-fail-fast --release -p forja --bin forja --run-ignored only || status=$?
+                exit "$status"
               '';
             })
             // {
