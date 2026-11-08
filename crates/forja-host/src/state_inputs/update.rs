@@ -6,6 +6,8 @@ use crate::{
 use std::sync::Arc;
 use wasmtime::component::Resource;
 
+const STAGING_BYTES_PER_WORD: u64 = 2 * size_of::<u32>() as u64;
+
 fn sampling_words(params: SamplingParams) -> [u32; 5] {
     let seed = params.seed.to_le_bytes();
     [
@@ -152,7 +154,7 @@ impl<B: Backend + 'static> Host<B> {
         let words = u64::from(layout.vocab.div_ceil(32))
             .checked_add(6)
             .and_then(|words| words.checked_mul(u64::try_from(lanes).ok()?))
-            .and_then(|words| words.checked_mul(8))
+            .and_then(|words| words.checked_mul(STAGING_BYTES_PER_WORD))
             .ok_or_else(|| invalid_handle("selection staging bytes overflowed"))?;
         let _charge = StateCharge::reserve(
             self.backend.as_ref(),
@@ -199,6 +201,9 @@ impl<B: Backend + 'static> Host<B> {
         pool: u32,
         input: &EngineBatch,
     ) -> Result<(), compute::Error> {
+        if input.shape.phase == BatchPhase::Verify {
+            self.write_verify_tokens(pool, input)?;
+        }
         self.write_state_inputs(
             pool,
             input.shape.phase,
@@ -207,6 +212,52 @@ impl<B: Backend + 'static> Host<B> {
                 tokens: lane.tokens.as_deref(),
                 sampling: lane.sampling,
             }),
+        )
+    }
+
+    fn write_verify_tokens(&self, pool: u32, input: &EngineBatch) -> Result<(), compute::Error> {
+        let (_, slot, max_context) = self
+            .input_slot(pool)?
+            .ok_or_else(|| invalid_handle("verify slot is missing"))?;
+        let layout = slot
+            .input_layout
+            .ok_or_else(|| invalid_handle("verify input layout is missing"))?;
+        let bank = &slot
+            .inputs
+            .as_ref()
+            .ok_or_else(|| invalid_handle("verify inputs are missing"))?
+            .banks[slot.active_bank];
+        let verify = bank
+            .verify
+            .as_ref()
+            .ok_or_else(|| invalid_handle("verify row storage is missing"))?;
+        let (_, tokens) = crate::validate_verify_lane(
+            input.shape,
+            &input.lanes,
+            u32::try_from(slot.binding.lanes.len()).map_err(invalid_handle)?,
+            verify.rows,
+            layout.vocab,
+            max_context,
+        )?;
+        let bytes = u64::from(verify.rows)
+            .checked_mul(STAGING_BYTES_PER_WORD)
+            .ok_or_else(|| invalid_handle("verify staging bytes overflowed"))?;
+        let _charge = StateCharge::reserve(
+            self.backend.as_ref(),
+            Arc::clone(&self.live_bytes),
+            self.limits.live_bytes,
+            bytes,
+        )?;
+        let padding = u64::from(verify.rows)
+            .checked_sub(u64::try_from(tokens.len()).map_err(invalid_handle)?)
+            .ok_or_else(|| invalid_handle("verify padding underflowed"))?;
+        self.recover_state_input_handles([verify.tokens])?;
+        self.write_input_words(
+            verify.tokens,
+            tokens.iter().copied().chain(std::iter::repeat_n(
+                0,
+                usize::try_from(padding).map_err(invalid_handle)?,
+            )),
         )
     }
 
@@ -253,7 +304,7 @@ impl<B: Backend + 'static> Host<B> {
             .checked_mul(7)
             .and_then(|n| n.checked_add(mask_count))
             .and_then(|n| n.checked_add(u64::from(layout.prompt_tokens)))
-            .and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_mul(STAGING_BYTES_PER_WORD))
             .ok_or_else(|| invalid_handle("input staging bytes overflow"))?;
         let _charge = StateCharge::reserve(
             self.backend.as_ref(),

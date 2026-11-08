@@ -12547,41 +12547,55 @@ mod tests {
         }
     }
 
+    fn verify_input_fixture(
+        rows: u32,
+        lanes: u32,
+    ) -> (
+        Host<CpuBackend>,
+        Resource<PagePoolEntry>,
+        Resource<BatchSlotEntry>,
+    ) {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        host.limits.live_tensor_handles = 128;
+        let pool = insert_test_pool(&mut host, 2, 33);
+        let entry = host.table.get_mut(&pool).unwrap();
+        entry.verify_rows = rows;
+        entry.active_lanes = lanes;
+        let inputs = paged_storage::StateInputLayout {
+            vocab: 7,
+            prompt_tokens: 1,
+            verify_rows: rows,
+        };
+        assert!(
+            host.open_state_slot(
+                &pool,
+                2,
+                vec![],
+                paged_storage::StateInputLayout {
+                    verify_rows: 1,
+                    ..inputs
+                }
+            )
+            .is_err()
+        );
+        let slot = host
+            .open_state_slot(
+                &pool,
+                2,
+                vec![paged_storage::StatePlaneDescriptor {
+                    dtype: compute::Dtype::F32,
+                    shape: vec![7],
+                }],
+                inputs,
+            )
+            .unwrap();
+        (host, pool, slot)
+    }
+
     #[test]
     fn declared_verify_rows_size_state_and_feedback_spares() {
         for rows in [0_u32, 2, 3, 8] {
-            let mut host = Host::new(CpuBackend::new(), GENEROUS);
-            host.limits.live_tensor_handles = 64;
-            let pool = insert_test_pool(&mut host, 2, 33);
-            host.table.get_mut(&pool).unwrap().verify_rows = rows;
-            let inputs = paged_storage::StateInputLayout {
-                vocab: 7,
-                prompt_tokens: 1,
-                verify_rows: rows,
-            };
-            assert!(
-                host.open_state_slot(
-                    &pool,
-                    2,
-                    vec![],
-                    paged_storage::StateInputLayout {
-                        verify_rows: 1,
-                        ..inputs
-                    }
-                )
-                .is_err()
-            );
-            let slot = host
-                .open_state_slot(
-                    &pool,
-                    2,
-                    vec![paged_storage::StatePlaneDescriptor {
-                        dtype: compute::Dtype::F32,
-                        shape: vec![7],
-                    }],
-                    inputs,
-                )
-                .unwrap();
+            let (host, _pool, slot) = verify_input_fixture(rows, 1);
             let inputs = host.table.get(&slot).unwrap().inputs.as_ref().unwrap();
             assert_eq!(
                 inputs.feedback.len(),
@@ -12770,6 +12784,147 @@ mod tests {
         );
         assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
         assert_eq!(host.live_handles, 0);
+    }
+
+    #[test]
+    fn verify_tokens_stage_by_row_without_touching_peer_buffers() {
+        let (mut host, pool, slot) = verify_input_fixture(3, 8);
+        let inputs = host.table.get(&slot).unwrap().inputs.as_ref().unwrap();
+        let rows = inputs.banks[0].verify.as_ref().unwrap().tokens;
+        let untouched = [
+            inputs.banks[1].verify.as_ref().unwrap().tokens,
+            inputs.banks[0].selected,
+            inputs.banks[0].verify.as_ref().unwrap().selected,
+        ];
+        let read = read_input_tensor;
+        for handle in untouched {
+            let bytes = read(&host, handle).len();
+            host.write(&Resource::new_borrow(handle), &vec![17; bytes])
+                .unwrap();
+        }
+        let mut input = EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Verify,
+                bucket: 1,
+                tokens: 3,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 5,
+                tokens: Some(vec![1, 2, 3]),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            })],
+        };
+        host.write_state_batch_inputs(pool.rep(), &input).unwrap();
+        assert_eq!(
+            read(&host, rows),
+            [1_u32, 2, 3].map(u32::to_ne_bytes).concat()
+        );
+        for tokens in [None, Some(vec![1, 2]), Some(vec![1, 7, 3])] {
+            input.lanes[0].as_mut().unwrap().tokens = tokens;
+            assert!(host.write_state_batch_inputs(pool.rep(), &input).is_err());
+            assert_eq!(
+                read(&host, rows),
+                [1_u32, 2, 3].map(u32::to_ne_bytes).concat()
+            );
+        }
+        input.shape.tokens = 2;
+        input.lanes[0].as_mut().unwrap().tokens = Some(vec![3, 1]);
+        host.write_state_batch_inputs(pool.rep(), &input).unwrap();
+        assert_eq!(
+            read(&host, rows),
+            [3_u32, 1, 0].map(u32::to_ne_bytes).concat()
+        );
+        host.limits.live_bytes = host.live_bytes.load(Ordering::Acquire);
+        assert!(host.write_state_batch_inputs(pool.rep(), &input).is_err());
+        assert_eq!(
+            read(&host, rows),
+            [3_u32, 1, 0].map(u32::to_ne_bytes).concat()
+        );
+        for handle in untouched {
+            assert!(read(&host, handle).iter().all(|byte| *byte == 17));
+        }
+    }
+
+    #[test]
+    fn verify_staging_refusals_preserve_row_storage() {
+        let (mut host, pool, slot) = verify_input_fixture(3, 8);
+        let rows = host
+            .table
+            .get(&slot)
+            .unwrap()
+            .inputs
+            .as_ref()
+            .unwrap()
+            .banks[0]
+            .verify
+            .as_ref()
+            .unwrap()
+            .tokens;
+        let valid = EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Verify,
+                bucket: 1,
+                tokens: 3,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 5,
+                tokens: Some(vec![1, 2, 3]),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            })],
+        };
+        host.write_state_batch_inputs(pool.rep(), &valid).unwrap();
+        let before = read_input_tensor(&host, rows);
+        for (case, expected) in [
+            ("bucket", "verify bucket must be one"),
+            ("forward", "verify selection must be combined"),
+            ("masked", "verify selection must be combined"),
+            ("slot", "verify lane slot exceeds the lane capacity"),
+            ("context", "verify rows exceed the context limit"),
+            ("overflow", "verify rows exceed the context limit"),
+            ("storage", "verify rows exceed the storage capacity"),
+            ("multiple", "verify requires exactly one lane"),
+            ("none", "verify requires exactly one lane"),
+            ("inactive", "verify lane is inactive"),
+            ("tokens", "verify tokens must be host-staged"),
+            ("count", "verify token count differs from the shape"),
+            ("vocab", "verify token is outside the vocabulary"),
+            ("short", "verify requires at least two rows"),
+            ("missing", "verify slot is missing"),
+        ] {
+            let mut input = valid.clone();
+            match case {
+                "bucket" => input.shape.bucket = 2,
+                "forward" => input.shape.selection = BatchSelection::Forward,
+                "masked" => input.shape.selection = BatchSelection::Masked,
+                "slot" => input.lanes[0].as_mut().unwrap().slot = 8,
+                "context" => input.lanes[0].as_mut().unwrap().start_pos = 31,
+                "overflow" => input.lanes[0].as_mut().unwrap().start_pos = u32::MAX,
+                "storage" => input.shape.tokens = 4,
+                "multiple" => input.lanes.push(input.lanes[0].clone()),
+                "none" => input.lanes.clear(),
+                "inactive" => input.lanes[0] = None,
+                "tokens" => input.lanes[0].as_mut().unwrap().tokens = None,
+                "count" => input.lanes[0].as_mut().unwrap().tokens = Some(vec![1, 2]),
+                "vocab" => input.lanes[0].as_mut().unwrap().tokens = Some(vec![1, 7, 3]),
+                "short" => input.shape.tokens = 1,
+                "missing" => host.table.get_mut(&pool).unwrap().slot = None,
+                _ => unreachable!(),
+            }
+            let error = host
+                .write_state_batch_inputs(pool.rep(), &input)
+                .unwrap_err();
+            let message = match error {
+                compute::Error::Layout(message) | compute::Error::InvalidHandle(message) => message,
+                other => panic!("unexpected error {other:?}"),
+            };
+            assert_eq!(message, expected, "case={case}");
+            assert_eq!(read_input_tensor(&host, rows), before, "case={case}");
+            host.table.get_mut(&pool).unwrap().slot = Some(slot.rep());
+        }
     }
 
     #[test]
