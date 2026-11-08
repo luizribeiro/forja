@@ -217,6 +217,11 @@ impl<B: Backend> StateStorage<B> {
         self.check_usable()?;
         let sequence = self.pool.reserve().map_err(pool_error)?;
         let table = sequence.allocation_table().map_err(pool_error)?;
+        self.clear_records(table.entries())?;
+        Ok(StateSequenceHandle::new(Arc::clone(self), sequence))
+    }
+
+    fn clear_records(&self, entries: &[forja_core::PageTableEntry]) -> Result<(), compute::Error> {
         for (plane, descriptor) in self.pool.layout().planes().iter().enumerate() {
             let size = descriptor
                 .elements()
@@ -235,13 +240,13 @@ impl<B: Backend> StateStorage<B> {
                 .try_reserve_exact(size)
                 .map_err(|_| quota("state initialization allocation failed"))?;
             zeros.resize(size, 0);
-            for entry in table.entries() {
+            for entry in entries {
                 self.backend
                     .write(&self.version_view(plane, entry.page())?, &zeros)
                     .map_err(guest_error)?;
             }
         }
-        Ok(StateSequenceHandle::new(Arc::clone(self), sequence))
+        Ok(())
     }
 
     fn check_usable(&self) -> Result<(), compute::Error> {
