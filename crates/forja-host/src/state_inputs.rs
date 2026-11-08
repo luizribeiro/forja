@@ -362,9 +362,8 @@ impl<B: Backend + 'static> Host<B> {
         lanes: u32,
         layout: paged_storage::StateInputLayout,
     ) -> Result<StateInputs, compute::Error> {
-        let scalars = lanes
-            .checked_mul(5)
-            .ok_or_else(|| invalid_handle("state feedback count overflowed"))?;
+        let scalars =
+            crate::state::feedback::FeedbackBinding::scalar_count(lanes).map_err(invalid_handle)?;
         let available = self
             .limits
             .live_tensor_handles
@@ -436,6 +435,11 @@ mod tests {
         };
         let inputs = host.allocate_state_inputs(2, layout).unwrap();
         let bytes = host.live_bytes.load(Ordering::Acquire);
+        assert_eq!(
+            inputs.feedback.len(),
+            usize::try_from(crate::state::feedback::FeedbackBinding::scalar_count(2).unwrap())
+                .unwrap()
+        );
         assert_ne!(inputs.banks[0].logits, inputs.banks[1].logits);
         host.drop_paged_handles(inputs.handles().collect());
         drop(inputs);
