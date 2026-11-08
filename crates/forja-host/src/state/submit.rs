@@ -28,9 +28,9 @@ impl<B: Backend> StateRecording<B> {
         profiled: bool,
     ) -> Result<StateSubmission<B>, compute::Error> {
         self.storage.check_usable()?;
-        if self.updated.iter().any(|&updated| !updated) {
+        if !self.updates_complete() {
             return Err(invalid_handle(
-                "every state plane must be updated before submission",
+                "every state plane must complete its update chain before submission",
             ));
         }
         let storage = std::sync::Arc::clone(&self.storage);

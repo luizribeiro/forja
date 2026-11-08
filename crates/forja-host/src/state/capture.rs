@@ -9,7 +9,7 @@ pub struct StateCapture {
     access: StateAccess,
     planes: Vec<[Tensor; 2]>,
     metadata: Vec<Tensor>,
-    updated: Vec<bool>,
+    updated: Vec<usize>,
     _owner: CompletionResource,
     private_scratch: Vec<CompletionResource>,
     scratch_charges: Vec<CompletionResource>,
@@ -100,7 +100,7 @@ impl StateCapture {
                     .updated
                     .iter()
                     .zip(&recording.updated)
-                    .any(|(old, new)| *old && *new))
+                    .any(|(old, new)| *old != 0 && *new != 0))
         {
             return Err(invalid_handle(
                 "captured state does not match the transaction",
@@ -135,7 +135,7 @@ impl StateCapture {
             .captured_scratch_charges
             .extend(self.scratch_charges.iter().cloned());
         for (current, updated) in recording.updated.iter_mut().zip(&self.updated) {
-            *current |= updated;
+            *current = (*current).max(*updated);
         }
         Ok(bindings)
     }

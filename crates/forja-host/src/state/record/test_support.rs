@@ -1,10 +1,14 @@
 use super::*;
 use crate::Host;
-use forja_core::{StateLayout, StatePlane, StateSequence};
+use forja_core::{StateLayout, StatePlane, StateSequence, Submission};
 
 pub(super) struct Fixture<B: Backend> {
     pub(super) host: Host<B>,
     pub(super) storage: Arc<StateStorage<B>>,
+    pub(super) input: Tensor,
+    pub(super) weights: Tensor,
+    pub(super) delta: Vec<Tensor>,
+    pub(super) outputs: Vec<[Tensor; 2]>,
 }
 
 impl<B: Backend + 'static> Fixture<B> {
@@ -20,7 +24,37 @@ impl<B: Backend + 'static> Fixture<B> {
                 2,
             )
             .unwrap();
-        Self { host, storage }
+        let tensor = |shape: &[u32], value: f32| {
+            let tensor = host.backend.alloc(DType::F32, shape).unwrap();
+            host.backend
+                .write(
+                    &tensor,
+                    &value
+                        .to_le_bytes()
+                        .repeat(usize::try_from(tensor.layout().element_count()).unwrap()),
+                )
+                .unwrap();
+            tensor
+        };
+        Self {
+            storage,
+            input: tensor(&[1, 7], 2.),
+            weights: tensor(&[4, 7], 1.),
+            delta: [
+                (&[1, 7][..], 0.125),
+                (&[1, 7], 0.125),
+                (&[1, 33], 2.),
+                (&[1], 1.),
+                (&[1], 0.5),
+            ]
+            .iter()
+            .map(|(shape, value)| tensor(shape, *value))
+            .collect(),
+            outputs: (0..2)
+                .map(|_| [tensor(&[1, 7], 0.), tensor(&[1, 33], 0.)])
+                .collect(),
+            host,
+        }
     }
 
     pub(super) fn reserve(&self) -> StateSequence {
@@ -54,5 +88,48 @@ impl<B: Backend + 'static> Fixture<B> {
             .unwrap();
         commands.initialize_slot(&slot).unwrap();
         commands
+    }
+
+    pub(super) fn update(&self, commands: &mut StateCommands<B>, row: usize) {
+        commands
+            .causal_convolution(0, &self.input, &self.weights, &self.outputs[row][0])
+            .unwrap();
+        commands
+            .delta_rule(
+                1,
+                self.delta.iter().collect::<Vec<_>>().try_into().unwrap(),
+                &self.outputs[row][1],
+            )
+            .unwrap();
+    }
+
+    pub(super) fn read_outputs(&self) -> Vec<Vec<Vec<u8>>> {
+        self.outputs
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|tensor| self.host.backend.read(tensor).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub(super) fn execute_result(
+        &self,
+        mut commands: StateCommands<B>,
+    ) -> Result<(), forja_core::BackendError> {
+        self.host
+            .backend
+            .submit_with_timeout(
+                std::mem::take(&mut commands.commands),
+                commands.retained_resources(),
+                false,
+                self.host.limits.submission_timeout,
+            )
+            .unwrap()
+            .wait_timeout(self.host.limits.submission_timeout)
+    }
+    pub(super) fn execute(&self, commands: StateCommands<B>) {
+        self.execute_result(commands).unwrap();
     }
 }

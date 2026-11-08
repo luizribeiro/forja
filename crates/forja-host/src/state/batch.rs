@@ -25,7 +25,7 @@ impl<B: Backend> StateBatch<B> {
         recordings.sort_by_key(|recording| recording.sequence.order_key());
         let storage = &recordings[0].storage;
         if recordings.iter().any(|recording| {
-            !Arc::ptr_eq(storage, &recording.storage) || recording.updated.contains(&false)
+            !Arc::ptr_eq(storage, &recording.storage) || !recording.updates_complete()
         }) || recordings
             .windows(2)
             .any(|pair| pair[0].sequence.order_key() == pair[1].sequence.order_key())

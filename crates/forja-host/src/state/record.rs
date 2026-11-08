@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod chain_tests;
+#[cfg(test)]
 mod metadata_tests;
 #[cfg(test)]
 mod plumbing_tests;
@@ -43,7 +45,7 @@ pub struct StateCommands<B: Backend> {
     pub(super) metadata: Arc<StateMetadata<B>>,
     pub(super) feedback: Option<super::feedback::FeedbackUse>,
     pub(crate) commands: CommandList,
-    pub(super) updated: Vec<bool>,
+    pub(super) updated: Vec<usize>,
     pub(super) limits: Limits,
 }
 
@@ -143,9 +145,6 @@ impl<B: Backend> StateStorage<B> {
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         sequence.materialize_snapshot()?;
         let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
-        if access.chain_len() != 1 {
-            return Err(invalid_handle("state recording requires a single update"));
-        }
         let mut body = prepare(access.clone())?;
         body.feedback = sequence
             .lock()
@@ -239,7 +238,7 @@ impl<B: Backend> StateCommands<B> {
                 charge,
             }),
             commands: CommandList::new(),
-            updated: vec![false; storage.planes.len()],
+            updated: vec![0; storage.planes.len()],
             limits,
         }
     }
@@ -323,6 +322,48 @@ impl<B: Backend> StateCommands<B> {
             .ok_or_else(|| quota("state table size overflow"))
     }
 
+    pub(super) fn table_view(&self, step: usize) -> Result<Tensor, compute::Error> {
+        self.access.step(step).map_err(pool_error)?;
+        let table = self
+            .metadata
+            .first()
+            .ok_or_else(|| invalid_handle("missing state authentication table"))?;
+        let offset = u64::try_from(step)
+            .ok()
+            .and_then(|step| step.checked_mul(4))
+            .ok_or_else(|| quota("state table offset overflow"))?;
+        let layout = forja_core::Layout::contiguous(
+            DType::U32,
+            offset,
+            vec![2, 2],
+            table.buffer().byte_len(),
+        )
+        .map_err(guest_error)?;
+        self.storage
+            .backend
+            .tensor(table.buffer(), layout)
+            .map_err(guest_error)
+    }
+
+    pub(super) fn next_access(&self, plane: usize) -> Result<StateStep, compute::Error> {
+        self.access
+            .step(self.update_count(plane)?)
+            .map_err(pool_error)
+    }
+
+    fn update_count(&self, plane: usize) -> Result<usize, compute::Error> {
+        self.updated
+            .get(plane)
+            .copied()
+            .ok_or_else(|| invalid_handle("unknown state plane"))
+    }
+
+    pub(super) fn updates_complete(&self) -> bool {
+        self.updated
+            .iter()
+            .all(|&count| count == self.access.chain_len())
+    }
+
     pub(crate) fn release_graph_scratch(&mut self) {
         self.scratch.clear();
         self.captured_scratch.clear();
@@ -363,25 +404,20 @@ impl<B: Backend> StateCommands<B> {
     /// Records one plane's delta-rule update from Q, K, V, decay and beta.
     ///
     /// # Errors
-    /// Refuses invalid geometry, aliasing, work quota or a duplicate plane update.
+    /// Refuses invalid geometry, aliasing, work quota or an update past the chain.
     pub fn delta_rule(
         &mut self,
         plane: usize,
         inputs: [&Tensor; 5],
         output: &Tensor,
     ) -> Result<(), compute::Error> {
-        self.update(
-            plane,
-            StateOp::DeltaRule(self.access.step(0).map_err(pool_error)?),
-            &inputs,
-            output,
-        )
+        self.update(plane, StateOp::DeltaRule, &inputs, output)
     }
 
     /// Records one plane's raw history carry and causal convolution.
     ///
     /// # Errors
-    /// Refuses invalid geometry, aliasing, work quota or a duplicate plane update.
+    /// Refuses invalid geometry, aliasing, work quota or an update past the chain.
     pub fn causal_convolution(
         &mut self,
         plane: usize,
@@ -391,7 +427,7 @@ impl<B: Backend> StateCommands<B> {
     ) -> Result<(), compute::Error> {
         self.update(
             plane,
-            StateOp::CausalDepthwiseConv(self.access.step(0).map_err(pool_error)?),
+            StateOp::CausalDepthwiseConv,
             &[input, weights],
             output,
         )
@@ -400,11 +436,17 @@ impl<B: Backend> StateCommands<B> {
     fn update(
         &mut self,
         plane: usize,
-        operation: StateOp,
+        operation: fn(StateStep) -> StateOp,
         inputs: &[&Tensor],
         output: &Tensor,
     ) -> Result<(), compute::Error> {
-        let dispatch = self.prepare_update(plane, operation, inputs, output, None)?;
+        let dispatch = self.prepare_update(
+            plane,
+            operation(self.next_access(plane)?),
+            inputs,
+            output,
+            None,
+        )?;
         self.record_update(plane, dispatch)
     }
 
@@ -421,7 +463,7 @@ impl<B: Backend> StateCommands<B> {
     {
         let mut dispatch = self.prepare_update(
             plane,
-            operation(self.access.step(0).map_err(pool_error)?),
+            operation(self.next_access(plane)?),
             inputs,
             output,
             None,
@@ -466,18 +508,22 @@ impl<B: Backend> StateCommands<B> {
         output: &Tensor,
         scratch: Option<&Tensor>,
     ) -> Result<forja_core::Dispatch, compute::Error> {
-        if self.access.chain_len() != 1 {
-            return Err(invalid_handle("state update requires a single destination"));
+        let access = self.next_access(plane)?;
+        if operation.access() != access {
+            return Err(invalid_handle("state update is out of chain order"));
         }
-        if self.updated.get(plane).copied() != Some(false) {
-            return Err(invalid_handle("state plane is unknown or already updated"));
-        }
-        let previous = self.storage.version_view(plane, self.access.source())?;
-        let next = self
-            .storage
-            .version_view(plane, self.access.destination())?;
+        let previous = self.storage.version_view(plane, access.source())?;
+        let next = self.storage.version_view(plane, access.destination())?;
+        let Some([generations, activity]) = self.metadata.get(1..3) else {
+            return Err(invalid_handle("incomplete state authentication metadata"));
+        };
+        let metadata = [
+            self.table_view(self.update_count(plane)?)?,
+            generations.clone(),
+            activity.clone(),
+        ];
         let operands = operation
-            .bind_inputs(inputs, &previous, &self.metadata)
+            .bind_inputs(inputs, &previous, &metadata)
             .map_err(guest_error)?;
         let outputs = [output, &next]
             .into_iter()
@@ -505,6 +551,10 @@ impl<B: Backend> StateCommands<B> {
         plane: usize,
         dispatch: forja_core::Dispatch,
     ) -> Result<(), compute::Error> {
+        if !matches!(dispatch.op(), Op::State(operation) if operation.access() == self.next_access(plane)?)
+        {
+            return Err(invalid_handle("state update is out of chain order"));
+        }
         let work = dispatch
             .work()
             .ok_or_else(|| quota("state work overflow"))?;
@@ -513,8 +563,15 @@ impl<B: Backend> StateCommands<B> {
         {
             return Err(quota("state recording exceeds command work limits"));
         }
+        let updated = self
+            .updated
+            .get_mut(plane)
+            .ok_or_else(|| invalid_handle("unknown state plane"))?;
+        let next = updated
+            .checked_add(1)
+            .ok_or_else(|| quota("state update count overflow"))?;
         self.commands.record_validated(dispatch);
-        self.updated[plane] = true;
+        *updated = next;
         Ok(())
     }
 }
