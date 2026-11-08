@@ -952,6 +952,55 @@ fn validate_batch_shapes(serving: &ServingInfo) -> Result<(), compute::Error> {
     Ok(())
 }
 
+fn validate_verify_lane(
+    shape: BatchShape,
+    lanes: &[Option<EngineBatchLane>],
+    active_lanes: u32,
+    verify_rows: u32,
+    vocab: u32,
+    max_context: u32,
+) -> Result<(&EngineBatchLane, &[u32]), compute::Error> {
+    let invalid = |message: &str| compute::Error::Layout(message.to_owned());
+    if shape.bucket != 1 {
+        return Err(invalid("verify bucket must be one"));
+    }
+    if shape.selection != BatchSelection::Combined {
+        return Err(invalid("verify selection must be combined"));
+    }
+    if shape.tokens < 2 {
+        return Err(invalid("verify requires at least two rows"));
+    }
+    if shape.tokens > verify_rows {
+        return Err(invalid("verify rows exceed the storage capacity"));
+    }
+    let [lane] = lanes else {
+        return Err(invalid("verify requires exactly one lane"));
+    };
+    let lane = lane
+        .as_ref()
+        .ok_or_else(|| invalid("verify lane is inactive"))?;
+    if lane.slot >= active_lanes {
+        return Err(invalid("verify lane slot exceeds the lane capacity"));
+    }
+    let tokens = lane
+        .tokens
+        .as_deref()
+        .ok_or_else(|| invalid("verify tokens must be host-staged"))?;
+    if usize::try_from(shape.tokens).ok() != Some(tokens.len()) {
+        return Err(invalid("verify token count differs from the shape"));
+    }
+    if tokens.iter().any(|&id| id >= vocab) {
+        return Err(invalid("verify token is outside the vocabulary"));
+    }
+    let end = u64::from(lane.start_pos)
+        .checked_add(u64::from(shape.tokens))
+        .ok_or_else(|| invalid("verify context extent overflowed"))?;
+    if end > u64::from(max_context) {
+        return Err(invalid("verify rows exceed the context limit"));
+    }
+    Ok((lane, tokens))
+}
+
 /// Validates one batch against an engine's serving descriptor.
 #[doc(hidden)]
 pub fn validate_batch_lanes(
@@ -959,11 +1008,23 @@ pub fn validate_batch_lanes(
     shape: BatchShape,
     lanes: &[Option<EngineBatchLane>],
     selection: BatchSelection,
+    vocab: u32,
 ) -> Result<Vec<u32>, compute::Error> {
     if shape.selection != selection || !serving.batch_shapes.contains(&shape) {
         return Err(compute::Error::Layout(
             "batch shape is not declared for this export".to_owned(),
         ));
+    }
+    if shape.phase == BatchPhase::Verify {
+        validate_verify_lane(
+            shape,
+            lanes,
+            serving.active_lanes,
+            shape.tokens,
+            vocab,
+            serving.max_context,
+        )?;
+        return Ok(vec![shape.tokens]);
     }
     if usize::try_from(shape.bucket) != Ok(lanes.len()) {
         return Err(compute::Error::Layout(
@@ -996,15 +1057,16 @@ pub fn validate_batch_lanes(
             None if shape.phase == BatchPhase::Decode => 1,
             None => {
                 return Err(compute::Error::Layout(
-                    "prompt lanes require input tokens".to_owned(),
+                    "non-decode lanes require input tokens".to_owned(),
                 ));
             }
         };
-        let valid_tokens = match shape.phase {
-            BatchPhase::Decode => tokens == 1,
-            BatchPhase::Verify => tokens == shape.tokens,
-            BatchPhase::Prompt => (1..=shape.tokens).contains(&tokens),
+        let max_tokens = if shape.phase == BatchPhase::Decode {
+            1
+        } else {
+            shape.tokens
         };
+        let valid_tokens = (1..=max_tokens).contains(&tokens);
         if !valid_tokens
             || lane
                 .start_pos
@@ -1903,12 +1965,16 @@ where
                 "engine does not declare batch serving".to_owned(),
             )));
         };
-        let appended =
-            match validate_batch_lanes(serving, input.shape, &input.lanes, BatchSelection::Forward)
-            {
-                Ok(appended) => appended,
-                Err(error) => return Ok(Err(error)),
-            };
+        let appended = match validate_batch_lanes(
+            serving,
+            input.shape,
+            &input.lanes,
+            BatchSelection::Forward,
+            info.vocab,
+        ) {
+            Ok(appended) => appended,
+            Err(error) => return Ok(Err(error)),
+        };
         let Some(pool) = self.page_pool else {
             return Ok(Err(invalid_handle("batch serving requires a paged pool")));
         };
@@ -2136,6 +2202,7 @@ where
             input.shape,
             &input.lanes,
             BatchSelection::Combined,
+            info.vocab,
         ) {
             Ok(appended) => appended,
             Err(error) => return Ok(Err(error)),
@@ -12936,12 +13003,13 @@ mod tests {
                 shape,
                 &[lane(0, 7), None],
                 BatchSelection::Combined,
+                4,
             )
             .unwrap(),
             [1, 0]
         );
         assert!(
-            validate_batch_lanes(&serving, shape, &[lane(0, 7)], BatchSelection::Combined,)
+            validate_batch_lanes(&serving, shape, &[lane(0, 7)], BatchSelection::Combined, 4,)
                 .is_err()
         );
         assert!(
@@ -12950,6 +13018,7 @@ mod tests {
                 shape,
                 &[lane(0, 32), None],
                 BatchSelection::Combined,
+                4,
             )
             .is_err()
         );
@@ -12960,6 +13029,60 @@ mod tests {
             validate_batch_output_layouts((DType::F32, &[1, 4]), (DType::U32, &[2]), 2, 4,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn verify_lanes_use_physical_slots_and_exact_staged_rows() {
+        let shape = BatchShape {
+            phase: BatchPhase::Verify,
+            bucket: 1,
+            tokens: 3,
+            selection: BatchSelection::Combined,
+        };
+        let serving = ServingInfo {
+            page_tokens: 4,
+            planes: Vec::new(),
+            active_lanes: 8,
+            max_context: 33,
+            prefill_chunk_multiple: None,
+            batch_shapes: vec![shape],
+        };
+        let lane = EngineBatchLane {
+            slot: 5,
+            tokens: Some(vec![1, 2, 3]),
+            start_pos: 30,
+            sampling: SamplingParams::default(),
+        };
+        let validate =
+            |lane| validate_batch_lanes(&serving, shape, &[lane], BatchSelection::Combined, 4);
+        assert_eq!(validate(Some(lane.clone())).unwrap(), [3]);
+        assert!(validate(None).is_err());
+        for tokens in [
+            None,
+            Some(vec![]),
+            Some(vec![1]),
+            Some(vec![1, 2]),
+            Some(vec![1, 2, 3, 0]),
+            Some(vec![1, 4, 3]),
+        ] {
+            assert!(
+                validate(Some(EngineBatchLane {
+                    tokens,
+                    ..lane.clone()
+                }))
+                .is_err()
+            );
+        }
+        for start_pos in [31, u32::MAX] {
+            assert!(
+                validate(Some(EngineBatchLane {
+                    start_pos,
+                    ..lane.clone()
+                }))
+                .is_err()
+            );
+        }
+        assert!(validate(Some(EngineBatchLane { slot: 8, ..lane })).is_err());
     }
 
     #[test]
