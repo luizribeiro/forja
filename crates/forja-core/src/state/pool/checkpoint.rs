@@ -238,6 +238,22 @@ impl StateSequence {
     /// # Errors
     /// Refuses foreign checkpoints, pending transactions or quarantined device work.
     pub fn rewind(&mut self, checkpoint: &StateCheckpoint) -> Result<(), PagePoolError> {
+        self.rewind_with(checkpoint, || Ok(()))
+    }
+
+    /// Restores a retained version only after a paired boundary update succeeds.
+    ///
+    /// The action runs after checkpoint validation, before publication. It must leave
+    /// its own boundary unchanged on error; no state version changes if it fails.
+    ///
+    /// # Errors
+    /// Refuses invalid checkpoints or undrained work without running the action,
+    /// and propagates action errors without changing the committed version.
+    pub fn rewind_with(
+        &mut self,
+        checkpoint: &StateCheckpoint,
+        action: impl FnOnce() -> Result<(), PagePoolError>,
+    ) -> Result<(), PagePoolError> {
         if !Arc::ptr_eq(&self.identity, &checkpoint.identity) {
             return Err(PagePoolError::InvalidCheckpoint);
         }
@@ -249,6 +265,7 @@ impl StateSequence {
         {
             return Err(PagePoolError::InvalidCheckpoint);
         }
+        action()?;
         self.committed = checkpoint.version();
         Ok(())
     }
@@ -258,6 +275,47 @@ impl StateSequence {
 mod tests {
     use super::*;
     use crate::{DType, StateLayout, StatePlane, StatePool};
+
+    #[test]
+    fn paired_rewind_validates_before_action_and_preserves_state_on_error() {
+        let pool = StatePool::new(
+            StateLayout::new(vec![StatePlane::new(DType::F32, vec![7, 33]).unwrap()]).unwrap(),
+            2,
+            65_536,
+        )
+        .unwrap();
+        let mut sequence = pool.reserve().unwrap();
+        let input = sequence.checkpoint().unwrap();
+        let transaction = sequence.begin(1).unwrap();
+        let output = sequence.checkpoint_latest().unwrap();
+        let called = std::cell::Cell::new(false);
+        let action = || {
+            called.set(true);
+            Ok(())
+        };
+        assert_eq!(
+            sequence.rewind_with(&input, action),
+            Err(PagePoolError::BankInFlight)
+        );
+        assert!(!called.get());
+        sequence.mark_submitted(&transaction).unwrap();
+        pool.observe_completion(1).unwrap();
+        sequence.finish(&transaction, true).unwrap();
+        let foreign = pool.reserve().unwrap().checkpoint().unwrap();
+        assert_eq!(
+            sequence.rewind_with(&foreign, action),
+            Err(PagePoolError::InvalidCheckpoint)
+        );
+        assert!(!called.get());
+        assert_eq!(
+            sequence.rewind_with(&input, || Err(PagePoolError::SharedTail)),
+            Err(PagePoolError::SharedTail)
+        );
+        assert_eq!(sequence.checkpoint().unwrap().version(), output.version());
+        sequence.rewind_with(&input, action).unwrap();
+        assert!(called.get());
+        assert_eq!(sequence.checkpoint().unwrap().version(), input.version());
+    }
 
     #[test]
     fn output_checkpoints_require_the_complete_chain_to_succeed() {
