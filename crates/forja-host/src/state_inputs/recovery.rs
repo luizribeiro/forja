@@ -67,11 +67,11 @@ mod tests {
                 paged_storage::StateInputLayout {
                     vocab: 33,
                     prompt_tokens: 7,
-                    verify_rows: 0,
+                    verify_rows: 2,
                 },
             )
             .unwrap();
-        let peer = Resource::new_borrow(inputs.banks[1].tokens);
+        let peer = Resource::new_borrow(inputs.banks[1].verify.as_ref().unwrap().tokens);
         host.write(
             &peer,
             &[17_u32, 23]
@@ -80,7 +80,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let failed = Resource::new_borrow(inputs.banks[0].tokens);
+        let failed = Resource::new_borrow(inputs.banks[0].verify.as_ref().unwrap().tokens);
         let feedback = Resource::new_borrow(inputs.feedback[0]);
         let mut access = SubmissionAccess::default();
         for resource in [&failed, &feedback] {

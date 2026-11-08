@@ -12609,6 +12609,112 @@ mod tests {
     }
 
     #[test]
+    fn verify_aliases_derive_geometry_from_the_bank_and_refund_failures() {
+        for rows in [0, 3] {
+            let mut host = Host::new(CpuBackend::new(), GENEROUS);
+            let pool = insert_test_pool(&mut host, 2, 33);
+            host.table.get_mut(&pool).unwrap().verify_rows = rows;
+            let slot = host
+                .open_state_slot(
+                    &pool,
+                    2,
+                    vec![paged_storage::StatePlaneDescriptor {
+                        dtype: compute::Dtype::F32,
+                        shape: vec![7],
+                    }],
+                    paged_storage::StateInputLayout {
+                        vocab: 7,
+                        prompt_tokens: 1,
+                        verify_rows: rows,
+                    },
+                )
+                .unwrap();
+            host.table
+                .get_mut(&slot)
+                .unwrap()
+                .input_layout
+                .as_mut()
+                .unwrap()
+                .verify_rows = 8;
+            let before = host.live_bytes.load(Ordering::Acquire);
+            let inputs = host.state_input_tensors(slot.rep(), None).unwrap().unwrap();
+            assert_eq!(
+                inputs.verify.as_ref().map(|verify| verify.rows),
+                (rows != 0).then_some(rows)
+            );
+            let handles = [
+                inputs.sampling,
+                inputs.tokens,
+                inputs.explicit,
+                inputs.prompt,
+                inputs.allow,
+                inputs.logits,
+                inputs.selected,
+            ]
+            .into_iter()
+            .chain(
+                inputs
+                    .verify
+                    .into_iter()
+                    .flat_map(|verify| [verify.tokens, verify.logits, verify.selected]),
+            );
+            for handle in handles {
+                host.drop_tensor(handle).unwrap();
+            }
+            assert_eq!(host.live_handles, 0);
+            assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+            let count = if rows == 0 { 7 } else { 10 };
+            for limit in 0..count {
+                host.limits.live_tensor_handles = limit;
+                assert!(host.state_input_tensors(slot.rep(), None).is_err());
+                assert_eq!(host.live_handles, 0, "limit={limit}");
+                assert_eq!(
+                    host.live_bytes.load(Ordering::Acquire),
+                    before,
+                    "limit={limit}"
+                );
+            }
+            for limit in 0..count + 3 {
+                host.limits.live_tensor_handles = limit;
+                assert!(host.slot_tensors(slot.rep(), None).is_err());
+                assert_eq!(host.live_handles, 0, "slot limit={limit}");
+                assert_eq!(
+                    host.live_bytes.load(Ordering::Acquire),
+                    before,
+                    "slot limit={limit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_open_checks_verify_logit_element_quota() {
+        let mut host = Host::new(CpuBackend::new(), GENEROUS);
+        let pool = insert_test_pool(&mut host, 2, 33);
+        host.table.get_mut(&pool).unwrap().verify_rows = 3;
+        host.limits.tensor_elements = 14;
+        let before = host.live_bytes.load(Ordering::Acquire);
+        let result = host.open_state_slot(
+            &pool,
+            2,
+            vec![paged_storage::StatePlaneDescriptor {
+                dtype: compute::Dtype::F32,
+                shape: vec![1],
+            }],
+            paged_storage::StateInputLayout {
+                vocab: 7,
+                prompt_tokens: 1,
+                verify_rows: 3,
+            },
+        );
+        assert!(
+            matches!(result, Err(compute::Error::Quota(message)) if message == "tensor element count exceeds the guest limit")
+        );
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), before);
+        assert_eq!(host.live_handles, 0);
+    }
+
+    #[test]
     fn state_token_loans_are_read_only_banked_and_quota_checked() {
         let (mut host, _pool, slot) = convolution_slot_host();
         host.state_slots

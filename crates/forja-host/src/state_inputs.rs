@@ -23,10 +23,24 @@ pub(crate) struct StateInputBank {
     pub(crate) allow: u32,
     pub(crate) logits: u32,
     pub(crate) selected: u32,
+    pub(crate) verify: Option<VerifyInputBank>,
+}
+
+pub(crate) struct VerifyInputBank {
+    pub(crate) rows: u32,
+    pub(crate) tokens: u32,
+    pub(crate) logits: u32,
+    pub(crate) selected: u32,
+}
+
+impl VerifyInputBank {
+    fn handles(&self) -> [u32; 3] {
+        [self.tokens, self.logits, self.selected]
+    }
 }
 
 impl StateInputBank {
-    pub(crate) const fn handles(&self) -> [u32; 7] {
+    fn lane_handles(&self) -> [u32; 7] {
         [
             self.sampling,
             self.tokens,
@@ -36,6 +50,12 @@ impl StateInputBank {
             self.logits,
             self.selected,
         ]
+    }
+
+    pub(crate) fn handles(&self) -> impl Iterator<Item = u32> + '_ {
+        self.lane_handles()
+            .into_iter()
+            .chain(self.verify.iter().flat_map(VerifyInputBank::handles))
     }
 }
 
@@ -289,26 +309,17 @@ impl<B: Backend + 'static> Host<B> {
                 [logical_lengths, query_starts, absolute_positions],
             )
         };
-        let aliases = self.alias_paged_tensors(&handles)?;
+        let [logical_lengths, query_starts, absolute_positions] =
+            self.alias_paged_array(handles)?;
         let inputs = match self.state_input_tensors(resource.rep(), bank) {
             Ok(inputs) => inputs,
             Err(error) => {
-                for alias in aliases {
+                for alias in [logical_lengths, query_starts, absolute_positions] {
                     let _ = self.drop_tensor(alias);
                 }
                 return Err(error);
             }
         };
-        let mut aliases = aliases.into_iter();
-        let logical_lengths = aliases
-            .next()
-            .ok_or_else(|| invalid_handle("paged logical lengths are missing"))?;
-        let query_starts = aliases
-            .next()
-            .ok_or_else(|| invalid_handle("paged query starts are missing"))?;
-        let absolute_positions = aliases
-            .next()
-            .ok_or_else(|| invalid_handle("paged absolute positions are missing"))?;
         Ok(paged_storage::SlotTensors {
             lanes,
             logical_lengths,
@@ -316,6 +327,21 @@ impl<B: Backend + 'static> Host<B> {
             absolute_positions,
             inputs,
         })
+    }
+
+    fn alias_paged_array<const N: usize>(
+        &mut self,
+        handles: [u32; N],
+    ) -> Result<[wasmtime::component::Resource<crate::TensorEntry>; N], compute::Error> {
+        let aliases = self.alias_paged_tensors(&handles)?;
+        aliases.try_into().map_err(
+            |aliases: Vec<wasmtime::component::Resource<crate::TensorEntry>>| {
+                for alias in aliases {
+                    let _ = self.drop_tensor(alias);
+                }
+                invalid_handle("paged alias count differs from its handles")
+            },
+        )
     }
 
     pub(crate) fn state_input_tensors(
@@ -330,20 +356,59 @@ impl<B: Backend + 'static> Host<B> {
         let Some(inputs) = &entry.inputs else {
             return Ok(None);
         };
-        let handles = inputs
+        let bank = inputs
             .banks
             .get(bank.unwrap_or(entry.active_bank))
-            .ok_or_else(|| invalid_handle("state input bank is out of range"))?
-            .handles();
+            .ok_or_else(|| invalid_handle("state input bank is out of range"))?;
+        let ordinary = bank.lane_handles();
+        let verify = bank
+            .verify
+            .as_ref()
+            .map(|verify| (verify.rows, verify.handles()));
         let layout = entry
             .input_layout
             .as_ref()
             .ok_or_else(|| invalid_handle("state input layout is missing"))?;
         let (vocab, prompt_tokens) = (layout.vocab, layout.prompt_tokens);
-        let [sampling, tokens, explicit, prompt, allow, logits, selected] = self
-            .alias_paged_tensors(&handles)?
-            .try_into()
-            .map_err(|_| invalid_handle("state input aliases are incomplete"))?;
+        let (ordinary, verify) = match verify {
+            None => (self.alias_paged_array(ordinary)?, None),
+            Some((rows, [verify_tokens, verify_logits, verify_selected])) => {
+                let [sampling, tokens, explicit, prompt, allow, logits, selected] = ordinary;
+                let [
+                    sampling,
+                    tokens,
+                    explicit,
+                    prompt,
+                    allow,
+                    logits,
+                    selected,
+                    verify_tokens,
+                    verify_logits,
+                    verify_selected,
+                ] = self.alias_paged_array([
+                    sampling,
+                    tokens,
+                    explicit,
+                    prompt,
+                    allow,
+                    logits,
+                    selected,
+                    verify_tokens,
+                    verify_logits,
+                    verify_selected,
+                ])?;
+                (
+                    [sampling, tokens, explicit, prompt, allow, logits, selected],
+                    Some(paged_storage::VerifyInputTensors {
+                        rows,
+                        tokens: verify_tokens,
+                        logits: verify_logits,
+                        selected: verify_selected,
+                    }),
+                )
+            }
+        };
+        let [sampling, tokens, explicit, prompt, allow, logits, selected] = ordinary;
         Ok(Some(paged_storage::StateInputTensors {
             vocab,
             prompt_tokens,
@@ -354,6 +419,7 @@ impl<B: Backend + 'static> Host<B> {
             allow,
             logits,
             selected,
+            verify,
         }))
     }
 
@@ -404,6 +470,19 @@ impl<B: Backend + 'static> Host<B> {
                     allow: alloc(compute::Dtype::U32, &[lanes, layout.vocab.div_ceil(32)])?,
                     logits: alloc(compute::Dtype::F32, &[lanes, layout.vocab])?,
                     selected: alloc(compute::Dtype::U32, &[lanes])?,
+                    verify: if layout.verify_rows == 0 {
+                        None
+                    } else {
+                        Some(VerifyInputBank {
+                            rows: layout.verify_rows,
+                            tokens: alloc(compute::Dtype::U32, &[layout.verify_rows])?,
+                            logits: alloc(
+                                compute::Dtype::F32,
+                                &[layout.verify_rows, layout.vocab],
+                            )?,
+                            selected: alloc(compute::Dtype::U32, &[layout.verify_rows])?,
+                        })
+                    },
                 })
             };
             let banks = [bank()?, bank()?];
@@ -444,7 +523,7 @@ mod tests {
         let layout = paged_storage::StateInputLayout {
             vocab: 33,
             prompt_tokens: 7,
-            verify_rows: 0,
+            verify_rows: 3,
         };
         let inputs = host.allocate_state_inputs(2, layout).unwrap();
         let bytes = host.live_bytes.load(Ordering::Acquire);
@@ -454,6 +533,24 @@ mod tests {
                 .unwrap()
         );
         assert_ne!(inputs.banks[0].logits, inputs.banks[1].logits);
+        let mut buffers = std::collections::HashSet::new();
+        for bank in &inputs.banks {
+            let verify = bank.verify.as_ref().unwrap();
+            for (handle, shape) in [
+                (verify.tokens, vec![3]),
+                (verify.logits, vec![3, 33]),
+                (verify.selected, vec![3]),
+                (bank.logits, vec![2, 33]),
+                (bank.selected, vec![2]),
+            ] {
+                let tensor = &host
+                    .entry(&wasmtime::component::Resource::new_borrow(handle))
+                    .unwrap()
+                    .tensor;
+                assert_eq!(tensor.layout().shape(), shape);
+                assert!(buffers.insert(tensor.buffer()));
+            }
+        }
         host.drop_paged_handles(inputs.handles().collect());
         drop(inputs);
         assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
@@ -461,7 +558,29 @@ mod tests {
             host.limits.live_bytes = limit;
             assert!(host.allocate_state_inputs(2, layout).is_err());
             assert_eq!(host.live_bytes.load(Ordering::Acquire), 0, "limit={limit}");
+            assert_eq!(host.live_handles, 0, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn verify_allocation_failure_refunds_bytes_and_handles() {
+        let layout = paged_storage::StateInputLayout {
+            vocab: 33,
+            prompt_tokens: 7,
+            verify_rows: 3,
+        };
+        let mut host = Host::new(CpuBackend::new(), Limits::new(65536, 8, 4096, 64, 4096));
+        let inputs = host.allocate_state_inputs(2, layout).unwrap();
+        let required = host.live_bytes.load(Ordering::Acquire);
+        host.drop_paged_handles(inputs.handles().collect());
+        drop(inputs);
+        host.limits.live_bytes = required - 1;
+        assert!(matches!(
+            host.allocate_state_inputs(2, layout),
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(host.live_handles, 0);
     }
 
     #[test]

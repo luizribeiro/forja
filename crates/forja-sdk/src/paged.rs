@@ -66,6 +66,18 @@ pub struct PagedInputTensors {
     pub logits: Tensor<f32>,
     /// Selected result tokens indexed by physical lane.
     pub selected: Tensor<u32>,
+    /// Row-indexed storage shared by the sole verifying lane, when supported.
+    pub verify: Option<PagedVerifyTensors>,
+}
+
+/// Dedicated row storage for a host-staged verify round.
+pub struct PagedVerifyTensors {
+    /// Input tokens in verification order.
+    pub tokens: Tensor<u32>,
+    /// Target logits indexed by verification row.
+    pub logits: Tensor<f32>,
+    /// Selected target tokens indexed by verification row.
+    pub selected: Tensor<u32>,
 }
 
 #[cfg(target_family = "wasm")]
@@ -79,6 +91,11 @@ impl PagedInputTensors {
             allow: Tensor::from_guest(raw.allow, vec![lanes, raw.vocab.div_ceil(32)]),
             logits: Tensor::from_guest(raw.logits, vec![lanes, raw.vocab]),
             selected: Tensor::from_guest(raw.selected, vec![lanes]),
+            verify: raw.verify.map(|verify| PagedVerifyTensors {
+                tokens: Tensor::from_guest(verify.tokens, vec![verify.rows]),
+                logits: Tensor::from_guest(verify.logits, vec![verify.rows, raw.vocab]),
+                selected: Tensor::from_guest(verify.selected, vec![verify.rows]),
+            }),
         }
     }
 }

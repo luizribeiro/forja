@@ -27,6 +27,13 @@ interface paged-storage {
     allow: tensor,
     logits: tensor,
     selected: tensor,
+    verify: option<verify-input-tensors>,
+  }
+  record verify-input-tensors {
+    rows: u32,
+    tokens: tensor,
+    logits: tensor,
+    selected: tensor,
   }
   resource batch-slot {
     tensors: func() -> result<slot-tensors, error>;

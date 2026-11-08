@@ -136,7 +136,7 @@ pub use half::{bf16, f16};
 pub use load::{Load, Weights};
 pub use paged::{
     PagedCache, PagedCacheSet, PagedInputLayout, PagedInputTensors, PagedPool, PagedSlot,
-    PagedSlotTensors, PagedState, PagedStateDescriptor,
+    PagedSlotTensors, PagedState, PagedStateDescriptor, PagedVerifyTensors,
 };
 pub use selections::{EngineSelections, EngineTunings, Tuning, VariantSelection};
 pub use sys::DType;

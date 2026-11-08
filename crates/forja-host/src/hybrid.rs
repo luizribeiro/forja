@@ -24,6 +24,10 @@ impl<B: Backend + 'static> Host<B> {
         let lanes = entry.active_lanes;
         self.limits.check_tensor_shape(&[lanes, inputs.vocab])?;
         self.limits.check_tensor_shape(&[inputs.prompt_tokens])?;
+        if inputs.verify_rows != 0 {
+            self.limits
+                .check_tensor_shape(&[inputs.verify_rows, inputs.vocab])?;
+        }
         let layout = StateLayout::new(
             descriptors
                 .into_iter()
