@@ -127,13 +127,14 @@ pub struct StateSequence {
     quarantine_until: u64,
 }
 
-/// A capability for one out-of-place update, tied to its original sequence.
+/// A capability for ordered out-of-place updates, tied to its original sequence.
 #[derive(Clone)]
 pub struct StateTransaction {
     identity: Arc<()>,
     serial: u64,
     input: u32,
-    output: u32,
+    preceding_outputs: Vec<u32>,
+    final_output: u32,
     submitted: Arc<AtomicU64>,
     bound: Arc<AtomicBool>,
     published: Arc<AtomicBool>,
@@ -150,6 +151,20 @@ impl StateTransaction {
     #[must_use]
     pub const fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// Ordered, nonempty logical output chain; allocation identities remain hidden.
+    pub fn output_versions(&self) -> impl Iterator<Item = u32> + '_ {
+        self.preceding_outputs
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.final_output))
+    }
+
+    /// Final logical output, used as the next transaction's input.
+    #[must_use]
+    pub const fn output_version(&self) -> u32 {
+        self.final_output
     }
 
     /// Logical input version; physical allocation identities remain hidden.
@@ -173,7 +188,10 @@ impl StateSequence {
         {
             return Err(PagePoolError::BankInFlight);
         }
-        let input = self.pending.back().map_or(self.committed, |tx| tx.output);
+        let input = self
+            .pending
+            .back()
+            .map_or(self.committed, StateTransaction::output_version);
         let output = (0..StatePool::VERSIONS)
             .find(|&version| {
                 version != self.committed
@@ -185,7 +203,8 @@ impl StateSequence {
             identity: Arc::clone(&self.identity),
             serial,
             input,
-            output,
+            preceding_outputs: Vec::new(),
+            final_output: output,
             submitted: Arc::new(AtomicU64::new(0)),
             bound: Arc::new(AtomicBool::new(false)),
             published: Arc::new(AtomicBool::new(false)),
@@ -303,7 +322,7 @@ impl StateSequence {
     ) -> Result<(), PagePoolError> {
         self.validate_finish(transaction, success)?;
         if success {
-            self.committed = transaction.output;
+            self.committed = transaction.output_version();
             transaction.published.store(true, Ordering::Release);
             self.pending.pop_front();
         } else {
@@ -357,7 +376,7 @@ impl StateSequence {
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
         self.pending_index(transaction)?;
         let table = self.storage.table()?;
-        let entries = [transaction.input, transaction.output]
+        let entries = [transaction.input, transaction.output_version()]
             .iter()
             .map(|&index| table.entries()[index as usize])
             .collect();
@@ -446,7 +465,14 @@ mod tests {
         assert!(pool.reserve().is_err());
         let first = a.begin(1).unwrap();
         assert!(b.finish(&first, true).is_err());
+        assert_eq!(first.output_versions().collect::<Vec<_>>(), &[1]);
+        assert_eq!(
+            first.clone().output_versions().collect::<Vec<_>>(),
+            first.output_versions().collect::<Vec<_>>()
+        );
         let second = a.begin(2).unwrap();
+        assert_eq!(second.input_version(), first.output_version());
+        assert_eq!(second.output_versions().collect::<Vec<_>>(), &[2]);
         assert!(a.mark_submitted(&second).is_err());
         a.mark_submitted(&first).unwrap();
         assert!(a.mark_submitted(&first).is_err());
@@ -619,7 +645,7 @@ mod tests {
             lane.validate_finish(&tx, true).unwrap();
         }
         lane.finish(&tx, true).unwrap();
-        assert_eq!(lane.begin(2).unwrap().input_version(), tx.output);
+        assert_eq!(lane.begin(2).unwrap().input_version(), tx.output_version());
     }
 
     #[test]

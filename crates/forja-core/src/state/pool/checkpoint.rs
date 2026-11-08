@@ -52,7 +52,7 @@ impl StateSequence {
         self.pin(
             self.pending
                 .back()
-                .map_or(self.committed, |transaction| transaction.output),
+                .map_or(self.committed, StateTransaction::output_version),
         )
     }
 
@@ -161,7 +161,7 @@ impl StateSequence {
             published: self
                 .pending
                 .iter()
-                .find(|transaction| transaction.output == version)
+                .find(|transaction| transaction.output_version() == version)
                 .map(|transaction| Arc::clone(&transaction.published)),
             pin: Arc::new(VersionPin {
                 counts: Arc::clone(&self.pins),
@@ -303,7 +303,7 @@ mod tests {
         let second = sequence
             .begin_releasing_checkpoint(2, &mut retained)
             .unwrap();
-        assert_ne!(second.output, caller.version());
+        assert_ne!(second.output_version(), caller.version());
         assert!(retained.is_none());
         sequence.cancel_unsubmitted(&second).unwrap();
         sequence.rewind(&caller).unwrap();
@@ -397,7 +397,10 @@ mod tests {
         sequence.finish(&first, true).unwrap();
         sequence.finish(&second, true).unwrap();
         sequence.rewind(&predecessor).unwrap();
-        assert_eq!(sequence.begin(3).unwrap().input_version(), first.output);
+        assert_eq!(
+            sequence.begin(3).unwrap().input_version(),
+            first.output_version()
+        );
         assert!(sequence.predecessor(&second).is_err());
     }
 
@@ -417,7 +420,7 @@ mod tests {
         pool.observe_completion(1).unwrap();
         sequence.finish(&first, true).unwrap();
         let second = sequence.begin(2).unwrap();
-        assert_eq!(second.output, 2);
+        assert_eq!(second.output_version(), 2);
         assert_eq!(sequence.begin(3).err(), Some(PagePoolError::BankInFlight));
         sequence.cancel_unsubmitted(&second).unwrap();
         sequence.rewind(&predecessor).unwrap();
