@@ -170,3 +170,37 @@ kernel void calibration_group_dispatch(device const float *input [[buffer(0)]],
     }
     output[index] = value;
 }
+
+kernel void calibration_read_wide_group(device const float *input [[buffer(0)]],
+                                        device float *output [[buffer(1)]],
+                                        uint index [[thread_position_in_grid]]) {
+    float4 sum = 0;
+    for (uint i = index * 4; i < calibration_iterations; i += 128 * 4) {
+        sum += float4(input[i], input[i + 1], input[i + 2], input[i + 3]);
+    }
+    output[index] = sum.x + sum.y + sum.z + sum.w;
+}
+
+calibration_serial_kernel(calibration_scalar_wide_group, fma(value, 0.9999999f, 0.0000001f), 128)
+calibration_serial_kernel(calibration_sfu_wide_group, fast::exp(-value), 128)
+
+kernel void calibration_scalar_parallel(device const float *input [[buffer(0)]],
+                                        device float *output [[buffer(1)]],
+                                        uint index [[thread_position_in_grid]]) {
+    float values[8];
+    float seed = input[index];
+    #pragma unroll
+    for (uint chain = 0; chain < 8; ++chain) {
+        values[chain] = seed * (0.5f + float(chain) * 0.0625f);
+    }
+    for (uint iteration = 0; iteration < calibration_iterations; ++iteration) {
+        #pragma unroll
+        for (uint chain = 0; chain < 8; ++chain) {
+            values[chain] = fma(values[chain], 0.9999999f, seed * 0.0000001f);
+        }
+    }
+    float sum = 0;
+    #pragma unroll
+    for (uint chain = 0; chain < 8; ++chain) { sum += values[chain]; }
+    output[index] = sum / 8.0f;
+}

@@ -166,6 +166,31 @@ impl MetalBackend {
         result
     }
 
+    pub(super) fn calibrate_compute_group(
+        &self,
+        repetitions: u32,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let input = self.alloc(DType::F32, &[THREADS])?;
+        let output = self.alloc(DType::F32, &[THREADS])?;
+        let result = (|| {
+            self.write(&input, &[1.0_f32.to_le_bytes(); THREADS as usize].concat())?;
+            let mut samples = Vec::new();
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let probe = self.prepare_calibration_probe(Probe::Mma(dtype, Chains::Four))?;
+                let mut group =
+                    self.compute_probe_samples(probe, [&input, &output], 0, repetitions, false)?;
+                for sample in &mut group {
+                    sample.name = "calibration_mma_group";
+                }
+                samples.extend(group);
+            }
+            Ok(samples)
+        })();
+        self.release(&input)?;
+        self.release(&output)?;
+        result
+    }
+
     fn prepare_calibration_probe(&self, probe: Probe) -> Result<PreparedProbe, BackendError> {
         let pipelines = &self.pipelines;
         let probe = if let Probe::Mma(DType::BF16, chains) = probe {
@@ -228,7 +253,10 @@ impl MetalBackend {
             }
         }
         .into_iter()
-        .chain([u64::from(GROUPS), u64::from(ITERATIONS)])
+        .chain([
+            tensors[0].layout().element_count() / u64::from(THREADS),
+            u64::from(ITERATIONS),
+        ])
         .try_fold(1_u64, u64::checked_mul)
         .ok_or(BackendError::InvalidInput)?;
         let [input, output] = tensors;

@@ -35,6 +35,8 @@ pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>
             samples.extend(probe.calibrate_compute(1, 6)?);
             samples.extend(probe.calibrate_dispatch(1, 6)?);
             samples.extend(probe.calibrate_work(1, 6)?);
+            samples.extend(probe.calibrate_compute_group(6)?);
+            samples.extend(probe.calibrate_work_group(6)?);
             Ok((probe.device.registryID(), Arc::new(from_samples(&samples)?)))
         })
         .as_ref()
@@ -85,7 +87,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
             copy,
             gather,
             matrix,
-            rate(&["calibration_scalar"])?,
+            rate(&["calibration_scalar_parallel"])?,
             rate(&["calibration_sfu"])?,
             launch,
         ),
@@ -99,12 +101,12 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
             launch,
         ),
         WorkRates::new(
-            rate(&["calibration_read_group"])?,
-            rate(&["calibration_read_group"])?,
+            rate(&["calibration_read_wide_group"])?,
+            rate(&["calibration_read_wide_group"])?,
             rate(&["calibration_gather_group"])?,
-            serial,
-            rate(&["calibration_scalar_group"])?,
-            rate(&["calibration_sfu_group"])?,
+            rate(&["calibration_mma_group"])?,
+            rate(&["calibration_scalar_wide_group"])?,
+            rate(&["calibration_sfu_wide_group"])?,
             launch,
         ),
     ];

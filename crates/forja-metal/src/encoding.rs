@@ -3595,6 +3595,16 @@ impl MetalBackend {
             set_argument_table(encoder, table);
             let count = usize::try_from(output.layout.element_count())
                 .map_err(|_| BackendError::InvalidInput)?;
+            let count = if dispatch
+                .backend_data::<crate::work_calibration::WorkProbe>()
+                .is_some_and(|probe| {
+                    matches!(probe, crate::work_calibration::WorkProbe::ReadWideGroup)
+                }) {
+                usize::try_from(crate::calibration::THREADS)
+                    .map_err(|_| BackendError::InvalidInput)?
+            } else {
+                count
+            };
             dispatch_threadgroups(
                 &pipeline,
                 encoder,

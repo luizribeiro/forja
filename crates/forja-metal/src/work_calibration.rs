@@ -12,6 +12,9 @@ const DISPATCH_GROUPS: u32 = 1 << 18;
 #[derive(Clone, Copy)]
 pub(super) enum WorkProbe {
     Scalar,
+    ScalarParallel,
+    ScalarWideGroup,
+    SfuWideGroup,
     Sfu,
     Gather,
     ScalarSerial,
@@ -21,6 +24,7 @@ pub(super) enum WorkProbe {
     ScalarGroup,
     SfuGroup,
     ReadGroup,
+    ReadWideGroup,
     GatherGroup,
     GroupDispatch,
 }
@@ -44,6 +48,9 @@ impl WorkProbe {
     pub(super) const fn kernel(self) -> &'static str {
         match self {
             Self::Scalar => "calibration_scalar",
+            Self::ScalarParallel => "calibration_scalar_parallel",
+            Self::ScalarWideGroup => "calibration_scalar_wide_group",
+            Self::SfuWideGroup => "calibration_sfu_wide_group",
             Self::Sfu => "calibration_sfu",
             Self::Gather => "calibration_gather",
             Self::ScalarSerial => "calibration_scalar_serial",
@@ -53,6 +60,7 @@ impl WorkProbe {
             Self::ScalarGroup => "calibration_scalar_group",
             Self::SfuGroup => "calibration_sfu_group",
             Self::ReadGroup => "calibration_read_group",
+            Self::ReadWideGroup => "calibration_read_wide_group",
             Self::GatherGroup => "calibration_gather_group",
             Self::GroupDispatch => "calibration_group_dispatch",
         }
@@ -62,8 +70,10 @@ impl WorkProbe {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
             Self::GroupDispatch => 16,
-            Self::ReadSerial | Self::ReadGroup => SERIAL_READ_ELEMENTS,
-            Self::ScalarSerial
+            Self::ReadSerial | Self::ReadGroup | Self::ReadWideGroup => SERIAL_READ_ELEMENTS,
+            Self::ScalarWideGroup
+            | Self::SfuWideGroup
+            | Self::ScalarSerial
             | Self::SfuSerial
             | Self::DependentRead
             | Self::ScalarGroup
@@ -78,11 +88,16 @@ impl WorkProbe {
         match self {
             Self::Gather => GATHER_ELEMENTS,
             Self::GroupDispatch => DISPATCH_GROUPS * crate::calibration::THREADS,
-            Self::ScalarSerial | Self::SfuSerial | Self::ScalarGroup | Self::SfuGroup => {
-                crate::calibration::THREADS
-            }
+            Self::ScalarWideGroup
+            | Self::SfuWideGroup
+            | Self::ScalarSerial
+            | Self::SfuSerial
+            | Self::ScalarGroup
+            | Self::SfuGroup => crate::calibration::THREADS,
             Self::DependentRead => DEPENDENT_ELEMENTS,
-            Self::ReadSerial | Self::ReadGroup | Self::GatherGroup => SERIAL_READ_ELEMENTS,
+            Self::ReadSerial | Self::ReadGroup | Self::ReadWideGroup | Self::GatherGroup => {
+                SERIAL_READ_ELEMENTS
+            }
             _ => ELEMENTS,
         }
     }
@@ -97,11 +112,26 @@ impl WorkProbe {
 
     fn units(self) -> Option<u64> {
         match self {
+            Self::ScalarParallel => {
+                return Some(
+                    u64::from(ELEMENTS) * u64::from(crate::calibration::ITERATIONS) * 8 * 2,
+                );
+            }
+            Self::ScalarWideGroup => {
+                return Some(
+                    u64::from(SERIAL_ITERATIONS) * u64::from(crate::calibration::THREADS) * 2,
+                );
+            }
+            Self::SfuWideGroup => {
+                return Some(u64::from(SERIAL_ITERATIONS) * u64::from(crate::calibration::THREADS));
+            }
             Self::GroupDispatch => return Some(u64::from(DISPATCH_GROUPS)),
             Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
             Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
             Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),
-            Self::ReadSerial | Self::ReadGroup => return Some(u64::from(SERIAL_READ_ELEMENTS) * 4),
+            Self::ReadSerial | Self::ReadGroup | Self::ReadWideGroup => {
+                return Some(u64::from(SERIAL_READ_ELEMENTS) * 4);
+            }
             Self::ScalarGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32 * 2),
             Self::SfuGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32),
             Self::GatherGroup => return Some(u64::from(SERIAL_ITERATIONS) * 32 * 4),
@@ -124,8 +154,11 @@ impl WorkProbe {
         }
         let probe = self;
         let bytes = backend.read(output)?;
-        if matches!(probe, WorkProbe::ReadSerial | WorkProbe::ReadGroup) {
-            let lanes = if matches!(probe, WorkProbe::ReadGroup) {
+        if matches!(
+            probe,
+            WorkProbe::ReadSerial | WorkProbe::ReadGroup | WorkProbe::ReadWideGroup
+        ) {
+            let lanes = if matches!(probe, WorkProbe::ReadGroup | WorkProbe::ReadWideGroup) {
                 32
             } else {
                 1
@@ -138,7 +171,7 @@ impl WorkProbe {
             if values
                 .iter()
                 .map(|v| f32::from_le_bytes(*v))
-                .any(|v| !v.is_finite() || !(1_000.0..1_000_000.0).contains(&v))
+                .any(|v| !v.is_finite() || !(1_000.0..20_000_000.0).contains(&v))
             {
                 return Err(BackendError::ExecutionFailed);
             }
@@ -166,6 +199,7 @@ impl WorkProbe {
                 | WorkProbe::DependentRead
                 | WorkProbe::ReadSerial
                 | WorkProbe::ReadGroup
+                | WorkProbe::ReadWideGroup
                 | WorkProbe::GatherGroup
         ) && bytes.as_chunks::<4>().0.iter().any(|bytes| {
             let value = f32::from_le_bytes(*bytes);
@@ -188,11 +222,36 @@ impl MetalBackend {
         warmups: u32,
         repetitions: u32,
     ) -> Result<Vec<CalibrationSample>, BackendError> {
+        self.calibrate_work_probes(&WorkProbe::ALL, warmups, repetitions)
+    }
+
+    pub(super) fn calibrate_work_group(
+        &self,
+        repetitions: u32,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        self.calibrate_work_probes(
+            &[
+                WorkProbe::ReadWideGroup,
+                WorkProbe::ScalarParallel,
+                WorkProbe::ScalarWideGroup,
+                WorkProbe::SfuWideGroup,
+            ],
+            0,
+            repetitions,
+        )
+    }
+
+    fn calibrate_work_probes(
+        &self,
+        probes: &[WorkProbe],
+        warmups: u32,
+        repetitions: u32,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
         if repetitions == 0 || warmups.checked_add(repetitions).is_none() {
             return Err(BackendError::InvalidInput);
         }
         let mut samples = Vec::new();
-        for probe in WorkProbe::ALL {
+        for &probe in probes {
             let input = self.alloc(DType::F32, &[probe.elements()])?;
             let output = match self.alloc(DType::F32, &[probe.elements()]) {
                 Ok(output) => output,
@@ -253,6 +312,35 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metal_private_admission_probes_verify_arithmetic_and_traffic() {
+        let backend = MetalBackend::new().unwrap();
+        let samples = backend.calibrate_compute_group(1).unwrap();
+        assert_eq!(samples.len(), 3);
+        for sample in samples {
+            assert_eq!(sample.name, "calibration_mma_group");
+            assert_eq!(
+                sample.units,
+                4 * 4 * 2 * 8 * 8 * 8 * u64::from(crate::calibration::ITERATIONS)
+            );
+            assert!(!sample.gpu.is_zero());
+        }
+        let samples = backend.calibrate_work_group(1).unwrap();
+        assert_eq!(samples.len(), 4);
+        assert_eq!(samples[0].name, "calibration_read_wide_group");
+        assert_eq!(samples[0].units, u64::from(SERIAL_READ_ELEMENTS) * 4);
+        for (sample, probe) in samples.iter().zip([
+            WorkProbe::ReadWideGroup,
+            WorkProbe::ScalarParallel,
+            WorkProbe::ScalarWideGroup,
+            WorkProbe::SfuWideGroup,
+        ]) {
+            assert_eq!(sample.name, probe.kernel());
+            assert_eq!(Some(sample.units), probe.units());
+            assert!(!sample.gpu.is_zero());
+        }
+    }
 
     #[test]
     fn scattered_read_schedule_is_a_bijection() {
