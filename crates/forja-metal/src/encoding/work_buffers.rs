@@ -1,5 +1,5 @@
 use super::{
-    BackendError, Cell, CommandList, CommandResources, CommitResidency, Completion,
+    Arc, BackendError, Cell, CommandList, CommandResources, CommitResidency, Completion,
     CompletionAccess, DispatchProfile, Duration, GpuTimestamps, GraphArenaReservation, Instant,
     InternalDispatchProfile, MTL4CommandBuffer, MetalBackend, MetalSubmission, Mutex,
     PreparedMetalGraph, ProfileTimestampGranularity, ProtocolObject, RefCell, Retained, Submission,
@@ -205,11 +205,18 @@ impl MetalBackend {
         graph: Option<&PreparedMetalGraph>,
         graph_arena: Option<&GraphArenaReservation>,
         granularity: ProfileTimestampGranularity,
+        cache_nodes: Option<&[Arc<super::work_prediction::NodeCache>]>,
     ) -> Result<MetalSubmission, BackendError> {
+        let cache_nodes = cache_nodes.or_else(|| graph.map(|graph| graph.predictions.as_slice()));
         let limits = self.submission_limits()?;
         let started = Instant::now();
-        let first =
-            self.prepare_commands::<PROFILE>(commands.clone(), graph, graph_arena, granularity)?;
+        let first = self.prepare_commands::<PROFILE>(
+            commands.clone(),
+            graph,
+            graph_arena,
+            granularity,
+            cache_nodes,
+        )?;
         if let Some(split) =
             self.split_oversized_outputs(&commands, &first.predictions, first.reserve, limits)?
         {
@@ -219,12 +226,22 @@ impl MetalBackend {
             let graph = graph
                 .map(|graph| graph.split_outputs(&first.predictions, budget))
                 .transpose()?;
+            let split_cache = if graph.is_none() {
+                cache_nodes
+                    .map(|nodes| {
+                        super::work_prediction::split_nodes(nodes, &first.predictions, budget)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             drop(first);
             return self.submit_commands_inner::<PROFILE>(
                 split,
                 graph.as_ref(),
                 graph_arena,
                 granularity,
+                split_cache.as_deref(),
             );
         }
         let ranges = partition(&first.predictions, limits, first.reserve)?;
@@ -255,19 +272,22 @@ impl MetalBackend {
             let chunks = ranges
                 .into_iter()
                 .map(|range| {
+                    let caches = cache_nodes
+                        .map(|nodes| nodes.get(range.clone()).ok_or(BackendError::InvalidInput))
+                        .transpose()?;
                     let prepared = graph.map(|graph| graph.window(range.clone())).transpose()?;
                     let mut chunk = CommandList::new();
                     for dispatch in dispatches.get(range).ok_or(BackendError::InvalidInput)? {
                         chunk.record_validated(dispatch.clone());
                     }
-                    Ok((chunk, prepared))
+                    Ok((chunk, prepared, caches))
                 })
                 .collect::<Result<Vec<_>, BackendError>>()?;
             let overhead = started.elapsed();
             let deadline = deadline()?;
             let mut prefixes = Vec::new();
             let last = chunks.len() - 1;
-            for (index, ((chunk, graph), forecast)) in
+            for (index, ((chunk, graph, caches), forecast)) in
                 chunks.into_iter().zip(predictions).enumerate()
             {
                 let committed = (|| {
@@ -276,6 +296,7 @@ impl MetalBackend {
                         graph.as_ref(),
                         graph_arena,
                         granularity,
+                        caches,
                     )?;
                     let actual = prepared
                         .predictions
@@ -472,6 +493,7 @@ mod tests {
                     None,
                     None,
                     ProfileTimestampGranularity::Precise,
+                    None,
                 )
                 .unwrap();
             if let Some(split) = backend
@@ -622,6 +644,7 @@ mod tests {
                 None,
                 None,
                 ProfileTimestampGranularity::Precise,
+                None,
             )
             .unwrap();
         let budget = *prepared.predictions.iter().max().unwrap();
@@ -664,6 +687,7 @@ mod tests {
                 None,
                 None,
                 ProfileTimestampGranularity::Precise,
+                None,
             )
             .unwrap();
         let original = prepared.predictions[0];
@@ -732,26 +756,14 @@ mod tests {
         let state = graph
             .as_ref()
             .and_then(forja_core::PreparedGraph::backend_state::<PreparedMetalGraph>);
-        if let Some(state) = state {
-            let expanded = state
-                .split_outputs(
-                    &[Duration::from_nanos(1), Duration::ZERO, Duration::ZERO],
-                    Duration::ZERO,
-                )
-                .unwrap();
-            let plans = &expanded.encoding.as_ref().unwrap().dispatches;
-            assert!(plans[0].is_none() && plans[1].is_none());
-            assert!(matches!(
-                plans[2].as_ref().unwrap().calls.first(),
-                Some(super::super::PlanCall::Pipeline(_))
-            ));
-        }
+        assert_split_plans(state);
         let prepared = backend
             .prepare_commands::<false>(
                 commands.clone(),
                 state,
                 None,
                 ProfileTimestampGranularity::Precise,
+                None,
             )
             .unwrap();
         let unit = prepared.predictions[0];
@@ -768,6 +780,7 @@ mod tests {
         )
         .unwrap();
         let before = *backend.next_event_value.lock().unwrap();
+        let predictions = forecast_count(state);
         let lookups = backend
             .pipelines
             .lookups
@@ -782,6 +795,8 @@ mod tests {
         submission.wait().unwrap();
         assert_eq!(*backend.next_event_value.lock().unwrap(), before + 3);
         if replay {
+            assert_eq!(predictions, Some(3));
+            assert_eq!(forecast_count(state), predictions);
             assert_eq!(
                 backend
                     .pipelines
@@ -794,6 +809,55 @@ mod tests {
         let profile = submission.profile().unwrap();
         assert_incremental_profile(&profile, unit, reserve);
         assert_eq!(Some(profile.gpu_time), submission.gpu_time());
+        if let Some(graph) = &graph {
+            assert_rebound_prediction_hits(&backend, graph, &tensors[0], &tensors[3]);
+        }
+    }
+    fn assert_split_plans(state: Option<&PreparedMetalGraph>) {
+        if let Some(state) = state {
+            let expanded = state
+                .split_outputs(
+                    &[Duration::from_nanos(1), Duration::ZERO, Duration::ZERO],
+                    Duration::ZERO,
+                )
+                .unwrap();
+            let plans = &expanded.encoding.as_ref().unwrap().dispatches;
+            assert!(plans[0].is_none() && plans[1].is_none());
+            assert!(matches!(
+                plans[2].as_ref().unwrap().calls.first(),
+                Some(super::super::PlanCall::Pipeline(_))
+            ));
+        }
+    }
+    fn assert_rebound_prediction_hits(
+        backend: &MetalBackend,
+        graph: &forja_core::PreparedGraph,
+        input: &forja_core::Tensor,
+        output: &forja_core::Tensor,
+    ) {
+        use forja_core::Backend;
+        let state = graph.backend_state::<PreparedMetalGraph>().unwrap();
+        let before = forecast_count(Some(state));
+        let replacement = backend.alloc(DType::F32, &[4097]).unwrap();
+        let changed = vec![17_u8; 4097 * 4];
+        backend.write(&replacement, &changed).unwrap();
+        let mut bindings = forja_core::ReplayBindings::default();
+        bindings.view(input.clone(), replacement).unwrap();
+        let submission = backend
+            .replay_graph(graph, Vec::new(), true, Some(&bindings))
+            .unwrap();
+        submission.wait().unwrap();
+        assert_eq!(forecast_count(Some(state)), before);
+        assert_eq!(backend.read(output).unwrap(), changed);
+    }
+    fn forecast_count(state: Option<&PreparedMetalGraph>) -> Option<usize> {
+        state.map(|state| {
+            state
+                .predictions
+                .iter()
+                .map(|cache| cache.calculations.load(super::super::Ordering::Relaxed))
+                .sum()
+        })
     }
     fn assert_incremental_profile(profile: &SubmissionProfile, unit: Duration, reserve: Duration) {
         assert_eq!(profile.command_buffers, 3);

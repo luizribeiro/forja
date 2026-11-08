@@ -11,6 +11,7 @@ pub(crate) use state::block_schedule;
 mod state_cache_tests;
 mod work_buffers;
 mod work_identity;
+mod work_prediction;
 pub(super) use work_buffers::{SubmissionOwners, TimeoutScope};
 
 use std::{
@@ -1533,6 +1534,7 @@ struct CommandResources {
 }
 
 pub(super) struct PreparedMetalGraph {
+    predictions: Vec<Arc<work_prediction::NodeCache>>,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
     encoding: Option<MetalEncodingPlan>,
@@ -1547,6 +1549,7 @@ impl PreparedMetalGraph {
         budget: Duration,
     ) -> Result<Self, BackendError> {
         let mut result = self.window(0..predictions.len())?;
+        result.predictions = work_prediction::split_nodes(&self.predictions, predictions, budget)?;
         if let Some(encoding) = &mut result.encoding {
             let mut pipeline = None;
             let mut interrupted = false;
@@ -1621,6 +1624,11 @@ impl PreparedMetalGraph {
             })
             .transpose()?;
         Ok(Self {
+            predictions: self
+                .predictions
+                .get(range.clone())
+                .ok_or(BackendError::InvalidInput)?
+                .to_vec(),
             residency: self.residency.clone(),
             buffers: self.buffers.clone(),
             encoding,
@@ -2692,6 +2700,7 @@ impl MetalBackend {
             None,
             None,
             ProfileTimestampGranularity::Precise,
+            None,
         )
     }
 
@@ -2712,7 +2721,7 @@ impl MetalBackend {
         commands: CommandList,
         granularity: ProfileTimestampGranularity,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<true>(commands, None, None, granularity)
+        self.submit_commands_inner::<true>(commands, None, None, granularity, None)
     }
 
     pub(super) fn prepare_metal_graph(
@@ -2758,6 +2767,7 @@ impl MetalBackend {
         residency.commit();
         self.check_allocation_limit()?;
         Ok(PreparedMetalGraph {
+            predictions: (0..graph.len()).map(|_| Arc::default()).collect(),
             residency,
             buffers: retained,
             encoding,
@@ -3004,6 +3014,7 @@ impl MetalBackend {
                 encoding,
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
+                Some(&state.predictions),
             )
         } else {
             self.submit_commands_inner::<false>(
@@ -3011,6 +3022,7 @@ impl MetalBackend {
                 encoding,
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
+                Some(&state.predictions),
             )
         };
         match submission {
@@ -3036,7 +3048,12 @@ impl MetalBackend {
         graph: Option<&PreparedMetalGraph>,
         graph_arena: Option<&GraphArenaReservation>,
         timestamp_granularity: ProfileTimestampGranularity,
+        cache_nodes: Option<&[Arc<work_prediction::NodeCache>]>,
     ) -> Result<work_buffers::PreparedBuffer, BackendError> {
+        let cache_nodes = cache_nodes.or_else(|| graph.map(|graph| graph.predictions.as_slice()));
+        if cache_nodes.is_some_and(|nodes| nodes.len() != commands.len()) {
+            return Err(BackendError::InvalidInput);
+        }
         self.compiler.ensure_enabled()?;
         self.in_flight.drain_done();
         self.work_faults.check_backend()?;
@@ -3188,15 +3205,23 @@ impl MetalBackend {
                 dispatches
                     .iter()
                     .zip(&launch_work)
-                    .map(|(dispatch, work)| {
-                        crate::work_admission::predict(
-                            rates,
-                            dispatch,
-                            work.launches,
-                            work.groups,
-                            work.threads,
-                            work.attention,
-                        )
+                    .enumerate()
+                    .map(|(index, (dispatch, work))| {
+                        let calculate = || {
+                            crate::work_admission::predict(
+                                rates,
+                                dispatch,
+                                work.launches,
+                                work.groups,
+                                work.threads,
+                                work.attention,
+                            )
+                        };
+                        if let Some(cache) = cache_nodes.and_then(|nodes| nodes.get(index)) {
+                            cache.predict(rates, dispatch, *work, calculate)
+                        } else {
+                            calculate()
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
