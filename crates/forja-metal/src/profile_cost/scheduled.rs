@@ -41,24 +41,24 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         cost.flops = 0;
         return scalar_issue_work(dispatch, addressing(dispatch, cost)?);
     }
-    let flops = model.padded_flops(dispatch, cost)?[1];
+    let flops = *model.padded_flops(dispatch, cost)?.get(1)?;
     let input_values = flops.checked_div(2)?.checked_div(columns)?;
     let weight_values = flops.checked_div(2)?.checked_div(rows)?;
     let input = dispatch.primitive_inputs();
-    let input_bytes = input_values.checked_mul(input[0].layout().dtype().byte_size())?;
+    let input_bytes = input_values.checked_mul(input.first()?.layout().dtype().byte_size())?;
     let weight_bytes = match dispatch.op() {
         Op::QuantMatmul { bits, .. } | Op::GatherQuantMatmul { bits, .. } => {
             let words = weight_values.div_ceil(32 / u64::from(bits));
             let parameters = words
                 .checked_mul(2)?
-                .checked_mul(input[2].layout().dtype().byte_size())?;
+                .checked_mul(input.get(2)?.layout().dtype().byte_size())?;
             cost.scalar_ops = cost
                 .scalar_ops
                 .checked_sub(cost.flops)?
                 .checked_add(weight_values.checked_mul(8)?)?;
             words.checked_mul(4)?.checked_add(parameters)?
         }
-        Op::Matmul => weight_values.checked_mul(input[1].layout().dtype().byte_size())?,
+        Op::Matmul => weight_values.checked_mul(input.get(1)?.layout().dtype().byte_size())?,
         _ => return None,
     };
     cost.read_bytes = cost
@@ -80,9 +80,9 @@ fn scalar_issue_work(dispatch: &Dispatch, mut cost: KernelCost) -> Option<Kernel
             .div_ceil(groups);
         cost.sfu_ops = cost.sfu_ops.checked_mul(slots)?.div_ceil(groups);
         let shape = dispatch.output().layout().shape();
-        let grid = u64::from(shape[0])
+        let grid = u64::from(*shape.first()?)
             .div_ceil(8)
-            .checked_mul(u64::from(shape[1]).div_ceil(8))?;
+            .checked_mul(u64::from(*shape.get(1)?).div_ceil(8))?;
         cost.scalar_ops = cost
             .scalar_ops
             .checked_add(grid.checked_mul(8 * 8 * 32 * 32)?)?;
@@ -169,11 +169,17 @@ pub(crate) fn launches(dispatch: &Dispatch) -> Option<u64> {
             u64::from(rejection_rounds).checked_mul(4)?.checked_add(7)?
         }
         Op::Sample { .. } | Op::SampleMasked { .. } | Op::Argmax { .. } | Op::TopK { .. } => 2,
-        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
-            u64::from(dispatch.inputs()[0].layout().shape()[0])
-                .checked_mul(12)?
-                .checked_add(16)?
-        }
+        Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => u64::from(
+            dispatch
+                .inputs()
+                .first()?
+                .layout()
+                .shape()
+                .first()
+                .copied()?,
+        )
+        .checked_mul(12)?
+        .checked_add(16)?,
         Op::State(_) | Op::Matmul | Op::QuantMatmul { .. } => 4,
         Op::Program(_)
         | Op::Copy

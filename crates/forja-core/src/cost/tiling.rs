@@ -31,17 +31,24 @@ impl CostModel {
         if tm == 0 {
             return Some([cost.flops; 2]);
         }
+        if !matches!(
+            dispatch.op(),
+            Op::Matmul | Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. }
+        ) {
+            return Some([cost.flops; 2]);
+        }
         let input = dispatch.primitive_inputs();
         let output = dispatch.output().layout().shape();
-        let inner = u64::from(*input[0].layout().shape().last()?);
+        let inner = u64::from(*input.first()?.layout().shape().last()?);
         let columns = u64::from(*output.last()?);
-        let rows = u64::from(input[0].layout().shape()[input[0].layout().shape().len() - 2]);
+        let input_shape = input.first()?.layout().shape();
+        let rows = u64::from(*input_shape.get(input_shape.len().checked_sub(2)?)?);
         let (minimum_rows, maximum_rows, batch) = match dispatch.op() {
             Op::Matmul => (
                 round(rows, tm)?,
                 round(rows, tm)?,
                 if output.len() == 3 {
-                    u64::from(output[0])
+                    u64::from(*output.first()?)
                 } else {
                     1
                 },
@@ -49,8 +56,8 @@ impl CostModel {
             Op::QuantMatmul { .. } => (round(rows, tm)?, round(rows, tm)?, 1),
             Op::GatherQuantMatmul { .. } => {
                 let index = super::quantized_route_index(input.len())?;
-                let routes = input[index].layout().element_count();
-                let experts = u64::from(input[1].layout().shape()[0]).min(routes);
+                let routes = input.get(index)?.layout().element_count();
+                let experts = u64::from(*input.get(1)?.layout().shape().first()?).min(routes);
                 let maximum_tiles = routes
                     .checked_add(experts.checked_mul(tm.checked_sub(1)?)?)?
                     .checked_div(tm)?;
@@ -91,11 +98,11 @@ impl CostModel {
 
 fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u64; 2]> {
     let input = dispatch.primitive_inputs();
-    let query = input[0].layout().shape();
+    let [heads, queries, width]: [u32; 3] = input.first()?.layout().shape().try_into().ok()?;
     let (causal, start, keys) = match dispatch.op() {
         Op::Sdpa {
             causal, q_start, ..
-        } => (causal, q_start, input[1].layout().shape()[1]),
+        } => (causal, q_start, *input.get(1)?.layout().shape().get(1)?),
         Op::PagedSdpaAppend { q_start, .. } => (true, q_start, q_start.checked_add(1)?),
         Op::PagedSdpa {
             causal,
@@ -122,13 +129,13 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
     };
     let tile = tiles
         .iter()
-        .find(|(width, _)| *width == query[2])?
+        .find(|(tile_width, _)| *tile_width == width)?
         .1
         .map(u64::from);
     if tile.contains(&0) {
         return None;
     }
-    let queries = u64::from(query[1]);
+    let queries = u64::from(queries);
     let trips = if causal {
         let full = queries / tile[0];
         let bias = u64::from(start)
@@ -147,8 +154,8 @@ fn attention_padded(tiles: &[(u32, [u32; 2])], dispatch: &Dispatch) -> Option<[u
     };
     let pairs = product(&[trips, tile[0], tile[1]])?;
     let width =
-        u64::from(query[2]).checked_add(u64::from(*dispatch.output().layout().shape().last()?))?;
-    Some([product(&[2, u64::from(query[0]), pairs, width])?; 2])
+        u64::from(width).checked_add(u64::from(*dispatch.output().layout().shape().last()?))?;
+    Some([product(&[2, u64::from(heads), pairs, width])?; 2])
 }
 
 fn triangular(value: u64) -> Option<u64> {
@@ -196,6 +203,20 @@ mod tests {
     use super::*;
     use crate::{CommandList, DType, cost::tests::tensor};
 
+    #[test]
+    fn a_matrix_cost_model_preserves_one_dimensional_copy_cost() {
+        let input = tensor(1, DType::F32, &[7]);
+        let output = tensor(2, DType::F32, &[7]);
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let dispatch = commands.last_dispatch().unwrap();
+        let cost = KernelCost::of(dispatch).unwrap();
+        let model = CostModel {
+            tile: [32, 64, 16],
+            ..CostModel::default()
+        };
+        assert_eq!(model.padded_flops(dispatch, cost), Some([cost.flops; 2]));
+    }
     #[test]
     fn floor_sum_matches_a_schedule_walk() {
         for count in [0_u64, 1, 7, 33, 4097] {

@@ -30,13 +30,13 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         .is_some_and(|p| p.program().program().kind == ProgramKind::Row);
     let groups = match dispatch.op() {
         Op::Sdpa { .. } | Op::PagedSdpa { .. } | Op::PagedSdpaAppend { .. } => {
-            let shape = dispatch.inputs()[0].layout().shape();
-            u64::from(shape[0]).checked_mul(u64::from(shape[1]))?
+            let shape = dispatch.inputs().first()?.layout().shape();
+            u64::from(*shape.first()?).checked_mul(u64::from(*shape.get(1)?))?
         }
         Op::State(StateOp::DeltaRule(_) | StateOp::DeltaRuleBlock(_)) => {
             // Prefix stages are shared by the value columns.
-            let state = dispatch.inputs()[5].layout().shape();
-            u64::from(state[0])
+            let state = dispatch.inputs().get(5)?.layout().shape();
+            u64::from(*state.first()?)
         }
         _ if row => elements.checked_div(width)?,
         _ => elements,
@@ -60,23 +60,28 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     match dispatch.op() {
         Op::Matmul | Op::GatherMatmul | Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. } => {
             let inputs = dispatch.primitive_inputs();
-            let inner = u64::from(*inputs[0].layout().shape().last()?);
+            let inner = u64::from(*inputs.first()?.layout().shape().last()?);
             let quantized = matches!(
                 dispatch.op(),
                 Op::QuantMatmul { .. } | Op::GatherQuantMatmul { .. }
             );
             let weight = if quantized {
                 4_u64
-                    .checked_add(inputs[2].layout().dtype().byte_size())?
-                    .checked_add(inputs[3].layout().dtype().byte_size())?
+                    .checked_add(inputs.get(2)?.layout().dtype().byte_size())?
+                    .checked_add(inputs.get(3)?.layout().dtype().byte_size())?
             } else {
-                inputs[1].layout().dtype().byte_size()
+                inputs.get(1)?.layout().dtype().byte_size()
             };
-            cost.read_bytes =
-                cost.read_bytes
-                    .max(inner.checked_mul(
-                        inputs[0].layout().dtype().byte_size().checked_add(weight)?,
-                    )?);
+            cost.read_bytes = cost.read_bytes.max(
+                inner.checked_mul(
+                    inputs
+                        .first()?
+                        .layout()
+                        .dtype()
+                        .byte_size()
+                        .checked_add(weight)?,
+                )?,
+            );
             cost.scalar_ops =
                 cost.scalar_ops
                     .max(inner.checked_mul(if quantized { 10 } else { 2 })?);

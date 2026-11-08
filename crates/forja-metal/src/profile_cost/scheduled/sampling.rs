@@ -26,7 +26,7 @@ pub(super) fn of(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost
     else {
         return None;
     };
-    let input = &dispatch.inputs()[0];
+    let input = &dispatch.inputs().first()?;
     let width = u64::from(*input.layout().shape().last()?);
     let rows = dispatch.output().layout().element_count();
     let chunks = width.div_ceil(u64::from(chunk_width));
