@@ -430,13 +430,22 @@ pub struct StateSlot {
 
 impl StateSlot {
     /// A padding lane with impossible generations and no authorized state access.
-    #[must_use]
-    pub fn poisoned() -> Self {
-        Self {
-            table: PageTable::poisoned(2),
+    ///
+    /// # Errors
+    /// Refuses an empty chain or an unrepresentable table extent.
+    pub fn poisoned(output_count: u32) -> Result<Self, PagePoolError> {
+        if output_count == 0 {
+            return Err(PagePoolError::InvalidCheckpoint);
+        }
+        let records = output_count
+            .checked_add(1)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(PagePoolError::ArithmeticOverflow)?;
+        Ok(Self {
+            table: PageTable::poisoned(records),
             active: false,
             owner: None,
-        }
+        })
     }
 
     /// Generation-authenticated input/output mappings for trusted backend upload.
@@ -490,6 +499,24 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_slots_size_the_whole_chain() {
+        for count in [1, 2] {
+            let slot = StateSlot::poisoned(count).unwrap();
+            assert_eq!(
+                slot.table().entries().len(),
+                usize::try_from(count + 1).unwrap()
+            );
+            assert!(!slot.is_active());
+            assert!(crate::StateAccess::from_slot(&slot).is_err());
+            for index in 0..=count {
+                assert!(slot.table().resolve(index).is_err());
+            }
+        }
+        assert!(StateSlot::poisoned(0).is_err());
+        assert!(StateSlot::poisoned(u32::MAX).is_err());
+    }
+
+    #[test]
     fn access_authenticates_every_chain_link() {
         use crate::{StateAccess, StateStep};
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
@@ -518,7 +545,7 @@ mod tests {
         assert!(access.step(2).is_err());
         assert!(access.step(usize::MAX).is_err());
         assert!(StateStep::from_slot(&slot).is_err());
-        assert!(StateAccess::from_slot(&StateSlot::poisoned()).is_err());
+        assert!(StateAccess::from_slot(&StateSlot::poisoned(1).unwrap()).is_err());
         for indices in [vec![], vec![0], vec![0, 0], vec![0, 1, 1], vec![0, 1, 0]] {
             let mut invalid = slot.clone();
             invalid.table = PageTable::new(
@@ -596,7 +623,8 @@ mod tests {
         assert!(b.bind(&retry).is_err());
         let other = StatePool::new(pool.layout().clone(), 1, 1024).unwrap();
         assert!(other.validate_slot(&slot).is_err());
-        pool.validate_slot(&StateSlot::poisoned()).unwrap();
+        pool.validate_slot(&StateSlot::poisoned(1).unwrap())
+            .unwrap();
         a.mark_submitted(&retry).unwrap();
         pool.observe_completion(3).unwrap();
         a.finish(&retry, true).unwrap();
@@ -705,7 +733,7 @@ mod tests {
         let slot = sequence.bind(&transaction).unwrap();
         let access = crate::StateStep::from_slot(&slot).unwrap();
         assert_ne!(access.source(), access.destination());
-        assert!(crate::StateStep::from_slot(&StateSlot::poisoned()).is_err());
+        assert!(crate::StateStep::from_slot(&StateSlot::poisoned(1).unwrap()).is_err());
         drop(sequence);
         assert!(pool.reserve().is_err());
         pool.observe_completion(6).unwrap();
