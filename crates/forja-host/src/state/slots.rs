@@ -150,7 +150,7 @@ impl<B: Backend> StateSlots<B> {
             .get_mut(lane)
             .ok_or_else(|| invalid_handle("state lane is out of range"))?;
         if let Some(sequence) = &lane.sequence {
-            sequence.lock().ensure_idle().map_err(pool_error)?;
+            sequence.lock().ensure_quiescent().map_err(pool_error)?;
         }
         lane.sequence = None;
         lane.prompt = None;

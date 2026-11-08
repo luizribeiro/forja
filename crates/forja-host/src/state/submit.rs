@@ -4,7 +4,7 @@ use forja_core::{Backend, BackendError, Submission};
 use std::sync::atomic::Ordering;
 
 /// Retains sequence ownership and reconciles a transaction even when dropped early.
-#[must_use = "Finishing publishes state; dropping cancels after one wait."]
+#[must_use = "Finishing completes state work; dropping cancels after one wait."]
 pub struct StateSubmission<B: Backend> {
     recording: StateRecording<B>,
     submission: B::Submission,
@@ -67,7 +67,7 @@ impl<B: Backend> StateRecording<B> {
 }
 
 impl<B: Backend> StateSubmission<B> {
-    /// Drains execution and publishes every plane together on success.
+    /// Drains execution; verify rows await acceptance, other updates publish on success.
     ///
     /// # Errors
     /// Returns a reconciliation or execution failure without publishing failed work.
@@ -75,7 +75,7 @@ impl<B: Backend> StateSubmission<B> {
         self.finish_with_time().map(|_| ())
     }
 
-    /// Drains and publishes state, retaining the backend's completed GPU duration.
+    /// Completes state work, retaining the backend's completed GPU duration.
     ///
     /// # Errors
     /// Returns reconciliation, timeout or execution failures without publishing failed work.

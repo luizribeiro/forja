@@ -114,3 +114,54 @@ fn verify_admission_preserves_predecessor_on_refusal_and_cancellation() {
         assert_eq!(journal.retained.as_ref().unwrap().position.tokens, 0);
     }
 }
+
+#[test]
+fn completed_verify_defers_publication_until_its_acceptance_is_settled() {
+    for rows in [2, 3] {
+        let (pool, mut journal) = fixture(rows);
+        let input = journal.checkpoint_latest().unwrap();
+        let chain = verify(&mut journal, 2, rows);
+        journal.mark_submitted(&chain).unwrap();
+        assert!(journal.finish(&chain, true).is_err());
+        pool.observe_completion(2).unwrap();
+        journal.finish(&chain, true).unwrap();
+        assert_eq!(journal.position, input.position);
+        assert_eq!(journal.phase, SelectionPhase::AwaitingAcceptance);
+        assert!(journal.checkpoint_latest().is_err());
+        assert!(journal.ensure_quiescent().is_err());
+        assert!(journal.canonical_boundary().is_err());
+        assert!(journal.reserve_selection(32, &Arc::new(())).is_err());
+        assert!(journal.begin(3, None).is_err());
+        journal.cancel_unsubmitted(&chain).unwrap();
+        assert_eq!(journal.position, input.position);
+        assert_eq!(journal.phase, input.phase);
+    }
+}
+
+#[test]
+fn verify_execution_failure_preserves_source_after_physical_drain() {
+    for rows in [2, 3] {
+        for abandoned in [false, true] {
+            let (pool, mut journal) = fixture(rows);
+            let input = journal.checkpoint_latest().unwrap();
+            let chain = verify(&mut journal, 2, rows);
+            journal.mark_submitted(&chain).unwrap();
+            if abandoned {
+                journal.abandon(&chain).unwrap();
+                assert!(journal.ensure_quiescent().is_err());
+                pool.observe_completion(2).unwrap();
+            } else {
+                pool.observe_completion(2).unwrap();
+                journal.finish(&chain, false).unwrap();
+            }
+            assert_eq!(journal.position, input.position);
+            assert!(journal.retained.is_none());
+            assert_eq!(
+                journal.checkpoint_latest().unwrap().version.version(),
+                input.version.version()
+            );
+            let plain = journal.begin(3, None).unwrap();
+            journal.cancel_unsubmitted(&plain).unwrap();
+        }
+    }
+}

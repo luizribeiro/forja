@@ -3,7 +3,7 @@ use crate::compute;
 use forja_core::{Backend, BackendError, Submission};
 
 /// Completion owner for every lane in a queued protected-state batch.
-#[must_use = "Finish publishes the batch; dropping cancels it after drain."]
+#[must_use = "Finish completes the batch; dropping cancels it after drain."]
 pub struct StateBatchSubmission<B: Backend> {
     pub(super) batch: StateBatch<B>,
     pub(super) submission: B::Submission,
@@ -12,7 +12,7 @@ pub struct StateBatchSubmission<B: Backend> {
 }
 
 impl<B: Backend> StateBatchSubmission<B> {
-    /// Drains once and publishes all lane versions and cursors on success.
+    /// Drains once; verify rows await acceptance, other lanes publish on success.
     ///
     /// # Errors
     /// Reports execution failure or taint from a failed predecessor.

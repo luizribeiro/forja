@@ -242,10 +242,10 @@ impl<B: Backend> StateSequenceHandle<B> {
         self.lock().rewind(tokens)
     }
 
-    /// Cancels an unsubmitted reservation and its descendants.
+    /// Cancels an unsubmitted reservation or restores a completed, unpublished verify input.
     ///
     /// # Errors
-    /// Refuses stale capabilities and reservations already sealed for submission.
+    /// Refuses stale capabilities and submitted work still awaiting completion.
     pub fn cancel(&self, transaction: &StateTransaction) -> Result<(), PagePoolError> {
         self.lock().cancel_unsubmitted(transaction)
     }

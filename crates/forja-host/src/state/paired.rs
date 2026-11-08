@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod verify_tests;
+
 use super::StateRecording;
 use forja_core::{Backend, PagePoolError, PagedSequence, SequenceCheckpoint};
 use std::sync::{

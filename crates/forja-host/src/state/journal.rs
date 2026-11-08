@@ -92,6 +92,13 @@ struct Pending {
     dependency: Option<Arc<StateOutcome>>,
 }
 
+struct Acceptance {
+    transaction: StateTransaction,
+    _outputs: Vec<forja_core::StateCheckpoint>,
+    _position: LanePosition,
+    outcome: Arc<StateOutcome>,
+}
+
 pub(super) struct StateJournal {
     canonical: CanonicalPosition,
     selection: std::sync::Weak<()>,
@@ -102,6 +109,7 @@ pub(super) struct StateJournal {
     pub(super) position: LanePosition,
     phase: SelectionPhase,
     pending: VecDeque<Pending>,
+    acceptance: Option<Acceptance>,
     retained: Option<super::StateLaneCheckpoint>,
 }
 
@@ -129,6 +137,7 @@ impl StateJournal {
             position: LanePosition::default(),
             phase: SelectionPhase::External,
             pending: VecDeque::new(),
+            acceptance: None,
             retained: None,
         }
     }
@@ -136,12 +145,16 @@ impl StateJournal {
     pub(super) fn ensure_snapshot_idle(&self) -> Result<(), PagePoolError> {
         self.sequence.ensure_idle()?;
         if !self.pending.is_empty()
-            || self.phase == SelectionPhase::AwaitingAcceptance
+            || self.acceptance.is_some()
             || self.selection.upgrade().is_some()
         {
             return Err(PagePoolError::BankInFlight);
         }
         Ok(())
+    }
+
+    pub(super) fn ensure_quiescent(&self) -> Result<(), PagePoolError> {
+        self.ensure_snapshot_idle()
     }
 
     pub(super) fn has_pristine_state(&self) -> Result<bool, PagePoolError> {
@@ -351,6 +364,13 @@ impl StateJournal {
         &mut self,
         transaction: &StateTransaction,
     ) -> Result<(), PagePoolError> {
+        if self
+            .acceptance
+            .as_ref()
+            .is_some_and(|accepted| accepted.transaction.same_reservation(transaction))
+        {
+            return self.rewind(self.position.tokens);
+        }
         let index = self
             .pending
             .iter()
@@ -417,15 +437,34 @@ impl StateJournal {
         if self.pending.front().map(|entry| entry.serial) != Some(transaction.serial()) {
             return Err(PagePoolError::InvalidCheckpoint);
         }
+        let outputs = if success
+            && self
+                .pending
+                .front()
+                .is_some_and(|entry| entry.phase == SelectionPhase::AwaitingAcceptance)
+        {
+            Some(self.sequence.checkpoint_outputs(transaction)?)
+        } else {
+            None
+        };
         self.sequence.finish(transaction, success)?;
         if success {
             if let Some(entry) = self.pending.pop_front() {
-                self.position = entry.position;
                 self.phase = entry.phase;
-                self.canonical = entry.canonical;
                 self.retained = Some(entry.predecessor);
                 self.retained_paged = entry.paged;
-                entry.outcome.finish(true);
+                if let Some(outputs) = outputs {
+                    self.acceptance = Some(Acceptance {
+                        transaction: transaction.clone(),
+                        _outputs: outputs,
+                        _position: entry.position,
+                        outcome: entry.outcome,
+                    });
+                } else {
+                    self.position = entry.position;
+                    self.canonical = entry.canonical;
+                    entry.outcome.finish(true);
+                }
             }
         } else {
             self.fail_pending(0);
@@ -531,7 +570,7 @@ impl StateJournal {
     }
 
     pub(super) fn checkpoint_latest(&self) -> Result<super::StateLaneCheckpoint, PagePoolError> {
-        if self.phase == SelectionPhase::AwaitingAcceptance
+        if self.acceptance.is_some()
             || self
                 .pending
                 .back()
@@ -669,6 +708,7 @@ impl StateJournal {
         self.canonical = checkpoint.canonical.clone();
         self.retained = None;
         self.retained_paged = None;
+        self.clear_acceptance();
         Ok(())
     }
 
@@ -692,12 +732,13 @@ impl StateJournal {
         self.phase = checkpoint.phase;
         self.canonical = checkpoint.canonical.clone();
         self.retained = None;
+        self.clear_acceptance();
         Ok(())
     }
 
     fn ensure_action_admissible(&self, action: Option<StateAction>) -> Result<(), PagePoolError> {
         if self.selection.upgrade().is_some()
-            || self.phase == SelectionPhase::AwaitingAcceptance
+            || self.acceptance.is_some()
             || self
                 .pending
                 .iter()
@@ -712,6 +753,12 @@ impl StateJournal {
             }
         }
         Ok(())
+    }
+
+    fn clear_acceptance(&mut self) {
+        if let Some(acceptance) = self.acceptance.take() {
+            acceptance.outcome.finish(false);
+        }
     }
 }
 

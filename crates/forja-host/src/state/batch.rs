@@ -37,7 +37,7 @@ impl<B: Backend> StateBatch<B> {
         Ok(Self { recordings })
     }
 
-    /// Submits once and publishes every lane only after the complete batch succeeds.
+    /// Submits once and completes every lane only after the complete batch succeeds.
     ///
     /// # Errors
     /// Returns admission, authentication or execution failure without partial publication.
