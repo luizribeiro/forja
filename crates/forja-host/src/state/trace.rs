@@ -1,6 +1,6 @@
 use super::{StateCharge, StateCommands, StateStorage};
 use crate::{compute, invalid_handle};
-use forja_core::{Backend, StateAccess};
+use forja_core::{Backend, StateStep};
 use std::{
     any::Any,
     sync::{Arc, Mutex, MutexGuard},
@@ -58,7 +58,7 @@ impl SharedStateTrace {
 impl<B: Backend> StateTrace<B> {
     pub(super) fn new(
         storage: &Arc<StateStorage<B>>,
-        access: StateAccess,
+        access: StateStep,
         lanes: usize,
     ) -> Result<Self, compute::Error> {
         if lanes == 0 {

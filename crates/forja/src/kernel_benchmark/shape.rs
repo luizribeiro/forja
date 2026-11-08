@@ -123,7 +123,7 @@ fn state_operation<'de, D: serde::Deserializer<'de>>(
         DeltaRule,
         CausalDepthwiseConv,
     }
-    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+    use forja_core::{StateLayout, StatePlane, StatePool, StateStep};
     let operation = StateOperation::deserialize(deserializer)?;
     let access = || -> Result<_, Box<dyn Error>> {
         let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1])?])?;
@@ -131,7 +131,7 @@ fn state_operation<'de, D: serde::Deserializer<'de>>(
         let mut sequence = pool.reserve()?;
         let transaction = sequence.begin(1)?;
         let slot = sequence.bind(&transaction)?;
-        Ok(StateAccess::from_slot(&slot)?)
+        Ok(StateStep::from_slot(&slot)?)
     };
     access()
         .map(|access| match operation {

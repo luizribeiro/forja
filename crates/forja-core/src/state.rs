@@ -5,7 +5,7 @@ pub use feedback::{FeedbackCheckpoint, FeedbackPin, FeedbackVersions};
 mod block;
 pub use block::DeltaBlockScratch;
 mod access;
-pub use access::StateAccess;
+pub use access::StateStep;
 mod ops;
 pub use ops::StateOp;
 mod pool;

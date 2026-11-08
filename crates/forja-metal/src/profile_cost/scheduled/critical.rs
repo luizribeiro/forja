@@ -96,7 +96,7 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forja_core::{CommandList, DType, StateAccess};
+    use forja_core::{CommandList, DType, StateStep};
     use forja_cpu::CpuBackend;
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn one_convolution_output_retains_the_entire_tap_chain() {
         let cpu = CpuBackend::new();
-        let access: StateAccess = forja_testing::state_test_metadata().unwrap().0;
+        let access: StateStep = forja_testing::state_test_metadata().unwrap().0;
         for taps in [7, 33, 4097] {
             for channels in [1, 7] {
                 let inputs = [

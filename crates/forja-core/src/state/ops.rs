@@ -1,4 +1,4 @@
-use crate::{DType, KernelCost, OpError, StateAccess, Tensor};
+use crate::{DType, KernelCost, OpError, StateStep, Tensor};
 
 // Activity, two expected identities, disjointness, two bounds and two generations.
 const METADATA_INPUTS: usize = 3;
@@ -8,18 +8,18 @@ const AUTHENTICATION_SCALAR_OPS: u64 = 1 + 2 + 1 + 2 + 2;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StateOp {
     /// One gated delta-rule update; inputs are Q, K, V, decay, beta, state and metadata.
-    DeltaRule(StateAccess),
+    DeltaRule(StateStep),
     /// Fixed-size WY blocks; inputs use log decay, with private float32 scratch as output three.
     /// Scratch contents after execution are unspecified.
-    DeltaRuleBlock(StateAccess),
+    DeltaRuleBlock(StateStep),
     /// Causal depthwise convolution; inputs are tokens, tap weights, history and metadata.
-    CausalDepthwiseConv(StateAccess),
+    CausalDepthwiseConv(StateStep),
 }
 
 impl StateOp {
     /// Authorized source and destination versions.
     #[must_use]
-    pub const fn access(self) -> StateAccess {
+    pub const fn access(self) -> StateStep {
         match self {
             Self::DeltaRule(access)
             | Self::DeltaRuleBlock(access)
@@ -224,7 +224,7 @@ mod layout_tests {
         .unwrap();
         let mut sequence = pool.reserve().unwrap();
         let transaction = sequence.begin(1).unwrap();
-        let access = StateAccess::from_slot(&sequence.bind(&transaction).unwrap()).unwrap();
+        let access = StateStep::from_slot(&sequence.bind(&transaction).unwrap()).unwrap();
         let delta = StateOp::DeltaRule(access);
         assert!(delta.input_suffix(&[0; 6]).is_err());
         assert_eq!(

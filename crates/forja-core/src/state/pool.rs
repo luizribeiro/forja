@@ -661,9 +661,9 @@ mod tests {
         let transaction = sequence.begin(7).unwrap();
         sequence.mark_submitted(&transaction).unwrap();
         let slot = sequence.bind(&transaction).unwrap();
-        let access = crate::StateAccess::from_slot(&slot).unwrap();
+        let access = crate::StateStep::from_slot(&slot).unwrap();
         assert_ne!(access.source(), access.destination());
-        assert!(crate::StateAccess::from_slot(&StateSlot::poisoned()).is_err());
+        assert!(crate::StateStep::from_slot(&StateSlot::poisoned()).is_err());
         drop(sequence);
         assert!(pool.reserve().is_err());
         pool.observe_completion(6).unwrap();

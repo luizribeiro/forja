@@ -1,12 +1,12 @@
 use super::StateCommands;
 use crate::{compute, invalid_handle};
-use forja_core::{Backend, CompletionResource, ReplayBindings, StateAccess, Tensor};
+use forja_core::{Backend, CompletionResource, ReplayBindings, StateStep, Tensor};
 use std::sync::Arc;
 
 /// Protected graph bindings whose ownership excludes a request's sequence reservation.
 #[derive(Clone)]
 pub struct StateCapture {
-    access: StateAccess,
+    access: StateStep,
     planes: Vec<[Tensor; 2]>,
     metadata: Vec<Tensor>,
     updated: Vec<bool>,

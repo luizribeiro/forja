@@ -1,14 +1,14 @@
 use crate::{PagePoolError, StateSlot};
 
-/// Authorized input and output version identities supplied only by the trusted host.
+/// Authorized input and output identities for one state dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StateAccess {
+pub struct StateStep {
     active: bool,
     source: u32,
     destination: u32,
 }
 
-impl StateAccess {
+impl StateStep {
     /// Resolves an active slot after validating both allocation generations.
     ///
     /// # Errors

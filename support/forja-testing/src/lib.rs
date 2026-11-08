@@ -1133,14 +1133,14 @@ fn decode(bytes: &[u8], dtype: DType) -> Result<Vec<f32>, AgreementError> {
 ///
 /// # Errors
 /// Returns an error if the small metadata allocator cannot be constructed.
-pub fn state_test_metadata() -> Result<(forja_core::StateAccess, [TensorSpec; 3]), AgreementError> {
-    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+pub fn state_test_metadata() -> Result<(forja_core::StateStep, [TensorSpec; 3]), AgreementError> {
+    use forja_core::{StateLayout, StatePlane, StatePool, StateStep};
     let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![1])?])?;
     let pool = StatePool::new(layout, 1, 128).map_err(|_| BackendError::InvalidInput)?;
     let mut sequence = pool.reserve().map_err(|_| BackendError::InvalidInput)?;
     let tx = sequence.begin(1).map_err(|_| BackendError::InvalidInput)?;
     let slot = sequence.bind(&tx).map_err(|_| BackendError::InvalidInput)?;
-    let access = StateAccess::from_slot(&slot).map_err(|_| BackendError::InvalidInput)?;
+    let access = StateStep::from_slot(&slot).map_err(|_| BackendError::InvalidInput)?;
     let table = slot.table();
     Ok((
         access,

@@ -1,11 +1,11 @@
 use super::tests::tensor;
 
 use crate::{
-    CommandList, DType, KernelCost, Op, StateAccess, StateLayout, StateOp, StatePlane, StatePool,
+    CommandList, DType, KernelCost, Op, StateLayout, StateOp, StatePlane, StatePool, StateStep,
     Tensor,
 };
 
-fn delta_fixture(block: bool) -> (StateAccess, Vec<Tensor>, [Tensor; 2]) {
+fn delta_fixture(block: bool) -> (StateStep, Vec<Tensor>, [Tensor; 2]) {
     let pool = StatePool::new(
         StateLayout::new(vec![StatePlane::new(DType::F32, vec![3, 7, 33]).unwrap()]).unwrap(),
         1,
@@ -14,7 +14,7 @@ fn delta_fixture(block: bool) -> (StateAccess, Vec<Tensor>, [Tensor; 2]) {
     .unwrap();
     let mut sequence = pool.reserve().unwrap();
     let tx = sequence.begin(1).unwrap();
-    let access = StateAccess::from_slot(&sequence.bind(&tx).unwrap()).unwrap();
+    let access = StateStep::from_slot(&sequence.bind(&tx).unwrap()).unwrap();
     let query = if block { vec![7, 1, 7] } else { vec![1, 7] };
     let value = if block { vec![7, 3, 33] } else { vec![3, 33] };
     let gate = if block { vec![7, 3] } else { vec![3] };

@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn feedback_uses_bind_ready_inputs_and_keep_their_charge_through_retirement() {
         use crate::{LanePosition, StateAction};
-        use forja_core::StateAccess;
+        use forja_core::StateStep;
         use std::sync::atomic::Ordering;
         let (host, _binding, pool, mut journal) = fixture();
         let before = host.live_bytes.load(Ordering::Acquire);
@@ -213,7 +213,7 @@ mod tests {
         let first = journal
             .begin_action(1, Some(position(1)), Some(StateAction::Combined))
             .unwrap();
-        let access = StateAccess::from_slot(&journal.bind(&first).unwrap()).unwrap();
+        let access = StateStep::from_slot(&journal.bind(&first).unwrap()).unwrap();
         let initial = journal
             .feedback_use(&first, access.destination(), Arc::clone(&charge))
             .unwrap()
@@ -227,7 +227,7 @@ mod tests {
         let second = journal
             .begin_action(2, Some(position(2)), Some(StateAction::Forward))
             .unwrap();
-        let access = StateAccess::from_slot(&journal.bind(&second).unwrap()).unwrap();
+        let access = StateStep::from_slot(&journal.bind(&second).unwrap()).unwrap();
         let next = journal
             .feedback_use(&second, access.destination(), Arc::clone(&charge))
             .unwrap()
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn omitted_tokens_refuse_external_and_unselected_predecessors() {
         use crate::{LanePosition, StateAction};
-        use forja_core::StateAccess;
+        use forja_core::StateStep;
         for action in [StateAction::Step, StateAction::Forward] {
             let (host, _binding, pool, mut journal) = fixture();
             let first = journal
@@ -290,7 +290,7 @@ mod tests {
                     Some(StateAction::Combined),
                 )
                 .unwrap();
-            let access = StateAccess::from_slot(&journal.bind(&second).unwrap()).unwrap();
+            let access = StateStep::from_slot(&journal.bind(&second).unwrap()).unwrap();
             let charge = Arc::new(
                 StateCharge::reserve(
                     host.backend.as_ref(),

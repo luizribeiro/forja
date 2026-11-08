@@ -106,7 +106,7 @@ fn input_shapes(kind: u32) -> &'static [&'static [u32]] {
 
 fn run(
     backend: &forja_metal::MetalBackend,
-    access: forja_core::StateAccess,
+    access: forja_core::StateStep,
     kind: u32,
     inputs: &[forja_core::Tensor],
     outputs: &[&forja_core::Tensor],

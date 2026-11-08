@@ -111,7 +111,7 @@ mod tests {
     fn state_inputs(
         backend: &CpuBackend,
         data: &[(&[u32], Vec<f32>)],
-    ) -> (forja_core::StateAccess, Vec<Tensor>) {
+    ) -> (forja_core::StateStep, Vec<Tensor>) {
         let (access, specs) = forja_testing::state_test_metadata().unwrap();
         let mut inputs = Vec::new();
         for (shape, values) in data {

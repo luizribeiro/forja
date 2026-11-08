@@ -1,6 +1,6 @@
 use super::{StateCharge, StateSequenceHandle, StateStorage, pool_error};
 use crate::{Limits, compute, guest_error, invalid_handle, quota};
-use forja_core::{Backend, CommandList, DType, Op, StateAccess, StateOp, StateTransaction, Tensor};
+use forja_core::{Backend, CommandList, DType, Op, StateOp, StateStep, StateTransaction, Tensor};
 use std::sync::Arc;
 
 pub(super) struct StateMetadata<B: Backend> {
@@ -27,7 +27,7 @@ impl<B: Backend> Drop for StateMetadata<B> {
 /// Authenticated plane commands without ownership of a request's transaction.
 pub struct StateCommands<B: Backend> {
     pub(super) storage: Arc<StateStorage<B>>,
-    pub(super) access: StateAccess,
+    pub(super) access: StateStep,
     pub(super) scratch: Vec<Arc<super::block::StateScratch<B>>>,
     pub(super) captured_scratch: Vec<forja_core::CompletionResource>,
     pub(super) captured_scratch_charges: Vec<forja_core::CompletionResource>,
@@ -116,7 +116,7 @@ impl<B: Backend> StateStorage<B> {
         self: &Arc<Self>,
         sequence: &StateSequenceHandle<B>,
         transaction: StateTransaction,
-        prepare: impl FnOnce(StateAccess) -> Result<StateCommands<B>, compute::Error>,
+        prepare: impl FnOnce(StateStep) -> Result<StateCommands<B>, compute::Error>,
     ) -> Result<StateRecording<B>, compute::Error> {
         self.check_usable()?;
         if !Arc::ptr_eq(self, &sequence.storage) {
@@ -131,7 +131,7 @@ impl<B: Backend> StateStorage<B> {
         };
         self.pool.validate_slot(&slot).map_err(pool_error)?;
         sequence.materialize_snapshot()?;
-        let access = StateAccess::from_slot(&slot).map_err(pool_error)?;
+        let access = StateStep::from_slot(&slot).map_err(pool_error)?;
         let table = slot
             .table()
             .entries()
@@ -160,7 +160,7 @@ impl<B: Backend> StateStorage<B> {
     }
     pub(super) fn prepare_record_metadata(
         self: &Arc<Self>,
-        access: StateAccess,
+        access: StateStep,
     ) -> Result<StateCommands<B>, compute::Error> {
         self.check_usable()?;
         let mut commands =
@@ -171,7 +171,7 @@ impl<B: Backend> StateStorage<B> {
 
     pub(super) fn inactive_commands(
         self: &Arc<Self>,
-        access: StateAccess,
+        access: StateStep,
     ) -> Result<StateCommands<B>, compute::Error> {
         let mut commands = self.prepare_record_metadata(access.inactive())?;
         let records = usize::try_from(self.planes[0].layout().shape()[0])
@@ -201,7 +201,7 @@ impl<B: Backend> StateStorage<B> {
 impl<B: Backend> StateCommands<B> {
     fn empty(
         storage: &Arc<StateStorage<B>>,
-        access: StateAccess,
+        access: StateStep,
         charge: Arc<StateCharge>,
         limits: Limits,
     ) -> Self {
@@ -358,7 +358,7 @@ impl<B: Backend> StateCommands<B> {
     pub(crate) fn update_variant(
         &mut self,
         plane: usize,
-        operation: fn(StateAccess) -> StateOp,
+        operation: fn(StateStep) -> StateOp,
         inputs: &[&Tensor],
         output: &Tensor,
         variant: &str,

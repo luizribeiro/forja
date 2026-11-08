@@ -1,4 +1,4 @@
-use crate::{BufferId, CommandList, Op, OpError, StateAccess, StateOp, Tensor};
+use crate::{BufferId, CommandList, Op, OpError, StateOp, StateStep, Tensor};
 
 /// Trusted per-replay replacements for protected views and authentication identities.
 /// Bindings do not add parameters to a guest's graph parameter space.
@@ -14,7 +14,7 @@ pub struct ReplayBindings {
 #[derive(Clone, Debug)]
 struct StateBinding {
     table: Tensor,
-    access: StateAccess,
+    access: StateStep,
     views: Vec<(Tensor, Tensor)>,
 }
 
@@ -80,7 +80,7 @@ impl ReplayBindings {
     pub fn state_table(
         &mut self,
         table: Tensor,
-        access: StateAccess,
+        access: StateStep,
         views: Vec<(Tensor, Tensor)>,
     ) -> Result<(), OpError> {
         if table.layout().dtype() != crate::DType::U32
@@ -263,7 +263,7 @@ mod tests {
             .iter_mut()
             .map(|lane| {
                 let tx = lane.begin(1).unwrap();
-                StateAccess::from_slot(&lane.bind(&tx).unwrap()).unwrap()
+                StateStep::from_slot(&lane.bind(&tx).unwrap()).unwrap()
             })
             .collect::<Vec<_>>();
         let input = shaped(1, DType::F32, &[1, 7]);

@@ -63,8 +63,8 @@ pub use profile_scope::{ProfileScope, ProfileScopeError};
 pub use quantized::{QuantizedMatrix, QuantizedMatrixError, QuantizedMatrixPart};
 pub use state::{
     DeltaBlockScratch, FeedbackCheckpoint, FeedbackPin, FeedbackVersions, ReleasedStateCheckpoint,
-    StateAccess, StateCheckpoint, StateLayout, StateOp, StatePlane, StatePool, StateSequence,
-    StateSlot, StateTransaction,
+    StateCheckpoint, StateLayout, StateOp, StatePlane, StatePool, StateSequence, StateSlot,
+    StateStep, StateTransaction,
 };
 pub use symbolic::{
     Affine, ByteHull, MAX_PARAMS, ParamError, ParamSpace, ParamValues, SymbolicLayout,

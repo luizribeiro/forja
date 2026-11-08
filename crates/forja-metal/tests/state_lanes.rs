@@ -378,7 +378,7 @@ fn lane_inputs(
     specs: &[TensorSpec],
     lane: usize,
     corrupt: bool,
-) -> (forja_core::StateAccess, Vec<forja_core::Tensor>) {
+) -> (forja_core::StateStep, Vec<forja_core::Tensor>) {
     let (access, metadata) = lane_metadata(lane % 8);
     let mut specs = specs.to_vec();
     specs.extend(metadata);
@@ -416,8 +416,8 @@ fn lane_inputs(
     (access, inputs)
 }
 
-fn lane_metadata(lane: usize) -> (forja_core::StateAccess, [TensorSpec; 3]) {
-    use forja_core::{StateAccess, StateLayout, StatePlane, StatePool};
+fn lane_metadata(lane: usize) -> (forja_core::StateStep, [TensorSpec; 3]) {
+    use forja_core::{StateLayout, StatePlane, StatePool, StateStep};
     let pool = StatePool::new(
         StateLayout::new(vec![StatePlane::new(DType::F32, vec![1]).unwrap()]).unwrap(),
         8,
@@ -431,7 +431,7 @@ fn lane_metadata(lane: usize) -> (forja_core::StateAccess, [TensorSpec; 3]) {
     let transaction = sequence.begin(1).unwrap();
     let slot = sequence.bind(&transaction).unwrap();
     let table = slot.table();
-    let access = StateAccess::from_slot(&slot).unwrap();
+    let access = StateStep::from_slot(&slot).unwrap();
     assert_eq!(usize::try_from(access.source()).unwrap() / 3, lane);
     (
         access,

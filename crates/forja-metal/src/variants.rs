@@ -3506,12 +3506,12 @@ mod tests {
         );
     }
 
-    fn state_dispatch(constructor: fn(forja_core::StateAccess) -> forja_core::StateOp) -> Dispatch {
+    fn state_dispatch(constructor: fn(forja_core::StateStep) -> forja_core::StateOp) -> Dispatch {
         state_dispatch_keys(constructor, 7)
     }
 
     fn state_dispatch_keys(
-        constructor: fn(forja_core::StateAccess) -> forja_core::StateOp,
+        constructor: fn(forja_core::StateStep) -> forja_core::StateOp,
         keys: u32,
     ) -> Dispatch {
         use forja_core::{DeltaBlockScratch, StateOp};
