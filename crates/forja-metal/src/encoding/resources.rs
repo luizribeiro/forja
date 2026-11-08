@@ -31,7 +31,7 @@ impl MetalBackend {
         }
         let kernel = quant_matmul_kernel(dispatch)?;
         let constants = quant_constants(dispatch)?;
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;

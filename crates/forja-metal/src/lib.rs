@@ -9,6 +9,8 @@ mod bandwidth;
 #[cfg(target_os = "macos")]
 mod calibration;
 #[cfg(target_os = "macos")]
+mod compile_cache;
+#[cfg(target_os = "macos")]
 mod compiler;
 #[cfg(target_os = "macos")]
 mod cost_sharing;

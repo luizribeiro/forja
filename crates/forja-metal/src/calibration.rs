@@ -167,7 +167,7 @@ impl MetalBackend {
     }
 
     fn prepare_calibration_probe(&self, probe: Probe) -> Result<PreparedProbe, BackendError> {
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;

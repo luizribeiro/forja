@@ -2604,7 +2604,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .epilogue_counts
+            .epilogue_counts()?
             .fallbacks;
         self.prepare_graph_epilogues(graph)?;
         let encoding = (self.graph_replay == crate::storage::MetalGraphReplay::Tier2)
@@ -2614,7 +2614,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .epilogue_counts
+            .epilogue_counts()?
             .fallbacks;
         if fallback_count_after != fallback_count {
             return Err(BackendError::ExecutionFailed);
@@ -2684,7 +2684,7 @@ impl MetalBackend {
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
-            .missing_epilogue_pipelines(requests);
+            .missing_epilogue_pipelines(requests)?;
         self.program_compile_tokens
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?
@@ -3011,7 +3011,7 @@ impl MetalBackend {
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?
-                .take_epilogue_counts();
+                .take_epilogue_counts()?;
             profile.metadata_buffers = temporary_profile.finish();
             profile.program_encoding = encoded.program_encoding;
             profile.program_compile_fallbacks = encoded.program_compile_fallbacks;
@@ -4535,7 +4535,7 @@ impl MetalBackend {
         let params = arguments.write(&params)?;
         let kernel = quant_matmul_kernel(dispatch)?;
         let constants = resources::quant_constants(dispatch)?;
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -4745,7 +4745,7 @@ impl MetalBackend {
             (225, qmv_vector_config(dispatch)[3]),
             (14, words_per_thread),
         ];
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -5585,7 +5585,7 @@ impl MetalBackend {
             (225, qmv_vector_config(dispatch)[3]),
             (16, block_rows),
         ];
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -6513,7 +6513,7 @@ impl MetalBackend {
                     constants,
                 )
             };
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -7059,7 +7059,7 @@ impl MetalBackend {
         width: u32,
         chunk_width: u32,
     ) -> Result<(ComputePipeline, ComputePipeline), BackendError> {
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -7220,7 +7220,7 @@ impl MetalBackend {
             (REDUCTION_CHUNK_WIDTH_CONSTANT, chunk_width),
         ];
         let (partials_pipeline, finalize_pipeline) = {
-            let mut pipelines = self
+            let pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
@@ -7377,7 +7377,7 @@ impl MetalBackend {
             partials_pipeline,
             reduce_finalize_pipeline,
         ) = {
-            let mut pipelines = self
+            let pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
@@ -7651,7 +7651,7 @@ impl MetalBackend {
             .ok_or(BackendError::InvalidInput)?;
         let partials = self.scratch_tensor(DType::U32, &[rows, chunks, partial_words])?;
         let (partials_pipeline, finalize_pipeline) = {
-            let mut pipelines = self
+            let pipelines = self
                 .pipelines
                 .lock()
                 .map_err(|_| BackendError::ExecutionFailed)?;
@@ -7840,7 +7840,7 @@ impl MetalBackend {
         width: u32,
         constants: &[(u32, u32)],
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
-        let mut pipelines = self
+        let pipelines = self
             .pipelines
             .lock()
             .map_err(|_| BackendError::ExecutionFailed)?;
@@ -10439,21 +10439,25 @@ fn encode_layout(layout: &Layout) -> Result<[u8; 112], BackendError> {
 pub(super) struct PipelineCache {
     pub(super) compiler: Arc<crate::compiler::Compiler>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
-    max_threadgroup_memory_length: usize,
+    max_threadgroup_memory_length: AtomicUsize,
     pipeline_budget: AtomicUsize,
     fast_library: Retained<ProtocolObject<dyn MTLLibrary>>,
     nan_preserving_library: Retained<ProtocolObject<dyn MTLLibrary>>,
-    pipelines: HashMap<PipelineKey, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    unavailable_pipelines: HashSet<PipelineKey>,
-    calibration_native: HashSet<PipelineKey>,
-    epilogue_libraries:
-        HashMap<epilogue_codegen::SourceKey, Retained<ProtocolObject<dyn MTLLibrary>>>,
-    epilogue_pipelines: HashMap<
-        epilogue_codegen::PipelineKey,
-        Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pipelines: crate::compile_cache::CompileCache<PipelineKey, ComputePipeline>,
+    epilogue_libraries: crate::compile_cache::CompileCache<
+        epilogue_codegen::SourceKey,
+        Retained<ProtocolObject<dyn MTLLibrary>>,
     >,
-    epilogue_counts: EpilogueCompileCounts,
+    epilogue_pipelines:
+        crate::compile_cache::CompileCache<epilogue_codegen::PipelineKey, ComputePipeline>,
+    epilogue_counts: Mutex<EpilogueCompileCounts>,
 }
+
+// SAFETY: Metal devices and immutable compiled objects allow access from multiple host threads.
+// Cache initialization, counters and resource limits are synchronized independently.
+unsafe impl Send for PipelineCache {}
+// SAFETY: Every mutable cache field is protected by a mutex, atomic, or per-key OnceLock.
+unsafe impl Sync for PipelineCache {}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EpilogueCompileCounts {
@@ -10482,14 +10486,16 @@ impl PipelineCache {
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) -> Result<(), BackendError> {
-        if pipeline.staticThreadgroupMemoryLength() > self.max_threadgroup_memory_length {
+        if pipeline.staticThreadgroupMemoryLength()
+            > self.max_threadgroup_memory_length.load(Ordering::Acquire)
+        {
             return Err(BackendError::UnsupportedOperation);
         }
         Ok(())
     }
 
     pub(super) fn try_calibration_shader(
-        &mut self,
+        &self,
         source: &str,
         name: &str,
         constants: &[(u32, u32)],
@@ -10499,38 +10505,34 @@ impl PipelineCache {
             name: name.to_owned(),
             constants: constants.to_vec(),
         };
-        if self.calibration_native.contains(&key) {
-            return Ok(true);
+        let result = self.pipelines.compile(
+            key,
+            || self.charge_pipeline(),
+            || {
+                let options = compile_options(MTLMathMode::Fast);
+                let library =
+                    self.compiler
+                        .library(&self.device, &NSString::from_str(source), &options)?;
+                let values = function_constants(constants)?;
+                let function =
+                    self.compiler
+                        .function(&library, &NSString::from_str(name), &values)?;
+                let pipeline = self.compiler.pipeline(&self.device, &function)?;
+                self.validate_pipeline_memory(&pipeline)?;
+                Ok(pipeline)
+            },
+        );
+        match result {
+            Ok(_) => Ok(true),
+            Err(BackendError::ExecutionFailed | BackendError::UnsupportedOperation) => Ok(false),
+            Err(error) => Err(error),
         }
-        self.charge_pipeline()?;
-        let options = compile_options(MTLMathMode::Fast);
-        let Ok(library) =
-            self.compiler
-                .library(&self.device, &NSString::from_str(source), &options)
-        else {
-            return Ok(false);
-        };
-        let values = function_constants(constants)?;
-        let Ok(function) = self
-            .compiler
-            .function(&library, &NSString::from_str(name), &values)
-        else {
-            return Ok(false);
-        };
-        let Ok(pipeline) = self.compiler.pipeline(&self.device, &function) else {
-            return Ok(false);
-        };
-        if self.validate_pipeline_memory(&pipeline).is_err() {
-            return Ok(false);
-        }
-        self.calibration_native.insert(key.clone());
-        self.pipelines.insert(key, pipeline);
-        Ok(true)
     }
 
     #[cfg(test)]
-    pub(super) fn set_threadgroup_memory_limit(&mut self, bytes: usize) {
-        self.max_threadgroup_memory_length = bytes;
+    pub(super) fn set_threadgroup_memory_limit(&self, bytes: usize) {
+        self.max_threadgroup_memory_length
+            .store(bytes, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -10558,105 +10560,126 @@ impl PipelineCache {
         Ok(Self {
             compiler: Arc::new(compiler),
             device: device.clone(),
-            max_threadgroup_memory_length: device.maxThreadgroupMemoryLength(),
+            max_threadgroup_memory_length: AtomicUsize::new(device.maxThreadgroupMemoryLength()),
             pipeline_budget: AtomicUsize::new(256),
             fast_library,
             nan_preserving_library,
-            pipelines: HashMap::new(),
-            unavailable_pipelines: HashSet::new(),
-            calibration_native: HashSet::new(),
-            epilogue_libraries: HashMap::new(),
-            epilogue_pipelines: HashMap::new(),
-            epilogue_counts: EpilogueCompileCounts::default(),
+            pipelines: crate::compile_cache::CompileCache::default(),
+            epilogue_libraries: crate::compile_cache::CompileCache::default(),
+            epilogue_pipelines: crate::compile_cache::CompileCache::default(),
+            epilogue_counts: Mutex::new(EpilogueCompileCounts::default()),
         })
     }
 
     pub(super) fn get(
-        &mut self,
+        &self,
         name: &str,
         constants: &[(u32, u32)],
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+    ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
         let key = PipelineKey {
             name: name.to_owned(),
             constants: constants.to_vec(),
         };
-        if let Some(pipeline) = self.pipelines.get(&key) {
-            return Ok(pipeline.clone());
-        }
-        if self.unavailable_pipelines.contains(&key) {
-            return Err(BackendError::UnsupportedOperation);
-        }
-        self.charge_pipeline()?;
-        let values = function_constants(constants)?;
-        let library = if nan_preserving_kernel(name) {
-            &self.nan_preserving_library
-        } else {
-            &self.fast_library
-        };
-        let function_name = NSString::from_str(name);
-        let function = self.compiler.function(library, &function_name, &values)?;
-        let pipeline = self.compiler.pipeline(&self.device, &function)?;
-        if let Err(error) = self.validate_pipeline_memory(&pipeline) {
-            self.unavailable_pipelines.insert(key);
-            return Err(error);
-        }
-        self.pipelines.insert(key, pipeline.clone());
-        Ok(pipeline)
+        self.pipelines.compile(
+            key,
+            || self.charge_pipeline(),
+            || {
+                let values = function_constants(constants)?;
+                let library = if nan_preserving_kernel(name) {
+                    &self.nan_preserving_library
+                } else {
+                    &self.fast_library
+                };
+                let function =
+                    self.compiler
+                        .function(library, &NSString::from_str(name), &values)?;
+                let pipeline = self.compiler.pipeline(&self.device, &function)?;
+                self.validate_pipeline_memory(&pipeline)?;
+                Ok(pipeline)
+            },
+        )
+    }
+
+    fn epilogue_counts(&self) -> Result<EpilogueCompileCounts, BackendError> {
+        self.epilogue_counts
+            .lock()
+            .map(|counts| *counts)
+            .map_err(|_| BackendError::ExecutionFailed)
+    }
+
+    fn epilogue_hit(&self) -> Result<(), BackendError> {
+        let mut counts = self
+            .epilogue_counts
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        counts.cache_hits = counts.cache_hits.saturating_add(1);
+        Ok(())
     }
 
     fn prepare_epilogue(
-        &mut self,
+        &self,
         family: epilogue_codegen::FamilySourceTag,
         epilogue: &PreparedEpilogue,
         name: &str,
         constants: &[(u32, u32)],
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
+    ) -> Result<ComputePipeline, BackendError> {
         self.compiler.ensure_enabled()?;
         let source_key = epilogue_codegen::SourceKey::new(family, epilogue);
         let pipeline_key =
             epilogue_codegen::PipelineKey::new(source_key.clone(), name, constants.to_vec());
-        if let Some(pipeline) = self.epilogue_pipelines.get(&pipeline_key) {
-            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
-            return Ok(pipeline.clone());
+        if let Some(pipeline) = self.epilogue_pipelines.get(&pipeline_key)? {
+            self.epilogue_hit()?;
+            return Ok(pipeline);
         }
-        self.charge_pipeline()?;
-        if self.epilogue_libraries.contains_key(&source_key) {
-            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
-        } else {
-            let generated = epilogue_codegen::generate_source(epilogue)
-                .map_err(|_| program_compile_failed(source_key.hash))?;
-            let source = NSString::from_str(&generated);
-            let options = compile_options(MTLMathMode::Safe);
-            let library = self
-                .compiler
-                .library(&self.device, &source, &options)
-                .map_err(|error| program_compile_error(source_key.hash, error))?;
-            self.epilogue_libraries.insert(source_key.clone(), library);
-            self.epilogue_counts.libraries = self.epilogue_counts.libraries.saturating_add(1);
-        }
-        let library = self
-            .epilogue_libraries
-            .get(&source_key)
-            .ok_or(BackendError::ExecutionFailed)?;
-        let values = function_constants(&pipeline_key.constants)?;
-        let function = self
-            .compiler
-            .function(library, &NSString::from_str(name), &values)
-            .map_err(|error| program_compile_error(source_key.hash, error))?;
-        let pipeline = self
-            .compiler
-            .pipeline(&self.device, &function)
-            .map_err(|error| program_compile_error(source_key.hash, error))?;
-        self.validate_pipeline_memory(&pipeline)?;
-        self.epilogue_pipelines
-            .insert(pipeline_key, pipeline.clone());
-        self.epilogue_counts.pipelines = self.epilogue_counts.pipelines.saturating_add(1);
-        Ok(pipeline)
+        self.epilogue_pipelines.compile(
+            pipeline_key.clone(),
+            || self.charge_pipeline(),
+            || {
+                if self.epilogue_libraries.contains_key(&source_key)? {
+                    self.epilogue_hit()?;
+                }
+                let library = self.epilogue_libraries.compile(
+                    source_key.clone(),
+                    || Ok(()),
+                    || {
+                        let generated = epilogue_codegen::generate_source(epilogue)
+                            .map_err(|_| program_compile_failed(source_key.hash))?;
+                        let options = compile_options(MTLMathMode::Safe);
+                        let library = self
+                            .compiler
+                            .library(&self.device, &NSString::from_str(&generated), &options)
+                            .map_err(|error| program_compile_error(source_key.hash, error))?;
+                        let mut counts = self
+                            .epilogue_counts
+                            .lock()
+                            .map_err(|_| BackendError::ExecutionFailed)?;
+                        counts.libraries = counts.libraries.saturating_add(1);
+                        Ok(library)
+                    },
+                )?;
+                let values = function_constants(&pipeline_key.constants)?;
+                let function = self
+                    .compiler
+                    .function(&library, &NSString::from_str(name), &values)
+                    .map_err(|error| program_compile_error(source_key.hash, error))?;
+                let pipeline = self
+                    .compiler
+                    .pipeline(&self.device, &function)
+                    .map_err(|error| program_compile_error(source_key.hash, error))?;
+                self.validate_pipeline_memory(&pipeline)?;
+                let mut counts = self
+                    .epilogue_counts
+                    .lock()
+                    .map_err(|_| BackendError::ExecutionFailed)?;
+                counts.pipelines = counts.pipelines.saturating_add(1);
+                Ok(pipeline)
+            },
+        )
     }
 
     fn lookup_epilogue(
-        &mut self,
+        &self,
         family: epilogue_codegen::FamilySourceTag,
         epilogue: &PreparedEpilogue,
         name: &str,
@@ -10668,7 +10691,7 @@ impl PipelineCache {
     }
 
     fn lookup_prepared_epilogue(
-        &mut self,
+        &self,
         family: epilogue_codegen::FamilySourceTag,
         epilogue: &PreparedEpilogue,
         name: &str,
@@ -10676,16 +10699,23 @@ impl PipelineCache {
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, BackendError> {
         let source = epilogue_codegen::SourceKey::new(family, epilogue);
         let key = epilogue_codegen::PipelineKey::new(source, name, constants.to_vec());
-        if let Some(pipeline) = self.epilogue_pipelines.get(&key) {
-            self.epilogue_counts.cache_hits = self.epilogue_counts.cache_hits.saturating_add(1);
-            return Ok(pipeline.clone());
+        if let Some(pipeline) = self.epilogue_pipelines.get(&key)? {
+            self.epilogue_hit()?;
+            return Ok(pipeline);
         }
-        self.epilogue_counts.fallbacks = self.epilogue_counts.fallbacks.saturating_add(1);
+        let mut counts = self
+            .epilogue_counts
+            .lock()
+            .map_err(|_| BackendError::ExecutionFailed)?;
+        counts.fallbacks = counts.fallbacks.saturating_add(1);
         Err(BackendError::ExecutionFailed)
     }
 
-    fn missing_epilogue_pipelines(&self, requests: &[EpiloguePipelineRequest]) -> usize {
-        requests
+    fn missing_epilogue_pipelines(
+        &self,
+        requests: &[EpiloguePipelineRequest],
+    ) -> Result<usize, BackendError> {
+        let keys = requests
             .iter()
             .map(|request| {
                 let source = epilogue_codegen::SourceKey::new(request.family, &request.epilogue);
@@ -10695,14 +10725,18 @@ impl PipelineCache {
                     request.constants.clone(),
                 )
             })
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .filter(|key| !self.epilogue_pipelines.contains_key(key))
-            .count()
+            .collect::<HashSet<_>>();
+        let mut count = 0;
+        for key in keys {
+            if !self.epilogue_pipelines.contains_key(&key)? {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     fn prepare_epilogue_pipelines(
-        &mut self,
+        &self,
         requests: &[EpiloguePipelineRequest],
     ) -> Result<(), BackendError> {
         for request in requests {
@@ -10716,8 +10750,11 @@ impl PipelineCache {
         Ok(())
     }
 
-    fn take_epilogue_counts(&mut self) -> EpilogueCompileCounts {
-        std::mem::take(&mut self.epilogue_counts)
+    fn take_epilogue_counts(&self) -> Result<EpilogueCompileCounts, BackendError> {
+        self.epilogue_counts
+            .lock()
+            .map(|mut counts| std::mem::take(&mut *counts))
+            .map_err(|_| BackendError::ExecutionFailed)
     }
 
     fn compile_program_source(
@@ -11004,7 +11041,7 @@ mod tests {
                 .map(|index| if index < 8 * top_k { index + 1 } else { 0 })
                 .flat_map(u32::to_ne_bytes)
                 .collect();
-            let mut pipelines = backend.pipelines.lock().unwrap();
+            let pipelines = backend.pipelines.lock().unwrap();
             let pipeline = pipelines
                 .get(
                     "fast_top_merge_canary",
@@ -13287,16 +13324,16 @@ mod tests {
             let pipelines = backend.pipelines.lock().unwrap();
             assert_eq!(pipelines.epilogue_libraries.len(), 1);
             assert_eq!(pipelines.epilogue_pipelines.len(), 9);
-            assert_eq!(pipelines.epilogue_counts.libraries, 1);
-            assert_eq!(pipelines.epilogue_counts.pipelines, 9);
+            assert_eq!(pipelines.epilogue_counts().unwrap().libraries, 1);
+            assert_eq!(pipelines.epilogue_counts().unwrap().pipelines, 9);
         }
 
         backend.replay(&graph, vec![1]).unwrap().wait().unwrap();
         backend.replay(&graph, vec![7]).unwrap().wait().unwrap();
         let pipelines = backend.pipelines.lock().unwrap();
         assert_eq!(pipelines.epilogue_pipelines.len(), 9);
-        assert_eq!(pipelines.epilogue_counts.cache_hits, 10);
-        assert_eq!(pipelines.epilogue_counts.fallbacks, 0);
+        assert_eq!(pipelines.epilogue_counts().unwrap().cache_hits, 10);
+        assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 0);
     }
 
     #[test]
@@ -13326,7 +13363,7 @@ mod tests {
             EpilogueSignature::new(1, 2, vec![], DType::F32),
         )
         .unwrap();
-        let mut pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = backend.pipelines.lock().unwrap();
         assert!(matches!(
             pipelines.lookup_prepared_epilogue(
                 epilogue_codegen::FamilySourceTag::Dense,
@@ -13336,7 +13373,7 @@ mod tests {
             ),
             Err(BackendError::ExecutionFailed)
         ));
-        assert_eq!(pipelines.epilogue_counts.fallbacks, 1);
+        assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 1);
         assert_eq!(pipelines.epilogue_libraries.len(), 0);
         assert_eq!(pipelines.epilogue_pipelines.len(), 0);
 
@@ -13353,7 +13390,7 @@ mod tests {
             Ok(Err(BackendError::ExecutionFailed)) => !cfg!(debug_assertions),
             _ => false,
         });
-        assert_eq!(pipelines.epilogue_counts.fallbacks, 2);
+        assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 2);
         assert_eq!(pipelines.epilogue_libraries.len(), 0);
         assert_eq!(pipelines.epilogue_pipelines.len(), 0);
     }
@@ -13463,9 +13500,9 @@ mod tests {
         }
         push_grouped_epilogue_requests(&mut requests, &epilogue, &gather_constants);
 
-        let mut pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = backend.pipelines.lock().unwrap();
         pipelines.prepare_epilogue_pipelines(&requests).unwrap();
-        let preparation_hits = pipelines.epilogue_counts.cache_hits;
+        let preparation_hits = pipelines.epilogue_counts().unwrap().cache_hits;
         for request in &requests {
             pipelines
                 .lookup_epilogue(
@@ -13476,9 +13513,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(pipelines.epilogue_counts.fallbacks, 0);
+        assert_eq!(pipelines.epilogue_counts().unwrap().fallbacks, 0);
         assert_eq!(
-            pipelines.epilogue_counts.cache_hits,
+            pipelines.epilogue_counts().unwrap().cache_hits,
             preparation_hits + u64::try_from(requests.len()).unwrap()
         );
     }
@@ -15128,7 +15165,10 @@ mod tests {
         let pipelines = backend.pipelines.lock().unwrap();
         assert_eq!(pipelines.epilogue_libraries.len(), 1);
         assert_eq!(pipelines.epilogue_pipelines.len(), 1);
-        assert_eq!(pipelines.epilogue_counts, EpilogueCompileCounts::default());
+        assert_eq!(
+            pipelines.epilogue_counts().unwrap(),
+            EpilogueCompileCounts::default()
+        );
     }
 
     fn f32_pattern(count: usize, modulus: u16) -> Vec<u8> {
@@ -15821,7 +15861,7 @@ mod tests {
             "steel_attention_256",
             &[(0, 0), (1, 0), (2, 0), (3, 0), (211, 0), (212, 1), (217, 0)],
         ));
-        let mut pipelines = backend.pipelines.lock().unwrap();
+        let pipelines = backend.pipelines.lock().unwrap();
         assert!(matches!(
             pipelines.get(
                 "steel_attention_256",
@@ -16036,7 +16076,7 @@ mod tests {
     fn scalar_catalog_pipelines_refuse_excess_threadgroup_storage() {
         let backend = MetalBackend::new().unwrap();
         backend.set_pipeline_threadgroup_memory_limit_for_test(1);
-        let mut cache = backend.pipelines.lock().unwrap();
+        let cache = backend.pipelines.lock().unwrap();
         for kernel in ["rms_norm_single", "rms_norm_looped"] {
             for _ in 0..2 {
                 assert!(matches!(
@@ -16055,7 +16095,7 @@ mod tests {
             Err(BackendError::InvalidInput)
         ));
         let backend = MetalBackend::with_pipeline_limit(2).unwrap();
-        let mut cache = backend.pipelines.lock().unwrap();
+        let cache = backend.pipelines.lock().unwrap();
         assert!(matches!(
             cache.get("missing_kernel", &[]),
             Err(BackendError::ExecutionFailed)
