@@ -120,10 +120,28 @@ impl LaneFeedback {
         sequence: &StateSequence,
     ) -> Result<Self, PagePoolError> {
         let table = sequence.allocation_table()?;
-        Ok(Self {
-            binding,
-            records: table.entries().iter().map(|entry| entry.page()).collect(),
-        })
+        Self::from_table(binding, &table, sequence.version_count())
+    }
+
+    fn from_table(
+        binding: FeedbackBinding,
+        table: &forja_core::PageTable,
+        versions: u32,
+    ) -> Result<Self, PagePoolError> {
+        if table.entries().len() != versions as usize {
+            return Err(PagePoolError::CorruptState);
+        }
+        let records: Box<[u32]> = table.entries().iter().map(|entry| entry.page()).collect();
+        {
+            let scalars = binding
+                .versions
+                .lock()
+                .map_err(|_| PagePoolError::CorruptState)?;
+            for &record in &records {
+                scalars.checkpoint(record)?;
+            }
+        }
+        Ok(Self { binding, records })
     }
 
     pub(super) fn checkpoint(&self, version: u32) -> Result<FeedbackBoundary, PagePoolError> {
@@ -216,6 +234,21 @@ mod tests {
         assert!(FeedbackBinding::scalar_count(maximum).is_ok());
         for lanes in [0, maximum + 1, u32::MAX] {
             assert!(FeedbackBinding::scalar_count(lanes).is_err());
+        }
+    }
+
+    #[test]
+    fn feedback_refuses_incomplete_or_oversized_allocation_tables() {
+        let (_host, binding, _pool, _journal) = fixture();
+        for count in [0, 1, 2, 4, 7] {
+            assert!(matches!(
+                LaneFeedback::from_table(
+                    binding.clone(),
+                    &forja_core::PageTable::poisoned(count),
+                    StatePool::VERSIONS
+                ),
+                Err(PagePoolError::CorruptState)
+            ));
         }
     }
 
