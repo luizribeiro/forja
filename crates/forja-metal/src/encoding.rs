@@ -1540,6 +1540,101 @@ pub(super) struct PreparedMetalGraph {
     memory_plan: Option<forja_core::GraphMemoryPlan>,
 }
 
+impl PreparedMetalGraph {
+    fn split_outputs(
+        &self,
+        predictions: &[Duration],
+        budget: Duration,
+    ) -> Result<Self, BackendError> {
+        let mut result = self.window(0..predictions.len())?;
+        if let Some(encoding) = &mut result.encoding {
+            let mut pipeline = None;
+            let mut interrupted = false;
+            let mut expanded = Vec::new();
+            for (plan, &prediction) in encoding.dispatches.iter().zip(predictions) {
+                let inherited = pipeline.clone();
+                if let Some(plan) = plan {
+                    for call in &plan.calls {
+                        if let PlanCall::Pipeline(next) = call {
+                            pipeline = Some(next.clone());
+                        }
+                    }
+                } else {
+                    pipeline = None;
+                }
+                if prediction > budget {
+                    expanded.extend([None, None]);
+                    interrupted = true;
+                } else {
+                    let mut restored = plan.clone();
+                    if interrupted
+                        && let Some(plan) = &mut restored
+                        && let Some(pipeline) = inherited
+                    {
+                        plan.calls.insert(0, PlanCall::Pipeline(pipeline));
+                    }
+                    expanded.push(restored);
+                    interrupted = plan.is_none();
+                }
+            }
+            encoding.dispatches = expanded;
+        }
+        result.variant_rechecks.clear();
+        Ok(result)
+    }
+    fn window(&self, range: std::ops::Range<usize>) -> Result<Self, BackendError> {
+        let encoding = self
+            .encoding
+            .as_ref()
+            .map(|encoding| {
+                let mut dispatches = encoding
+                    .dispatches
+                    .get(range.clone())
+                    .ok_or(BackendError::InvalidInput)?
+                    .to_vec();
+                let mut inherited = None;
+                for plan in encoding
+                    .dispatches
+                    .get(..range.start)
+                    .ok_or(BackendError::InvalidInput)?
+                {
+                    if let Some(plan) = plan {
+                        for call in &plan.calls {
+                            if let PlanCall::Pipeline(pipeline) = call {
+                                inherited = Some(pipeline.clone());
+                            }
+                        }
+                    } else {
+                        inherited = None;
+                    }
+                }
+                if let Some(first) = dispatches.first_mut().and_then(Option::as_mut)
+                    && let Some(pipeline) = inherited
+                {
+                    first.calls.insert(0, PlanCall::Pipeline(pipeline));
+                }
+                Ok::<_, BackendError>(MetalEncodingPlan {
+                    dispatches,
+                    arena: encoding.arena.clone(),
+                    argument_offset: encoding.argument_offset,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            residency: self.residency.clone(),
+            buffers: self.buffers.clone(),
+            encoding,
+            variant_rechecks: self
+                .variant_rechecks
+                .iter()
+                .filter(|&&index| range.contains(&index))
+                .map(|&index| index - range.start)
+                .collect(),
+            memory_plan: self.memory_plan.clone(),
+        })
+    }
+}
+
 #[derive(Clone)]
 struct StaticEncodingPlan {
     calls: Vec<PlanCall>,
@@ -10509,6 +10604,8 @@ type CalibrationSources =
     HashMap<(String, Vec<(u32, u32)>), crate::pipeline_identity::SourceIdentity>;
 
 pub(super) struct PipelineCache {
+    #[cfg(test)]
+    lookups: AtomicUsize,
     pub(super) compiler: Arc<crate::compiler::Compiler>,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     max_threadgroup_memory_length: AtomicUsize,
@@ -10683,6 +10780,8 @@ impl PipelineCache {
             device: device.clone(),
             max_threadgroup_memory_length: AtomicUsize::new(device.maxThreadgroupMemoryLength()),
             pipeline_budget: AtomicUsize::new(256),
+            #[cfg(test)]
+            lookups: AtomicUsize::new(0),
             entries,
             sources,
             calibration_sources: Mutex::new(HashMap::new()),
@@ -10712,6 +10811,8 @@ impl PipelineCache {
         name: &str,
         constants: &[(u32, u32)],
     ) -> Result<ComputePipeline, BackendError> {
+        #[cfg(test)]
+        self.lookups.fetch_add(1, Ordering::Relaxed);
         self.compiler.ensure_enabled()?;
         let key = self.key(name, constants)?;
         prewarming::record(name, &key.constants);

@@ -213,8 +213,19 @@ impl MetalBackend {
         if let Some(split) =
             self.split_oversized_outputs(&commands, &first.predictions, first.reserve, limits)?
         {
+            let budget = limits
+                .dispatch()
+                .min(limits.command_buffer().saturating_sub(first.reserve));
+            let graph = graph
+                .map(|graph| graph.split_outputs(&first.predictions, budget))
+                .transpose()?;
             drop(first);
-            return self.submit_commands_inner::<PROFILE>(split, None, graph_arena, granularity);
+            return self.submit_commands_inner::<PROFILE>(
+                split,
+                graph.as_ref(),
+                graph_arena,
+                granularity,
+            );
         }
         let ranges = partition(&first.predictions, limits, first.reserve)?;
         let deadline = || {
@@ -225,52 +236,46 @@ impl MetalBackend {
         let result = if ranges.len() == 1 {
             first.submit(self, deadline()?)
         } else {
+            let predictions = ranges
+                .iter()
+                .map(|range| {
+                    first
+                        .predictions
+                        .get(range.clone())
+                        .ok_or(BackendError::InvalidInput)?
+                        .iter()
+                        .try_fold(first.reserve, |sum, &p| {
+                            sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             drop(first);
             let recording = commands.program_recording();
             let dispatches = commands.into_dispatches();
             let chunks = ranges
                 .into_iter()
                 .map(|range| {
+                    let prepared = graph.map(|graph| graph.window(range.clone())).transpose()?;
                     let mut chunk = CommandList::new();
-                    for dispatch in &dispatches[range] {
+                    for dispatch in dispatches.get(range).ok_or(BackendError::InvalidInput)? {
                         chunk.record_validated(dispatch.clone());
                     }
-                    chunk
+                    Ok((chunk, prepared))
                 })
-                .collect::<Vec<_>>();
-            let mut predictions = Vec::new();
-            for chunk in &chunks {
-                let prepared = self.prepare_commands::<PROFILE>(
-                    chunk.clone(),
-                    None,
-                    graph_arena,
-                    granularity,
-                )?;
-                if partition(&prepared.predictions, limits, prepared.reserve)?.len() != 1 {
-                    return Err(BackendError::QuotaExceeded);
-                }
-                predictions.push(
-                    prepared
-                        .predictions
-                        .iter()
-                        .try_fold(prepared.reserve, |sum, &p| {
-                            sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
-                        })?,
-                );
-            }
-            let total = predictions.iter().try_fold(Duration::ZERO, |sum, &p| {
-                sum.checked_add(p).ok_or(BackendError::QuotaExceeded)
-            })?;
-            if total > limits.submission() {
-                return Err(BackendError::QuotaExceeded);
-            }
+                .collect::<Result<Vec<_>, BackendError>>()?;
             let overhead = started.elapsed();
             let deadline = deadline()?;
             let mut prefixes = Vec::new();
             let last = chunks.len() - 1;
-            for (index, (chunk, forecast)) in chunks.into_iter().zip(predictions).enumerate() {
-                let mut prepared =
-                    self.prepare_commands::<PROFILE>(chunk, None, graph_arena, granularity)?;
+            for (index, ((chunk, graph), forecast)) in
+                chunks.into_iter().zip(predictions).enumerate()
+            {
+                let mut prepared = self.prepare_commands::<PROFILE>(
+                    chunk,
+                    graph.as_ref(),
+                    graph_arena,
+                    granularity,
+                )?;
                 let actual = prepared
                     .predictions
                     .iter()
@@ -661,6 +666,13 @@ mod tests {
 
     #[test]
     fn incremental_copy_submission_preserves_dependencies_and_profiles() {
+        incremental_copy(false);
+    }
+    #[test]
+    fn incremental_replay_keeps_static_plans_and_the_inherited_pipeline() {
+        incremental_copy(true);
+    }
+    fn incremental_copy(replay: bool) {
         use forja_core::Backend;
         let mut backend = MetalBackend::new().unwrap();
         let tensors = (0..4)
@@ -674,10 +686,43 @@ mod tests {
         for pair in tensors.windows(2) {
             commands.dispatch(Op::Copy, &[&pair[0]], &pair[1]).unwrap();
         }
+        let graph = replay.then(|| {
+            let mut template = forja_core::GraphTemplate::new(
+                forja_core::ParamSpace::new(Vec::new()).unwrap(),
+                forja_core::GraphLimits::default(),
+            );
+            for pair in tensors.windows(2) {
+                template
+                    .dispatch(
+                        Op::Copy,
+                        &[&pair[0].clone().into()],
+                        &pair[1].clone().into(),
+                    )
+                    .unwrap();
+            }
+            backend.prepare_graph(template).unwrap()
+        });
+        let state = graph
+            .as_ref()
+            .and_then(forja_core::PreparedGraph::backend_state::<PreparedMetalGraph>);
+        if let Some(state) = state {
+            let expanded = state
+                .split_outputs(
+                    &[Duration::from_nanos(1), Duration::ZERO, Duration::ZERO],
+                    Duration::ZERO,
+                )
+                .unwrap();
+            let plans = &expanded.encoding.as_ref().unwrap().dispatches;
+            assert!(plans[0].is_none() && plans[1].is_none());
+            assert!(matches!(
+                plans[2].as_ref().unwrap().calls.first(),
+                Some(super::super::PlanCall::Pipeline(_))
+            ));
+        }
         let prepared = backend
             .prepare_commands::<false>(
                 commands.clone(),
-                None,
+                state,
                 None,
                 ProfileTimestampGranularity::Precise,
             )
@@ -696,11 +741,34 @@ mod tests {
         )
         .unwrap();
         let before = *backend.next_event_value.lock().unwrap();
-        let submission = backend.submit_commands_profiled(commands).unwrap();
+        let lookups = backend
+            .pipelines
+            .lookups
+            .load(super::super::Ordering::Relaxed);
+        let submission = graph
+            .as_ref()
+            .map_or_else(
+                || backend.submit_commands_profiled(commands),
+                |graph| backend.replay_graph(graph, Vec::new(), true, None),
+            )
+            .unwrap();
         submission.wait().unwrap();
         assert_eq!(*backend.next_event_value.lock().unwrap(), before + 3);
+        if replay {
+            assert_eq!(
+                backend
+                    .pipelines
+                    .lookups
+                    .load(super::super::Ordering::Relaxed),
+                lookups
+            );
+        }
         assert_eq!(backend.read(&tensors[3]).unwrap(), expected);
         let profile = submission.profile().unwrap();
+        assert_incremental_profile(&profile, unit, reserve);
+        assert_eq!(Some(profile.gpu_time), submission.gpu_time());
+    }
+    fn assert_incremental_profile(profile: &SubmissionProfile, unit: Duration, reserve: Duration) {
         assert_eq!(profile.command_buffers, 3);
         assert_eq!(profile.per_dispatch.len(), 3);
         assert_eq!(profile.predicted_gpu, (unit + reserve) * 3);
@@ -722,6 +790,5 @@ mod tests {
                 .sum::<Duration>(),
             profile.gpu_time
         );
-        assert_eq!(Some(profile.gpu_time), submission.gpu_time());
     }
 }
