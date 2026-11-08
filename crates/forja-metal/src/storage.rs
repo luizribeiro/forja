@@ -575,6 +575,7 @@ pub struct MetalBackend {
     pub(super) event_listener: Retained<MTLSharedEventListener>,
     pub(super) gpu_timeout: Duration,
     pub(super) work_limits: forja_core::GpuWorkLimits,
+    pub(super) enforce_work_limits: bool,
     pub(super) work_faults: Arc<crate::work_admission::WorkFaults>,
     pub(super) graph_replay: MetalGraphReplay,
     graph_arenas: Mutex<GraphArenaPool>,
@@ -912,12 +913,26 @@ impl MetalBackend {
         )
     }
 
-    /// Selects host-controlled admission budgets and their completion deadline.
+    /// Enables forecast admission, incremental submission and the measured-time backstop.
+    ///
+    /// Backends otherwise estimate work only for profiled submissions.
     #[must_use]
     pub fn with_work_limits(mut self, limits: forja_core::GpuWorkLimits) -> Self {
         self.gpu_timeout = limits.timeout();
         self.work_limits = limits;
+        self.enforce_work_limits = true;
         self
+    }
+
+    /// Selects the GPU completion deadline without enabling forecast admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError::InvalidInput`] if the timeout cannot define work limits.
+    pub fn with_submission_timeout(mut self, timeout: Duration) -> Result<Self, BackendError> {
+        self.work_limits = forja_core::GpuWorkLimits::for_timeout(timeout)?;
+        self.gpu_timeout = timeout;
+        Ok(self)
     }
 
     /// Creates a backend with a deadline for each wait on submitted GPU work.
@@ -1015,6 +1030,7 @@ impl MetalBackend {
             event_listener,
             gpu_timeout,
             work_limits: forja_core::GpuWorkLimits::for_timeout(gpu_timeout)?,
+            enforce_work_limits: false,
             work_faults: Arc::default(),
             graph_replay,
             graph_arenas: Mutex::new(GraphArenaPool::default()),

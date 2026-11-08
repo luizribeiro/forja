@@ -57,8 +57,11 @@ per engine load). Cache hits cost no attempts; failed compiles
 consume their attempt. Budget expiry disables that backend's compilation and GPU
 submission. These are operator settings; engine components cannot raise them.
 
-Metal admits work using conservative device calibration and the actual encoded
-launch schedule, in addition to the logical work and dispatch-count limits. With
+Metal always enforces logical work, dispatch-count, allocation and completion
+deadline limits. The CLI records calibrated forecasts in profiles without enforcing
+them. Embedders can opt into forecast admission, incremental submission and the
+measured-time backstop with `MetalBackend::with_work_limits`. These use conservative
+device calibration and the actual encoded launch schedule. With
 the default ten-second deadline, forecasts are limited to two seconds per dispatch
 and command buffer and eight seconds per submission. Shorter host deadlines lower
 these ceilings and bound waits for resources. Engine components cannot raise them.

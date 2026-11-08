@@ -3057,7 +3057,8 @@ impl MetalBackend {
         self.compiler.ensure_enabled()?;
         self.in_flight.drain_done();
         self.work_faults.check_backend()?;
-        let work_calibration = if !crate::work_admission::calibrating()
+        let work_calibration = if (PROFILE || self.enforce_work_limits)
+            && !crate::work_admission::calibrating()
             && !commands
                 .dispatches()
                 .iter()
@@ -3290,6 +3291,7 @@ impl MetalBackend {
             resources,
             residency: CommitResidency {
                 work: work_calibration
+                    .filter(|_| self.enforce_work_limits)
                     .map(|_| {
                         self.work_faults.track(
                             composition,
@@ -14378,7 +14380,9 @@ mod tests {
 
     #[test]
     fn short_deadline_refuses_work_before_queue_commit() {
-        let backend = MetalBackend::with_gpu_timeout(Duration::from_micros(1)).unwrap();
+        let backend = MetalBackend::new().unwrap().with_work_limits(
+            forja_core::GpuWorkLimits::for_timeout(Duration::from_micros(1)).unwrap(),
+        );
         let shape = [1024, 4097];
         let input = backend.alloc(DType::F32, &shape).unwrap();
         let output = backend.alloc(DType::F32, &shape).unwrap();
@@ -17859,7 +17863,9 @@ mod tests {
     fn waiter_free_overrun_quarantines_its_signature_and_keeps_unrelated_work_usable() {
         use forja_core::Backend;
         let _rates = crate::work_admission::TestCalibration::fast();
-        let backend = MetalBackend::new().unwrap();
+        let backend = MetalBackend::new().unwrap().with_work_limits(
+            forja_core::GpuWorkLimits::for_timeout(Duration::from_secs(10)).unwrap(),
+        );
         let input = backend.alloc(DType::F32, &[33]).unwrap();
         let output = backend.alloc(DType::F32, &[33]).unwrap();
         let bytes = [1.0_f32.to_ne_bytes(); 33].concat();

@@ -217,6 +217,15 @@ impl MetalBackend {
             granularity,
             cache_nodes,
         )?;
+        if !self.enforce_work_limits {
+            let deadline = Instant::now()
+                .checked_add(self.command_timeout())
+                .ok_or(BackendError::InvalidInput)?;
+            let result = first.submit(self, deadline);
+            #[cfg(test)]
+            store_duration(&LAST_SUBMIT_NANOS, started.elapsed());
+            return result;
+        }
         if let Some(split) =
             self.split_oversized_outputs(&commands, &first.predictions, first.reserve, limits)?
         {
@@ -414,9 +423,51 @@ pub(super) fn merge_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn enforcing_backend() -> MetalBackend {
+        MetalBackend::new().unwrap().with_work_limits(
+            forja_core::GpuWorkLimits::for_timeout(Duration::from_secs(10)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn forecasting_is_observational_until_host_enables_admission() {
+        use forja_core::Backend;
+        let _rates = crate::work_admission::TestCalibration::fast();
+        let backend = MetalBackend::new().unwrap();
+        let input = backend.alloc(DType::F32, &[33, 4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[33, 4097]).unwrap();
+        let bytes = vec![1.0_f32.to_ne_bytes(); 33 * 4097].concat();
+        backend.write(&input, &bytes).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        for _ in 0..2 {
+            let submission = backend.submit_commands_profiled(commands.clone()).unwrap();
+            submission.wait().unwrap();
+            assert!(submission.profile().unwrap().predicted_gpu > Duration::ZERO);
+            assert!(submission.completion.work.get().is_none());
+            assert_eq!(backend.read(&output).unwrap(), bytes);
+        }
+        let backend = backend.with_work_limits(
+            forja_core::GpuWorkLimits::new(
+                Duration::from_nanos(1),
+                Duration::from_nanos(1),
+                Duration::from_nanos(1),
+                Duration::from_secs(10),
+                4,
+            )
+            .unwrap(),
+        );
+        let serial = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.submit_commands(commands),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), serial);
+    }
+
     #[test]
     fn default_limits_admit_real_attention_chunks_after_query_splitting() {
-        let backend = MetalBackend::new().unwrap();
+        let backend = enforcing_backend();
         for (heads, width, dtype, queries, keys, variant) in [
             (
                 16_u32,
@@ -546,7 +597,7 @@ mod tests {
     #[test]
     fn caller_deadlines_refuse_before_commit_and_do_not_leak_between_calls() {
         use forja_core::Backend;
-        let backend = MetalBackend::new().unwrap();
+        let backend = enforcing_backend();
         let input = backend.alloc(DType::F32, &[4097]).unwrap();
         let output = backend.alloc(DType::F32, &[4097]).unwrap();
         let mut commands = CommandList::new();
@@ -576,7 +627,7 @@ mod tests {
     #[test]
     fn caller_deadline_bounds_slot_backpressure_before_commit() {
         use forja_core::Backend;
-        let backend = MetalBackend::new().unwrap();
+        let backend = enforcing_backend();
         backend.prepare_work_estimation().unwrap();
         let input = backend.alloc(DType::F32, &[33]).unwrap();
         let output = backend.alloc(DType::F32, &[33]).unwrap();
@@ -625,7 +676,7 @@ mod tests {
     #[test]
     fn failed_prefix_does_not_commit_the_remaining_buffer() {
         use forja_core::Backend;
-        let mut backend = MetalBackend::new().unwrap();
+        let mut backend = enforcing_backend();
         let table = backend.alloc(DType::F32, &[1, 4097]).unwrap();
         let ids = backend.alloc(DType::U32, &[1]).unwrap();
         let output = backend.alloc(DType::F32, &[1, 4097]).unwrap();
@@ -672,7 +723,7 @@ mod tests {
     #[test]
     fn oversized_copy_splits_output_views_without_changing_bits() {
         use forja_core::Backend;
-        let mut backend = MetalBackend::new().unwrap();
+        let mut backend = enforcing_backend();
         let input = backend.alloc(DType::F32, &[33, 4097]).unwrap();
         let output = backend.alloc(DType::F32, &[33, 4097]).unwrap();
         let expected = (0..33 * 4097_u32)
@@ -725,7 +776,7 @@ mod tests {
     }
     fn incremental_copy(replay: bool) {
         use forja_core::Backend;
-        let mut backend = MetalBackend::new().unwrap();
+        let mut backend = enforcing_backend();
         let tensors = (0..4)
             .map(|_| backend.alloc(DType::F32, &[4097]).unwrap())
             .collect::<Vec<_>>();
