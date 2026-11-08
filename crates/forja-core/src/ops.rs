@@ -568,13 +568,19 @@ impl Dispatch {
         if self.program.is_some() || self.epilogue.is_some() {
             return Ok(None);
         }
-        let independent_dimensions = match self.op {
-            Op::Copy => shape.len(),
-            Op::RmsNorm { .. } => shape.len().saturating_sub(1),
-            Op::Matmul | Op::QuantMatmul { .. } if shape.len() == 2 => 1,
-            _ => return Ok(None),
+        let attention = matches!(self.op, Op::Sdpa { .. } | Op::PagedSdpa { .. });
+        let axis = if attention {
+            shape.get(1).filter(|&&queries| queries > 1).map(|_| 1)
+        } else {
+            let independent_dimensions = match self.op {
+                Op::Copy => shape.len(),
+                Op::RmsNorm { .. } => shape.len().saturating_sub(1),
+                Op::Matmul | Op::QuantMatmul { .. } if shape.len() == 2 => 1,
+                _ => return Ok(None),
+            };
+            (0..independent_dimensions).find(|&axis| shape.get(axis).is_some_and(|&n| n > 1))
         };
-        let Some(axis) = (0..independent_dimensions).find(|&axis| shape[axis] > 1) else {
+        let Some(axis) = axis else {
             return Ok(None);
         };
         let half = shape[axis] / 2;
@@ -597,8 +603,36 @@ impl Dispatch {
             let mut inputs = self.inputs.clone();
             inputs[0] = slice(&inputs[0], start, len).map_err(OpError::Layout)?;
             let output = slice(self.output(), start, len).map_err(OpError::Layout)?;
-            let mut split =
-                Self::new_many(self.op, &inputs.iter().collect::<Vec<_>>(), &[&output])?;
+            let op = match self.op {
+                Op::Sdpa {
+                    scale,
+                    causal,
+                    q_start,
+                } => Op::Sdpa {
+                    scale,
+                    causal,
+                    q_start: q_start
+                        .checked_add(start)
+                        .ok_or(OpError::Layout(LayoutError::ArithmeticOverflow))?,
+                },
+                Op::PagedSdpa {
+                    scale,
+                    causal,
+                    q_start,
+                    key_length,
+                    page_tokens,
+                } => Op::PagedSdpa {
+                    scale,
+                    causal,
+                    q_start: q_start
+                        .checked_add(start)
+                        .ok_or(OpError::Layout(LayoutError::ArithmeticOverflow))?,
+                    key_length,
+                    page_tokens,
+                },
+                op => op,
+            };
+            let mut split = Self::new_many(op, &inputs.iter().collect::<Vec<_>>(), &[&output])?;
             split.backend_data.clone_from(&self.backend_data);
             split.profile_scope.clone_from(&self.profile_scope);
             Ok::<_, OpError>(split)
@@ -2372,6 +2406,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attention_query_splits_preserve_cache_and_absolute_positions() {
+        let query = tensor(1, DType::F32, &[16, 33, 128], &[33 * 128, 128, 1]);
+        let key = tensor(2, DType::F16, &[8, 40, 128], &[40 * 128, 128, 1]);
+        let value = tensor(3, DType::F16, &[8, 40, 128], &[40 * 128, 128, 1]);
+        let output = tensor(4, DType::F32, &[16, 33, 128], &[33 * 128, 1, 33]);
+        for causal in [false, true] {
+            let dispatch = Dispatch::new(
+                Op::Sdpa {
+                    scale: 1.0,
+                    causal,
+                    q_start: 7,
+                },
+                &[&query, &key, &value],
+                &output,
+            )
+            .unwrap();
+            let [left, right] = dispatch.split_output_rows().unwrap().unwrap();
+            assert_eq!(left.inputs()[0].layout().shape(), &[16, 16, 128]);
+            assert_eq!(right.inputs()[0].layout().shape(), &[16, 17, 128]);
+            assert_eq!(right.output().layout().offset(), 16);
+            for half in [left, right.clone()] {
+                assert_eq!(&half.inputs()[1..], &[key.clone(), value.clone()]);
+            }
+            assert!(matches!(right.op(), Op::Sdpa { q_start: 23, .. }));
+        }
+    }
     #[test]
     fn output_row_splits_preserve_reduction_operands_and_view_offsets() {
         let input = tensor(1, DType::F32, &[33, 1024], &[1024, 1]);
