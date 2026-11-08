@@ -1538,9 +1538,23 @@ where
             Err(error) => Err(error),
         };
         if matches!(result, Ok(Ok(()))) {
+            if let Err(error) = self.validate_loaded_verify_storage(&info) {
+                return Ok(Err(error));
+            }
             self.loaded_num_hidden_layers = num_hidden_layers;
         }
         result
+    }
+
+    fn validate_loaded_verify_storage(&self, info: &EngineInfo) -> Result<(), compute::Error> {
+        let rows = info.serving.as_ref().map_or(0, ServingInfo::verify_rows);
+        if rows == 0 {
+            return Ok(());
+        }
+        let pool = self
+            .page_pool
+            .ok_or_else(|| invalid_handle("verify shapes require host row storage"))?;
+        self.store.data().validate_verify_storage(pool, rows)
     }
 
     fn bind_page_pool(
@@ -12629,6 +12643,9 @@ mod tests {
                     },
                 )
                 .unwrap();
+            if rows != 0 {
+                host.validate_verify_storage(pool.rep(), rows).unwrap();
+            }
             host.table
                 .get_mut(&slot)
                 .unwrap()
@@ -12684,6 +12701,47 @@ mod tests {
                     "slot limit={limit}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_registration_refuses_engines_without_row_storage() {
+        for paged_cache in [false, true] {
+            let weights = test_weight_file();
+            let mut runner = EngineRunner::new(
+                test_guests::engine_smoke(),
+                CpuBackend::new(),
+                GENEROUS,
+                &weights,
+            )
+            .await
+            .unwrap();
+            let mut info = runner.describe().await.unwrap();
+            info.serving
+                .as_mut()
+                .unwrap()
+                .batch_shapes
+                .push(BatchShape {
+                    phase: BatchPhase::Verify,
+                    bucket: 1,
+                    tokens: 2,
+                    selection: BatchSelection::Combined,
+                });
+            runner.info = Some(info);
+            let error = runner
+                .load_with_selections(
+                    None,
+                    &super::EngineLoadConfig {
+                        paged_cache,
+                        ..super::EngineLoadConfig::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                matches!(error, compute::Error::InvalidHandle(message) if message == "verify shapes require host row storage")
+            );
         }
     }
 

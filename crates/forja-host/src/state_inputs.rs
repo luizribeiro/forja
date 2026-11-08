@@ -344,6 +344,32 @@ impl<B: Backend + 'static> Host<B> {
         )
     }
 
+    pub(crate) fn validate_verify_storage(
+        &self,
+        pool: u32,
+        rows: u32,
+    ) -> Result<(), compute::Error> {
+        let missing = || invalid_handle("verify shapes require host row storage");
+        let pool = self
+            .table
+            .get(&wasmtime::component::Resource::<crate::PagePoolEntry>::new_borrow(pool))
+            .map_err(invalid_handle)?;
+        let slot = pool.slot.ok_or_else(missing)?;
+        let slot = self
+            .table
+            .get(&wasmtime::component::Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?;
+        let inputs = slot.inputs.as_ref().ok_or_else(missing)?;
+        if inputs.banks.iter().any(|bank| {
+            bank.verify
+                .as_ref()
+                .is_none_or(|verify| verify.rows != rows)
+        }) {
+            return Err(missing());
+        }
+        Ok(())
+    }
+
     pub(crate) fn state_input_tensors(
         &mut self,
         slot: u32,
