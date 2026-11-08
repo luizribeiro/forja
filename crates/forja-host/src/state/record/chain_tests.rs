@@ -3,15 +3,15 @@ mod replay_tests;
 use super::{test_support::Fixture, *};
 use crate::StateBatch;
 
-fn chained_updates<B: Backend + Send + Sync + 'static>(backend: B) {
-    let f = Fixture::new(backend);
-    let mut chain_lane = f.reserve();
+fn chained_updates<B: Backend + Send + Sync + 'static>(backend: B, spares: u32) {
+    let f = Fixture::with_spares(backend, spares);
+    let mut chain_lane = f.reserve_with_spares(true);
     let mut plain_lane = f.reserve();
-    let mut chain = f.commands(&mut chain_lane, 1, 2);
-    f.update(&mut chain, 0);
-    assert!(!chain.updates_complete());
-    f.update(&mut chain, 1);
-    assert!(chain.updates_complete());
+    let mut chain = f.commands(&mut chain_lane, 1, 2 + spares);
+    for row in 0..f.outputs.len() {
+        f.update(&mut chain, row);
+        assert_eq!(chain.updates_complete(), row + 1 == f.outputs.len());
+    }
     for (index, dispatch) in chain.commands.dispatches().iter().enumerate() {
         let Op::State(operation) = dispatch.op() else {
             unreachable!()
@@ -31,10 +31,14 @@ fn chained_updates<B: Backend + Send + Sync + 'static>(backend: B) {
     f.execute(chain);
     let expected = f.read_outputs();
     for (row, expected_row) in expected.iter().enumerate() {
-        let mut plain = f.commands(&mut plain_lane, u64::try_from(row + 1).unwrap(), 1);
+        let serial = u64::try_from(row + 1).unwrap();
+        let (transaction, mut plain) = f.begin_commands(&mut plain_lane, serial, 1);
         f.update(&mut plain, row);
         let records = plain.access.destination();
+        plain_lane.mark_submitted(&transaction).unwrap();
         f.execute(plain);
+        f.storage.pool.observe_completion(serial).unwrap();
+        plain_lane.finish(&transaction, true).unwrap();
         for (plane, expected_output) in expected_row.iter().enumerate() {
             assert_eq!(
                 f.host.backend.read(&f.outputs[row][plane]).unwrap(),
@@ -56,13 +60,17 @@ fn chained_updates<B: Backend + Send + Sync + 'static>(backend: B) {
 
 #[test]
 fn chained_state_matches_separate_updates() {
-    chained_updates(forja_cpu::CpuBackend::new());
+    for spares in [0, 1] {
+        chained_updates(forja_cpu::CpuBackend::new(), spares);
+    }
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_chained_state_matches_separate_updates() {
-    chained_updates(forja_metal::MetalBackend::new().unwrap());
+    for spares in [0, 1] {
+        chained_updates(forja_metal::MetalBackend::new().unwrap(), spares);
+    }
 }
 
 #[test]
@@ -144,13 +152,15 @@ fn corrupted_link<B: Backend + 'static>(backend: impl Fn() -> B) {
         Corruption::Generation(0),
         Corruption::Generation(1),
         Corruption::Generation(2),
+        Corruption::Generation(3),
         Corruption::Table,
     ] {
-        let f = Fixture::new(backend());
-        let mut lane = f.reserve();
-        let mut chain = f.commands(&mut lane, 1, 2);
-        f.update(&mut chain, 0);
-        f.update(&mut chain, 1);
+        let f = Fixture::with_spares(backend(), 1);
+        let mut lane = f.reserve_with_spares(true);
+        let mut chain = f.commands(&mut lane, 1, 3);
+        for row in 0..f.outputs.len() {
+            f.update(&mut chain, row);
+        }
         match corruption {
             Corruption::Table => {
                 let first = f.host.backend.read(&chain.table_view(0).unwrap()).unwrap();

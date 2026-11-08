@@ -13,15 +13,20 @@ pub(super) struct Fixture<B: Backend> {
 
 impl<B: Backend + 'static> Fixture<B> {
     pub(super) fn new(backend: B) -> Self {
+        Self::with_spares(backend, 0)
+    }
+
+    pub(super) fn with_spares(backend: B, spares: u32) -> Self {
         let host = Host::new(backend, Limits::new(1_048_576, 8, 4096, 128, 1_048_576));
         let storage = host
-            .create_state_storage(
+            .create_state_storage_with_spares(
                 StateLayout::new(vec![
                     StatePlane::new(DType::F32, vec![3, 7]).unwrap(),
                     StatePlane::new(DType::F32, vec![1, 7, 33]).unwrap(),
                 ])
                 .unwrap(),
                 2,
+                spares,
             )
             .unwrap();
         let tensor = |shape: &[u32], value: f32| {
@@ -50,7 +55,7 @@ impl<B: Backend + 'static> Fixture<B> {
             .iter()
             .map(|(shape, value)| tensor(shape, *value))
             .collect(),
-            outputs: (0..2)
+            outputs: (0..2 + spares)
                 .map(|_| [tensor(&[1, 7], 0.), tensor(&[1, 33], 0.)])
                 .collect(),
             host,
@@ -58,19 +63,17 @@ impl<B: Backend + 'static> Fixture<B> {
     }
 
     pub(super) fn reserve(&self) -> StateSequence {
-        let sequence = self.storage.pool.reserve().unwrap();
-        for entry in sequence.allocation_table().unwrap().entries() {
-            for plane in 0..self.storage.planes.len() {
-                let view = self.storage.version_view(plane, entry.page()).unwrap();
-                self.host
-                    .backend
-                    .write(
-                        &view,
-                        &vec![0; usize::try_from(view.layout().element_count() * 4).unwrap()],
-                    )
-                    .unwrap();
-            }
+        self.reserve_with_spares(false)
+    }
+
+    pub(super) fn reserve_with_spares(&self, spares: bool) -> StateSequence {
+        let mut sequence = self.storage.pool.reserve().unwrap();
+        if spares {
+            sequence.reserve_spares().unwrap();
         }
+        self.storage
+            .clear_records(sequence.allocation_table().unwrap().entries())
+            .unwrap();
         sequence
     }
 
@@ -80,6 +83,15 @@ impl<B: Backend + 'static> Fixture<B> {
         serial: u64,
         count: u32,
     ) -> StateCommands<B> {
+        self.begin_commands(sequence, serial, count).1
+    }
+
+    pub(super) fn begin_commands(
+        &self,
+        sequence: &mut StateSequence,
+        serial: u64,
+        count: u32,
+    ) -> (StateTransaction, StateCommands<B>) {
         let tx = sequence.begin_chain(serial, count).unwrap();
         let slot = sequence.bind(&tx).unwrap();
         let mut commands = self
@@ -87,7 +99,7 @@ impl<B: Backend + 'static> Fixture<B> {
             .prepare_record_metadata(StateAccess::from_slot(&slot).unwrap())
             .unwrap();
         commands.initialize_slot(&slot).unwrap();
-        commands
+        (tx, commands)
     }
 
     pub(super) fn update(&self, commands: &mut StateCommands<B>, row: usize) {
