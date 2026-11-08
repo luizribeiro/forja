@@ -16,8 +16,8 @@ pub(crate) struct FeedbackBinding {
 }
 
 impl FeedbackBinding {
-    fn geometry(lanes: u32) -> Result<(u32, u32), PagePoolError> {
-        let records = StatePool::record_count(lanes)?;
+    fn geometry(lanes: u32, spares: u32) -> Result<(u32, u32), PagePoolError> {
+        let records = StatePool::record_count_with_spares(lanes, spares)?;
         let scratch = u64::from(lanes)
             .checked_mul(2)
             .and_then(|count| u32::try_from(count).ok())
@@ -26,16 +26,30 @@ impl FeedbackBinding {
         Ok((records, scratch))
     }
 
+    #[cfg(test)]
     pub(crate) fn scalar_count(lanes: u32) -> Result<u32, PagePoolError> {
-        let (records, scratch) = Self::geometry(lanes)?;
+        Self::scalar_count_with_spares(lanes, 0)
+    }
+
+    pub(crate) fn scalar_count_with_spares(lanes: u32, spares: u32) -> Result<u32, PagePoolError> {
+        let (records, scratch) = Self::geometry(lanes, spares)?;
         u64::from(records)
             .checked_add(u64::from(scratch))
             .and_then(|count| u32::try_from(count).ok())
             .ok_or(PagePoolError::ArithmeticOverflow)
     }
 
+    #[cfg(test)]
     pub(crate) fn new<B: Backend>(host: &Host<B>, lanes: u32) -> Result<Self, compute::Error> {
-        let (records, scratch) = Self::geometry(lanes).map_err(invalid_handle)?;
+        Self::with_spares(host, lanes, 0)
+    }
+
+    pub(crate) fn with_spares<B: Backend>(
+        host: &Host<B>,
+        lanes: u32,
+        spares: u32,
+    ) -> Result<Self, compute::Error> {
+        let (records, scratch) = Self::geometry(lanes, spares).map_err(invalid_handle)?;
         let record_bytes = u64::from(records)
             .checked_mul(size_of::<u32>() as u64)
             .ok_or_else(|| invalid_handle("feedback record metadata overflow"))?;
@@ -238,6 +252,28 @@ mod tests {
     }
 
     #[test]
+    fn spare_feedback_scalars_precede_selection_scratch_without_aliasing() {
+        for lanes in [1, 7, 33, 4097] {
+            assert_eq!(
+                FeedbackBinding::scalar_count_with_spares(lanes, 1).unwrap(),
+                lanes * 5 + 1
+            );
+        }
+        assert!(FeedbackBinding::scalar_count_with_spares(u32::MAX / 5, 1).is_err());
+        let (host, _binding, _pool, _journal) = fixture();
+        let binding = FeedbackBinding::with_spares(&host, 2, 1).unwrap();
+        let versions = binding.versions.lock().unwrap();
+        assert_eq!(versions.checkpoint(6).unwrap().scalar().index(), 6);
+        assert!(versions.checkpoint(7).is_err());
+        for scratch in 0..4 {
+            assert_eq!(
+                versions.claim_scratch(scratch).unwrap().index(),
+                7 + scratch
+            );
+        }
+    }
+
+    #[test]
     fn feedback_refuses_incomplete_or_oversized_allocation_tables() {
         let (_host, binding, _pool, _journal) = fixture();
         for count in [0, 1, 2, 4, 7] {
@@ -254,14 +290,21 @@ mod tests {
 
     #[test]
     fn feedback_maps_every_allocated_version_of_each_lane() {
+        for spares in [0, 1] {
+            feedback_maps_allocated_versions(spares);
+        }
+    }
+
+    fn feedback_maps_allocated_versions(spares: u32) {
         let (host, _binding, pool, _journal) = fixture();
-        let binding = FeedbackBinding::new(&host, 2).unwrap();
-        let pool = StatePool::new(pool.layout().clone(), 2, 65536).unwrap();
-        let first = pool.reserve().unwrap();
+        let binding = FeedbackBinding::with_spares(&host, 2, spares).unwrap();
+        let pool = StatePool::with_spares(pool.layout().clone(), 2, spares, 65536).unwrap();
+        let mut first = pool.reserve().unwrap();
         let second = pool.reserve().unwrap();
+        first.reserve_spares().unwrap();
         let lanes = [&first, &second].map(|sequence| {
             let feedback = LaneFeedback::new(binding.clone(), sequence).unwrap();
-            for version in 0..StatePool::VERSIONS {
+            for version in 0..sequence.version_count() {
                 let boundary = feedback.checkpoint(version).unwrap();
                 let record =
                     sequence.allocation_table().unwrap().entries()[version as usize].page();
@@ -270,10 +313,14 @@ mod tests {
                     boundary.checkpoint.scalar().index()
                 );
             }
-            assert!(feedback.checkpoint(StatePool::VERSIONS).is_err());
+            assert!(feedback.checkpoint(sequence.version_count()).is_err());
             feedback
         });
         assert!(lanes[0].destination(lanes[1].records[0]).is_err());
+        if spares != 0 {
+            let undersized = FeedbackBinding::new(&host, 2).unwrap();
+            assert!(LaneFeedback::new(undersized, &first).is_err());
+        }
     }
 
     #[test]

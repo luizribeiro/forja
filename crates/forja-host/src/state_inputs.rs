@@ -362,8 +362,18 @@ impl<B: Backend + 'static> Host<B> {
         lanes: u32,
         layout: paged_storage::StateInputLayout,
     ) -> Result<StateInputs, compute::Error> {
+        self.allocate_state_inputs_with_spares(lanes, layout, 0)
+    }
+
+    pub(crate) fn allocate_state_inputs_with_spares(
+        &mut self,
+        lanes: u32,
+        layout: paged_storage::StateInputLayout,
+        spares: u32,
+    ) -> Result<StateInputs, compute::Error> {
         let scalars =
-            crate::state::feedback::FeedbackBinding::scalar_count(lanes).map_err(invalid_handle)?;
+            crate::state::feedback::FeedbackBinding::scalar_count_with_spares(lanes, spares)
+                .map_err(invalid_handle)?;
         let available = self
             .limits
             .live_tensor_handles
@@ -374,7 +384,8 @@ impl<B: Backend + 'static> Host<B> {
                 "feedback scalar count exceeds the tensor handle quota",
             ));
         }
-        let feedback_versions = crate::state::feedback::FeedbackBinding::new(self, lanes)?;
+        let feedback_versions =
+            crate::state::feedback::FeedbackBinding::with_spares(self, lanes, spares)?;
         let mut handles = Vec::new();
         let result = (|| {
             let mut alloc = |dtype, shape: &[u32]| {
@@ -449,6 +460,28 @@ mod tests {
             assert!(host.allocate_state_inputs(2, layout).is_err());
             assert_eq!(host.live_bytes.load(Ordering::Acquire), 0, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn spare_feedback_handles_share_the_existing_handle_quota() {
+        let mut host = Host::new(CpuBackend::new(), Limits::new(65536, 8, 4096, 64, 4096));
+        let layout = paged_storage::StateInputLayout {
+            vocab: 33,
+            prompt_tokens: 7,
+        };
+        let inputs = host
+            .allocate_state_inputs_with_spares(2, layout, 1)
+            .unwrap();
+        assert_eq!(inputs.feedback.len(), 11);
+        host.drop_paged_handles(inputs.handles().collect());
+        drop(inputs);
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+        host.limits.live_tensor_handles = 10;
+        assert!(
+            host.allocate_state_inputs_with_spares(2, layout, 1)
+                .is_err()
+        );
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
     }
     #[tokio::test]
     async fn failed_feedback_write_preserves_other_versions() {
