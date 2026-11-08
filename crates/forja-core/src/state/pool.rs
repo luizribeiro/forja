@@ -14,6 +14,7 @@ mod checkpoint;
 pub use checkpoint::{ReleasedStateCheckpoint, StateCheckpoint};
 mod capacity;
 use capacity::CapacityLease;
+mod spare;
 
 /// Allocator for opaque sequence state with [`Self::VERSIONS`] versions per sequence.
 #[derive(Clone)]
@@ -23,18 +24,20 @@ pub struct StatePool {
     completed: Arc<AtomicU64>,
     sequences: u32,
     reserved: Arc<AtomicU32>,
+    spare_records: u32,
     maximum_versions: u32,
+    spare_owner: Arc<AtomicU32>,
 }
 
 impl StatePool {
     /// Records reserved for each sequence, including speculative descendants.
     pub const VERSIONS: u32 = 3;
 
-    fn validate_output_count(output_count: u32) -> Result<usize, PagePoolError> {
+    fn validate_output_count(output_count: u32, capacity: u32) -> Result<usize, PagePoolError> {
         if output_count == 0 {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        if output_count > Self::VERSIONS {
+        if output_count > capacity {
             return Err(PagePoolError::BankInFlight);
         }
         usize::try_from(output_count).map_err(|_| PagePoolError::ArithmeticOverflow)
@@ -96,7 +99,9 @@ impl StatePool {
             completed: Arc::new(AtomicU64::new(0)),
             sequences,
             reserved: Arc::default(),
+            spare_records,
             maximum_versions,
+            spare_owner: Arc::default(),
         })
     }
 
@@ -122,9 +127,12 @@ impl StatePool {
             pool: self.clone(),
             storage: self.pages.reserve(u64::from(Self::VERSIONS))?,
             _capacity: capacity,
+            spare: None,
             identity: Arc::new(()),
             committed: 0,
-            pins: (0..Self::VERSIONS).map(|_| AtomicU32::new(0)).collect(),
+            pins: (0..self.maximum_versions())
+                .map(|_| AtomicU32::new(0))
+                .collect(),
             latest_serial: 0,
             latest_submission: 0,
             pending: VecDeque::new(),
@@ -174,6 +182,7 @@ pub struct StateSequence {
     pool: StatePool,
     storage: PagedSequence,
     _capacity: CapacityLease,
+    spare: Option<(PagedSequence, CapacityLease)>,
     identity: Arc<()>,
     committed: u32,
     pins: Arc<[AtomicU32]>,
@@ -252,7 +261,7 @@ impl StateSequence {
         if serial <= self.latest_serial {
             return Err(PagePoolError::InvalidCheckpoint);
         }
-        let output_count = StatePool::validate_output_count(output_count)?;
+        let output_count = StatePool::validate_output_count(output_count, self.version_count())?;
         if self.pool.completed.load(Ordering::Acquire) < self.drain_until {
             return Err(PagePoolError::BankInFlight);
         }
@@ -260,7 +269,7 @@ impl StateSequence {
             .pending
             .back()
             .map_or(self.committed, StateTransaction::output_version);
-        let mut outputs: Vec<_> = (0..StatePool::VERSIONS)
+        let mut outputs: Vec<_> = (0..self.version_count())
             .filter(|&version| {
                 version != self.committed
                     && version != input
@@ -311,6 +320,9 @@ impl StateSequence {
     ) -> Result<(), PagePoolError> {
         self.validate_submission_at(transaction, queue_serial)?;
         self.storage.mark_submitted(queue_serial)?;
+        if let Some((spare, _)) = &self.spare {
+            spare.mark_submitted(queue_serial)?;
+        }
         self.latest_submission = queue_serial;
         transaction.submitted.store(queue_serial, Ordering::Release);
         Ok(())
@@ -443,7 +455,21 @@ impl StateSequence {
     /// Returns an error for stale or corrupted allocation metadata.
     #[doc(hidden)]
     pub fn allocation_table(&self) -> Result<PageTable, PagePoolError> {
-        self.storage.table()
+        if self.spare.is_none() {
+            return self.storage.table();
+        }
+        let table = self.storage.table()?;
+        let entries = self
+            .storage
+            .page_entries()
+            .chain(
+                self.spare
+                    .iter()
+                    .flat_map(|(spare, _)| spare.page_entries()),
+            )
+            .collect();
+        PageTable::new(entries, table.generations().to_vec())
+            .map_err(|_| PagePoolError::CorruptState)
     }
 
     /// Builds the slot-bound input/output allocation table for a live transaction.
@@ -452,7 +478,7 @@ impl StateSequence {
     /// Refuses foreign, retired or already bound transaction capabilities.
     pub fn bind(&self, transaction: &StateTransaction) -> Result<StateSlot, PagePoolError> {
         self.pending_index(transaction)?;
-        let table = self.storage.table()?;
+        let table = self.allocation_table()?;
         let entries = std::iter::once(transaction.input)
             .chain(transaction.output_versions())
             .map(|index| table.entries()[index as usize])
@@ -485,7 +511,7 @@ impl StateSlot {
     /// # Errors
     /// Refuses an empty chain or a request beyond the pool version capacity.
     pub fn poisoned(output_count: u32) -> Result<Self, PagePoolError> {
-        let records = StatePool::validate_output_count(output_count)?
+        let records = StatePool::validate_output_count(output_count, StatePool::VERSIONS)?
             .checked_add(1)
             .ok_or(PagePoolError::ArithmeticOverflow)?;
         Ok(Self {
