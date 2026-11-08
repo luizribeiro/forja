@@ -1,3 +1,5 @@
+mod replay_tests;
+
 use super::{test_support::Fixture, *};
 use crate::StateBatch;
 

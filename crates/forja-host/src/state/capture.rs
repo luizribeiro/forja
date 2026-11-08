@@ -7,8 +7,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct StateCapture {
     access: StateAccess,
-    planes: Vec<[Tensor; 2]>,
+    planes: Vec<Vec<Tensor>>,
     metadata: Vec<Tensor>,
+    tables: Vec<Tensor>,
     updated: Vec<usize>,
     _owner: CompletionResource,
     private_scratch: Vec<CompletionResource>,
@@ -31,22 +32,21 @@ impl<B: Backend + Send + Sync + 'static> StateCommands<B> {
     /// # Errors
     /// Returns an error if any protected plane view cannot be constructed.
     pub fn capture(&self) -> Result<StateCapture, compute::Error> {
-        if self.access.chain_len() != 1 {
-            return Err(invalid_handle("captured state requires a single update"));
-        }
         let planes = (0..self.updated.len())
             .map(|plane| {
-                Ok([
-                    self.storage.version_view(plane, self.access.source())?,
-                    self.storage
-                        .version_view(plane, self.access.destination())?,
-                ])
+                std::iter::once(self.access.source())
+                    .chain(self.access.destinations())
+                    .map(|record| self.storage.version_view(plane, record))
+                    .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<_, compute::Error>>()?;
         Ok(StateCapture {
             access: self.access.clone(),
             planes,
             metadata: self.metadata.to_vec(),
+            tables: (0..self.access.chain_len())
+                .map(|step| self.table_view(step))
+                .collect::<Result<_, _>>()?,
             updated: self.updated.clone(),
             binding_charges: self.binding_resources(),
             scratch_charges: self
@@ -92,7 +92,7 @@ impl StateCapture {
         recording: &mut StateCommands<B>,
     ) -> Result<ReplayBindings, compute::Error> {
         let same_recording = self.metadata.as_slice() == &**recording.metadata;
-        if recording.access.chain_len() != 1
+        if self.access.chain_len() != recording.access.chain_len()
             || self.planes.len() != recording.updated.len()
             || self.metadata.len() != recording.metadata.len()
             || (!same_recording
@@ -107,22 +107,24 @@ impl StateCapture {
             ));
         }
         let mut bindings = ReplayBindings::default();
-        let mut views = Vec::new();
-        for (plane, captured) in self.planes.iter().enumerate() {
-            for (old, record) in captured
-                .iter()
-                .zip([recording.access.source(), recording.access.destination()])
-            {
-                views.push((old.clone(), recording.storage.version_view(plane, record)?));
+        for (index, table) in self.tables.iter().enumerate() {
+            let access = recording.access.step(index).map_err(super::pool_error)?;
+            let end = index
+                .checked_add(2)
+                .ok_or_else(|| invalid_handle("captured state index overflow"))?;
+            let mut views = Vec::new();
+            for (plane, captured) in self.planes.iter().enumerate() {
+                let pair = captured
+                    .get(index..end)
+                    .ok_or_else(|| invalid_handle("captured state chain is incomplete"))?;
+                for (old, record) in pair.iter().zip([access.source(), access.destination()]) {
+                    views.push((old.clone(), recording.storage.version_view(plane, record)?));
+                }
             }
+            bindings
+                .state_table(table.clone(), access, views)
+                .map_err(invalid_handle)?;
         }
-        bindings
-            .state_table(
-                self.metadata[0].clone(),
-                recording.access.step(0).map_err(super::pool_error)?,
-                views,
-            )
-            .map_err(invalid_handle)?;
         for (old, new) in self.metadata.iter().zip(recording.metadata.iter()) {
             bindings
                 .buffer(old.buffer(), new.buffer())
@@ -170,6 +172,11 @@ mod tests {
             .unwrap();
         let capture = recording.capture().unwrap();
         assert!(capture.retained_resources().count() >= 2);
+        let mut incomplete = capture.clone();
+        incomplete.planes.first_mut().unwrap().clear();
+        let updated = recording.updated.clone();
+        assert!(incomplete.bind(&mut recording).is_err());
+        assert_eq!(recording.updated, updated);
         let mut graph =
             GraphTemplate::new(ParamSpace::new(Vec::new()).unwrap(), GraphLimits::default());
         for dispatch in recording.commands.dispatches() {
