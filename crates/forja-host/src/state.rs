@@ -102,12 +102,26 @@ impl<B: Backend + 'static> Host<B> {
         layout: StateLayout,
         sequences: u32,
     ) -> Result<Arc<StateStorage<B>>, compute::Error> {
-        StateStorage::create(
+        self.create_state_storage_with_spares(layout, sequences, 0)
+    }
+
+    /// Creates state backing with extra records shared by one sequence at a time.
+    ///
+    /// # Errors
+    /// Refuses enlarged tensors or tables beyond runner limits, overflow or allocation failure.
+    pub fn create_state_storage_with_spares(
+        &self,
+        layout: StateLayout,
+        sequences: u32,
+        spare_records: u32,
+    ) -> Result<Arc<StateStorage<B>>, compute::Error> {
+        StateStorage::create_with_spares(
             Arc::clone(&self.backend),
             self.limits,
             Arc::clone(&self.live_bytes),
             layout,
             sequences,
+            spare_records,
         )
     }
 }
@@ -120,8 +134,19 @@ impl<B: Backend> StateStorage<B> {
         layout: StateLayout,
         sequences: u32,
     ) -> Result<Arc<Self>, compute::Error> {
-        let records =
-            StatePool::record_count(sequences).map_err(|_| quota("state record count overflow"))?;
+        Self::create_with_spares(backend, limits, live_bytes, layout, sequences, 0)
+    }
+
+    pub(crate) fn create_with_spares(
+        backend: Arc<B>,
+        limits: Limits,
+        live_bytes: Arc<AtomicU64>,
+        layout: StateLayout,
+        sequences: u32,
+        spare_records: u32,
+    ) -> Result<Arc<Self>, compute::Error> {
+        let records = StatePool::record_count_with_spares(sequences, spare_records)
+            .map_err(|_| quota("state record count overflow"))?;
         if usize::try_from(records).map_or(true, |count| count > limits.table_elements) {
             return Err(quota("state records exceed the table limit"));
         }
@@ -143,6 +168,10 @@ impl<B: Backend> StateStorage<B> {
         )
         .and_then(|n| n.checked_add(POOL_METADATA_RESERVE))
         .ok_or_else(|| quota("state metadata size overflow"))?;
+        let pin_bytes = u64::from(sequences)
+            .checked_mul(u64::from(spare_records))
+            .and_then(|count| count.checked_mul(size_of::<std::sync::atomic::AtomicU32>() as u64))
+            .ok_or_else(|| quota("state pin metadata size overflow"))?;
         let bytes = layout
             .version_bytes()
             .checked_add(4)
@@ -150,9 +179,11 @@ impl<B: Backend> StateStorage<B> {
             .and_then(|n| n.checked_add(u64::from(records) * RECORD_METADATA_RESERVE))
             .and_then(|n| n.checked_add(u64::from(sequences) * SEQUENCE_METADATA_RESERVE))
             .and_then(|n| n.checked_add(descriptor_bytes))
+            .and_then(|n| n.checked_add(pin_bytes))
             .ok_or_else(|| quota("state byte count overflow"))?;
         let charge = StateCharge::reserve(backend.as_ref(), live_bytes, limits.live_bytes, bytes)?;
-        let pool = StatePool::new(layout, sequences, bytes).map_err(pool_error)?;
+        let pool =
+            StatePool::with_spares(layout, sequences, spare_records, bytes).map_err(pool_error)?;
         let mut storage = StateStorage {
             backend,
             pool,

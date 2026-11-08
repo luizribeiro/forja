@@ -70,6 +70,43 @@ fn state_record_limits_refuse_backing_before_charging() {
     assert!(storage.reserve().is_err());
 }
 
+#[test]
+fn spare_backing_is_charged_once_and_checked_against_element_limits() {
+    let layout = StateLayout::new(vec![StatePlane::new(DType::F32, vec![7]).unwrap()]).unwrap();
+    for (table_elements, tensor_elements, accepted) in
+        [(6, 49, false), (7, 48, false), (7, 49, true)]
+    {
+        let host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            Limits::new(65536, 8, tensor_elements, 128, 4096).with_store_limits(
+                4096,
+                table_elements,
+                128,
+            ),
+        );
+        let storage = host.create_state_storage_with_spares(layout.clone(), 2, 1);
+        assert_eq!(storage.is_ok(), accepted);
+        if let Ok(storage) = storage {
+            assert_eq!(storage.planes[0].layout().shape(), [7, 7]);
+            assert_eq!(
+                host.live_bytes.load(Ordering::Acquire),
+                storage.charged_bytes()
+            );
+            let _first = storage.reserve().unwrap();
+            let _second = storage.reserve().unwrap();
+            assert!(storage.reserve().is_err());
+        }
+        assert_eq!(host.live_bytes.load(Ordering::Acquire), 0);
+    }
+    let host = Host::new(
+        forja_cpu::CpuBackend::new(),
+        Limits::new(65536, 8, 4096, 128, 4096),
+    );
+    let plain = host.create_state_storage(layout.clone(), 2).unwrap();
+    let enlarged = host.create_state_storage_with_spares(layout, 2, 1).unwrap();
+    assert!(enlarged.charged_bytes() > plain.charged_bytes());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_state_reservation_reclaims_completed_charges_after_caller_timeout() {
