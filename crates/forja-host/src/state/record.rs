@@ -551,9 +551,15 @@ impl<B: Backend> StateCommands<B> {
         plane: usize,
         dispatch: forja_core::Dispatch,
     ) -> Result<(), compute::Error> {
-        if !matches!(dispatch.op(), Op::State(operation) if operation.access() == self.next_access(plane)?)
-        {
+        let access = self.next_access(plane)?;
+        if !matches!(dispatch.op(), Op::State(operation) if operation.access() == access) {
             return Err(invalid_handle("state update is out of chain order"));
+        }
+        let destination = self.storage.version_view(plane, access.destination())?;
+        if dispatch.outputs().get(1) != Some(&destination) {
+            return Err(invalid_handle(
+                "state update targets an unauthorized version view",
+            ));
         }
         let work = dispatch
             .work()

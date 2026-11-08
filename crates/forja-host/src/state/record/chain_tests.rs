@@ -186,3 +186,38 @@ fn missing_authentication_metadata_is_refused() {
     );
     assert_eq!(chain.updated, [0, 0]);
 }
+
+#[test]
+fn mismatched_destination_view_does_not_consume_a_link() {
+    let f = Fixture::new(forja_cpu::CpuBackend::new());
+    let mut lane = f.reserve();
+    let mut chain = f.commands(&mut lane, 1, 2);
+    let access = chain.access.step(0).unwrap();
+    let valid = chain
+        .prepare_update(
+            0,
+            StateOp::CausalDepthwiseConv(access),
+            &[&f.input, &f.weights],
+            &f.outputs[0][0],
+            None,
+        )
+        .unwrap();
+    let wrong = f
+        .storage
+        .version_view(0, chain.access.destination())
+        .unwrap();
+    let mut candidate = CommandList::new();
+    candidate
+        .dispatch_many(
+            valid.op(),
+            &valid.inputs().iter().collect::<Vec<_>>(),
+            &[&f.outputs[0][0], &wrong],
+        )
+        .unwrap();
+    let mismatched = candidate.into_dispatches().pop().unwrap();
+    assert!(chain.record_update(0, mismatched).is_err());
+    assert_eq!(chain.updated, [0, 0]);
+    assert!(chain.commands.is_empty());
+    chain.record_update(0, valid).unwrap();
+    assert_eq!(chain.updated, [1, 0]);
+}
