@@ -367,6 +367,74 @@ mod tests {
     }
 
     #[test]
+    fn host_selected_boundaries_require_staging_before_device_feedback_resumes() {
+        use crate::{LanePosition, StateAction};
+        use forja_core::StateStep;
+        let (host, _binding, pool, mut journal) = fixture();
+        let charge = Arc::new(
+            StateCharge::reserve(
+                host.backend.as_ref(),
+                Arc::clone(&host.live_bytes),
+                host.limits.live_bytes,
+                FEEDBACK_USE_BYTES,
+            )
+            .unwrap(),
+        );
+        let mut previous = None;
+        for (index, (action, outcome)) in [
+            (StateAction::Combined, Some(true)),
+            (StateAction::Step, Some(true)),
+            (StateAction::Combined, None),
+            (StateAction::Combined, Some(false)),
+            (StateAction::Combined, Some(true)),
+            (StateAction::Step, Some(false)),
+            (StateAction::Combined, Some(true)),
+            (StateAction::Step, Some(true)),
+            (StateAction::Combined, Some(true)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let serial = u64::try_from(index).unwrap() + 1;
+            let transaction = journal
+                .begin_action(
+                    serial,
+                    Some(LanePosition {
+                        tokens: journal.position.tokens + 1,
+                        reserved_tokens: 33,
+                        ..LanePosition::default()
+                    }),
+                    Some(action),
+                )
+                .unwrap();
+            let access = StateStep::from_slot(&journal.bind(&transaction).unwrap()).unwrap();
+            let feedback = journal
+                .feedback_use(&transaction, access.destination(), Arc::clone(&charge))
+                .unwrap()
+                .unwrap();
+            assert_eq!(feedback.source.as_ref().map(FeedbackPin::index), previous);
+            assert_eq!(feedback.select_input(false).is_ok(), previous.is_some());
+            assert_eq!(feedback.source_index().unwrap(), previous);
+            feedback.select_input(true).unwrap();
+            assert_eq!(feedback.source_index().unwrap(), None);
+            let selected =
+                matches!(action, StateAction::Combined).then_some(feedback.destination.index());
+            assert_eq!(feedback.combined, selected.is_some());
+            drop(feedback);
+            if let Some(succeeded) = outcome {
+                journal.mark_submitted(&transaction).unwrap();
+                pool.observe_completion(serial).unwrap();
+                journal.finish(&transaction, succeeded).unwrap();
+                if succeeded {
+                    previous = selected;
+                }
+            } else {
+                journal.cancel_unsubmitted(&transaction).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn lane_restore_preserves_feedback_when_paged_restore_refuses() {
         let (_host, binding, _pool, mut journal) = fixture();
         let input = journal.checkpoint_latest().unwrap();
