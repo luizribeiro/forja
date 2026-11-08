@@ -39,7 +39,8 @@ impl WorkRates {
             .then_some(Self { rates })
     }
 
-    /// Predicts GPU time by adding calibrated memory, arithmetic and launch costs.
+    /// Predicts GPU time with a shared twofold memory/arithmetic safety margin.
+    /// Rates must be at most half measured rates: twice their maximum also bounds their serial sum.
     /// Scalar operations include SFUs; matrix FLOPs must exclude work counted as scalar.
     /// Returns `None` on inconsistent subsets, overflow, or zero launches.
     #[must_use]
@@ -60,11 +61,9 @@ impl WorkRates {
             MemoryAccess::Scattered => bytes as f64 / gather,
         };
         let scalar_ops = cost.scalar_ops.checked_sub(cost.sfu_ops)?;
-        let seconds = memory
-            + cost.flops as f64 / matrix
-            + scalar_ops as f64 / scalar
-            + cost.sfu_ops as f64 / sfu
-            + launches as f64 * launch;
+        let arithmetic =
+            cost.flops as f64 / matrix + scalar_ops as f64 / scalar + cost.sfu_ops as f64 / sfu;
+        let seconds = memory.max(arithmetic) + launches as f64 * launch;
         Duration::try_from_secs_f64(seconds)
             .ok()
             .filter(|time| !time.is_zero())
@@ -98,11 +97,11 @@ mod tests {
         };
         assert_eq!(
             rates.predict(cost, 7, MemoryAccess::Coalesced),
-            Some(Duration::from_secs_f64(4.07))
+            Some(Duration::from_secs_f64(3.07))
         );
         assert_eq!(
             rates.predict(cost, 7, MemoryAccess::Scattered),
-            Some(Duration::from_secs_f64(23.07))
+            Some(Duration::from_secs_f64(20.07))
         );
         assert!(rates.predict(cost, 0, MemoryAccess::Coalesced).is_none());
         assert!(
@@ -130,6 +129,22 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn shared_margin_still_bounds_serial_execution_at_observed_rates() {
+        let rates = WorkRates::new(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0).unwrap();
+        for memory in [1_u32, 7, 33] {
+            for arithmetic in [1_u32, 7, 33] {
+                let cost = KernelCost {
+                    read_bytes: u64::from(memory),
+                    flops: u64::from(arithmetic),
+                    ..KernelCost::default()
+                };
+                let prediction = rates.predict(cost, 1, MemoryAccess::Coalesced).unwrap();
+                assert!(prediction >= Duration::from_secs(u64::from(memory + arithmetic + 1)));
+            }
+        }
     }
 
     #[test]
