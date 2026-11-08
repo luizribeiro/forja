@@ -190,3 +190,82 @@ fn refuse_shared_paged_cut(
     drop(sibling);
     journal.cancel_unsubmitted(tx).unwrap();
 }
+
+fn accepted_paged_append<B: Backend + Send + Sync + 'static>(backend: impl Fn() -> B) {
+    for rows in [2, 3] {
+        for accepted in 0..rows {
+            let (mut host, pool, slot, _) = crate::tests::lifecycle_fixture_backend(backend());
+            let sequence = host.state_slots[&slot.rep()]
+                .sequence_handle(0)
+                .unwrap()
+                .unwrap();
+            assert!(sequence.try_reserve_spares().unwrap());
+            let binding = Arc::clone(&host.table.get(&slot).unwrap().binding);
+            let kv = Arc::clone(
+                binding
+                    .lane(0)
+                    .unwrap()
+                    .sequence
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+            );
+            host.begin_paged_lane_update(pool.rep(), 0, 0, rows, Some(StateAction::Verify))
+                .unwrap();
+            assert_eq!(binding.banks.append_window(0, 0), Ok(0..u64::from(rows)));
+            let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+            let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
+            let output = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+            host.backend
+                .write(&input, &2_f32.to_le_bytes().repeat(7))
+                .unwrap();
+            host.backend
+                .write(&weights, &1_f32.to_le_bytes().repeat(28))
+                .unwrap();
+            let slots = host.state_slots.get_mut(&slot.rep()).unwrap();
+            let recording = slots.recording(0, 0).unwrap();
+            let transaction = recording.transaction.clone();
+            for _ in 0..rows {
+                recording
+                    .causal_convolution(0, &input, &weights, &output)
+                    .unwrap();
+            }
+            slots.take_batch(0).unwrap().submit_and_finish().unwrap();
+            sequence.publish_accepted(&transaction, accepted).unwrap();
+            let tokens = accepted + 1;
+            assert_eq!(kv.lock().unwrap().logical_len(), u64::from(tokens));
+            for bank in 0..2 {
+                host.table.get_mut(&slot).unwrap().active_bank = bank;
+                let (checkpoint, _) = host
+                    .begin_paged_lane_update(pool.rep(), 0, tokens, 1, Some(StateAction::Combined))
+                    .unwrap();
+                assert_eq!(
+                    binding.banks.append_window(bank, 0),
+                    Ok(u64::from(tokens)..u64::from(tokens + 1))
+                );
+                assert_eq!(
+                    binding.banks.slot(bank, 0).unwrap().logical_len(),
+                    u64::from(tokens + 1)
+                );
+                host.rollback_paged_lane_append(pool.rep(), 0, checkpoint.unwrap())
+                    .unwrap();
+                assert_eq!(sequence.position().tokens, u64::from(tokens));
+                assert_eq!(kv.lock().unwrap().logical_len(), u64::from(tokens));
+            }
+            sequence.rewind(0).unwrap();
+            assert_eq!(kv.lock().unwrap().logical_len(), 0);
+        }
+    }
+}
+
+#[test]
+fn accepted_verify_reopens_paged_windows_at_the_published_boundary() {
+    accepted_paged_append(forja_cpu::CpuBackend::new);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_accepted_verify_reopens_paged_windows_at_the_published_boundary() {
+    accepted_paged_append(|| forja_metal::MetalBackend::new().unwrap());
+}

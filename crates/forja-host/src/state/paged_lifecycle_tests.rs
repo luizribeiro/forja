@@ -4,15 +4,25 @@ fn lifecycle_fixture() -> (
     Resource<BatchSlotEntry>,
     Arc<super::state::StateStorage<CpuBackend>>,
 ) {
-    let mut host = Host::new(CpuBackend::new(), GENEROUS);
+    lifecycle_fixture_backend(CpuBackend::new())
+}
+
+pub(crate) fn lifecycle_fixture_backend<B: Backend + 'static>(backend: B) -> (
+    Host<B>,
+    Resource<PagePoolEntry>,
+    Resource<BatchSlotEntry>,
+    Arc<super::state::StateStorage<B>>,
+) {
+    let mut host = Host::new(backend, GENEROUS);
     let pool = insert_test_pool(&mut host, 2, 8);
     let slot = host.open_paged_slot(&pool, 2).unwrap();
     let storage = host
-        .create_state_storage(
+        .create_state_storage_with_spares(
             forja_core::StateLayout::new(vec![
                 forja_core::StatePlane::new(DType::F32, vec![3, 7]).unwrap(),
             ])
             .unwrap(),
+            1,
             1,
         )
         .unwrap();
