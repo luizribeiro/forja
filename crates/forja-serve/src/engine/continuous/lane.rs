@@ -118,6 +118,24 @@ impl BatchLane {
         self.prefix_reuse
     }
 
+    pub(super) async fn accept_tokens(
+        &mut self,
+        tokens: &[u32],
+        stop_tokens: &[u32],
+        metrics: &mut ServingMetrics,
+    ) -> Result<Option<FinishReason>, GenerationError> {
+        for &token in tokens {
+            if let Some(reason) = self.accept(token, stop_tokens, metrics).await? {
+                return Ok(Some(reason));
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn remaining_tokens(&self) -> u64 {
+        u64::from(self.params.max_tokens.saturating_sub(self.consumed))
+    }
+
     pub(super) async fn accept(
         &mut self,
         token: u32,
@@ -228,9 +246,7 @@ impl BatchLane {
     }
 
     pub(super) fn needs_successor(&self) -> bool {
-        self.consumed
-            .checked_add(1)
-            .is_some_and(|consumed| consumed < self.params.max_tokens)
+        self.remaining_tokens() > 1
     }
 
     pub(super) const fn is_constrained(&self) -> bool {
@@ -265,6 +281,51 @@ impl BatchLane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepted_rounds_stream_in_order_with_one_shared_output_budget() {
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges([("a".to_owned(), 0), ("b".to_owned(), 1)], Vec::new())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let mut request = crate::engine::continuous::prefill::tests::request();
+        request.params.max_tokens = 7;
+        let (events, mut received) = mpsc::channel(16);
+        let (reply, _receiver) = oneshot::channel();
+        request.sink = CompletionSink::Stream { events, reply };
+        let mut lane = BatchLane::new(request, 0, 0, 0, SamplingParams::default(), tokenizer, None);
+        let mut metrics = ServingMetrics::default();
+        assert_eq!(
+            lane.accept_tokens(&[0, 1, 0], &[], &mut metrics)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(lane.remaining_tokens(), 4);
+        assert!(lane.needs_successor());
+        assert_eq!(lane.token_ids, [0, 1, 0]);
+        assert_eq!(lane.text, "aba");
+        for text in ["a", "b", "a"] {
+            assert_eq!(
+                received.try_recv().unwrap(),
+                crate::GenerationEvent::Content(text.to_owned())
+            );
+        }
+        assert_eq!(
+            lane.accept_tokens(&[1, 1, 0, 1], &[], &mut metrics)
+                .await
+                .unwrap(),
+            Some(FinishReason::Length)
+        );
+        assert_eq!(lane.remaining_tokens(), 0);
+        assert!(!lane.needs_successor());
+        let completion = lane.completion(FinishReason::Length).await.unwrap();
+        assert_eq!(completion.usage.completion_tokens, 7);
+        assert_eq!(completion.token_ids, [0, 1, 0, 1, 1, 0, 1]);
+        assert_eq!(completion.text, "ababbab");
+    }
 
     #[tokio::test]
     async fn constrained_lanes_preserve_special_token_delimiters() {

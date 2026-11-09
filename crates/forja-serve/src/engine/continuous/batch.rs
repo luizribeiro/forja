@@ -306,7 +306,7 @@ where
                 continue;
             };
             match lane
-                .accept(token, &self.chat_info.stop_token_ids, &mut self.metrics)
+                .accept_tokens(&[token], &self.chat_info.stop_token_ids, &mut self.metrics)
                 .await
             {
                 Ok(Some(reason)) => {
@@ -642,7 +642,7 @@ where
         };
         lane.position = position;
         match lane
-            .accept(token, &self.chat_info.stop_token_ids, &mut self.metrics)
+            .accept_tokens(&[token], &self.chat_info.stop_token_ids, &mut self.metrics)
             .await
         {
             Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
