@@ -3,6 +3,8 @@ use crate::{BatchSelection, BatchShape, EngineBatchLane, SamplingParams, StateAc
 use forja_core::SequenceCheckpoint;
 use forja_cpu::CpuBackend;
 
+mod kv;
+
 struct Fixture {
     host: Host<CpuBackend>,
     pool: Resource<PagePoolEntry>,
