@@ -507,14 +507,12 @@ where
                 let Some(RequestEnvelope::Quiesce { reply }) = pending.pop_front() else {
                     continue;
                 };
-                let quiescence = self.wait_for_quiescence();
-                drop(
-                    reply.send(
-                        quiescence
-                            .await
-                            .map_err(|error| GenerationError::unavailable(error.to_string())),
-                    ),
-                );
+                let result = self
+                    .wait_for_quiescence()
+                    .await
+                    .map_err(|error| GenerationError::unavailable(error.to_string()));
+                self.refresh_shared_metrics(&shared_metrics);
+                drop(reply.send(result));
                 continue;
             }
             let scheduled = Instant::now();
