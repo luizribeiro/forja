@@ -378,6 +378,9 @@ impl<B: Backend + 'static> Host<B> {
         }
         if let Some(reference) = &slot.decode_arithmetic {
             validate_equivalence(&dispatches, &reference.summary.dispatches)?;
+            if baseline {
+                validate_equivalence(&reference.summary.dispatches, &dispatches)?;
+            }
             return Ok(None);
         }
         let summary = ArithmeticSummary { dispatches };
@@ -529,16 +532,6 @@ mod tests {
             .is_err()
         );
     }
-
-    #[test]
-    fn block_updates_are_refused_even_when_the_reference_matches() {
-        let mut block = row("same", 0..=33);
-        block.arithmetic.kind = OperationKind::DeltaRuleBlock;
-        assert!(validate_equivalence(std::slice::from_ref(&block), &[block.clone()]).is_err());
-        let mut other = row("same", 0..=33);
-        other.arithmetic.operation = std::mem::discriminant(&Op::Copy);
-        assert!(validate_equivalence(&[other], &[row("same", 0..=33)]).is_err());
-    }
     #[test]
     fn references_are_single_valued_on_each_weight_and_scratch_operation() {
         let weight = ArithmeticResource::Weight {
@@ -558,5 +551,14 @@ mod tests {
             high.resources = vec![ArithmeticResource::Plane(BufferId::new(1, 2, 28))];
             validate_reference(&[low, high]).unwrap();
         }
+    }
+    #[test]
+    fn block_updates_are_refused_even_when_the_reference_matches() {
+        let mut block = row("same", 0..=33);
+        block.arithmetic.kind = OperationKind::DeltaRuleBlock;
+        assert!(validate_equivalence(std::slice::from_ref(&block), &[block.clone()]).is_err());
+        let mut other = row("same", 0..=33);
+        other.arithmetic.operation = std::mem::discriminant(&Op::Copy);
+        assert!(validate_equivalence(&[other], &[row("same", 0..=33)]).is_err());
     }
 }

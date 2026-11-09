@@ -248,6 +248,39 @@ fn decode_reference_requires_real_output_roles() {
 }
 
 #[test]
+fn decode_reference_requires_output_roles_and_mutual_equivalence() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    let decode = test_capture_shape(false);
+    assert!(
+        capture_arithmetic_body(&mut host, &slot, decode, Some(compute::Op::Copy), false).is_err()
+    );
+    let reference = capture_arithmetic_body(
+        &mut host,
+        &slot,
+        decode,
+        Some(compute::Op::RmsNorm(1e-6)),
+        true,
+    )
+    .unwrap();
+    assert!(capture_arithmetic_body(&mut host, &slot, decode, None, true).is_err());
+    assert!(
+        capture_arithmetic_body(&mut host, &slot, decode, Some(compute::Op::Copy), true).is_err()
+    );
+    let equivalent = capture_arithmetic_body(
+        &mut host,
+        &slot,
+        decode,
+        Some(compute::Op::RmsNorm(1e-6)),
+        true,
+    )
+    .unwrap();
+    host.drop_graph(equivalent).unwrap();
+    assert!(host.table.get(&slot).unwrap().decode_arithmetic.is_some());
+    host.drop_graph(reference).unwrap();
+    assert!(host.table.get(&slot).unwrap().decode_arithmetic.is_none());
+}
+
+#[test]
 fn later_decode_capture_cannot_add_unmatched_arithmetic() {
     let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
     let shape = test_capture_shape(false);
