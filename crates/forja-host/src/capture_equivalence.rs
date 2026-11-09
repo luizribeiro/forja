@@ -44,7 +44,7 @@ struct ArithmeticDispatch {
 
 #[derive(Debug)]
 pub(crate) struct DecodeReference {
-    _graph: u32,
+    graph: u32,
     _summary: ArithmeticSummary,
     _charge: Arc<StateCharge>,
 }
@@ -78,14 +78,30 @@ impl<B: Backend + 'static> Host<B> {
                 .get_mut(&Resource::<BatchSlotEntry>::new_borrow(arithmetic.slot))
                 .map_err(invalid_handle)?
                 .decode_arithmetic = Some(DecodeReference {
-                _graph: graph,
+                graph,
                 _summary: arithmetic.summary,
                 _charge: arithmetic.charge,
             });
         }
         Ok(())
     }
-
+    pub(crate) fn retire_capture_arithmetic(
+        &mut self,
+        scope: Option<&crate::slot_capture::SlotCapture>,
+        graph: u32,
+    ) {
+        if let Some(scope) = scope
+            && let Ok(slot) = self
+                .table
+                .get_mut(&Resource::<BatchSlotEntry>::new_borrow(scope.slot))
+            && slot
+                .decode_arithmetic
+                .as_ref()
+                .is_some_and(|reference| reference.graph == graph)
+        {
+            slot.decode_arithmetic = None;
+        }
+    }
     fn arithmetic_dispatches(
         graph: &GraphTemplate,
         entry: &CommandListEntry,

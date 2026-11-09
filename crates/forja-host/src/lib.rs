@@ -6945,7 +6945,9 @@ impl<B: Backend + 'static> Host<B> {
     }
 
     fn drop_graph(&mut self, resource: Resource<GraphEntry>) -> Result<(), compute::Error> {
+        let id = resource.rep();
         let entry = self.table.delete(resource).map_err(invalid_handle)?;
+        self.retire_capture_arithmetic(entry.slot_capture.as_ref(), id);
         self.release_retained(entry.retained)
     }
 

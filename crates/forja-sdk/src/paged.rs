@@ -105,6 +105,7 @@ impl PagedSlot<'_> {
     ///
     /// The kind and selection must match the serving catalog.
     /// Capture bucket-one combined decode on this slot before capturing verify.
+    /// Keep that graph alive when creating further verify captures.
     ///
     /// # Errors
     /// Refuses nested capture, pending lazy work, incompatible parameters or host quota.

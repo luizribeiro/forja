@@ -61,3 +61,62 @@ fn decode_arithmetic_reference_authenticates_the_capture_slot_identity() {
     );
     assert_eq!(other.host.engine_metrics().live_graphs, 0);
 }
+
+#[tokio::test]
+async fn captured_verify_replays_after_its_decode_reference_is_dropped() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    let decode = test_capture_shape(false);
+    let reference = capture_arithmetic_copy(&mut host, &slot, decode).unwrap();
+    let verify = capture_arithmetic_copy(
+        &mut host,
+        &slot,
+        BatchShape {
+            phase: BatchPhase::Verify,
+            tokens: 3,
+            ..decode
+        },
+    )
+    .unwrap();
+    host.drop_graph(reference).unwrap();
+    let flight = ReplayFlight::acquire(host.replay_state(&verify).unwrap()).unwrap();
+    host.prepare_state_replay_with_flight(&verify, vec![], flight)
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert!(host.table.get(&slot).unwrap().decode_arithmetic.is_none());
+}
+
+#[test]
+fn only_a_live_combined_decode_capture_supplies_the_reference() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    let decode = test_capture_shape(false);
+    let verify = BatchShape {
+        phase: BatchPhase::Verify,
+        tokens: 3,
+        ..decode
+    };
+    for shape in [
+        test_capture_shape(true),
+        BatchShape {
+            bucket: 2,
+            ..decode
+        },
+        BatchShape {
+            selection: BatchSelection::Forward,
+            ..decode
+        },
+        BatchShape {
+            selection: BatchSelection::Masked,
+            ..decode
+        },
+    ] {
+        let graph = capture_arithmetic_copy(&mut host, &slot, shape).unwrap();
+        host.drop_graph(graph).unwrap();
+        assert!(capture_arithmetic_copy(&mut host, &slot, verify).is_err());
+    }
+    let graph = capture_arithmetic_copy(&mut host, &slot, decode).unwrap();
+    assert!(capture_arithmetic_copy(&mut host, &slot, verify).is_ok());
+    host.drop_graph(graph).unwrap();
+    assert!(capture_arithmetic_copy(&mut host, &slot, verify).is_err());
+}
