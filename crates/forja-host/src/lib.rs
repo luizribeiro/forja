@@ -9157,6 +9157,14 @@ impl<B> compute::Host for Host<B>
 where
     B: Backend + Send + Sync + 'static,
 {
+    fn describe_limits(
+        &mut self,
+    ) -> impl Future<Output = wasmtime::Result<compute::CommandLimits>> + Send {
+        std::future::ready(Ok(compute::CommandLimits {
+            dispatches_per_list: u64::try_from(self.limits.dispatches_per_list).unwrap_or(u64::MAX),
+        }))
+    }
+
     fn describe_device(
         &mut self,
     ) -> impl Future<Output = wasmtime::Result<Result<compute::DeviceInfo, compute::Error>>> + Send
@@ -17945,6 +17953,20 @@ mod tests {
         host.drop_tensor(second).unwrap();
         host.drop_weights(weights).unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn guests_observe_the_configured_command_recording_limit() {
+        for limit in [4096, 8192] {
+            let mut host = Host::new(
+                CpuBackend::new(),
+                GENEROUS.with_command_limits(limit, forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
+            );
+            let observed = <Host<CpuBackend> as compute::Host>::describe_limits(&mut host)
+                .await
+                .unwrap();
+            assert_eq!(observed.dispatches_per_list, u64::try_from(limit).unwrap());
+        }
     }
 
     fn test_weight_file() -> std::path::PathBuf {

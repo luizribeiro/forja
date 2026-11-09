@@ -184,6 +184,10 @@ interface compute {
     shape: list<u32>,
   }
 
+  record command-limits {
+    dispatches-per-list: u64,
+  }
+
   record device-info {
     family: string,
     recommended-max-working-set-size: u64,
@@ -245,6 +249,8 @@ interface compute {
 
   submit: async func(cmds: command-list) -> result<option<u64>, error>;
   replay: async func(g: borrow<graph>, values: list<u32>) -> result<option<u64>, error>;
+  describe-limits: func() -> command-limits;
+
   describe-device: func() -> result<device-info, error>;
   open-weights: func(grant: string) -> result<weights, error>;
 }

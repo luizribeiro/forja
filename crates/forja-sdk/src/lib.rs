@@ -161,6 +161,20 @@ pub struct DeviceInfo {
     pub streaming_copy_gigabytes_per_second: f64,
 }
 
+/// Immutable command-recording budgets supplied by the current host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandLimits {
+    /// Maximum dispatches in one recorded command list.
+    pub dispatches_per_list: u64,
+}
+
+/// Returns host recording limits before engine metadata or slots are constructed.
+/// Native execution has no component host and reports an unbounded limit.
+#[must_use]
+pub fn command_limits() -> CommandLimits {
+    sys::command_limits()
+}
+
 /// Returns read-only capabilities for the host compute device.
 ///
 /// # Errors

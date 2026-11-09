@@ -25,6 +25,16 @@ pub enum DType {
     I32,
 }
 
+pub(crate) fn command_limits() -> crate::CommandLimits {
+    #[cfg(target_family = "wasm")]
+    let dispatches_per_list = guest::compute::describe_limits().dispatches_per_list;
+    #[cfg(not(target_family = "wasm"))]
+    let dispatches_per_list = u64::MAX;
+    crate::CommandLimits {
+        dispatches_per_list,
+    }
+}
+
 #[cfg(target_family = "wasm")]
 pub(crate) fn device_info() -> Result<DeviceInfo> {
     let info =
