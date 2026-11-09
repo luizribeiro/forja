@@ -19,9 +19,14 @@ fn state_versions_bytes() -> Result<u64, Box<dyn Error>> {
             .ok_or("state byte overflow")?;
         bytes = bytes.checked_add(size).ok_or("state byte overflow")?;
     }
+    let records = 3_u64
+        .checked_mul(8)
+        .and_then(|records| {
+            records.checked_add(u64::from(qwen38::Qwen38::VERIFY_ROWS).saturating_sub(2))
+        })
+        .ok_or("state record count overflow")?;
     Ok(bytes
-        .checked_mul(3)
-        .and_then(|size| size.checked_mul(8))
+        .checked_mul(records)
         .ok_or("state version byte overflow")?)
 }
 

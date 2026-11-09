@@ -32,7 +32,7 @@ pub struct Qwen38 {
 }
 impl Qwen38 {
     /// Largest number of target rows in a single verify round.
-    pub const VERIFY_ROWS: u32 = 2;
+    pub const VERIFY_ROWS: u32 = 3;
 
     /// Returns the finite serving shapes; eight-lane combined decode executes eagerly.
     #[must_use]
