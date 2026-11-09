@@ -21,7 +21,7 @@ mod tool_output;
 pub use chat_format::{
     ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
 };
-pub use draft::{DraftProposal, DraftSource};
+pub use draft::{DraftProposal, DraftSource, PromptLookup};
 pub use engine::{
     Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,
     ServingEngine, Usage,

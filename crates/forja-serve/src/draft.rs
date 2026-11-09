@@ -1,5 +1,8 @@
 use forja_host::SamplingParams;
 
+mod lookup;
+pub use lookup::PromptLookup;
+
 /// Host-visible continuation and the guest policy's cap at the current context.
 #[derive(Default)]
 pub struct DraftProposal {
