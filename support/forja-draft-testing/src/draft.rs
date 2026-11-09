@@ -152,15 +152,24 @@ pub struct Trace {
 pub struct ExactnessChecks {
     verify_expected: bool,
     oracle_acceptance: bool,
+    sampling: Option<SamplingParams>,
 }
 
 impl ExactnessChecks {
+    /// Restricts a fixture to one sampling configuration while preserving all drafter checks.
+    #[must_use]
+    pub const fn for_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = Some(sampling);
+        self
+    }
+
     /// Checks a real host source whose proposals can legitimately be rejected.
     #[must_use]
     pub const fn source(verify_expected: bool) -> Self {
         Self {
             verify_expected,
             oracle_acceptance: false,
+            sampling: None,
         }
     }
 }
@@ -170,20 +179,15 @@ impl From<bool> for ExactnessChecks {
         Self {
             verify_expected,
             oracle_acceptance: true,
+            sampling: None,
         }
     }
 }
 
-/// Compares fresh plain and draft traces across supported sampling modes.
-///
-/// # Panics
-/// Panics when paths, oracle acceptance or output streams differ.
-pub fn assert_draft_exact(
-    checks: impl Into<ExactnessChecks>,
-    mut run: impl FnMut(SamplingParams, Option<TestDrafter>) -> Trace,
-) {
-    let checks = checks.into();
-    for sampling in [
+/// Sampling configurations shared by exact-stream fixtures.
+#[must_use]
+pub fn sampling_modes() -> [SamplingParams; 4] {
+    [
         SamplingParams::default(),
         SamplingParams {
             temperature: 0.7,
@@ -202,7 +206,22 @@ pub fn assert_draft_exact(
             seed: 7,
             ..SamplingParams::default()
         },
-    ] {
+    ]
+}
+
+/// Compares fresh plain and draft traces across supported sampling modes.
+///
+/// # Panics
+/// Panics when paths, oracle acceptance or output streams differ.
+pub fn assert_draft_exact(
+    checks: impl Into<ExactnessChecks>,
+    mut run: impl FnMut(SamplingParams, Option<TestDrafter>) -> Trace,
+) {
+    let checks = checks.into();
+    let samplings = checks
+        .sampling
+        .map_or_else(|| sampling_modes().to_vec(), |sampling| vec![sampling]);
+    for sampling in samplings {
         let plain = run(sampling, None);
         for drafter in [
             TestDrafter::Oracle,
@@ -336,4 +355,26 @@ fn exactness_helper_refuses_each_changed_serving_observable() {
         });
         assert!(result.is_err(), "observable {field} was not compared");
     }
+}
+
+#[test]
+fn sampling_override_runs_every_drafter_with_the_requested_configuration() {
+    let mode = SamplingParams {
+        temperature: 0.5,
+        seed: 9,
+        ..SamplingParams::default()
+    };
+    let mut calls = 0;
+    assert_draft_exact(
+        ExactnessChecks::from(false).for_sampling(mode),
+        |sampling, _| {
+            assert_eq!(sampling, mode);
+            calls += 1;
+            Trace {
+                tokens: vec![7],
+                ..Trace::default()
+            }
+        },
+    );
+    assert_eq!(calls, 8);
 }

@@ -5,5 +5,7 @@
 
 mod draft;
 mod target;
-pub use draft::{ExactnessChecks, RequestOutput, TestDrafter, Trace, assert_draft_exact};
+pub use draft::{
+    ExactnessChecks, RequestOutput, TestDrafter, Trace, assert_draft_exact, sampling_modes,
+};
 pub use target::Target;
