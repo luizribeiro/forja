@@ -7,6 +7,7 @@ mod sample;
 mod tests;
 mod timing;
 mod warmup;
+mod worker;
 mod workload;
 
 use forja_config::{BackendKind, DevConfig, Profile};
@@ -22,6 +23,7 @@ pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box
     if options.json.exists() {
         return Err("refusing to overwrite a benchmark record".into());
     }
+    let started = Instant::now();
     let (profile, suite, identities) = prepare(options, config)?;
     match config.backend.kind {
         BackendKind::Cpu => {
@@ -34,6 +36,7 @@ pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box
                 &profile,
                 &suite,
                 &identities,
+                started,
             )
             .await
         }
@@ -56,6 +59,7 @@ pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box
                     &profile,
                     &suite,
                     &identities,
+                    started,
                 )
                 .await
             }
@@ -110,13 +114,27 @@ async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
     profile: &Profile,
     suite: &workload::Suite,
     inputs: &Value,
+    started: Instant,
 ) -> Result<(), Box<dyn Error>> {
     let session = engine::load(backend, limits, options, config, profile, inputs).await?;
-    let result = measure(options, config, profile, suite, inputs, &session, device).await;
+    let result = async {
+        if options.measurement.worker {
+            worker::run(
+                options, config, profile, suite, inputs, &session, device, started,
+            )
+            .await
+        } else {
+            write_record(
+                options,
+                measure(options, config, profile, suite, inputs, &session, device).await?,
+            )
+        }
+    }
+    .await;
     let cleanup = session.close().await;
-    let document = result?;
+    result?;
     cleanup?;
-    write_record(options, document)
+    Ok(())
 }
 
 fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Error>> {
@@ -214,7 +232,8 @@ async fn measure<S: ChatService>(
             "os_version":crate::benchmark::command_output("sw_vers", &["-productVersion"])?,
             "os_build":crate::benchmark::command_output("sw_vers", &["-buildVersion"])?, "device":device},
         "source":suite.source, "context_semantics":suite.context_semantics,
-        "measurement_mode":{"sampling":"fixed", "execution":"scheduled-request-groups", "decoding":options.mode,
+        "measurement_mode":{"sampling":"fixed", "early_stop":false, "explicit_no_early_stop":options.measurement.no_early_stop,
+            "explicit_raw_samples":options.measurement.raw_samples, "execution":"scheduled-request-groups", "decoding":options.mode,
             "reps":options.reps,"warmups":options.warmups,"raw_samples":true,"cache_state":if options.cached {"prefix-reuse-enabled"} else {"fresh-request"}},
         "timing_semantics":"Wall samples cover a whole request group. Decode wall is the maximum lane decode span. Plain GPU includes prompt work and excludes Verify. Whole request groups are the independent trials.",
         "results":results}),

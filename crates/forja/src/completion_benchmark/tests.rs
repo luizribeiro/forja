@@ -61,6 +61,10 @@ fn fixture() -> Result<(std::path::PathBuf, Options, DevConfig), Box<dyn Error>>
         mode: Mode::Plain,
         plain_record: None,
         cached: false,
+        measurement: options::Measurement {
+            raw_samples: true,
+            ..options::Measurement::default()
+        },
         reps: 1,
         warmups: 1,
         json: root.join("plain.json"),

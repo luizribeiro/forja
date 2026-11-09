@@ -37,6 +37,8 @@ pub(crate) struct Options {
     /// Reuse a separately prepared prompt prefix before each measured request.
     #[arg(long)]
     pub cached: bool,
+    #[command(flatten)]
+    pub measurement: Measurement,
     /// Independent whole request-group repetitions.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
     pub reps: u32,
@@ -48,19 +50,33 @@ pub(crate) struct Options {
     pub json: PathBuf,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, clap::Args)]
+pub(crate) struct Measurement {
+    /// Retain the loaded runner for immutable sample requests on stdin.
+    #[arg(long, conflicts_with = "cached")]
+    pub worker: bool,
+    /// Retain individual samples (always enabled for completion records).
+    #[arg(long)]
+    pub raw_samples: bool,
+    /// Explicitly retain fixed repetitions without sequential stopping.
+    #[arg(long)]
+    pub no_early_stop: bool,
+}
+
 #[cfg(test)]
 mod tests {
-    use clap::Parser as _;
-
-    #[derive(clap::Parser)]
-    struct Parser {
-        #[command(flatten)]
-        options: super::Options,
+    fn parse(arguments: Vec<String>) -> Result<super::Options, clap::Error> {
+        let crate::args::Command::BenchCompletion(options, _) = crate::args::parse(arguments)?
+        else {
+            panic!("expected completion benchmark");
+        };
+        Ok(options)
     }
 
     #[test]
     fn plain_is_the_default() {
         let arguments = [
+            "bench",
             "completion",
             "--engine",
             "engine.wasm",
@@ -75,15 +91,20 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec();
-        let options = Parser::try_parse_from(arguments.clone()).unwrap().options;
+        let options = parse(arguments.clone()).unwrap();
         assert_eq!(options.mode, super::Mode::Plain);
         assert!(!options.cached);
         assert_eq!(options.group, "regular");
         assert_eq!(options.reps, 5);
+        let mut worker = arguments.clone();
+        worker.extend(["--worker", "--raw-samples", "--no-early-stop"].map(str::to_owned));
+        assert!(parse(worker.clone()).unwrap().measurement.worker);
+        worker.push("--cached".to_owned());
+        assert!(parse(worker).is_err());
         let mut draft = arguments;
         draft.extend(["--mode", "draft"].map(str::to_owned));
-        assert!(Parser::try_parse_from(draft.clone()).is_err());
+        assert!(parse(draft.clone()).is_err());
         draft.extend(["--plain-record", "plain.json"].map(str::to_owned));
-        assert!(Parser::try_parse_from(draft).is_ok());
+        assert!(parse(draft).is_ok());
     }
 }
