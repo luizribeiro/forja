@@ -15,3 +15,58 @@ pub trait DraftSource: Send {
     fn propose(&mut self, prefix: &[u32], position: u32, sampling: SamplingParams)
     -> DraftProposal;
 }
+
+#[allow(dead_code)]
+impl DraftProposal {
+    pub(crate) fn truncate_invalid_tokens(&mut self, vocab: u32) {
+        let valid = self
+            .tokens
+            .iter()
+            .position(|token| *token >= vocab)
+            .unwrap_or(self.tokens.len());
+        self.tokens.truncate(valid);
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DraftMode {
+    #[default]
+    Plain,
+    Drafting,
+    Exiting,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forja_host::{BatchPhase, BatchSelection, BatchShape, speculative::VerifyBudget};
+
+    #[test]
+    fn proposals_shrink_at_invalid_tokens_and_declared_shape_gaps() {
+        let shapes: Vec<_> = [2, 3]
+            .map(|tokens| BatchShape {
+                phase: BatchPhase::Verify,
+                selection: BatchSelection::Combined,
+                bucket: 1,
+                tokens,
+            })
+            .into();
+        for (tokens, expected) in [
+            (vec![], None),
+            (vec![33, 1], None),
+            (vec![7, 33, 1], Some(2)),
+            (vec![7, 1], Some(3)),
+        ] {
+            let mut proposal = DraftProposal {
+                tokens,
+                rule_cap: 2,
+            };
+            let budget = VerifyBudget::new(7, proposal.rule_cap, 33, 64, 64).unwrap();
+            proposal.truncate_invalid_tokens(33);
+            let fed =
+                forja_host::speculative::select_verify_shape(&shapes, &proposal.tokens, budget);
+            assert_eq!(fed.map(|fed| fed.shape().tokens), expected);
+        }
+    }
+}
