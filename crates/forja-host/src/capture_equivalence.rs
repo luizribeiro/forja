@@ -178,6 +178,35 @@ fn covered_by_decode(
     next > u64::from(*dispatch.positions.end())
 }
 
+fn same_operation(left: &Arithmetic, right: &Arithmetic) -> bool {
+    // A scalar program's content hash defines its operation, just as an opcode does.
+    left.kind == right.kind && left.operation == right.operation && left.program == right.program
+}
+
+fn validate_reference(dispatches: &[ArithmeticDispatch]) -> Result<(), compute::Error> {
+    for (index, left) in dispatches.iter().enumerate() {
+        for right in &dispatches[index + 1..] {
+            let shared = (left.resources.is_empty() && right.resources.is_empty())
+                || left
+                    .resources
+                    .iter()
+                    .any(|resource| right.resources.contains(resource));
+            let overlap = left.positions.start() <= right.positions.end()
+                && right.positions.start() <= left.positions.end();
+            if shared
+                && overlap
+                && same_operation(&left.arithmetic, &right.arithmetic)
+                && left.arithmetic != right.arithmetic
+            {
+                return Err(invalid_handle(
+                    "decode reference has conflicting arithmetic on overlapping keys",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn fixed_positions(
     space: Option<&forja_core::ParamSpace>,
     rows: u32,
@@ -344,6 +373,9 @@ impl<B: Backend + 'static> Host<B> {
             ));
         }
         let dispatches = self.arithmetic_dispatches(scope.slot, graph, entry)?;
+        if baseline {
+            validate_reference(&dispatches)?;
+        }
         if let Some(reference) = &slot.decode_arithmetic {
             validate_equivalence(&dispatches, &reference.summary.dispatches)?;
             return Ok(None);
@@ -506,5 +538,25 @@ mod tests {
         let mut other = row("same", 0..=33);
         other.arithmetic.operation = std::mem::discriminant(&Op::Copy);
         assert!(validate_equivalence(&[other], &[row("same", 0..=33)]).is_err());
+    }
+    #[test]
+    fn references_are_single_valued_on_each_weight_and_scratch_operation() {
+        let weight = ArithmeticResource::Weight {
+            buffer: BufferId::new(1, 1, 28),
+            start: 0,
+            end: 28,
+        };
+        for resources in [Vec::new(), vec![weight]] {
+            let mut low = row("low", 0..=510);
+            low.resources.clone_from(&resources);
+            let mut high = row("high", 510..=1022);
+            high.resources = resources;
+            assert!(validate_reference(&[low.clone(), high.clone()]).is_err());
+            high.positions = 511..=1022;
+            validate_reference(&[low.clone(), high.clone()]).unwrap();
+            high.positions = 0..=510;
+            high.resources = vec![ArithmeticResource::Plane(BufferId::new(1, 2, 28))];
+            validate_reference(&[low, high]).unwrap();
+        }
     }
 }
