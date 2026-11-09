@@ -491,7 +491,7 @@ pub(crate) fn record_import(
 pub(crate) fn record_import_variant(
     selection: crate::target::metal::VariantChoice<'_>,
     fixed: impl FnOnce(&mut sys::Commands, &str) -> Result<()>,
-    rule: impl FnOnce(&mut sys::Commands, &sys::Params, u8, &[sys::VariantArm]) -> Result<()>,
+    rule: impl FnOnce(&mut sys::Commands, &sys::Params, u8, u32, &[sys::VariantArm]) -> Result<()>,
 ) -> Result<()> {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
@@ -523,7 +523,13 @@ pub(crate) fn record_import_variant(
                     .ok_or_else(|| {
                         crate::Error::new("variant rule parameter is not part of this capture")
                     })?;
-                rule(commands, params, parameter, &selection.arms)
+                rule(
+                    commands,
+                    params,
+                    parameter,
+                    selection.row_offset,
+                    &selection.arms,
+                )
             }
             (Some(Recording::Lazy(_)), crate::target::metal::VariantChoice::Rule(_)) => Err(
                 crate::Error::new("Metal variant rules can only be used during capture"),
@@ -600,7 +606,13 @@ pub(crate) fn record_variant_many(
                         crate::Error::new("variant rule parameter is not part of this capture")
                     })?;
                 sys::dispatch_variant_rule(
-                    commands, params, parameter, &rule.arms, operation, inputs, outputs,
+                    commands,
+                    params,
+                    parameter,
+                    rule.unshifted_arms()?,
+                    operation,
+                    inputs,
+                    outputs,
                 )
             }
             (Some(Recording::Lazy(_)), crate::target::metal::VariantChoice::Rule(_)) => Err(
@@ -690,7 +702,12 @@ pub(crate) fn record_epilogue(
                         crate::Error::new("variant rule parameter is not part of this capture")
                     })?;
                 sys::dispatch_epilogue(commands, operation, inputs, output, epilogue, extras)?;
-                sys::select_epilogue_variant_rule(commands, params, parameter, &rule.arms)
+                sys::select_epilogue_variant_rule(
+                    commands,
+                    params,
+                    parameter,
+                    rule.unshifted_arms()?,
+                )
             }
             (Some(Recording::Lazy(_)), Some(crate::target::metal::VariantChoice::Rule(_))) => Err(
                 crate::Error::new("Metal variant rules can only be used during capture"),

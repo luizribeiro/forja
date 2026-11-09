@@ -52,6 +52,7 @@ impl Variant {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VariantRule {
     pub(crate) parameter_id: u64,
+    pub(crate) row_offset: u32,
     pub(crate) arms: Vec<crate::sys::VariantArm>,
 }
 
@@ -66,13 +67,32 @@ impl VariantRule {
     /// Returns an error for no arms, an empty interval, a gap, overlap, ordering error, or an
     /// incomplete final arm.
     pub fn new(parameter: &Param, arms: Vec<(RangeInclusive<u32>, Variant)>) -> Result<Self> {
+        Self::for_row(parameter, 0, arms)
+    }
+
+    /// Validates arms covering the parameter plus a serving row offset.
+    ///
+    /// # Errors
+    /// Refuses overflowing keys, gaps, overlaps or incomplete coverage.
+    pub fn for_row(
+        parameter: &Param,
+        row_offset: u32,
+        arms: Vec<(RangeInclusive<u32>, Variant)>,
+    ) -> Result<Self> {
+        let shifted = |value: u32| {
+            u64::from(value)
+                .checked_add(u64::from(row_offset))
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| Error::new("variant rule row key overflowed"))
+        };
+        let end = shifted(*parameter.range().end())?;
         if arms.is_empty() {
             return Err(Error::new("Metal variant rule requires at least one arm"));
         }
         if arms.len() > MAX_VARIANT_RULE_ARMS {
             return Err(Error::new("Metal variant rule has too many arms"));
         }
-        let mut expected = *parameter.range().start();
+        let mut expected = shifted(*parameter.range().start())?;
         let arm_count = arms.len();
         let mut validated = Vec::with_capacity(arm_count);
         for (index, (range, variant)) in arms.into_iter().enumerate() {
@@ -98,15 +118,22 @@ impl VariantRule {
                 })?;
             }
         }
-        if validated.last().map(|arm| arm.hi) != Some(*parameter.range().end()) {
+        if validated.last().map(|arm| arm.hi) != Some(end) {
             return Err(Error::new(
                 "Metal variant rule arms must cover the complete parameter range",
             ));
         }
         Ok(Self {
             parameter_id: parameter.id(),
+            row_offset,
             arms: validated,
         })
+    }
+    pub(crate) fn unshifted_arms(&self) -> Result<&[crate::sys::VariantArm]> {
+        if self.row_offset != 0 {
+            return Err(Error::new("shifted rules require paged attention"));
+        }
+        Ok(&self.arms)
     }
 }
 
@@ -135,6 +162,20 @@ impl<'a> From<&'a VariantRule> for VariantChoice<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_rules_cover_shifted_ranges_and_refuse_overflow_or_lost_offsets() {
+        let parameter = Param::new(7..=33).unwrap();
+        let arms = || vec![(9..=35, Variant::new("future.algorithm").unwrap())];
+        let rule = VariantRule::for_row(&parameter, 2, arms()).unwrap();
+        assert_eq!(rule.row_offset, 2);
+        assert!(rule.unshifted_arms().is_err());
+        assert!(VariantRule::new(&parameter, arms()).is_err());
+        assert!(VariantRule::for_row(&parameter, 3, arms()).is_err());
+        assert!(
+            VariantRule::for_row(&Param::new(u32::MAX..=u32::MAX).unwrap(), 1, arms()).is_err()
+        );
+    }
 
     #[test]
     fn constructors_validate_syntax_without_resolving_names() {

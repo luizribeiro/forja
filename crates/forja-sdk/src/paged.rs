@@ -548,7 +548,7 @@ impl PagedCache<'_> {
                     name,
                 )
             },
-            |commands, params, parameter, arms| {
+            |commands, params, parameter, row_offset, arms| {
                 crate::sys::paged_sdpa(
                     commands,
                     &self._set._slot,
@@ -564,7 +564,9 @@ impl PagedCache<'_> {
                     end,
                     "",
                 )?;
-                crate::sys::select_paged_sdpa_variant_rule(commands, params, parameter, arms)
+                crate::sys::select_paged_sdpa_variant_rule(
+                    commands, params, parameter, row_offset, arms,
+                )
             },
         )?;
         #[cfg(not(target_family = "wasm"))]

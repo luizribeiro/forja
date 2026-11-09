@@ -1746,6 +1746,7 @@ pub(crate) fn select_paged_sdpa_variant_rule(
     commands: &mut Commands,
     params: &Params,
     parameter: u8,
+    row_offset: u32,
     arms: &[VariantArm],
 ) -> Result<()> {
     let arms = arms
@@ -1756,8 +1757,10 @@ pub(crate) fn select_paged_sdpa_variant_rule(
             name: arm.name.clone(),
         })
         .collect::<Vec<_>>();
-    guest::paged_storage::select_paged_sdpa_variant_rule(commands, params, parameter, 0, &arms)
-        .map_err(|error| Error::new(format!("{error:?}")))
+    guest::paged_storage::select_paged_sdpa_variant_rule(
+        commands, params, parameter, row_offset, &arms,
+    )
+    .map_err(|error| Error::new(format!("{error:?}")))
 }
 
 pub(crate) fn dispatch_variant(
