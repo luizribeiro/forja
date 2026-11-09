@@ -219,6 +219,10 @@ impl<B: Backend> StateStorage<B> {
 }
 
 impl<B: Backend> StateCommands<B> {
+    pub(super) fn chain_len(&self) -> usize {
+        self.access.chain_len()
+    }
+
     fn empty(
         storage: &Arc<StateStorage<B>>,
         access: StateAccess,

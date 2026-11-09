@@ -63,13 +63,27 @@ impl<B: Backend + 'static> Host<B> {
 }
 
 impl crate::BatchSlotEntry {
+    fn validate_replay_state_span(&self, tokens: u64) -> Result<(), compute::Error> {
+        if self
+            .input_layout
+            .as_ref()
+            .is_none_or(|inputs| tokens > u64::from(inputs.prompt_tokens))
+        {
+            return Err(invalid_handle(
+                "captured state exceeds the slot prompt budget",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_state_span(
         &self,
         bank: usize,
         lane: usize,
         active: bool,
         tokens: u64,
-    ) -> Result<(), compute::Error> {
+        rows: u64,
+    ) -> Result<u64, compute::Error> {
         if tokens
             > self
                 .input_layout
@@ -80,19 +94,23 @@ impl crate::BatchSlotEntry {
         {
             return Err(invalid_handle("state update exceeds its prompt budget"));
         }
+        let span = tokens
+            .checked_mul(rows)
+            .filter(|_| rows == 1 || tokens == 1)
+            .ok_or_else(|| invalid_handle("verify state updates require one token per row"))?;
         if active {
             let window = self
                 .binding
                 .banks
                 .append_window(bank, lane)
                 .map_err(invalid_handle)?;
-            if tokens == 0 || window.end.checked_sub(window.start) != Some(tokens) {
+            if tokens == 0 || window.end.checked_sub(window.start) != Some(span) {
                 return Err(invalid_handle(
                     "state update differs from its admitted token span",
                 ));
             }
         }
-        Ok(())
+        Ok(span)
     }
 }
 
@@ -159,7 +177,18 @@ impl<B: Backend + 'static> Host<B> {
                 .copied()
                 .map_or(0, u64::from),
         };
-        slot_entry.validate_state_span(bank, lane, active, tokens)?;
+        let rows = match &capture {
+            Some(capture) if capture.shape.phase == crate::BatchPhase::Verify => {
+                u64::from(capture.shape.tokens)
+            }
+            Some(_) => 1,
+            None => self
+                .state_slots
+                .get_mut(&slot.rep())
+                .ok_or_else(|| invalid_handle("state slot is missing"))?
+                .recording_rows(bank, lane, active)?,
+        };
+        let tokens = slot_entry.validate_state_span(bank, lane, active, tokens, rows)?;
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if entry.recorded.len() >= self.limits.dispatches_per_list {
             return Err(crate::quota(
@@ -732,15 +761,7 @@ impl<B: Backend + 'static> Host<B> {
                 ))
                 .map_err(invalid_handle)?;
             let bank = slot.active_bank;
-            if slot
-                .input_layout
-                .as_ref()
-                .is_none_or(|inputs| original.tokens > u64::from(inputs.prompt_tokens))
-            {
-                return Err(invalid_handle(
-                    "captured state exceeds the slot prompt budget",
-                ));
-            }
+            slot.validate_replay_state_span(original.tokens)?;
             if slots.insert(original.slot) {
                 if captures.iter().any(|capture| {
                     capture.usage.slot == original.slot && capture.usage.bank != original.bank
@@ -889,4 +910,86 @@ fn record_state_operation<B: Backend + 'static>(
         _ => return Err(invalid_handle("invalid state operands or algorithm")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod verify_span_tests {
+
+    #[test]
+    fn replay_refuses_verify_rows_wider_than_the_prompt_storage() {
+        let (mut host, _pool, slot) =
+            crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), 3, 1);
+        assert!(
+            host.table
+                .get(&slot)
+                .unwrap()
+                .validate_replay_state_span(3)
+                .is_err()
+        );
+        host.table
+            .get_mut(&slot)
+            .unwrap()
+            .input_layout
+            .as_mut()
+            .unwrap()
+            .prompt_tokens = 3;
+        assert!(
+            host.table
+                .get(&slot)
+                .unwrap()
+                .validate_replay_state_span(3)
+                .is_ok()
+        );
+        assert!(
+            host.table
+                .get(&slot)
+                .unwrap()
+                .validate_replay_state_span(4)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_rows_authenticate_the_full_window_with_single_token_updates() {
+        for rows in [2_u32, 3] {
+            let (mut host, pool, slot) =
+                crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), rows, 8);
+            host.bind_paged_lane(pool.rep(), 7, None, 33).unwrap();
+            let sequence = host.lane_state(pool.rep(), 7).unwrap().unwrap();
+            assert!(sequence.try_reserve_spares().unwrap());
+            let (checkpoint, _) = host
+                .begin_paged_lane_update(pool.rep(), 7, 0, rows, Some(crate::StateAction::Verify))
+                .unwrap();
+            assert_eq!(
+                host.state_slots
+                    .get_mut(&slot.rep())
+                    .unwrap()
+                    .recording_rows(0, 7, true)
+                    .unwrap(),
+                u64::from(rows)
+            );
+            let entry = host.table.get(&slot).unwrap();
+            assert_eq!(
+                entry
+                    .validate_state_span(0, 7, true, 1, u64::from(rows))
+                    .unwrap(),
+                u64::from(rows)
+            );
+            for (tokens, chain) in [(0, rows), (2, rows), (rows, rows), (1, 1)] {
+                assert!(
+                    entry
+                        .validate_state_span(0, 7, true, u64::from(tokens), u64::from(chain))
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                entry
+                    .validate_state_span(0, 7, false, 1, u64::from(rows))
+                    .unwrap(),
+                u64::from(rows)
+            );
+            host.rollback_paged_lane_append(pool.rep(), 7, checkpoint.unwrap())
+                .unwrap();
+        }
+    }
 }

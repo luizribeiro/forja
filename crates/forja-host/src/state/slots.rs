@@ -665,6 +665,15 @@ impl<B: Backend> StateSlots<B> {
         Ok(())
     }
 
+    pub(crate) fn recording_rows(
+        &mut self,
+        bank: usize,
+        lane: usize,
+        active: bool,
+    ) -> Result<u64, compute::Error> {
+        u64::try_from(self.commands(bank, lane, active)?.chain_len()).map_err(invalid_handle)
+    }
+
     pub(crate) fn sequence_handle(
         &self,
         lane: usize,
