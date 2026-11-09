@@ -31,6 +31,77 @@ impl<'a> FedDrafts<'a> {
     }
 }
 
+/// Why a verified output prefix ends before plain decoding can continue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyCut {
+    /// The request exhausted its output token allowance.
+    MaxTokens,
+}
+
+/// Exact target output, including the final sampled, unfed pending token.
+#[derive(Debug)]
+pub struct VerifyAcceptance<'a> {
+    tokens: &'a [u32],
+    accepted: u32,
+    cut: Option<VerifyCut>,
+}
+
+impl<'a> VerifyAcceptance<'a> {
+    /// Accepts exact drafts followed by one target sample, within the output budget.
+    ///
+    /// Consumes the exact fed draft prefix and its selection budget. The budget
+    /// counts newly sampled output tokens, excluding the pending input token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid row geometry or a target sample outside `vocab`.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Acceptance consumes the selected draft prefix to prevent reuse."
+    )]
+    pub fn new(
+        fed: FedDrafts<'_>,
+        target_samples: &'a [u32],
+        vocab: u32,
+    ) -> Result<Self, compute::Error> {
+        let matched = exact_match_prefix(&fed, target_samples, vocab)?;
+        let left = fed.budget().max_tokens_left();
+        let accepted = u64::from(matched).min(left - 1);
+        let index = usize::try_from(accepted).map_err(invalid_handle)?;
+        Ok(Self {
+            tokens: &target_samples[..=index],
+            accepted: u32::try_from(accepted).map_err(invalid_handle)?,
+            cut: (left <= u64::from(matched) + 1).then_some(VerifyCut::MaxTokens),
+        })
+    }
+
+    /// Tokens to account for, with stop text suppression left to the detokenizer.
+    #[must_use]
+    pub const fn tokens(&self) -> &'a [u32] {
+        self.tokens
+    }
+
+    /// State destination to publish; fed length becomes `n + accepted + 1`.
+    ///
+    /// The sampler position becomes `n + accepted`, the last fed row's position.
+    #[must_use]
+    pub const fn accepted(&self) -> u32 {
+        self.accepted
+    }
+
+    /// Target sample that remains unfed and must be host-staged on continuation.
+    #[must_use]
+    pub fn pending(&self) -> u32 {
+        self.tokens[self.tokens.len() - 1]
+    }
+
+    /// Boundary reached while accepting this round, if any.
+    #[must_use]
+    pub const fn cut(&self) -> Option<VerifyCut> {
+        self.cut
+    }
+}
+
 /// Counts consecutive drafts equal to the target's own selected tokens.
 ///
 /// Target row `i` must have sampled with the lane's seed at fed position `n+i`,
@@ -149,6 +220,47 @@ impl VerifyBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_output_includes_exactly_one_pending_target_sample() {
+        let drafts = [7, 33];
+        for (target, expected) in [([4097, 33, 1], 0_u32), ([7, 4097, 1], 1), ([7, 33, 1], 2)] {
+            for left in 2..=7 {
+                let fed = fed_drafts(&drafts, left);
+                let rows = fed.tokens().len() + 1;
+                let output = VerifyAcceptance::new(fed, &target[..rows], 4098).unwrap();
+                let accepted = u64::from(expected).min(left - 1);
+                let index = usize::try_from(accepted).unwrap();
+                assert_eq!(output.accepted(), u32::try_from(accepted).unwrap());
+                assert_eq!(output.tokens(), &target[..=index]);
+                assert_eq!(output.pending(), target[index]);
+                assert_eq!(
+                    output.cut(),
+                    (left <= u64::from(expected) + 1).then_some(VerifyCut::MaxTokens)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acceptance_uses_the_same_large_budget_and_supports_the_maximum_extent() {
+        let target = vec![7; usize::try_from(MAX_VERIFY_ROWS).unwrap()];
+        let left = u64::from(u32::MAX) + 2;
+        let fed = fed_drafts(&target[..target.len() - 1], left);
+        assert_eq!(fed.budget().max_tokens_left(), left);
+        let output = VerifyAcceptance::new(fed, &target, 33).unwrap();
+        assert_eq!(output.tokens(), target.as_slice());
+        assert_eq!(output.accepted(), MAX_VERIFY_ROWS - 1);
+        assert_eq!(output.pending(), 7);
+        assert_eq!(output.cut(), None);
+    }
+
+    #[test]
+    fn acceptance_refuses_invalid_samples_before_pending_or_detokenization() {
+        for target in [[7, 4098, 1], [7, 33, 4098], [1, 33, u32::MAX]] {
+            assert!(VerifyAcceptance::new(fed_drafts(&[7, 33], 33), &target, 4098).is_err());
+        }
+    }
 
     fn fed_drafts(drafts: &[u32], left: u64) -> FedDrafts<'_> {
         let budget = VerifyBudget::new(4097, MAX_VERIFY_ROWS, left, 8192, 8192).unwrap();
