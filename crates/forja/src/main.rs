@@ -14,6 +14,7 @@ mod benchmark_stats;
 mod calibration;
 #[cfg(any(target_os = "macos", test))]
 mod calibration_identity;
+mod completion_stream;
 mod config_show;
 mod engine;
 mod generate;
@@ -59,6 +60,9 @@ fn main() -> ExitCode {
 fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
     if let args::Command::BenchHttp(options) = command {
         return http_benchmark::run(&options);
+    }
+    if let args::Command::BenchCheckStreams(options) = command {
+        return completion_stream::run(&options);
     }
     if let args::Command::Build(options) = command {
         println!(
@@ -114,6 +118,7 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .build()?;
     match command {
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
+        args::Command::BenchCheckStreams(_) => unreachable!("stream checks return before runtime"),
         args::Command::BenchHttp(_) => unreachable!("HTTP benchmarks own their client process"),
         args::Command::BenchKernel(options, config) => kernel_benchmark::run(&options, &config),
         args::Command::BenchSnapshot(options, config) => benchmark_snapshot::run(&options, &config),

@@ -286,6 +286,8 @@ struct BenchArgs {
 enum HttpMode {
     /// Measure a conversation through the shared HTTP client (requires Python).
     Http(Box<crate::http_benchmark::Options>),
+    /// Assert identical token streams in compatible plain and draft records.
+    CheckStreams(crate::completion_stream::Options),
 }
 
 #[derive(Args)]
@@ -359,6 +361,7 @@ enum AxisClass {
 pub(crate) enum Command {
     Bench(Bench),
     BenchHttp(crate::http_benchmark::Options),
+    BenchCheckStreams(crate::completion_stream::Options),
     BenchKernel(crate::kernel_benchmark::Options, Box<DevConfig>),
     BenchSnapshot(crate::benchmark_snapshot::Options, Box<DevConfig>),
     Build(Build),
@@ -593,15 +596,16 @@ fn parse_with(
         ParsedCommand::BenchSnapshot(options) => {
             Command::BenchSnapshot(options, Box::new(layered.config))
         }
-        ParsedCommand::Bench(mut options) if options.http.is_some() => {
-            let Some(HttpMode::Http(http)) = options.http.take() else {
+        ParsedCommand::Bench(mut options) if options.http.is_some() => match options.http.take() {
+            Some(HttpMode::Http(http)) => Command::BenchHttp(*http),
+            Some(HttpMode::CheckStreams(options)) => Command::BenchCheckStreams(options),
+            None => {
                 return Err(Cli::command().error(
                     clap::error::ErrorKind::MissingSubcommand,
-                    "missing HTTP mode",
+                    "missing benchmark mode",
                 ));
-            };
-            Command::BenchHttp(*http)
-        }
+            }
+        },
         ParsedCommand::Bench(options) => Command::Bench(options.with_config(
             &layered,
             limits,
