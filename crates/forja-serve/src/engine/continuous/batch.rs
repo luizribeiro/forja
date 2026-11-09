@@ -397,7 +397,7 @@ where
         }))
     }
 
-    fn checkpoint_lanes(
+    pub(super) fn checkpoint_lanes(
         &self,
         lanes: &[&BatchLane],
     ) -> Result<Vec<EngineLaneCheckpoint<()>>, GenerationError> {
@@ -1017,7 +1017,11 @@ where
             .ok_or_else(|| GenerationError::new("no decode batch shape can accept active lanes"))
     }
 
-    async fn finish_batch_lane(&mut self, mut lane: BatchLane, reason: crate::FinishReason) {
+    pub(super) async fn finish_batch_lane(
+        &mut self,
+        mut lane: BatchLane,
+        reason: crate::FinishReason,
+    ) {
         #[cfg(test)]
         if let Some(barrier) = &self.batch_test_barrier {
             barrier.note_finish(lane.is_constrained());
@@ -1063,7 +1067,7 @@ where
         }
     }
 
-    fn fail_batch_lane(&mut self, lane: BatchLane, error: GenerationError) {
+    pub(super) fn fail_batch_lane(&mut self, lane: BatchLane, error: GenerationError) {
         let error = self.release_failed_lane(lane.slot).unwrap_or(error);
         lane.fail(error);
     }

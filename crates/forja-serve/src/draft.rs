@@ -27,7 +27,6 @@ impl DraftProposal {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum DraftMode {
     #[default]
