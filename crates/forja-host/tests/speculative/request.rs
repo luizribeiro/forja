@@ -1,5 +1,5 @@
 use super::cpu::Target;
-use crate::common::draft::TestDrafter;
+use crate::common::draft::{TestDrafter, Trace};
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, SamplingParams,
     speculative::{VerifyAcceptance, VerifyBudget, VerifyCut, select_verify_shape},
@@ -36,15 +36,6 @@ impl Default for Request {
             cut: None,
         }
     }
-}
-
-#[derive(Default, Debug)]
-pub(super) struct Trace {
-    pub tokens: Vec<u32>,
-    pub accepted: Vec<u32>,
-    pub shapes: Vec<u32>,
-    pub plain: usize,
-    pub cut: Option<VerifyCut>,
 }
 
 impl Request {

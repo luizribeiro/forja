@@ -1,3 +1,5 @@
+use forja_host::{SamplingParams, speculative::VerifyCut};
+
 #[derive(Clone, Copy, Debug)]
 pub enum TestDrafter {
     Oracle,
@@ -105,4 +107,101 @@ fn random_drafts_are_seeded_in_range_and_continue_across_rounds() {
         split.extend(drafter.propose(&[], 26, vocab, |_| unreachable!()));
         assert_eq!(split, expected);
     }
+}
+#[derive(Default, Debug)]
+pub struct Trace {
+    pub tokens: Vec<u32>,
+    pub accepted: Vec<u32>,
+    pub shapes: Vec<u32>,
+    pub plain: usize,
+    pub cut: Option<VerifyCut>,
+}
+
+pub fn assert_draft_exact(
+    verify_expected: bool,
+    mut run: impl FnMut(SamplingParams, Option<TestDrafter>) -> Trace,
+) {
+    for sampling in [
+        SamplingParams::default(),
+        SamplingParams {
+            temperature: 0.7,
+            seed: 0xfeed_beef_dead_cafe,
+            ..SamplingParams::default()
+        },
+        SamplingParams {
+            temperature: 0.7,
+            top_k: 7,
+            top_p: 0.9,
+            seed: 33,
+        },
+        SamplingParams {
+            temperature: 0.7,
+            top_p: 0.8,
+            seed: 7,
+            ..SamplingParams::default()
+        },
+    ] {
+        let plain = run(sampling, None);
+        for drafter in [
+            TestDrafter::Oracle,
+            TestDrafter::Adversary,
+            TestDrafter::OraclePrefix(1),
+            TestDrafter::OraclePrefix(2),
+            TestDrafter::WrongFirstRightSecond,
+            TestDrafter::Random(0),
+            TestDrafter::Random(7),
+        ] {
+            let trace = run(sampling, Some(drafter));
+            assert_eq!(
+                trace.tokens, plain.tokens,
+                "draft token stream differs: sampling={sampling:?}, drafter={drafter:?}"
+            );
+            assert_eq!(trace.shapes.len(), trace.accepted.len());
+            assert_eq!(
+                !trace.shapes.is_empty(),
+                verify_expected,
+                "verify path differs: sampling={sampling:?}, drafter={drafter:?}"
+            );
+            if matches!(drafter, TestDrafter::Oracle) {
+                let mut remaining = trace.tokens.len();
+                for (shape, accepted) in trace.shapes.iter().zip(&trace.accepted) {
+                    let expected = (shape - 1).min(u32::try_from(remaining - 1).unwrap());
+                    assert_eq!(
+                        *accepted, expected,
+                        "oracle must accept every fitting draft"
+                    );
+                    remaining -= usize::try_from(accepted + 1).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "draft token stream differs")]
+fn exactness_helper_refuses_a_changed_token_stream() {
+    assert_draft_exact(false, |_, drafter| Trace {
+        tokens: vec![u32::from(drafter.is_some())],
+        ..Trace::default()
+    });
+}
+
+#[test]
+#[should_panic(expected = "verify path differs")]
+fn exactness_helper_refuses_silent_plain_fallback() {
+    assert_draft_exact(true, |_, _| Trace {
+        tokens: vec![7; 3],
+        ..Trace::default()
+    });
+}
+
+#[test]
+#[should_panic(expected = "oracle must accept every fitting draft")]
+fn exactness_helper_refuses_incomplete_oracle_acceptance() {
+    assert_draft_exact(true, |_, _| Trace {
+        tokens: vec![7; 3],
+        shapes: vec![3],
+        accepted: vec![0],
+        ..Trace::default()
+    });
 }
