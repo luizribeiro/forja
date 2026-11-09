@@ -209,7 +209,11 @@ impl<B: Backend + 'static> Host<B> {
                 || usage.active
                 || usage.bank != 0
                 || (capture.prefill() && usage.lane != 0)
-                || (!capture.prefill() && usage.tokens != 1)
+                || match capture.shape.phase {
+                    BatchPhase::Prompt => false,
+                    BatchPhase::Decode => usage.tokens != 1,
+                    BatchPhase::Verify => usage.tokens != u64::from(capture.shape.tokens),
+                }
             {
                 return Err(invalid_handle(
                     "state work differs from its capture declaration",
@@ -235,6 +239,70 @@ impl<B: Backend + 'static> Host<B> {
 mod tests {
     use super::*;
     use crate::paged_storage::{CaptureKind, CaptureSelection};
+
+    #[test]
+    fn captured_state_spans_require_the_declared_phase_extent() {
+        use crate::hybrid::StateUse;
+        let (mut host, _pool, slot) =
+            crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), 3, 8);
+        for (kind, extent) in [
+            (CaptureKind::Decode(1), 1),
+            (CaptureKind::Verify(2), 2),
+            (CaptureKind::Verify(3), 3),
+        ] {
+            let commands = host.command_list().unwrap();
+            host.declare_slot_capture(
+                &commands,
+                &slot,
+                capture_shape(kind, CaptureSelection::Combined),
+            )
+            .unwrap();
+            let capture = host
+                .table
+                .get(&commands)
+                .unwrap()
+                .slot_capture
+                .clone()
+                .unwrap();
+            let usage = StateUse {
+                slot: slot.rep(),
+                bank: 0,
+                lane: 0,
+                active: false,
+                tokens: extent,
+            };
+            host.with_state_commands(usage, Some(&capture), |_| Ok(()))
+                .unwrap();
+            for tokens in [0, 1, 2, 3, 4]
+                .into_iter()
+                .filter(|tokens| *tokens != extent)
+            {
+                assert!(
+                    host.with_state_commands(StateUse { tokens, ..usage }, Some(&capture), |_| Ok(
+                        ()
+                    ))
+                    .is_err()
+                );
+            }
+            for bad in [
+                StateUse { bank: 1, ..usage },
+                StateUse {
+                    active: true,
+                    ..usage
+                },
+                StateUse {
+                    slot: u32::MAX,
+                    ..usage
+                },
+            ] {
+                assert!(
+                    host.with_state_commands(bad, Some(&capture), |_| Ok(()))
+                        .is_err()
+                );
+            }
+            host.drop_command_list(commands).unwrap();
+        }
+    }
 
     #[test]
     fn capture_shapes_require_declared_phase_extent_and_selection() {
