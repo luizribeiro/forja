@@ -30,3 +30,6 @@ mod qwen38;
 
 #[path = "../verify_fixture.rs"]
 mod verify_fixture;
+
+#[path = "../verify_admission.rs"]
+mod verify_admission;

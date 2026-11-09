@@ -45,6 +45,25 @@ impl<B: Backend + 'static> Host<B> {
     }
 }
 
+impl crate::EngineInfo {
+    pub(crate) fn validate_verify_load(
+        &self,
+        config: &crate::EngineLoadConfig,
+    ) -> Result<(), compute::Error> {
+        if !config.paged_cache
+            && self
+                .serving
+                .as_ref()
+                .is_some_and(|serving| serving.verify_rows() != 0)
+        {
+            return Err(compute::Error::Layout(
+                "verify shapes require paged serving storage".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tests::verify_input_fixture;

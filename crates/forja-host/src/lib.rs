@@ -1461,6 +1461,9 @@ where
             Some(info) => info.clone(),
             None => self.describe().await?,
         };
+        if let Err(error) = info.validate_verify_load(config) {
+            return Ok(Err(error));
+        }
         let pool = if config.paged_cache {
             match self.bind_page_pool(&info, config.max_context, config.kv_cache) {
                 Ok(pool) => pool,
@@ -12915,9 +12918,15 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_err();
-            assert!(
-                matches!(error, compute::Error::InvalidHandle(message) if message == "verify shapes require host row storage")
-            );
+            if paged_cache {
+                assert!(
+                    matches!(error, compute::Error::InvalidHandle(message) if message == "verify shapes require host row storage")
+                );
+            } else {
+                assert!(
+                    matches!(error, compute::Error::Layout(message) if message == "verify shapes require paged serving storage")
+                );
+            }
         }
     }
 
