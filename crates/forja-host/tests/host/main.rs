@@ -18,6 +18,8 @@ mod qwen_engine;
 mod qwen_weights;
 #[path = "../smollm2.rs"]
 mod smollm2;
+#[path = "../speculative.rs"]
+mod speculative;
 #[path = "../tensor_smoke.rs"]
 mod tensor_smoke;
 #[path = "../toy_mlp.rs"]
