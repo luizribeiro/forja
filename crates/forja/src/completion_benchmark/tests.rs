@@ -119,7 +119,16 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
     );
     if let Some(destination) = std::env::var_os("FORJA_BENCH_FIXTURE_RECORDS") {
         fs::create_dir_all(&destination)?;
-        for name in ["plain.json", "draft.json"] {
+        for name in [
+            "plain.json",
+            "draft.json",
+            "engine.wasm",
+            "tokenizer.json",
+            "model.safetensors",
+            "suite.json",
+            "prompt.txt",
+            "padding.txt",
+        ] {
             fs::copy(
                 root.join(name),
                 std::path::Path::new(&destination).join(name),
@@ -132,6 +141,40 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
             .unwrap_err()
             .to_string()
             .contains("overwrite")
+    );
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn a_stream_mismatch_keeps_a_failed_record_and_returns_an_error() -> Result<(), Box<dyn Error>> {
+    let (root, mut options, _) = fixture()?;
+    let plain = json!({"kind":"completion-benchmark","schema_version":1,"mode":"plain",
+        "stream_config":{"sampling":"greedy"}, "measurement_mode":{"execution":"scheduled-request-groups"},
+        "results":[{"identity":{"seed":42,"prompt_sha256":format!("sha256:{}", "c".repeat(64)),"concurrency":1,"reps":1},
+            "token_stream_hashes":[format!("sha256:{}", "a".repeat(64))],
+            "samples":[{"wall_seconds":1.0,"decode_wall_seconds":1.0,"gpu_seconds":0.0,
+                "plain_gpu_seconds":0.0,"verify_gpu_seconds":0.0}]}]});
+    fs::write(&options.json, serde_json::to_vec(&plain)?)?;
+    options.mode = Mode::Draft;
+    options.plain_record = Some(options.json.clone());
+    options.json = root.join("failed.json");
+    let mut draft = plain;
+    draft["mode"] = json!("draft");
+    draft["results"][0]["token_stream_hashes"][0] = json!(format!("sha256:{}", "b".repeat(64)));
+    assert!(
+        write_record(&options, draft)
+            .unwrap_err()
+            .to_string()
+            .contains("token-stream hash")
+    );
+    let failed: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
+    assert_eq!(failed["stream_check"]["status"], "failed");
+    assert!(
+        failed["stream_check"]["plain_record_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
     );
     fs::remove_dir_all(root)?;
     Ok(())

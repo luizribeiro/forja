@@ -139,22 +139,26 @@ async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
 
 fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Error>> {
     record::decorate(&mut document)?;
-    if options.mode == Mode::Draft {
+    let stream_check = if options.mode == Mode::Draft {
         let path = options
             .plain_record
             .as_ref()
             .ok_or("draft mode requires a plain record")?;
         let plain = serde_json::from_slice(&fs::read(path)?)?;
-        crate::completion_stream::assert_matches(&plain, &document)?;
-        document["stream_check"] =
-            json!({"status":"pass", "plain_record_hash":record::hash(&plain)?});
-    }
+        let check = crate::completion_stream::assert_matches(&plain, &document);
+        document["stream_check"] = json!({"status":if check.is_ok() {"pass"} else {"failed"},
+            "plain_record_hash":record::hash(&plain)?, "error":check.as_ref().err()});
+        check
+    } else {
+        Ok(())
+    };
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&options.json)?;
     serde_json::to_writer_pretty(&mut output, &document)?;
     output.write_all(b"\n")?;
+    stream_check?;
     eprintln!("completion record written; mode={:?}", options.mode);
     Ok(())
 }
