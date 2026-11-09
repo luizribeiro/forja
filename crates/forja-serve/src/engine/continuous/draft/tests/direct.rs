@@ -40,7 +40,6 @@ pub(super) async fn run_case(
     case: Case,
 ) -> Result<Trace, TestError> {
     let mut engine = engine().await?;
-    engine.chat_info.stop_token_ids = case.stop_token.into_iter().collect();
     if let Some(drafter) = drafter {
         engine = engine.with_drafter(Source {
             drafter,
@@ -49,6 +48,15 @@ pub(super) async fn run_case(
             calls: Arc::default(),
         });
     }
+    Box::pin(run_engine(engine, sampling, case)).await
+}
+
+pub(super) async fn run_engine(
+    mut engine: ServingEngine<forja_cpu::CpuBackend>,
+    sampling: SamplingParams,
+    case: Case,
+) -> Result<Trace, TestError> {
+    engine.chat_info.stop_token_ids = case.stop_token.into_iter().collect();
     let mut request = crate::engine::continuous::prefill::tests::request();
     request.prompt_tokens = u32::try_from(case.prompt.len())?;
     request.tokens = case.prompt;
@@ -143,7 +151,7 @@ async fn plain_step(
     .await
 }
 
-async fn observe(
+pub(super) async fn observe(
     engine: &ServingEngine<forja_cpu::CpuBackend>,
     lane: &mut BatchLane,
     reason: FinishReason,
@@ -156,7 +164,8 @@ async fn observe(
         .checkpoint_state_lane(lane.slot)?
         .unwrap()
         .position();
-    assert_eq!(position.tokens, ledger_len);
+    let cancelled = lane.control.is_cancelled();
+    assert_eq!(position.tokens + u64::from(cancelled), ledger_len);
     assert_eq!(position.sampler, position.tokens - 1);
     assert_eq!(position.grammar, position.tokens);
     assert_eq!(position.parser, position.tokens);
@@ -170,7 +179,7 @@ async fn observe(
     let prompt = usize::try_from(completion.usage.prompt_tokens)?;
     assert_eq!(
         &lane.ledger().tokens()[prompt..],
-        &completion.token_ids[..completion.token_ids.len() - 1]
+        &completion.token_ids[..completion.token_ids.len() - usize::from(!cancelled)]
     );
     let mut streamed_text = String::new();
     while let Ok(event) = events.try_recv() {

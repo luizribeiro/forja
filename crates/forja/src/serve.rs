@@ -293,6 +293,7 @@ where
         profile.workload().prefill_chunk.get(),
         identity,
     )
+    .map(|engine| engine.with_profile_lookup(&profile))
     .and_then(|engine| engine.with_profile_prefixes(&profile))
     .map_err(|error| error.to_string())?;
     let retained_bytes = engine

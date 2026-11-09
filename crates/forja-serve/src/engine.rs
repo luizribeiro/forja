@@ -493,6 +493,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     config_generation: u64,
     scheduler: SchedulerConfig,
     drafter: Option<Box<dyn crate::DraftSource>>,
+    lookup_policy: Option<forja_config::LookupPolicy>,
     #[cfg(test)]
     batch_test_barrier: Option<Arc<BatchTestBarrier>>,
 }
@@ -1055,6 +1056,7 @@ where
             config_generation: 0,
             scheduler,
             drafter: None,
+            lookup_policy: None,
             #[cfg(test)]
             batch_test_barrier: None,
         })
@@ -1064,6 +1066,13 @@ where
     #[must_use]
     pub fn with_drafter(mut self, drafter: impl crate::DraftSource + 'static) -> Self {
         self.drafter = Some(Box::new(drafter));
+        self
+    }
+
+    /// Configures lane-owned lookup sources from the guest profile declaration.
+    #[must_use]
+    pub fn with_profile_lookup(mut self, profile: &forja_config::Profile) -> Self {
+        self.lookup_policy = profile.prompt_lookup().cloned();
         self
     }
 

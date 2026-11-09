@@ -27,10 +27,11 @@ struct Component;
 
 impl Guest for Component {
     fn describe() -> EngineInfo {
+        let context = if cfg!(feature = "verify") { 128 } else { 32 };
         EngineInfo {
             prompt_block_tokens: None,
             vocab: 4,
-            max_context: 33,
+            max_context: context + 1,
             tap_layers: vec![0],
             router_layers: vec![],
             serving: Some(ServingInfo {
@@ -41,7 +42,7 @@ impl Guest for Component {
                     label: "cache".to_owned(),
                 }],
                 active_lanes: 2,
-                max_context: 32,
+                max_context: context,
                 prefill_chunk_multiple: Some(2),
                 batch_shapes: [1, 2]
                     .into_iter()

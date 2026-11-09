@@ -192,7 +192,7 @@ where
                 .iter()
                 .any(|lane| lane.draft_mode != DraftMode::Plain)
                 || (wants_draft_drain(
-                    self.drafter.is_some(),
+                    self.has_drafter(),
                     !admission_waiting && pending.is_empty(),
                     &active,
                 ) && self.draft_candidate(&mut active[0]).is_some());

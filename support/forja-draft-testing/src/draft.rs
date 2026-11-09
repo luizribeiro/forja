@@ -148,14 +148,41 @@ pub struct Trace {
     pub cut: Option<VerifyCut>,
 }
 
+/// Path checks for a real source or the deterministic test-drafter suite.
+pub struct ExactnessChecks {
+    verify_expected: bool,
+    oracle_acceptance: bool,
+}
+
+impl ExactnessChecks {
+    /// Checks a real host source whose proposals can legitimately be rejected.
+    #[must_use]
+    pub const fn source(verify_expected: bool) -> Self {
+        Self {
+            verify_expected,
+            oracle_acceptance: false,
+        }
+    }
+}
+
+impl From<bool> for ExactnessChecks {
+    fn from(verify_expected: bool) -> Self {
+        Self {
+            verify_expected,
+            oracle_acceptance: true,
+        }
+    }
+}
+
 /// Compares fresh plain and draft traces across supported sampling modes.
 ///
 /// # Panics
 /// Panics when paths, oracle acceptance or output streams differ.
 pub fn assert_draft_exact(
-    verify_expected: bool,
+    checks: impl Into<ExactnessChecks>,
     mut run: impl FnMut(SamplingParams, Option<TestDrafter>) -> Trace,
 ) {
+    let checks = checks.into();
     for sampling in [
         SamplingParams::default(),
         SamplingParams {
@@ -198,10 +225,10 @@ pub fn assert_draft_exact(
             assert_eq!(trace.shapes.len(), trace.accepted.len());
             assert_eq!(
                 !trace.shapes.is_empty(),
-                verify_expected,
+                checks.verify_expected,
                 "verify path differs: sampling={sampling:?}, drafter={drafter:?}"
             );
-            if matches!(drafter, TestDrafter::Oracle) {
+            if checks.oracle_acceptance && matches!(drafter, TestDrafter::Oracle) {
                 let mut remaining = trace.tokens.len();
                 for (round, (shape, accepted)) in
                     trace.shapes.iter().zip(&trace.accepted).enumerate()
@@ -235,6 +262,20 @@ pub fn assert_draft_exact(
 fn exactness_helper_refuses_a_changed_token_stream() {
     assert_draft_exact(false, |_, drafter| Trace {
         tokens: vec![u32::from(drafter.is_some())],
+        ..Trace::default()
+    });
+}
+
+#[test]
+fn exactness_helper_accepts_rejected_real_source_proposals() {
+    assert_draft_exact(ExactnessChecks::source(true), |_, source| Trace {
+        tokens: vec![7; 7],
+        shapes: if source.is_some() { vec![3; 3] } else { vec![] },
+        accepted: if source.is_some() {
+            vec![0, 1, 2]
+        } else {
+            vec![]
+        },
         ..Trace::default()
     });
 }

@@ -1,5 +1,6 @@
 mod cuts;
 mod direct;
+mod lookup;
 use super::super::{RequestEnvelope, draft_support::*};
 use super::*;
 use crate::engine::BatchTestBarrier;

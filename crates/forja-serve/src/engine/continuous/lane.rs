@@ -59,6 +59,7 @@ pub(super) struct BatchLane {
     pub(super) draft_mode: crate::draft::DraftMode,
     pub(super) draft_refused: bool,
     pub(super) draft_probe_position: Option<u32>,
+    lookup: Option<crate::PromptLookup>,
     pub(super) position: u32,
     pub(super) reserved_tokens: u64,
     pub(super) sampling: SamplingParams,
@@ -102,6 +103,7 @@ impl BatchLane {
             draft_mode: crate::draft::DraftMode::Plain,
             draft_refused: false,
             draft_probe_position: None,
+            lookup: None,
             position: request.prompt_tokens,
             reserved_tokens: u64::from(request.prompt_tokens)
                 + u64::from(request.params.max_tokens),
@@ -127,6 +129,21 @@ impl BatchLane {
 
     pub(super) const fn prefix_reuse(&self) -> bool {
         self.prefix_reuse
+    }
+
+    pub(super) fn lane_source<'a>(
+        &'a mut self,
+        external: Option<&'a mut (dyn crate::DraftSource + 'static)>,
+        policy: Option<&forja_config::LookupPolicy>,
+    ) -> Option<(&'a mut (dyn crate::DraftSource + 'static), &'a [u32])> {
+        let source = if let Some(source) = external {
+            source
+        } else {
+            let policy = policy?;
+            self.lookup
+                .get_or_insert_with(|| crate::PromptLookup::new(policy.clone()))
+        };
+        Some((source, self.ledger.tokens()))
     }
 
     pub(super) async fn accept_tokens(

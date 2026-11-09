@@ -188,7 +188,7 @@ pub(super) async fn prepare_request(
         .begin_batch_prefill(request, slot)
         .await
         .map_err(|(_, error)| error)?;
-    assert!(engine.advance_batch_prefill(&mut prefill, 16).await?);
+    while !engine.advance_batch_prefill(&mut prefill, 16).await? {}
     let mut lane = ServingEngine::<forja_cpu::CpuBackend>::finish_batch_prefill(prefill)
         .map_err(|(_, error)| error)?;
     let _ = lane

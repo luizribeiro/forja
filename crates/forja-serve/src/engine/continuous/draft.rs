@@ -28,8 +28,12 @@ pub(super) fn reset_draft_refusals(active: &mut [BatchLane]) {
 }
 
 impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
+    pub(super) fn has_drafter(&self) -> bool {
+        self.drafter.is_some() || self.lookup_policy.is_some()
+    }
+
     pub(super) fn draft_candidate(&mut self, lane: &mut BatchLane) -> Option<Candidate> {
-        if !wants_draft_drain(self.drafter.is_some(), true, std::slice::from_ref(lane)) {
+        if !wants_draft_drain(self.has_drafter(), true, std::slice::from_ref(lane)) {
             return None;
         }
         let shapes = &self.info.serving.as_ref()?.batch_shapes;
@@ -37,10 +41,10 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             return None;
         }
         lane.draft_probe_position = Some(lane.position);
-        let mut proposal =
-            self.drafter
-                .as_mut()?
-                .propose(lane.ledger().tokens(), lane.position, lane.sampling);
+        let (position, sampling) = (lane.position, lane.sampling);
+        let (source, prefix) =
+            lane.lane_source(self.drafter.as_deref_mut(), self.lookup_policy.as_ref())?;
+        let mut proposal = source.propose(prefix, position, sampling);
         let budget = VerifyBudget::new(
             u64::from(lane.position),
             proposal.rule_cap,
@@ -62,7 +66,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         if active.len() != 1 {
             return false;
         }
-        let wanted = wants_draft_drain(self.drafter.is_some(), exclusive, active);
+        let wanted = wants_draft_drain(self.has_drafter(), exclusive, active);
         if !wanted && active[0].draft_mode == DraftMode::Plain {
             return false;
         }
