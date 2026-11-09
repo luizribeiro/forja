@@ -1,7 +1,11 @@
 //! CPU policy for exact speculative decoding.
 
 use crate::{BatchPhase, BatchSelection, BatchShape, MAX_VERIFY_ROWS, compute, invalid_handle};
-use std::{borrow::Cow, num::NonZeroU64};
+use std::{borrow::Cow, future::Future, num::NonZeroU64, pin::Pin};
+
+/// One asynchronous token-boundary operation borrowing its request state.
+pub type BoundaryFuture<'a, E> =
+    Pin<Box<dyn Future<Output = Result<Option<VerifyCut>, E>> + Send + 'a>>;
 
 /// The exact immutable draft prefix selected for staging with the pending token.
 #[derive(Debug)]
@@ -123,11 +127,28 @@ impl<'a> VerifyAcceptance<'a> {
         mut boundary: impl FnMut(u32) -> Result<Option<VerifyCut>, E>,
     ) -> Result<VerifyDecision<'a>, E> {
         let mut decision = self.decision;
-        for (index, row) in (0..=decision.accepted).enumerate() {
-            if let Some(cut) = boundary(decision.tokens[index])? {
-                decision.tokens = &decision.tokens[..=index];
-                decision.accepted = row;
-                decision.cut = Some(cut);
+        for (index, (token, row)) in decision.rows() {
+            if decision.apply_cut(index, row, boundary(token)?) {
+                break;
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Scans each accepted token once, awaiting its live request boundary.
+    ///
+    /// Uses the same cut ordering and pending-token rule as [`Self::scan`].
+    ///
+    /// # Errors
+    /// Propagates boundary errors without returning a decision to publish.
+    pub async fn scan_async<S, E>(
+        self,
+        state: &mut S,
+        mut boundary: impl for<'s> FnMut(&'s mut S, u32) -> BoundaryFuture<'s, E>,
+    ) -> Result<VerifyDecision<'a>, E> {
+        let mut decision = self.decision;
+        for (index, (token, row)) in decision.rows() {
+            if decision.apply_cut(index, row, boundary(state, token).await?) {
                 break;
             }
         }
@@ -136,6 +157,25 @@ impl<'a> VerifyAcceptance<'a> {
 }
 
 impl<'a> VerifyDecision<'a> {
+    fn rows(&self) -> impl Iterator<Item = (usize, (u32, u32))> + 'a {
+        self.tokens
+            .iter()
+            .copied()
+            .zip(0..=self.accepted)
+            .enumerate()
+    }
+
+    fn apply_cut(&mut self, index: usize, row: u32, cut: Option<VerifyCut>) -> bool {
+        if let Some(cut) = cut {
+            self.tokens = &self.tokens[..=index];
+            self.accepted = row;
+            self.cut = Some(cut);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Tokens to account for, with stop text suppression left to the detokenizer.
     #[must_use]
     pub const fn tokens(&self) -> &'a [u32] {
@@ -355,6 +395,45 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, "decode failed");
+        assert_eq!(seen, [7]);
+    }
+
+    #[tokio::test]
+    async fn async_boundaries_cut_once_in_order_and_fail_without_a_decision() {
+        let target = [7, 33, 4097];
+        for cut in [VerifyCut::Stop, VerifyCut::Eos, VerifyCut::Activate] {
+            for row in 0..3 {
+                let mut seen = Vec::new();
+                let output = VerifyAcceptance::new(fed_drafts(&target[..2], 3), &target, 4098)
+                    .unwrap()
+                    .scan_async(&mut seen, |seen, token| {
+                        Box::pin(async move {
+                            tokio::task::yield_now().await;
+                            seen.push(token);
+                            Ok::<_, ()>((token == target[row]).then_some(cut))
+                        })
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(seen, target[..=row]);
+                assert_eq!(output.tokens(), seen);
+                assert_eq!(output.accepted(), u32::try_from(row).unwrap());
+                assert_eq!(output.pending(), target[row]);
+                assert_eq!(output.cut(), Some(cut));
+            }
+        }
+        let mut seen = Vec::new();
+        let error = VerifyAcceptance::new(fed_drafts(&[7, 1], 7), &target, 4098)
+            .unwrap()
+            .scan_async(&mut seen, |seen, token| {
+                Box::pin(async move {
+                    seen.push(token);
+                    Err::<Option<VerifyCut>, _>("boundary failed")
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "boundary failed");
         assert_eq!(seen, [7]);
     }
 
