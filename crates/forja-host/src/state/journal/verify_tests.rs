@@ -139,6 +139,63 @@ fn completed_verify_defers_publication_until_its_acceptance_is_settled() {
 }
 
 #[test]
+fn activation_publishes_the_row_preceding_the_unfed_trigger() {
+    use crate::speculative::{VerifyAcceptance, VerifyBudget, VerifyCut, select_verify_shape};
+    use crate::{BatchPhase, BatchSelection, BatchShape};
+
+    let target = [7, 33, 4097];
+    let shape = BatchShape {
+        phase: BatchPhase::Verify,
+        bucket: 1,
+        tokens: 3,
+        selection: BatchSelection::Combined,
+    };
+    for (drafts, matched) in [([1, 1], 0), ([7, 1], 1), ([7, 33], 2)] {
+        for row in 0..=matched {
+            let (pool, mut journal) = fixture(3);
+            let start = journal.position.tokens;
+            let chain = verify(&mut journal, 2, 3);
+            let destination = chain.output_versions().nth(row).unwrap();
+            journal.mark_submitted(&chain).unwrap();
+            pool.observe_completion(2).unwrap();
+            journal.finish(&chain, true).unwrap();
+            let mut seen = Vec::new();
+            let budget = VerifyBudget::new(start, 2, 3, 4097, 4097).unwrap();
+            let fed = select_verify_shape(&[shape], &drafts, budget).unwrap();
+            let decision = VerifyAcceptance::new(fed, &target, 4098)
+                .unwrap()
+                .scan(|token| {
+                    seen.push(token);
+                    Ok::<_, ()>((token == target[row]).then_some(VerifyCut::Activate))
+                })
+                .unwrap();
+            assert_eq!(decision.tokens(), &target[..=row]);
+            assert_eq!(seen, decision.tokens());
+            assert_eq!(decision.pending(), target[row]);
+            assert_eq!(decision.accepted(), u32::try_from(row).unwrap());
+            assert_eq!(decision.cut(), Some(VerifyCut::Activate));
+            journal
+                .publish_accepted(&chain, decision.accepted())
+                .unwrap();
+            assert_eq!(
+                journal.position.tokens,
+                start + u64::try_from(row).unwrap() + 1
+            );
+            assert_eq!(
+                journal.position.sampler,
+                start + u64::try_from(row).unwrap()
+            );
+            assert_eq!(journal.position.grammar, journal.position.tokens);
+            assert_eq!(journal.position.parser, journal.position.tokens);
+            assert_eq!(
+                journal.checkpoint_latest().unwrap().version.version(),
+                destination
+            );
+        }
+    }
+}
+
+#[test]
 fn verify_execution_failure_preserves_source_after_physical_drain() {
     for rows in [2, 3] {
         for abandoned in [false, true] {

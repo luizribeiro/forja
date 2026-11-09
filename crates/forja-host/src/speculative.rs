@@ -38,6 +38,8 @@ pub enum VerifyCut {
     Stop,
     /// The target selected an end-of-sequence token.
     Eos,
+    /// Feed the pending trigger through the constrained path's masked selection.
+    Activate,
     /// The request exhausted its output token allowance.
     MaxTokens,
 }
@@ -91,7 +93,9 @@ impl<'a> VerifyAcceptance<'a> {
     ///
     /// The callback uses the request's detokenizer and boundary state. It never
     /// sees a rejected draft's successor or a token beyond the output budget.
-    /// Stop/EOS at the last permitted token takes precedence over `MaxTokens`.
+    /// Stop/EOS/activation at the last permitted token precedes `MaxTokens`.
+    /// Activation at draft `d_m` leaves `m-1` accepted drafts, with `d_m` pending.
+    /// Activation at the bonus sample leaves all matched drafts accepted.
     ///
     /// # Errors
     ///
