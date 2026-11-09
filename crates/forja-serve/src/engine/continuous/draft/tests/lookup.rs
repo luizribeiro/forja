@@ -318,3 +318,54 @@ async fn lookup_indexes_belong_to_the_request_even_at_equal_positions() -> Resul
     assert!(engine.draft_candidate(&mut unmatched).is_none());
     Ok(())
 }
+
+#[tokio::test]
+async fn zero_acceptance_exits_even_when_the_new_suffix_has_a_continuation() -> Result<(), TestError>
+{
+    use crate::{DraftSource, PromptLookup};
+    let profile = profile(2, 31);
+    let mut engine = engine().await?.with_profile_lookup(&profile);
+    let pattern = [0, 0, 0, 1, 2, 3, 1, 2];
+    let mut request = crate::engine::continuous::prefill::tests::request();
+    request.tokens = pattern
+        .into_iter()
+        .chain([1])
+        .chain(pattern[1..].iter().copied())
+        .chain([3])
+        .chain(pattern[..7].iter().copied())
+        .collect();
+    request.prompt_tokens = u32::try_from(request.tokens.len())?;
+    request.params.max_tokens = 7;
+    let lane = prepare_request(&mut engine, request, 0).await?;
+    let barrier = Arc::new(BatchTestBarrier::passive());
+    engine.set_batch_test_barrier(Arc::clone(&barrier));
+    let mut active = vec![lane];
+    assert!(engine.advance_drafting(&mut active, true).await);
+    assert_eq!(*barrier.verified.lock().unwrap(), [(3, 0)]);
+    let mut fresh = PromptLookup::new(profile.prompt_lookup().unwrap().clone());
+    let proposal = fresh.propose(
+        active[0].ledger().tokens(),
+        active[0].position,
+        active[0].sampling,
+    );
+    assert_eq!(proposal.tokens, [0, 0]);
+    assert!(!engine.advance_drafting(&mut active, true).await);
+    assert_eq!(active[0].draft_mode, DraftMode::Plain);
+    engine.runner.prepare_paged_lane(1, None, 1)?;
+    assert!(engine.runner.try_reserve_draft_lane(1)?);
+    assert!(engine.runner.try_release_draft_lane(1)?);
+    assert!(
+        direct::plain_step(&mut engine, &mut active[0])
+            .await?
+            .is_none()
+    );
+    let expected = fresh.propose(
+        active[0].ledger().tokens(),
+        active[0].position,
+        active[0].sampling,
+    );
+    let candidate = engine.draft_candidate(&mut active[0]).unwrap();
+    assert_eq!(candidate.fed.tokens(), expected.tokens);
+    assert_eq!(candidate.fed.shape().tokens, 3);
+    Ok(())
+}

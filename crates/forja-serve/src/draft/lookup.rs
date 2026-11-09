@@ -22,6 +22,8 @@ pub struct PromptLookup {
     indexed: usize,
     ends: HashMap<u64, u32>,
     previous: Vec<u32>,
+    blocked_at: Option<usize>,
+    rejection_delay: usize,
 }
 
 impl PromptLookup {
@@ -33,6 +35,8 @@ impl PromptLookup {
             indexed: 0,
             ends: HashMap::new(),
             previous: Vec::new(),
+            blocked_at: None,
+            rejection_delay: 0,
         }
     }
 }
@@ -40,6 +44,10 @@ impl PromptLookup {
 // Repetitive n-grams must not make query work grow with accepted history.
 const MAX_CHAIN_PROBES: usize = 64;
 const NO_OCCURRENCE: u32 = u32::MAX;
+
+// Failed episodes should become rarer while still periodically reconsidering
+// the accepted history, which continues to change after a rejection.
+const MAX_REJECTION_BACKOFF: usize = 64;
 
 fn ngram_hash(tokens: &[u32]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -99,7 +107,7 @@ impl DraftSource for PromptLookup {
             return DraftProposal::default();
         }
         let cap = self.policy.cap(position);
-        if cap == 0 {
+        if cap == 0 || self.blocked_at.is_some_and(|length| prefix.len() <= length) {
             return DraftProposal::default();
         }
         let minimum = *self.policy.match_lengths().start();
@@ -127,6 +135,20 @@ impl DraftSource for PromptLookup {
         DraftProposal {
             tokens,
             rule_cap: cap,
+        }
+    }
+
+    fn observe_acceptance(&mut self, accepted: u32) {
+        if accepted == 0 {
+            self.rejection_delay = self
+                .rejection_delay
+                .checked_mul(2)
+                .unwrap_or(MAX_REJECTION_BACKOFF)
+                .clamp(1, MAX_REJECTION_BACKOFF);
+            self.blocked_at = self.indexed.checked_add(self.rejection_delay);
+        } else {
+            self.rejection_delay = 0;
+            self.blocked_at = None;
         }
     }
 }
@@ -276,5 +298,53 @@ mod tests {
         assert_eq!(lookup.indexed, prefix.len());
         assert_eq!(lookup.previous.len(), prefix.len());
         assert_eq!(lookup.ends.len(), 0);
+    }
+
+    #[test]
+    fn diverging_repetitions_escalate_retry_delays_and_bound_verify_rounds() {
+        let minimum = 8;
+        let mut history = vec![0; minimum];
+        let mut lookup = source(minimum, 32);
+        let mut rounds = 0;
+        let mut delays = Vec::new();
+        for novel in 1..=u32::try_from(MAX_REJECTION_BACKOFF * 4).unwrap() {
+            for actual in [novel].into_iter().chain(std::iter::repeat_n(0, minimum)) {
+                let proposal = probe(&mut lookup, &history);
+                if let Some(&draft) = proposal.first() {
+                    assert_ne!(draft, actual);
+                    lookup.observe_acceptance(0);
+                    delays.push(lookup.rejection_delay);
+                    rounds += 1;
+                }
+                history.push(actual);
+            }
+        }
+        assert_eq!(lookup.rejection_delay, MAX_REJECTION_BACKOFF);
+        assert!(delays.starts_with(&[1, 2, 4, 8, 16, 32, MAX_REJECTION_BACKOFF]));
+        let steps = history.len() - minimum;
+        let ramp = usize::try_from(MAX_REJECTION_BACKOFF.ilog2()).unwrap();
+        assert!(rounds <= ramp + steps.div_ceil(MAX_REJECTION_BACKOFF + 1));
+        for accepted in 1..=2 {
+            lookup.observe_acceptance(accepted);
+            assert_eq!(lookup.rejection_delay, 0);
+            assert_ne!(probe(&mut lookup, &history), [] as [u32; 0]);
+            lookup.observe_acceptance(0);
+            assert_eq!(lookup.rejection_delay, 1);
+        }
+    }
+
+    #[test]
+    fn zero_acceptance_requires_an_observed_plain_token_before_reentry() {
+        let mut lookup = source(1, 7);
+        assert_eq!(probe(&mut lookup, &[1; 7]), [1]);
+        lookup.observe_acceptance(0);
+        assert_eq!(probe(&mut lookup, &[1; 7]), [] as [u32; 0]);
+        assert_eq!(probe(&mut lookup, &[1; 8]), [] as [u32; 0]);
+        assert_eq!(probe(&mut lookup, &[1; 9]), [1]);
+        assert_eq!(probe(&mut lookup, &[1; 7]), [] as [u32; 0]);
+        assert_eq!(
+            lookup.propose(&[1; 8], 8, SamplingParams::default()).tokens,
+            [] as [u32; 0]
+        );
     }
 }

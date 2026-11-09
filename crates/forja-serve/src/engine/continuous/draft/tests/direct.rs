@@ -112,7 +112,7 @@ pub(super) async fn run_engine(
     })
 }
 
-async fn plain_step(
+pub(super) async fn plain_step(
     engine: &mut ServingEngine<forja_cpu::CpuBackend>,
     lane: &mut BatchLane,
 ) -> Result<Option<FinishReason>, GenerationError> {

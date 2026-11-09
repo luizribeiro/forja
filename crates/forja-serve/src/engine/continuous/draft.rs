@@ -135,6 +135,11 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                     .map_or(error, draft_error));
             }
         };
+        if let Some((source, _)) =
+            lane.lane_source(self.drafter.as_deref_mut(), self.lookup_policy.as_ref())
+        {
+            source.observe_acceptance(accepted);
+        }
         lane.position = lane
             .position
             .checked_add(accepted)

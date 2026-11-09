@@ -17,6 +17,10 @@ pub trait DraftSource: Send {
     /// Proposes a continuation at the pending token's absolute fed position.
     fn propose(&mut self, prefix: &[u32], position: u32, sampling: SamplingParams)
     -> DraftProposal;
+
+    /// Observes the accepted draft count after a successful verify round.
+    /// Sources may use zero acceptance to end a drafting episode.
+    fn observe_acceptance(&mut self, _accepted: u32) {}
 }
 
 impl DraftProposal {
