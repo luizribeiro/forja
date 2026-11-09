@@ -24,6 +24,7 @@ mod recovery;
 mod selection_attempt;
 pub use selection_attempt::SelectionAttempt;
 mod slot_capture;
+pub mod speculative;
 mod state;
 mod state_inputs;
 pub use state::{
