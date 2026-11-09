@@ -17,6 +17,8 @@ use crate::{
 };
 
 mod batch;
+#[cfg_attr(not(test), allow(dead_code))]
+mod draft;
 mod lane;
 mod prefill;
 

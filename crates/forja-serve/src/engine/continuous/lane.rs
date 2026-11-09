@@ -53,6 +53,9 @@ impl Detokenizer {
 pub(super) struct BatchLane {
     pub(super) slot: u32,
     pub(super) pending_token: u32,
+    pub(super) draft_mode: crate::draft::DraftMode,
+    pub(super) draft_refused: bool,
+    pub(super) draft_probe_position: Option<u32>,
     pub(super) position: u32,
     pub(super) reserved_tokens: u64,
     pub(super) sampling: SamplingParams,
@@ -92,6 +95,9 @@ impl BatchLane {
         Self {
             slot,
             pending_token,
+            draft_mode: crate::draft::DraftMode::Plain,
+            draft_refused: false,
+            draft_probe_position: None,
             position: request.prompt_tokens,
             reserved_tokens: u64::from(request.prompt_tokens)
                 + u64::from(request.params.max_tokens),

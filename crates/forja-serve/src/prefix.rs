@@ -370,6 +370,10 @@ impl PrefixLedger {
             self.0.push(token);
         }
     }
+    pub(crate) fn tokens(&self) -> &[u32] {
+        &self.0
+    }
+
     pub(crate) fn into_tokens(self) -> Vec<u32> {
         self.0
     }

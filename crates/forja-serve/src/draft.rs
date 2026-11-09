@@ -16,7 +16,6 @@ pub trait DraftSource: Send {
     -> DraftProposal;
 }
 
-#[allow(dead_code)]
 impl DraftProposal {
     pub(crate) fn truncate_invalid_tokens(&mut self, vocab: u32) {
         let valid = self
