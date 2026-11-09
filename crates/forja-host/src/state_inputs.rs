@@ -140,11 +140,11 @@ impl<B: Backend + 'static> Host<B> {
         if commands
             .slot_capture
             .as_ref()
-            .is_some_and(crate::slot_capture::SlotCapture::prefill)
+            .is_some_and(crate::slot_capture::SlotCapture::single_lane)
             && commands.paged.iter().any(|usage| usage.lane != 0)
         {
             return Err(invalid_handle(
-                "prompt capture requires logical paged lane zero",
+                "single-lane capture requires logical paged lane zero",
             ));
         }
         for entry in &commands.retained {
@@ -163,7 +163,7 @@ impl<B: Backend + 'static> Host<B> {
                 )
                 .map_err(invalid_handle)?;
             if source.slot != scope.slot
-                || (scope.prefill() && source.lane != 0)
+                || (scope.single_lane() && source.lane != 0)
                 || usize::try_from(source.lane).map_err(invalid_handle)? >= slot.binding.lanes.len()
                 || entry.tensor.layout().element_count() != 1
                 || entry.tensor.is_writable()

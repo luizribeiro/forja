@@ -56,13 +56,17 @@ impl SlotCapture {
         self.shape.phase == BatchPhase::Prompt
     }
 
+    pub(crate) fn single_lane(&self) -> bool {
+        self.shape.phase != BatchPhase::Decode
+    }
+
     pub(crate) fn prompt_lane<B: Backend + 'static>(
         &self,
         host: &Host<B>,
         numerical: bool,
     ) -> Result<Option<PromptReplayLane>, compute::Error> {
         self.validate(host, numerical)?;
-        if !self.prefill() {
+        if !self.single_lane() {
             return Ok(None);
         }
         let slot = host
@@ -76,7 +80,7 @@ impl SlotCapture {
         let lane = active.next().map(|(lane, _)| lane);
         if active.next().is_some() {
             return Err(invalid_handle(
-                "prompt replay requires at most one active lane",
+                "single-lane replay requires at most one active lane",
             ));
         }
         Ok(lane.map(|lane| PromptReplayLane {
@@ -213,7 +217,7 @@ impl<B: Backend + 'static> Host<B> {
             if capture.slot != usage.slot
                 || usage.active
                 || usage.bank != 0
-                || (capture.prefill() && usage.lane != 0)
+                || (capture.single_lane() && usage.lane != 0)
                 || match capture.shape.phase {
                     BatchPhase::Prompt => false,
                     BatchPhase::Decode => usage.tokens != 1,
@@ -245,6 +249,117 @@ mod tests {
     use super::*;
     use crate::paged_storage::{CaptureKind, CaptureSelection};
 
+    fn declared_capture(
+        host: &mut Host<forja_cpu::CpuBackend>,
+        slot: &Resource<BatchSlotEntry>,
+        shape: BatchShape,
+    ) -> (Resource<CommandListEntry>, SlotCapture) {
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, slot, shape).unwrap();
+        let capture = host
+            .table
+            .get(&commands)
+            .unwrap()
+            .slot_capture
+            .clone()
+            .unwrap();
+        (commands, capture)
+    }
+
+    #[test]
+    fn verify_capture_refuses_nonzero_paged_and_token_source_lanes() {
+        let (mut host, _pool, slot) =
+            crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), 3, 8);
+        let shape = capture_shape(CaptureKind::Verify(3), CaptureSelection::Combined);
+        let (commands, _) = declared_capture(&mut host, &slot, shape);
+        let query = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[1, 1, 2]).unwrap();
+        let affine = |offset| crate::compute::Affine {
+            param: None,
+            scale: 0,
+            offset,
+        };
+        host.record_paged_attention(
+            &commands,
+            &slot,
+            1,
+            &query,
+            &output,
+            &crate::paged_storage::SdpaCfg {
+                key_plane: 0,
+                value_plane: 1,
+                scale: 1.0,
+                causal: true,
+                q_start: affine(0),
+                key_length: affine(1),
+                algorithm: String::new(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            host.validate_slot_capture_roles(host.table.get(&commands).unwrap())
+                .is_err()
+        );
+        host.drop_command_list(commands).unwrap();
+        let (commands, _) = declared_capture(&mut host, &slot, shape);
+        let token = host
+            .state_input_token_in_bank(slot.rep(), 1, Some(0))
+            .unwrap();
+        let output = host.alloc(compute::Dtype::U32, &[1]).unwrap();
+        host.dispatch(
+            &commands,
+            compute::Op::Copy,
+            &[Resource::new_borrow(token.rep())],
+            &output,
+        )
+        .unwrap();
+        assert!(
+            host.validate_slot_capture_roles(host.table.get(&commands).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_remaps_only_the_single_active_lane_in_the_selected_bank() {
+        let (mut host, _pool, slot) =
+            crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), 3, 8);
+        let (commands, capture) = declared_capture(
+            &mut host,
+            &slot,
+            capture_shape(CaptureKind::Verify(3), CaptureSelection::Combined),
+        );
+        for bank in 0..2 {
+            host.table.get_mut(&slot).unwrap().active_bank = bank;
+            for lane in 0..8 {
+                let binding = Arc::clone(&host.table.get(&slot).unwrap().binding);
+                assert!(capture.prompt_lane(&host, false).unwrap().is_none());
+                binding.activity[bank][lane].store(true, Ordering::Release);
+                let remap = capture.prompt_lane(&host, true).unwrap();
+                assert_eq!(PromptReplayLane::map(remap, slot.rep(), 0), lane);
+                assert_eq!(PromptReplayLane::map(remap, u32::MAX, 0), 0);
+                assert_eq!(PromptReplayLane::map(remap, slot.rep(), 1), 1);
+                let peer = (lane + 1) % 8;
+                binding.activity[bank][peer].store(true, Ordering::Release);
+                assert!(capture.prompt_lane(&host, true).is_err());
+                binding.activity[bank][peer].store(false, Ordering::Release);
+                binding.activity[bank][lane].store(false, Ordering::Release);
+                let usage = crate::hybrid::StateUse {
+                    slot: slot.rep(),
+                    bank: 0,
+                    lane: 7,
+                    active: false,
+                    tokens: 3,
+                };
+                assert!(
+                    host.with_state_commands(usage, Some(&capture), |_| Ok(()))
+                        .is_err()
+                );
+            }
+        }
+        host.drop_command_list(commands).unwrap();
+    }
+
     #[test]
     fn two_plane_verify_traces_advance_every_row_and_refuse_extra_links() {
         use crate::hybrid::StateUse;
@@ -267,15 +382,7 @@ mod tests {
                 },
                 CaptureSelection::Combined,
             );
-            let commands = host.command_list().unwrap();
-            host.declare_slot_capture(&commands, &slot, shape).unwrap();
-            let capture = host
-                .table
-                .get(&commands)
-                .unwrap()
-                .slot_capture
-                .clone()
-                .unwrap();
+            let (commands, capture) = declared_capture(&mut host, &slot, shape);
             let usage = StateUse {
                 slot: slot.rep(),
                 bank: 0,
@@ -325,20 +432,11 @@ mod tests {
             (CaptureKind::Verify(2), 2),
             (CaptureKind::Verify(3), 3),
         ] {
-            let commands = host.command_list().unwrap();
-            host.declare_slot_capture(
-                &commands,
+            let (commands, capture) = declared_capture(
+                &mut host,
                 &slot,
                 capture_shape(kind, CaptureSelection::Combined),
-            )
-            .unwrap();
-            let capture = host
-                .table
-                .get(&commands)
-                .unwrap()
-                .slot_capture
-                .clone()
-                .unwrap();
+            );
             let usage = StateUse {
                 slot: slot.rep(),
                 bank: 0,
