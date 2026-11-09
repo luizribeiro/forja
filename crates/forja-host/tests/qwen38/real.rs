@@ -24,9 +24,12 @@ async fn load_configured(
     layers: Option<u32>,
     context: Option<u32>,
 ) -> Result<(Runner, golden_fixtures::FixtureDirectory), Box<dyn Error>> {
-    let component = env::var_os("FORJA_QWEN38_COMPONENT")
-        .map_or_else(|| test_guests::qwen38().to_path_buf(), PathBuf::from);
-    load_profiled(replay, layers, context, component).await
+    load_profiled(replay, layers, context, component()).await
+}
+
+fn component() -> PathBuf {
+    env::var_os("FORJA_QWEN38_COMPONENT")
+        .map_or_else(|| test_guests::qwen38().to_path_buf(), PathBuf::from)
 }
 
 async fn load_profiled(

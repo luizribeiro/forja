@@ -885,6 +885,7 @@ dependencies = [
  "forja-program-conversions",
  "forja-sampling",
  "forja-sdk",
+ "forja-serve",
  "forja-testing",
  "golden-fixtures",
  "olmoe",
