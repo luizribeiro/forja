@@ -71,6 +71,7 @@ pub(super) struct BatchLane {
     prompt_tokens: u32,
     cached_tokens: u32,
     started: std::time::Instant,
+    decode_started: std::time::Instant,
     consumed: u32,
     decoder: Detokenizer,
     boundary: BoundaryState,
@@ -121,6 +122,7 @@ impl BatchLane {
             prompt_tokens: request.prompt_tokens,
             cached_tokens,
             started: request.started,
+            decode_started: std::time::Instant::now(),
             consumed: 0,
             text: String::new(),
             token_ids: Vec::new(),
@@ -286,6 +288,8 @@ impl BatchLane {
             .and_then(|constraint| constraint.parser);
         let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
         let reason = crate::engine::tool_finish_reason(reason, &tool_call);
+        self.drafting.decode_wall_ns =
+            u64::try_from(self.decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.drafting.exit(match reason {
             FinishReason::Length => "max-tokens",
             FinishReason::Stop => "stop-or-eos",
@@ -437,6 +441,7 @@ mod tests {
         assert!(!lane.needs_successor());
         let completion = lane.completion(FinishReason::Length).await.unwrap();
         assert_eq!(completion.usage.completion_tokens, 7);
+        assert!(completion.drafting.decode_wall_ns > 0);
         assert_eq!(completion.token_ids, [0, 1, 0, 1, 1, 0, 1]);
         assert_eq!(completion.text, "ababbab");
     }

@@ -17,6 +17,8 @@ pub struct DraftMetrics {
     pub episode_entry_reasons: BTreeMap<String, u64>,
     /// Exits indexed by the event that ended the episode.
     pub episodes_exited: BTreeMap<String, u64>,
+    /// Wall time from prompt completion through the terminal decode boundary.
+    pub decode_wall_ns: u64,
     /// GPU time for completed verify calls, excluding plain and prompt work.
     pub verify_gpu_ns: u64,
     #[serde(skip)]
