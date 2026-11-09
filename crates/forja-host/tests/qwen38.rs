@@ -250,13 +250,13 @@ mod verification;
 fn serving_catalog_preserves_eager_bucket_and_tail_budgets() {
     use forja_sdk::{BatchPhase, BatchSelection};
     let shapes = qwen38::Qwen38::serving_shapes();
-    assert_eq!(shapes.len(), 15);
+    assert_eq!(shapes.len(), 13);
     for bucket in [1, 2, 4, 8] {
         let decode = shapes
             .iter()
             .filter(|shape| shape.phase == BatchPhase::Decode && shape.bucket == bucket)
             .collect::<Vec<_>>();
-        assert_eq!(decode.len(), 3);
+        assert_eq!(decode.len(), if bucket == 8 { 1 } else { 3 });
         for selection in [
             BatchSelection::Combined,
             BatchSelection::Forward,
@@ -267,7 +267,7 @@ fn serving_catalog_preserves_eager_bucket_and_tail_budgets() {
                     .iter()
                     .filter(|shape| shape.selection == selection && shape.tokens == 1)
                     .count(),
-                1
+                usize::from(bucket != 8 || selection == BatchSelection::Combined)
             );
         }
     }
@@ -383,7 +383,7 @@ fn component_metadata_declares_the_text_only_batched_contract() -> Result<(), Bo
             .iter()
             .all(|plane| plane.elements_per_token == 1024 && plane.alignment == 256)
     );
-    assert_eq!(serving.batch_shapes.len(), 15);
+    assert_eq!(serving.batch_shapes.len(), 13);
     assert_eq!(profile.workload().prefill_chunk.get(), 2048);
     assert_eq!(
         profile

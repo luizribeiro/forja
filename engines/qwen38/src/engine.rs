@@ -31,7 +31,7 @@ pub struct Qwen38 {
     feedback: Feedback,
 }
 impl Qwen38 {
-    /// Returns the finite serving shapes; the eight-lane shapes execute eagerly.
+    /// Returns the finite serving shapes; eight-lane combined decode executes eagerly.
     #[must_use]
     pub fn serving_shapes() -> Vec<forja_sdk::BatchShape> {
         use forja_sdk::{BatchPhase, BatchSelection, BatchShape};
@@ -50,6 +50,7 @@ impl Qwen38 {
                     selection,
                 })
             })
+            .filter(|shape| shape.bucket != 8 || shape.selection == BatchSelection::Combined)
             .chain([64, 512, 2048].map(|tokens| BatchShape {
                 phase: BatchPhase::Prompt,
                 bucket: 1,

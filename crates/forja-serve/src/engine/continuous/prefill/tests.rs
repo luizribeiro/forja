@@ -102,7 +102,7 @@ pub(in crate::engine::continuous) fn request() -> PreparedRequest {
 async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> Result<(), TestError>
 {
     let mut engine = engine().await?;
-    for slot in [0, 7] {
+    for slot in [0, 3] {
         engine.runner.prepare_paged_lane(slot, None, 0)?;
         engine.runner.prepare_paged_lane(slot, None, 67)?;
     }
@@ -115,7 +115,7 @@ async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> R
     assert_eq!(allow, [2, 0]);
     let mut prefill = PendingPrefill {
         request: request(),
-        slot: 7,
+        slot: 3,
         sampling: forja_host::SamplingParams::default(),
         tokenizer: engine.tokenizer()?,
         cached: 0,
@@ -137,7 +137,7 @@ async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> R
     assert_eq!(
         engine
             .runner
-            .checkpoint_state_lane(7)?
+            .checkpoint_state_lane(3)?
             .ok_or("missing carry")?
             .position()
             .tokens,
@@ -150,7 +150,7 @@ async fn chunked_constrained_prefill_selects_only_the_final_physical_lane() -> R
     );
     let position = engine
         .runner
-        .checkpoint_state_lane(7)?
+        .checkpoint_state_lane(3)?
         .ok_or("missing carry")?
         .position();
     assert_eq!(
@@ -493,19 +493,19 @@ async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
     let mut input = request();
     input.prefix_reuse = true;
     let hit = engine
-        .begin_batch_prefill(input, 7)
+        .begin_batch_prefill(input, 3)
         .await
         .map_err(|(_, error)| error)?;
     assert_eq!((hit.cached, hit.position), (64, 64));
-    let before = engine.runner.state_lane_fingerprint(7)?;
+    let before = engine.runner.state_lane_fingerprint(3)?;
     let mut checkpoint = EngineLaneCheckpoint::new(
         63,
         0,
         (),
         hit.reserved,
-        engine.runner.checkpoint_paged_lane(7)?.unwrap(),
+        engine.runner.checkpoint_paged_lane(3)?.unwrap(),
     );
-    checkpoint.state_version = engine.runner.checkpoint_state_lane(7)?;
+    checkpoint.state_version = engine.runner.checkpoint_state_lane(3)?;
     let tail = engine
         .runner
         .batch_step(EngineBatch {
@@ -516,15 +516,15 @@ async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
                 selection: BatchSelection::Combined,
             },
             lanes: vec![Some(EngineBatchLane {
-                slot: 7,
+                slot: 3,
                 tokens: Some(vec![0]),
                 start_pos: 64,
                 sampling: SamplingParams::default(),
             })],
         })
         .await??;
-    let mut lanes = vec![None; 8];
-    lanes[7] = Some(EngineBatchSelectLane {
+    let mut lanes = vec![None; 4];
+    lanes[3] = Some(EngineBatchSelectLane {
         start_pos: 64,
         sampling: SamplingParams::default(),
         allow: TokenIds::new(vec![1]),
@@ -536,7 +536,7 @@ async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
             EngineBatchSelect {
                 shape: BatchShape {
                     phase: BatchPhase::Decode,
-                    bucket: 8,
+                    bucket: 4,
                     tokens: 1,
                     selection: BatchSelection::Masked,
                 },
@@ -545,11 +545,11 @@ async fn paired_hit_admission_supports_immediate_constrained_selection_rewind()
         )
         .await??;
     let selected = engine.runner.read_queued_batch_tokens(selected).await?;
-    assert_eq!(super::super::read_batch_tokens(&selected)?[7], 1);
-    engine.runner.rollback_lane(7, checkpoint)?;
-    assert_eq!(engine.runner.state_lane_fingerprint(7)?, before);
+    assert_eq!(super::super::read_batch_tokens(&selected)?[3], 1);
+    engine.runner.rollback_lane(3, checkpoint)?;
+    assert_eq!(engine.runner.state_lane_fingerprint(3)?, before);
     assert_eq!(
-        engine.runner.paged_lane_prefix(7)?.unwrap().logical_len()?,
+        engine.runner.paged_lane_prefix(3)?.unwrap().logical_len()?,
         64
     );
     assert_eq!(engine.runner.state_lane_fingerprint(0)?, parent_bits);

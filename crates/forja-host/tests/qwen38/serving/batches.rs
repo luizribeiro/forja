@@ -288,7 +288,7 @@ async fn partial_selection_case(bucket: u32, replay: bool) -> Result<(), Box<dyn
 #[tokio::test]
 async fn partial_selection_preserves_another_resident_lane_and_its_feedback()
 -> Result<(), Box<dyn Error>> {
-    for bucket in [2, 4, 8] {
+    for bucket in [2, 4] {
         for replay in [false, true] {
             partial_selection_case(bucket, replay).await?;
         }
