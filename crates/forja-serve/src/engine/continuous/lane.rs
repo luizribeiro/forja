@@ -1,6 +1,9 @@
 use tokio::sync::{mpsc, oneshot};
 
-use forja_host::SamplingParams;
+use forja_host::{
+    SamplingParams,
+    speculative::{VerifyAcceptance, VerifyCut, VerifyDecision},
+};
 
 use super::{CompletionSink, PreparedRequest};
 use crate::engine::{
@@ -136,6 +139,30 @@ impl BatchLane {
             }
         }
         Ok(None)
+    }
+
+    pub(super) async fn accept_verified<'a>(
+        &mut self,
+        acceptance: VerifyAcceptance<'a>,
+        stop_tokens: &[u32],
+        metrics: &mut ServingMetrics,
+    ) -> Result<VerifyDecision<'a>, GenerationError> {
+        acceptance
+            .scan_async(&mut (self, metrics), |(lane, metrics), token| {
+                Box::pin(async move {
+                    if lane.control.is_cancelled() {
+                        return Err(GenerationError::cancelled());
+                    }
+                    let reason = lane.accept(token, stop_tokens, metrics).await?;
+                    Ok(reason.map(|reason| match reason {
+                        FinishReason::Stop if stop_tokens.contains(&token) => VerifyCut::Eos,
+                        FinishReason::Stop => VerifyCut::Stop,
+                        FinishReason::Length => VerifyCut::MaxTokens,
+                        FinishReason::ToolCalls => VerifyCut::Activate,
+                    }))
+                })
+            })
+            .await
     }
 
     pub(super) fn remaining_tokens(&self) -> u64 {
@@ -288,8 +315,7 @@ impl BatchLane {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn accepted_rounds_stream_in_order_with_one_shared_output_budget() {
+    fn streaming_lane(stops: &[&str]) -> (BatchLane, mpsc::Receiver<crate::GenerationEvent>) {
         let model = tokenizers::models::bpe::BPE::builder()
             .vocab_and_merges([("a".to_owned(), 0), ("b".to_owned(), 1)], Vec::new())
             .build()
@@ -298,10 +324,60 @@ mod tests {
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
         let mut request = crate::engine::continuous::prefill::tests::request();
         request.params.max_tokens = 7;
-        let (events, mut received) = mpsc::channel(16);
+        request.params.stops = stops.iter().map(|stop| (*stop).to_owned()).collect();
+        let (events, received) = mpsc::channel(16);
         let (reply, _receiver) = oneshot::channel();
         request.sink = CompletionSink::Stream { events, reply };
-        let mut lane = BatchLane::new(request, 0, 0, 0, SamplingParams::default(), tokenizer, None);
+        let lane = BatchLane::new(request, 0, 0, 0, SamplingParams::default(), tokenizer, None);
+        (lane, received)
+    }
+
+    fn acceptance<'a>(samples: &'a [u32], drafts: &[u32]) -> VerifyAcceptance<'a> {
+        use forja_host::{
+            BatchPhase, BatchSelection, BatchShape,
+            speculative::{VerifyBudget, select_verify_shape},
+        };
+        let shapes = [BatchShape {
+            phase: BatchPhase::Verify,
+            selection: BatchSelection::Combined,
+            bucket: 1,
+            tokens: u32::try_from(samples.len()).unwrap(),
+        }];
+        let fed = select_verify_shape(&shapes, drafts, VerifyBudget::new(7, 2, 7, 32, 32).unwrap())
+            .unwrap();
+        VerifyAcceptance::new(fed, samples, 2).unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_stop_strings_span_rounds_without_scanning_or_streaming_the_tail() {
+        let (mut lane, mut events) = streaming_lane(&["bba"]);
+        let mut metrics = ServingMetrics::default();
+        let first = lane
+            .accept_verified(acceptance(&[0, 1], &[0]), &[], &mut metrics)
+            .await
+            .unwrap();
+        assert_eq!(first.cut(), None);
+        let second = lane
+            .accept_verified(acceptance(&[1, 0, 1], &[1, 0]), &[], &mut metrics)
+            .await
+            .unwrap();
+        assert_eq!(second.cut(), Some(VerifyCut::Stop));
+        assert_eq!(second.accepted(), 1);
+        assert_eq!(second.tokens(), [1, 0]);
+        assert_eq!(lane.token_ids, [0, 1, 1, 0]);
+        assert_eq!(lane.text, "a");
+        assert_eq!(lane.remaining_tokens(), 3);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            crate::GenerationEvent::Content("a".to_owned())
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(&lane.ledger().tokens()[65..], &[0, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn accepted_rounds_stream_in_order_with_one_shared_output_budget() {
+        let (mut lane, mut received) = streaming_lane(&[]);
         let mut metrics = ServingMetrics::default();
         assert_eq!(
             lane.accept_tokens(&[0, 1, 0], &[], &mut metrics)

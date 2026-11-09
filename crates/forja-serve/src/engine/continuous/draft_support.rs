@@ -104,6 +104,21 @@ pub(super) async fn run_with_stop(
     max_tokens: u32,
     stop: Option<u32>,
 ) -> Result<Trace, TestError> {
+    Box::pin(run_with_boundaries(
+        sampling, drafter, count, cap, max_tokens, stop, None,
+    ))
+    .await
+}
+
+pub(super) async fn run_with_boundaries(
+    sampling: SamplingParams,
+    drafter: Option<TestDrafter>,
+    count: usize,
+    cap: u32,
+    max_tokens: u32,
+    stop: Option<u32>,
+    stop_text: Option<String>,
+) -> Result<Trace, TestError> {
     let mut engine = engine().await?;
     engine.chat_info.stop_token_ids = stop.into_iter().collect();
     if let Some(drafter) = drafter {
@@ -116,12 +131,23 @@ pub(super) async fn run_with_stop(
     }
     let barrier = Arc::new(BatchTestBarrier::passive());
     engine.set_batch_test_barrier(Arc::clone(&barrier));
-    let (request, reply) = envelope(sampling, max_tokens);
+    let (mut request, reply) = envelope(sampling, max_tokens);
+    if let RequestEnvelope::Text { request, .. } = &mut request {
+        request.params.stop = stop_text.clone().map(crate::Stop::One);
+    }
     let (_sender, mut receiver) = mpsc::channel(2);
     engine
         .run_batch_lanes(&mut receiver, &mut VecDeque::from([request]))
         .await;
     let completion = reply.await??;
+    if let Some(stop_text) = &stop_text {
+        let decoded: String = completion
+            .token_ids
+            .iter()
+            .map(|id| char::from(b'a' + u8::try_from(*id).unwrap()))
+            .collect();
+        assert_eq!(completion.text, decoded.split(stop_text).next().unwrap());
+    }
     let verified = barrier.verified.lock().unwrap();
     Ok(Trace {
         output: None,
@@ -131,7 +157,11 @@ pub(super) async fn run_with_stop(
         plain: usize::try_from(barrier.decoded_batches.load(Ordering::Acquire))?,
         cut: match completion.finish_reason {
             FinishReason::Length => Some(forja_host::speculative::VerifyCut::MaxTokens),
-            FinishReason::Stop => Some(forja_host::speculative::VerifyCut::Eos),
+            FinishReason::Stop => Some(if stop_text.is_some() {
+                forja_host::speculative::VerifyCut::Stop
+            } else {
+                forja_host::speculative::VerifyCut::Eos
+            }),
             FinishReason::ToolCalls => None,
         },
     })

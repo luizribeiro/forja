@@ -4,7 +4,7 @@ mod tests;
 use forja_core::Backend;
 use forja_host::{
     BatchPhase, EngineBatch, EngineBatchLane, EngineBatchOutput,
-    speculative::{FedDrafts, VerifyAcceptance, VerifyBudget, select_verify_shape},
+    speculative::{FedDrafts, VerifyAcceptance, VerifyBudget, VerifyCut, select_verify_shape},
 };
 
 use super::{lane::BatchLane, read_batch_tokens};
@@ -121,7 +121,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .pop()
             .ok_or_else(|| GenerationError::new("draft checkpoint is missing"))?;
         let result = self.verify_tokens(lane, candidate).await;
-        let (tokens, accepted) = match result {
+        let (accepted, finish) = match result {
             Ok(output) => output,
             Err(error) => {
                 return Err(self
@@ -136,15 +136,14 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             .checked_add(accepted)
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| GenerationError::new("verify position overflowed"))?;
-        lane.accept_tokens(&tokens, &self.chat_info.stop_token_ids, &mut self.metrics)
-            .await
+        Ok(finish)
     }
 
     async fn verify_tokens(
         &mut self,
-        lane: &BatchLane,
+        lane: &mut BatchLane,
         Candidate { fed }: Candidate,
-    ) -> Result<(Vec<u32>, u32), GenerationError> {
+    ) -> Result<(u32, Option<FinishReason>), GenerationError> {
         let shape = fed.shape();
         let mut tokens = vec![lane.pending_token];
         tokens.extend_from_slice(fed.tokens());
@@ -178,9 +177,17 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 return Err(self.abandon_output(output, error).await);
             }
         };
-        let decision = VerifyAcceptance::new(fed, &samples, self.info.vocab)
-            .and_then(|acceptance| acceptance.scan(|_| Ok(None)))
-            .map_err(draft_error);
+        let decision = match VerifyAcceptance::new(fed, &samples, self.info.vocab) {
+            Ok(acceptance) => {
+                lane.accept_verified(
+                    acceptance,
+                    &self.chat_info.stop_token_ids,
+                    &mut self.metrics,
+                )
+                .await
+            }
+            Err(error) => Err(draft_error(error)),
+        };
         let decision = match decision {
             Ok(decision) if !lane.control.is_cancelled() => decision,
             result => {
@@ -193,10 +200,23 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             }
         };
         let accepted = decision.accepted();
-        let emitted = decision.tokens().to_vec();
+        let finish = match decision.cut() {
+            Some(VerifyCut::Stop | VerifyCut::Eos) => Some(FinishReason::Stop),
+            Some(VerifyCut::MaxTokens) => Some(FinishReason::Length),
+            Some(VerifyCut::Activate) => {
+                return Err(self
+                    .abandon_output(
+                        output,
+                        GenerationError::new("verify round cannot activate a tool constraint"),
+                    )
+                    .await);
+            }
+            None => None,
+        };
         self.runner
             .publish_verified_batch(output, &decision)
             .map_err(draft_error)?;
+        lane.pending_token = decision.pending();
         #[cfg(test)]
         if let Some(barrier) = &self.batch_test_barrier {
             barrier
@@ -205,7 +225,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 .unwrap()
                 .push((shape.tokens, accepted));
         }
-        Ok((emitted, accepted))
+        Ok((accepted, finish))
     }
     async fn abandon_output(
         &mut self,

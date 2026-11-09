@@ -1,3 +1,4 @@
+mod cuts;
 mod direct;
 use super::super::{RequestEnvelope, draft_support::*};
 use super::*;
@@ -394,5 +395,94 @@ async fn candidates_bind_one_owned_prefix_and_refuse_ineligible_lanes() -> Resul
         .retain(|shape| shape.phase != BatchPhase::Verify);
     assert!(engine.draft_candidate(&mut lane).is_none());
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn multi_token_stop_strings_match_plain_decode_for_every_test_drafter() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for length in [3, 4, 5] {
+        assert_draft_exact(true, |sampling, drafter| {
+            let mut prefix = vec![1; 7];
+            let stop: String = (0..length)
+                .map(|_| {
+                    let token = target(&prefix, sampling);
+                    prefix.push(token);
+                    char::from(b'a' + u8::try_from(token).unwrap())
+                })
+                .collect();
+            let trace = runtime
+                .block_on(run_with_boundaries(
+                    sampling,
+                    drafter,
+                    2,
+                    2,
+                    17,
+                    None,
+                    Some(stop),
+                ))
+                .unwrap();
+            assert_eq!(trace.tokens.len(), length);
+            assert_eq!(trace.cut, Some(forja_host::speculative::VerifyCut::Stop));
+            trace
+        });
+    }
+}
+
+#[tokio::test]
+async fn unexpected_verify_activation_rolls_back_without_publication() -> Result<(), TestError> {
+    let mut engine = engine().await?.with_drafter(source(Arc::default()));
+    let mut prepared = prepared_lane(&mut engine, 7, 0).await?;
+    let candidate = engine.draft_candidate(&mut prepared).unwrap();
+    assert!(engine.runner.try_reserve_draft_lane(0)?);
+    let guidance = engine.guidance.compile(r#"start: "d""#.to_owned()).await?;
+    let allow = guidance.mask().await?.unwrap();
+    let mut request = crate::engine::continuous::prefill::tests::request();
+    request.tokens = vec![1; 7];
+    request.prompt_tokens = 7;
+    request.params.max_tokens = 7;
+    let mut lane = BatchLane::new(
+        request,
+        0,
+        0,
+        prepared.pending_token,
+        SamplingParams::default(),
+        engine.tokenizer()?,
+        Some(crate::engine::continuous::lane::BatchConstraint {
+            guidance,
+            allow,
+            parser: None,
+        }),
+    );
+    assert!(lane.is_constrained());
+    let before = engine.runner.checkpoint_state_lane(0)?.unwrap().position();
+    let fingerprint = engine.runner.state_lane_fingerprint(0)?;
+    let barrier = Arc::new(BatchTestBarrier::passive());
+    engine.set_batch_test_barrier(Arc::clone(&barrier));
+    let error = engine
+        .run_draft_round(&mut lane, candidate)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "verify round cannot activate a tool constraint"
+    );
+    assert_eq!(
+        engine.runner.checkpoint_state_lane(0)?.unwrap().position(),
+        before
+    );
+    assert_eq!(engine.runner.state_lane_fingerprint(0)?, fingerprint);
+    assert_eq!(
+        engine
+            .runner
+            .checkpoint_paged_lane(0)?
+            .unwrap()
+            .logical_len(),
+        before.tokens
+    );
+    assert_eq!(*barrier.verified.lock().unwrap(), []);
+    assert_eq!(lane.pending_token, prepared.pending_token);
+    assert_eq!(u64::from(lane.position), before.tokens);
+    assert!(engine.runner.try_release_draft_lane(0)?);
     Ok(())
 }
