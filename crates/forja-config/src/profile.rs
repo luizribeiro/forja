@@ -85,6 +85,12 @@ impl Profile {
         self.0.serving.as_ref()
     }
 
+    /// Returns the guest's optional accepted-history lookup policy.
+    #[must_use]
+    pub const fn prompt_lookup(&self) -> Option<&crate::LookupPolicy> {
+        self.0.prompt_lookup.as_ref()
+    }
+
     /// Returns the default tuning names.
     #[must_use]
     pub fn default_tunings(&self) -> &[String] {
@@ -153,6 +159,8 @@ struct ProfileData {
     numerics: Numerics,
     workload: Workload,
     serving: Option<Serving>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_lookup: Option<crate::LookupPolicy>,
     variants: Variants,
     tuning_variants: BTreeMap<String, Variants>,
     quantization: Option<Quantization>,
@@ -494,6 +502,14 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     }
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
+    }
+    if let Some(lookup) = &profile.prompt_lookup
+        && (profile.serving.is_none()
+            || lookup.context_limit() != u64::from(profile.workload.max_context.get()))
+    {
+        return Err(
+            "prompt-lookup requires serving and context arms covering max-context".to_owned(),
+        );
     }
     if profile
         .serving

@@ -33,6 +33,12 @@ state-snapshot-interval = 4096
 prompt-token-budget = 2048
 paged-cache = true
 
+[prompt-lookup]
+min-match = 8
+max-suffix = 32
+max-drafts = 2
+k-rule = [{ lo = 0, hi = 32767, k = 2 }]
+
 [variants.fixed]
 quant = "quant-matmul.tiled-k64"
 quant-decode = "quant-matmul.vector8-2g"

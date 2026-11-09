@@ -54,6 +54,49 @@ fn error(source: &str) -> String {
 }
 
 #[test]
+fn lookup_policy_is_optional_and_part_of_the_profile_identity() {
+    let plain: Profile = toml::from_str(PROFILE).unwrap();
+    assert!(plain.prompt_lookup().is_none());
+    assert!(!plain.canonical_toml().unwrap().contains("prompt-lookup"));
+    let source = format!(
+        "{PROFILE}\n[prompt-lookup]\nmin-match = 8\nmax-suffix = 32\nmax-drafts = 2\nk-rule = [{{ lo = 0, hi = 4095, k = 2 }}]\n"
+    );
+    let profile: Profile = toml::from_str(&source).unwrap();
+    assert_eq!(profile.prompt_lookup().unwrap().cap(33), 2);
+    assert_ne!(plain.sha256().unwrap(), profile.sha256().unwrap());
+    assert_eq!(
+        toml::from_str::<Profile>(&profile.canonical_toml().unwrap()).unwrap(),
+        profile
+    );
+    assert!(
+        error(&source.replace("hi = 4095, k = 2", "hi = 4094, k = 2"))
+            .contains("covering max-context")
+    );
+    assert!(
+        error(&source.replace("[serving]\nprompt-token-budget = 512\n", ""))
+            .contains("requires serving")
+    );
+}
+
+#[test]
+fn qwen38_declares_lookup_without_changing_its_weight_identity() {
+    let profile: Profile = toml::from_str(include_str!(
+        "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml"
+    ))
+    .unwrap();
+    let policy = profile.prompt_lookup().unwrap();
+    assert_eq!(policy.match_lengths(), 8..=32);
+    assert_eq!(
+        (policy.cap(0), policy.cap(32767), policy.cap(32768)),
+        (2, 2, 0)
+    );
+    assert_eq!(
+        profile.model().weights_sha256,
+        "sha256:35735f203613e028e6654d7b4f7a3c07da5e5aad896bd5dd453f1529e11d0367"
+    );
+}
+
+#[test]
 fn parses_and_canonicalizes_a_dense_profile() {
     let profile: Profile = toml::from_str(PROFILE).unwrap();
     assert_eq!(profile.schema_version(), 1);
