@@ -4098,6 +4098,7 @@ pub struct Host<B: Backend> {
     live_kernels: Arc<AtomicUsize>,
     live_graphs: Arc<AtomicUsize>,
     verify_graph_budget: usize,
+    capture_shapes: Vec<BatchShape>,
     prepared_graphs: AtomicU64,
     graph_replays: AtomicU64,
     graph_preparation_time_ns: AtomicU64,
@@ -4144,6 +4145,7 @@ impl<B: Backend + 'static> Host<B> {
             live_kernels: Arc::new(AtomicUsize::new(0)),
             live_graphs: Arc::new(AtomicUsize::new(0)),
             verify_graph_budget: 0,
+            capture_shapes: Vec::new(),
             prepared_graphs: AtomicU64::new(0),
             graph_replays: AtomicU64::new(0),
             graph_preparation_time_ns: AtomicU64::new(0),
@@ -6820,6 +6822,7 @@ impl<B: Backend + 'static> Host<B> {
             ));
         }
         self.verify_graph_budget = budget;
+        self.capture_shapes.clone_from(&serving.batch_shapes);
         Ok(())
     }
 
@@ -10188,6 +10191,7 @@ mod tests {
 
     include!("state/paged_lifecycle_tests.rs");
     include!("recovery_tests.rs");
+    include!("capture_equivalence/test_support.rs");
 
     impl<B: Backend + Send + Sync + 'static> Host<B> {
         fn test_capture(
@@ -13407,7 +13411,9 @@ mod tests {
                 }],
             };
             host.register_batch_shapes(&serving).unwrap();
+            assert_eq!(host.capture_shapes, serving.batch_shapes);
             host.register_batch_shapes(&serving).unwrap();
+            assert_eq!(host.capture_shapes, serving.batch_shapes);
             let limit = if verify { 19 } else { 16 };
             assert_eq!(host.limits.live_graphs, 16);
             assert_eq!(host.graph_limit().unwrap(), limit);
