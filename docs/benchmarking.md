@@ -498,3 +498,119 @@ constructor as well as the server admission limit. Its separate `--audit-log` mo
 records actual BatchGenerator request IDs and cache types. Collect admission
 proof with observation enabled, then disable observation for timing runs and
 retain the matching source/configuration identities.
+
+### Scheduled completion records
+
+`forja bench completion` runs rendered prompt files plus their declared suffixes through the serving
+scheduler. Plain decoding is the default. `--mode draft` enables only the
+embedded profile's prompt-lookup policy; it requires `--plain-record` from the
+same model, component, tokenizer, prompt, seed and effective configuration.
+A mismatched token stream fails the command and retains a record marked
+`stream_check.status = "failed"`. The reusable check is:
+
+```sh
+forja bench check-streams --plain plain.json --draft draft.json
+```
+
+`bench/suites/prompt-lookup.json` defines the original prompt fixtures, their
+sources, fixed seeds and thresholds. Padding uses 256 distinct synthetic background
+documents from unrelated survey/catalogue topics; its deterministic generator
+and seed are checked in. Every ordinary row records its own acceptance counts. Select regular rows with `--row NAME`;
+select the separate long group with `--group long`. Long workloads reserve
+32,512 prompt tokens plus 256 generated tokens within the profile's 32,768-token
+limit. Records retain the actual rendered prompt length and hash.
+
+```sh
+forja bench completion --engine /path/engine.wasm --model /path/model --chat-format /path/chat.wasm --suite bench/suites/prompt-lookup.json --row code-edit-short --set limits.dispatches_per_list=8192 --reps 1 --json plain.json
+forja bench completion --engine /path/engine.wasm --model /path/model --chat-format /path/chat.wasm --suite bench/suites/prompt-lookup.json --row code-edit-short --set limits.dispatches_per_list=8192 --reps 1 --mode draft --plain-record plain.json --json draft.json
+```
+
+Both modes use identical quotas and profile settings. `--cached` prepares a
+prefix before each measured request; `cached_tokens` records whether reuse
+actually occurred. It changes no lookup setting. A cached draft record requires
+a correspondingly cached plain record.
+
+Per-row observations include rounds, exact accepted-depth counts, mean accepted
+drafts, k (zero in plain mode), committed effective-k counts, episode
+entry/exit reasons, policy identity, GPU times, and ordered per-request token
+hashes. GPU time labelled plain includes prompt work and excludes Verify.
+Decode wall spans start after prompt completion; whole-group wall time includes
+prompt execution. Repetitions are whole request groups, with raw windows and
+median/95% confidence intervals. Token hashes use little-endian u32 IDs;
+`output_digest` binds the ordered request hashes without logits. Records retain
+finish reasons and output counts; shortened outputs, non-length finishes and
+prompt-token counts differing from service usage are refused. Decode spans must
+be positive. c4 and prompt rows gate **only on group wall time**; their decode
+spans are diagnostic. Single-lane generation rows gate on decode wall time.
+
+Reported k is the largest observed effective depth, and drafter identity comes
+from admitted episode sources. A draft row without verify rounds records
+`drafting: "never-entered"`, k zero and no observed drafter. The reusable stream
+check refuses that state on any row with `minimum_speedup > 1`.
+
+Performance hashes bind binary SHA-256, clean-source state and device. Stream
+checking refuses dirty or incomplete provenance. Candidate checks require the
+same binary and source. To compare a frozen baseline with a candidate explicitly:
+
+```sh
+forja bench check-streams --comparison baseline-vs-candidate --plain baseline.json --draft candidate.json
+```
+
+That mode permits source, binary, component and profile hashes to differ; model,
+tokenizer, chat format, policy, effective settings, device and OS must match.
+`bench completion --stream-comparison baseline-vs-candidate` labels its automatic
+assertion likewise. Prepare a compatible clean plain reference before starting
+workers, including when startup or leg order puts the draft worker first.
+
+`--worker --raw-samples` supports immutable ordered sample requests using the
+native worker protocol (version 1), retaining one loaded completion runner.
+Each leg prepares fresh requests; prefix reuse is disabled in this mode.
+Each leg warms the row's concurrency and full output budget (at least
+`min-match + max-drafts + 2` tokens), identically in both modes. Records include
+that shape, request count and observed warm-up rounds. Uncached long legs need
+a full-context warm-up and another full prefill for the sample: retaining the
+warm-up prefix would change the cache path being compared. Cached process runs
+keep their declared reuse policy; worker prefix reuse remains disabled.
+`--reps N --no-early-stop` retains fixed repetitions. Worker and process records
+name their execution and decoding modes separately.
+
+### Workload-based runtime planning
+
+These are **planning estimates, not benchmarks**. The illustrative cost model
+assumes 2,000 prompt tokens/s and 25 output tokens/s in aggregate, charging lanes
+serially. Short ASCII prompt byte counts conservatively bound token counts;
+other rows use their declared prompt budgets. For prompt allowance P, output O,
+concurrency C and warm-up W=max(O,12), a leg costs
+`C * (2*P/2000 + (W+O)/25)` seconds. This includes the second long-context prefill.
+The table assumes one warm-up and one measured group per leg, four legs per
+block, and all 30 blocks. It excludes model loading, preflight references, drift
+probes and any regression confirmation. Actual elapsed time must be recorded.
+
+| Row | Prompt allowance | Lanes | Estimated hours for 30 blocks |
+| --- | ---: | ---: | ---: |
+| code-edit-short | 992 | 1 | 0.72 |
+| jsonl-copy-short | 1036 | 1 | 0.72 |
+| code-short | 447 | 1 | 0.70 |
+| chat-short | 437 | 1 | 0.70 |
+| thinking-short | 788 | 1 | 0.71 |
+| jsonl-generate-short | 433 | 1 | 0.70 |
+| code-edit-4k | 4096 | 1 | 0.82 |
+| jsonl-copy-4k | 4096 | 1 | 0.82 |
+| code-4k | 4096 | 1 | 0.82 |
+| chat-4k | 4096 | 1 | 0.82 |
+| thinking-4k | 4096 | 1 | 0.82 |
+| jsonl-generate-4k | 4096 | 1 | 0.82 |
+| jsonl-copy-seeded | 4096 | 1 | 0.82 |
+| code-edit-32k | 32512 | 1 | 1.77 |
+| jsonl-copy-32k | 32512 | 1 | 1.77 |
+| chat-32k | 32512 | 1 | 1.77 |
+| thinking-32k | 32512 | 1 | 1.77 |
+| c4-short | 437 | 4 | 2.79 |
+| prompt-short | 437 | 1 | 0.03 |
+| c4-4k | 4096 | 4 | 3.28 |
+| prompt-4k | 4096 | 1 | 0.15 |
+
+The size-only planning estimate totals 16.2 hours for regular rows and 7.1
+hours for the separately selected long group (23.3 hours combined), before
+startup and diagnostics. One fresh confirmation of every regression row could
+double the affected portion; it is not part of the original acceptance run.
