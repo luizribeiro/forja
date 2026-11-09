@@ -15,6 +15,9 @@ mod benchmark_worker;
 mod calibration;
 #[cfg(any(target_os = "macos", test))]
 mod calibration_identity;
+#[cfg(test)]
+#[path = "completion_benchmark/record.rs"]
+mod completion_record;
 mod completion_stream;
 #[cfg(test)]
 #[path = "completion_benchmark/workload.rs"]

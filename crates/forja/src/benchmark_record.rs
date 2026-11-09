@@ -9,7 +9,7 @@ use crate::args::{Bench, BenchPoint};
 pub(crate) const SCHEMA_VERSION: u32 = 5;
 
 pub(crate) fn measurement_mode(options: &Bench) -> serde_json::Value {
-    serde_json::json!({"sampling": "fixed", "early_stop": false,
+    serde_json::json!({"sampling": "fixed", "decoding": "plain", "early_stop": false,
         "execution": options.mode.execution, "batch_measurements": options.mode.batch_measurements,
         "reps": options.reps, "explicit_no_early_stop": options.mode.no_early_stop,
         "acceptance": if options.mode.remeasure { "remeasured" } else { "measured" }})
@@ -455,6 +455,7 @@ mod tests {
             config_hash(&after, &[]).unwrap()
         );
         assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(measurement_mode(&options)["decoding"], "plain");
         assert_eq!(measurement_mode(&options)["reps"], 30);
         assert_eq!(measurement_mode(&options)["sampling"], "fixed");
         assert!(!measurement_mode(&options)["early_stop"].as_bool().unwrap());
