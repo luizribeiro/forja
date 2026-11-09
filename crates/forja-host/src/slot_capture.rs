@@ -161,11 +161,16 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
                     .map(|entry| entry.tensor.buffer())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let rows = if shape.phase == BatchPhase::Verify {
+            shape.tokens
+        } else {
+            1
+        };
         let trace = self
             .state_slots
             .get(&slot.rep())
             .ok_or_else(|| invalid_handle("capture slot has no state"))?
-            .trace()?;
+            .trace_chain(rows)?;
         let entry = self.table.get_mut(commands).map_err(invalid_handle)?;
         entry.protected.extend(buffers);
         entry.slot_capture = Some(SlotCapture {
@@ -239,6 +244,76 @@ impl<B: Backend + 'static> Host<B> {
 mod tests {
     use super::*;
     use crate::paged_storage::{CaptureKind, CaptureSelection};
+
+    #[test]
+    fn two_plane_verify_traces_advance_every_row_and_refuse_extra_links() {
+        use crate::hybrid::StateUse;
+        use forja_core::DType;
+        let (mut host, _pool, slot) = crate::tests::verify_input_fixture_with_planes(
+            forja_cpu::CpuBackend::new(),
+            3,
+            1,
+            vec![vec![3, 7], vec![3, 7]],
+        );
+        let input = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+        let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
+        let output = host.backend.alloc(DType::F32, &[1, 7]).unwrap();
+        for rows in [1, 2, 3] {
+            let shape = capture_shape(
+                if rows == 1 {
+                    CaptureKind::Decode(1)
+                } else {
+                    CaptureKind::Verify(rows)
+                },
+                CaptureSelection::Combined,
+            );
+            let commands = host.command_list().unwrap();
+            host.declare_slot_capture(&commands, &slot, shape).unwrap();
+            let capture = host
+                .table
+                .get(&commands)
+                .unwrap()
+                .slot_capture
+                .clone()
+                .unwrap();
+            let usage = StateUse {
+                slot: slot.rep(),
+                bank: 0,
+                lane: 0,
+                active: false,
+                tokens: u64::from(rows),
+            };
+            for _ in 0..rows {
+                for plane in 0..2 {
+                    host.with_state_commands(usage, Some(&capture), |body| {
+                        body.causal_convolution(plane, &input, &weights, &output)
+                    })
+                    .unwrap();
+                }
+            }
+            for plane in 0..2 {
+                assert!(
+                    host.with_state_commands(usage, Some(&capture), |body| body
+                        .causal_convolution(plane, &input, &weights, &output))
+                        .is_err()
+                );
+            }
+            host.drop_command_list(commands).unwrap();
+        }
+        for rows in [0, 4] {
+            let commands = host.command_list().unwrap();
+            assert!(
+                host.declare_slot_capture(
+                    &commands,
+                    &slot,
+                    capture_shape(CaptureKind::Verify(rows), CaptureSelection::Combined)
+                )
+                .is_err()
+            );
+            assert!(host.table.get(&commands).unwrap().slot_capture.is_none());
+            host.drop_command_list(commands).unwrap();
+        }
+    }
 
     #[test]
     fn captured_state_spans_require_the_declared_phase_extent() {

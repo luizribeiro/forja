@@ -12698,6 +12698,15 @@ mod tests {
         lanes: u32,
         shape: Vec<u32>,
     ) -> (Host<B>, Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
+        verify_input_fixture_with_planes(backend, rows, lanes, vec![shape])
+    }
+
+    pub(super) fn verify_input_fixture_with_planes<B: Backend + 'static>(
+        backend: B,
+        rows: u32,
+        lanes: u32,
+        shapes: Vec<Vec<u32>>,
+    ) -> (Host<B>, Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
         let mut host = Host::new(backend, GENEROUS);
         host.limits.live_tensor_handles = 128;
         let pool = insert_test_pool(&mut host, 2, 33);
@@ -12725,10 +12734,13 @@ mod tests {
             .open_state_slot(
                 &pool,
                 2,
-                vec![paged_storage::StatePlaneDescriptor {
-                    dtype: compute::Dtype::F32,
-                    shape,
-                }],
+                shapes
+                    .into_iter()
+                    .map(|shape| paged_storage::StatePlaneDescriptor {
+                        dtype: compute::Dtype::F32,
+                        shape,
+                    })
+                    .collect(),
                 inputs,
             )
             .unwrap();
