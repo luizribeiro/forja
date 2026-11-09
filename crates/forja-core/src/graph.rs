@@ -1310,6 +1310,16 @@ impl GraphTemplate {
             })
     }
 
+    /// Returns the affine selector of a rule dispatch, if present.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dispatch_rule_key(&self, index: usize) -> Option<RuleKey> {
+        match self.dispatches.get(index) {
+            Some(TemplateDispatch::Rule { key, .. }) => Some(*key),
+            _ => None,
+        }
+    }
+
     /// Returns the effective key interval of each reachable arm at a dispatch index.
     ///
     /// Fixed selections and missing indices return `None`. Intervals include the rule key's
@@ -2213,6 +2223,8 @@ mod tests {
             Some(vec![1..=7, 8..=33])
         );
         assert_eq!(graph.dispatch_rule_intervals(1).unwrap(), None);
+        assert_eq!(graph.dispatch_rule_key(0), Some(RuleKey::from(0)));
+        assert_eq!(graph.dispatch_rule_key(1), None);
         let at_seven = graph.instantiate(&space.values(vec![7]).unwrap()).unwrap();
         let at_eight = graph.instantiate(&space.values(vec![8]).unwrap()).unwrap();
         assert_eq!(

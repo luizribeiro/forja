@@ -165,3 +165,56 @@ pub(super) fn record_test_weight_operations(
         host.drop_tensor(output).unwrap();
     }
 }
+
+#[test]
+fn decode_reference_rejects_shifted_or_foreign_rule_parameters() {
+    use forja_core::{BackendDispatchData, GraphLimits, GraphTemplate, ParamSpace, RuleKey};
+    for (key, accepted) in [
+        (
+            RuleKey {
+                parameter: 0,
+                row_offset: 0,
+            },
+            true,
+        ),
+        (
+            RuleKey {
+                parameter: 0,
+                row_offset: 1,
+            },
+            false,
+        ),
+        (
+            RuleKey {
+                parameter: 1,
+                row_offset: 0,
+            },
+            false,
+        ),
+    ] {
+        let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, test_capture_shape(false))
+            .unwrap();
+        record_test_decode_roles(&mut host, &commands, &slot);
+        let space = ParamSpace::new(vec![0..=33, 0..=33]).unwrap();
+        host.table.get_mut(&commands).unwrap().space = Some(space.clone());
+        let input = host.backend.alloc(DType::F32, &[7]).unwrap();
+        let output = host.backend.alloc(DType::F32, &[7]).unwrap();
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+        for recorded in &host.table.get(&commands).unwrap().recorded {
+            super::record_graph_dispatch(&mut graph, recorded).unwrap();
+        }
+        graph
+            .dispatch_variant_rule_many(
+                Op::Copy,
+                &[&input.into()],
+                &[&output.into()],
+                key,
+                vec![(34, BackendDispatchData::new(0_u32))],
+            )
+            .unwrap();
+        let result = host.capture_arithmetic(&graph, host.table.get(&commands).unwrap());
+        assert_eq!(result.is_ok(), accepted);
+    }
+}

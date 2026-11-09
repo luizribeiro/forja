@@ -6,6 +6,7 @@ use crate::{
 use forja_core::{BufferId, Tensor};
 use forja_core::{Dispatch, GraphTemplate, Op, OperationKind, program::ProgramHash};
 use std::collections::HashSet;
+use std::{collections::HashMap, ops::RangeInclusive};
 use std::{mem::Discriminant, sync::Arc};
 use wasmtime::component::Resource;
 
@@ -89,6 +90,7 @@ impl CaptureResources {
 #[derive(Clone, Debug, PartialEq)]
 struct ArithmeticDispatch {
     arithmetic: Arithmetic,
+    positions: RangeInclusive<u32>,
     resources: Vec<ArithmeticResource>,
 }
 
@@ -122,6 +124,21 @@ impl ArithmeticSummary {
             });
         bytes.ok_or_else(|| invalid_handle("arithmetic summary size overflowed"))
     }
+}
+
+fn fixed_positions(
+    space: Option<&forja_core::ParamSpace>,
+    rows: u32,
+) -> Result<RangeInclusive<u32>, compute::Error> {
+    let Some(range) = space.and_then(|space| space.ranges().first()) else {
+        // A fixed graph without a position parameter has no key boundary to extend.
+        return Ok(0..=u32::MAX);
+    };
+    let end = rows
+        .checked_sub(1)
+        .and_then(|offset| range.end().checked_add(offset))
+        .ok_or_else(|| invalid_handle("capture row positions overflowed"))?;
+    Ok(*range.start()..=end)
 }
 pub(crate) struct CapturedArithmetic {
     slot: u32,
@@ -199,16 +216,48 @@ impl<B: Backend + 'static> Host<B> {
         entry: &CommandListEntry,
     ) -> Result<Vec<ArithmeticDispatch>, compute::Error> {
         let resources = self.capture_resources(slot, entry)?;
+        let rows = entry
+            .slot_capture
+            .as_ref()
+            .filter(|scope| scope.shape.phase == BatchPhase::Verify)
+            .map_or(1, |scope| scope.shape.tokens);
+        let fixed = fixed_positions(entry.space.as_ref(), rows)?;
+        let baseline = entry
+            .slot_capture
+            .as_ref()
+            .is_some_and(|scope| scope.shape.phase == BatchPhase::Decode);
+        let mut ordinals = HashMap::<usize, usize>::new();
         let candidates = graph
             .backend_dispatch_candidates()
             .map_err(|error| graph_error(&error))?;
         candidates
             .into_iter()
             .map(|(index, _, dispatch)| {
-                let _ = (index, entry);
+                if let Some(key) = graph.dispatch_rule_key(index)
+                    && (key.parameter != 0 || (baseline && key.row_offset != 0))
+                {
+                    return Err(invalid_handle(
+                        "decode reference rules require the unshifted position parameter",
+                    ));
+                }
+                let ordinal = ordinals.entry(index).or_default();
+                let positions = graph
+                    .dispatch_rule_intervals(index)
+                    .map_err(|error| graph_error(&error))?
+                    .map_or_else(
+                        || Ok(fixed.clone()),
+                        |intervals| {
+                            intervals
+                                .get(*ordinal)
+                                .cloned()
+                                .ok_or_else(|| invalid_handle("capture rule interval is missing"))
+                        },
+                    )?;
+                *ordinal += 1;
                 let reads = resources.reads(&dispatch);
                 Ok(ArithmeticDispatch {
                     arithmetic: Arithmetic::of(&dispatch),
+                    positions,
                     resources: reads,
                 })
             })
@@ -339,5 +388,15 @@ mod tests {
             resources.key(&view(state, 0)).unwrap(),
             resources.key(&view(page, 0)).unwrap()
         );
+    }
+    #[test]
+    fn fixed_verify_dispatch_covers_the_next_rule_key() {
+        let space = forja_core::ParamSpace::new(std::iter::once(509..=509).collect()).unwrap();
+        assert_eq!(fixed_positions(Some(&space), 1).unwrap(), 509..=509);
+        assert_eq!(fixed_positions(Some(&space), 2).unwrap(), 509..=510);
+        let end =
+            forja_core::ParamSpace::new(std::iter::once(u32::MAX..=u32::MAX).collect()).unwrap();
+        assert!(fixed_positions(Some(&end), 2).is_err());
+        assert_eq!(fixed_positions(None, 3).unwrap(), 0..=u32::MAX);
     }
 }
