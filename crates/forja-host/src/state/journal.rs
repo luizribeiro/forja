@@ -12,7 +12,7 @@ mod verify;
 mod verify_tests;
 
 /// Publication requested by a stateful engine entry point.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateAction {
     /// Publishes carry with externally supplied token feedback.
     Step,

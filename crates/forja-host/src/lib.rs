@@ -251,6 +251,16 @@ pub struct BatchShape {
 }
 
 impl BatchShape {
+    fn state_action(self) -> StateAction {
+        if self.phase == BatchPhase::Verify {
+            StateAction::Verify
+        } else if self.selection == BatchSelection::Forward {
+            StateAction::Forward
+        } else {
+            StateAction::Combined
+        }
+    }
+
     fn output_rows(self) -> u32 {
         if self.phase == BatchPhase::Verify {
             self.tokens
@@ -2374,11 +2384,7 @@ where
                 lane,
                 input_lane.start_pos,
                 tokens,
-                Some(if input.shape.selection == BatchSelection::Forward {
-                    StateAction::Forward
-                } else {
-                    StateAction::Combined
-                }),
+                Some(input.shape.state_action()),
             );
             let (checkpoint, copy) = match prepared {
                 Ok(prepared) => prepared,
@@ -11486,6 +11492,63 @@ mod tests {
             .banks;
         assert!(banks[0].prompt_phase.load(Ordering::Acquire));
         assert!(!banks[1].prompt_phase.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn verify_batch_admission_reserves_every_row_before_submission() {
+        for (rows, lane) in [(2, 0), (3, 7)] {
+            let (mut host, pool, _slot) = verify_input_fixture(CpuBackend::new(), rows, 8);
+            host.bind_paged_lane(pool.rep(), lane, None, 33).unwrap();
+            let sequence = host.lane_state(pool.rep(), lane).unwrap().unwrap();
+            assert!(sequence.try_reserve_spares().unwrap());
+            let shape = BatchShape {
+                phase: BatchPhase::Verify,
+                bucket: 1,
+                tokens: rows,
+                selection: BatchSelection::Combined,
+            };
+            let (checkpoint, _) = host
+                .begin_paged_lane_update(pool.rep(), lane, 0, rows, Some(shape.state_action()))
+                .unwrap();
+            assert!(host.state_lane_checkpoint(pool.rep(), lane).is_err());
+            host.rollback_paged_lane_append(pool.rep(), lane, checkpoint.unwrap())
+                .unwrap();
+            assert_eq!(sequence.position().tokens, 0);
+            assert_eq!(
+                host.paged_lane_prefix(pool.rep(), lane)
+                    .unwrap()
+                    .logical_len()
+                    .unwrap(),
+                0
+            );
+            assert!(sequence.try_release_spares().unwrap());
+        }
+        for (phase, selection, expected) in [
+            (
+                BatchPhase::Prompt,
+                BatchSelection::Combined,
+                StateAction::Combined,
+            ),
+            (
+                BatchPhase::Decode,
+                BatchSelection::Combined,
+                StateAction::Combined,
+            ),
+            (
+                BatchPhase::Decode,
+                BatchSelection::Forward,
+                StateAction::Forward,
+            ),
+        ] {
+            let action = BatchShape {
+                phase,
+                selection,
+                bucket: 1,
+                tokens: 1,
+            }
+            .state_action();
+            assert_eq!(action, expected);
+        }
     }
 
     #[test]
