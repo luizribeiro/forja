@@ -103,6 +103,8 @@ impl PagedInputTensors {
 impl PagedSlot<'_> {
     /// Captures slot operations with inactive state and replay-bound ordinary inputs.
     ///
+    /// The kind and selection must match the serving catalog.
+    ///
     /// # Errors
     /// Refuses nested capture, pending lazy work, incompatible parameters or host quota.
     #[cfg(target_family = "wasm")]

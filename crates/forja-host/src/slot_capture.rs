@@ -114,6 +114,22 @@ impl SlotCapture {
 }
 
 impl<B: Backend + Send + Sync + 'static> Host<B> {
+    pub(crate) fn validate_capture_shape(&self, shape: BatchShape) -> Result<(), compute::Error> {
+        let declared = self.capture_shapes.iter().any(|declared| {
+            if shape.phase == BatchPhase::Prompt {
+                declared.phase == BatchPhase::Prompt && declared.selection == shape.selection
+            } else {
+                *declared == shape
+            }
+        });
+        if !declared {
+            return Err(invalid_handle(
+                "capture kind and shape are not declared for serving",
+            ));
+        }
+        Ok(())
+    }
+
     /// Declares a graph-only slot recording with independent inactive state bindings.
     ///
     /// # Errors
@@ -219,6 +235,61 @@ impl<B: Backend + 'static> Host<B> {
 mod tests {
     use super::*;
     use crate::paged_storage::{CaptureKind, CaptureSelection};
+
+    #[test]
+    fn capture_shapes_require_declared_phase_extent_and_selection() {
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            crate::Limits::new(65536, 8, 4096, 16, 4096),
+        );
+        let shape = capture_shape(CaptureKind::Verify(3), CaptureSelection::Combined);
+        assert!(host.validate_capture_shape(shape).is_err());
+        host.capture_shapes.push(shape);
+        host.validate_capture_shape(shape).unwrap();
+        for kind in [
+            CaptureKind::Prompt,
+            CaptureKind::Decode(1),
+            CaptureKind::Verify(2),
+            CaptureKind::Verify(9),
+        ] {
+            assert!(
+                host.validate_capture_shape(capture_shape(kind, CaptureSelection::Combined))
+                    .is_err()
+            );
+        }
+        for selection in [CaptureSelection::Forward, CaptureSelection::Masked] {
+            assert!(
+                host.validate_capture_shape(capture_shape(CaptureKind::Verify(3), selection))
+                    .is_err()
+            );
+        }
+        host.capture_shapes.push(BatchShape {
+            phase: BatchPhase::Prompt,
+            tokens: 33,
+            ..shape
+        });
+        host.validate_capture_shape(capture_shape(
+            CaptureKind::Prompt,
+            CaptureSelection::Combined,
+        ))
+        .unwrap();
+        host.capture_shapes.push(capture_shape(
+            CaptureKind::Decode(4),
+            CaptureSelection::Forward,
+        ));
+        host.validate_capture_shape(capture_shape(
+            CaptureKind::Decode(4),
+            CaptureSelection::Forward,
+        ))
+        .unwrap();
+        assert!(
+            host.validate_capture_shape(capture_shape(
+                CaptureKind::Decode(1),
+                CaptureSelection::Forward
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn capture_kinds_preserve_geometry_and_selection() {

@@ -9236,11 +9236,11 @@ where
         kind: paged_storage::CaptureKind,
         selection: paged_storage::CaptureSelection,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        std::future::ready(Ok(self.declare_slot_capture(
-            &commands,
-            &slot,
-            slot_capture::capture_shape(kind, selection),
-        )))
+        let shape = slot_capture::capture_shape(kind, selection);
+        let result = self
+            .validate_capture_shape(shape)
+            .and_then(|()| self.declare_slot_capture(&commands, &slot, shape));
+        std::future::ready(Ok(result))
     }
 
     fn capture_tensors(
@@ -10474,6 +10474,7 @@ mod tests {
         }
         host.table.get_mut(&slot).unwrap().active_bank = 1;
         let commands = host.command_list().unwrap();
+        host.capture_shapes.push(test_capture_shape(false));
         <Host<CpuBackend> as paged_storage::Host>::capture_slot(
             &mut host,
             Resource::new_borrow(commands.rep()),

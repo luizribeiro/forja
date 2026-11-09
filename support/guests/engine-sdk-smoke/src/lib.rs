@@ -49,7 +49,20 @@ impl Engine for ConstantEngine {
                         tokens: 1,
                         selection,
                     })
-                    .into(),
+                    .into_iter()
+                    .chain(
+                        [BatchPhase::Prompt, BatchPhase::Decode].map(|phase| BatchShape {
+                            phase,
+                            bucket: 1,
+                            tokens: 1,
+                            selection: if phase == BatchPhase::Prompt {
+                                BatchSelection::Combined
+                            } else {
+                                BatchSelection::Forward
+                            },
+                        }),
+                    )
+                    .collect(),
             }),
         }
     }
@@ -350,7 +363,11 @@ impl ConstantEngine {
                         phase: input.phase,
                         bucket: 1,
                         tokens: 1,
-                        selection: BatchSelection::Forward,
+                        selection: if input.phase == BatchPhase::Prompt {
+                            BatchSelection::Combined
+                        } else {
+                            BatchSelection::Forward
+                        },
                     },
                     || {
                         let inputs = slot.tensors()?.inputs.ok_or_else(|| {
