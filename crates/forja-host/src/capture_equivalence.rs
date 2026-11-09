@@ -339,6 +339,26 @@ impl<B: Backend + 'static> Host<B> {
                     )?;
                 *ordinal += 1;
                 let reads = resources.reads(&dispatch);
+                #[cfg(target_os = "macos")]
+                if !baseline
+                    && (self.backend.as_ref() as &dyn std::any::Any)
+                        .is::<forja_metal::MetalBackend>()
+                    && !reads.is_empty()
+                    && dispatch
+                        .backend_data::<forja_metal::ValidatedVariant>()
+                        .is_none()
+                    && matches!(
+                        OperationKind::of(dispatch.op()),
+                        OperationKind::Matmul
+                            | OperationKind::Sdpa
+                            | OperationKind::PagedSdpa
+                            | OperationKind::PagedSdpaAppend
+                    )
+                {
+                    return Err(invalid_handle(
+                        "verify tracked shape-dependent operation requires an explicit variant",
+                    ));
+                }
                 Ok(ArithmeticDispatch {
                     arithmetic: Arithmetic::of(&dispatch),
                     positions,

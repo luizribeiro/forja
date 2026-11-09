@@ -421,3 +421,51 @@ fn verify_capture_matches_arithmetic_to_weight_regions_without_exemptions() {
     host.drop_graph(reference).unwrap();
     fs::remove_file(path).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_verify_refuses_unresolved_matmul_on_weights_at_multiple_rows() {
+    let (mut host, _pool, slot) =
+        verify_input_fixture(forja_metal::MetalBackend::new().unwrap(), 4, 1);
+    let path = test_weight_file();
+    host.grants = Grants::new().with_weights("capture", &path);
+    let source = host.open_weights("capture").unwrap();
+    let scalar = host.weight_tensor(&source, "value").unwrap();
+    let weight = host
+        .view(&scalar, compute::ViewOp::Reshape(vec![1, 1]))
+        .unwrap();
+    let decode = test_capture_shape(false);
+    for rows in [1, 4] {
+        let shape = if rows == 1 {
+            decode
+        } else {
+            BatchShape {
+                phase: BatchPhase::Verify,
+                tokens: rows,
+                ..decode
+            }
+        };
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, shape).unwrap();
+        record_test_decode_roles(&mut host, &commands, &slot);
+        let left = host.alloc(compute::Dtype::F32, &[rows, 1]).unwrap();
+        let output = host.alloc(compute::Dtype::F32, &[rows, 1]).unwrap();
+        host.dispatch_core(
+            &commands,
+            Op::Matmul.into(),
+            Some(Op::Matmul),
+            &[left, Resource::new_borrow(weight.rep())],
+            &[output],
+        )
+        .unwrap();
+        let result = host.create_graph(commands);
+        if rows == 1 {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(result, Err(compute::Error::InvalidHandle(message)) if message.contains("requires an explicit variant"))
+            );
+        }
+    }
+    fs::remove_file(path).unwrap();
+}
