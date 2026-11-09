@@ -184,12 +184,26 @@ pub fn assert_draft_exact(
             );
             if matches!(drafter, TestDrafter::Oracle) {
                 let mut remaining = trace.tokens.len();
-                for (shape, accepted) in trace.shapes.iter().zip(&trace.accepted) {
+                for (round, (shape, accepted)) in
+                    trace.shapes.iter().zip(&trace.accepted).enumerate()
+                {
                     let expected = (shape - 1).min(u32::try_from(remaining - 1).unwrap());
-                    assert_eq!(
-                        *accepted, expected,
-                        "oracle must accept every fitting draft"
-                    );
+                    let boundary_cut = round + 1 == trace.shapes.len()
+                        && matches!(
+                            trace.cut,
+                            Some(VerifyCut::Stop | VerifyCut::Eos | VerifyCut::Activate)
+                        );
+                    if boundary_cut {
+                        assert!(
+                            *accepted <= expected,
+                            "a cut cannot extend the oracle prefix"
+                        );
+                    } else {
+                        assert_eq!(
+                            *accepted, expected,
+                            "oracle must accept every fitting draft"
+                        );
+                    }
                     remaining -= usize::try_from(accepted + 1).unwrap();
                 }
             }
@@ -224,4 +238,17 @@ fn exactness_helper_refuses_incomplete_oracle_acceptance() {
         accepted: vec![0],
         ..Trace::default()
     });
+}
+
+#[test]
+fn exactness_helper_allows_a_terminal_boundary_to_shorten_the_oracle_prefix() {
+    for cut in [VerifyCut::Stop, VerifyCut::Eos, VerifyCut::Activate] {
+        assert_draft_exact(true, |_, _| Trace {
+            tokens: vec![7, 33],
+            accepted: vec![0],
+            shapes: vec![3],
+            cut: Some(cut),
+            ..Trace::default()
+        });
+    }
 }
