@@ -118,9 +118,24 @@ fn random_drafts_are_seeded_in_range_and_continue_across_rounds() {
         assert_eq!(split, expected);
     }
 }
+/// Final serving observables captured before a lane releases its storage.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct RequestOutput {
+    /// Concatenated content events from the real stream sink.
+    pub streamed_text: String,
+    /// Prompt, cached prompt and completion token usage, in that order.
+    pub usage: [u32; 3],
+    /// Number of tokens in the accepted prefix ledger.
+    pub ledger_len: u64,
+    /// Logical length of the lane's KV storage.
+    pub kv_logical_len: u64,
+}
+
 /// Observable output and paths from one fresh request.
 #[derive(Default, Debug)]
 pub struct Trace {
+    /// Serving observables, when this trace drives a serving lane.
+    pub output: Option<RequestOutput>,
     /// Selected output stream.
     pub tokens: Vec<u32>,
     /// Accepted draft counts in verify order.
@@ -175,6 +190,10 @@ pub fn assert_draft_exact(
             assert_eq!(
                 trace.tokens, plain.tokens,
                 "draft token stream differs: sampling={sampling:?}, drafter={drafter:?}"
+            );
+            assert_eq!(
+                trace.output, plain.output,
+                "draft request output differs: sampling={sampling:?}, drafter={drafter:?}"
             );
             assert_eq!(trace.shapes.len(), trace.accepted.len());
             assert_eq!(
@@ -250,5 +269,30 @@ fn exactness_helper_allows_a_terminal_boundary_to_shorten_the_oracle_prefix() {
             cut: Some(cut),
             ..Trace::default()
         });
+    }
+}
+
+#[test]
+fn exactness_helper_refuses_each_changed_serving_observable() {
+    for field in 0..6 {
+        let result = std::panic::catch_unwind(|| {
+            assert_draft_exact(false, |_, drafter| {
+                let mut output = RequestOutput::default();
+                if drafter.is_some() {
+                    match field {
+                        0 => output.streamed_text.push('x'),
+                        1..=3 => output.usage[field - 1] = 1,
+                        4 => output.ledger_len = 1,
+                        _ => output.kv_logical_len = 1,
+                    }
+                }
+                Trace {
+                    output: Some(output),
+                    tokens: vec![7],
+                    ..Trace::default()
+                }
+            });
+        });
+        assert!(result.is_err(), "observable {field} was not compared");
     }
 }

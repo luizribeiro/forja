@@ -124,6 +124,7 @@ pub(super) async fn run_with_stop(
     let completion = reply.await??;
     let verified = barrier.verified.lock().unwrap();
     Ok(Trace {
+        output: None,
         tokens: completion.token_ids,
         shapes: verified.iter().map(|(shape, _)| *shape).collect(),
         accepted: verified.iter().map(|(_, accepted)| *accepted).collect(),
