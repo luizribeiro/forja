@@ -89,3 +89,84 @@ async fn verify_rows_match_decode_logits_samples_and_each_state_plane() -> Resul
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn recording_quota_controls_verify_declarations_and_plain_decode_fallback()
+-> Result<(), Box<dyn Error>> {
+    for limit in [4096, 8191, 8192] {
+        let enabled = limit >= 8192;
+        let mut runner = forja_host::EngineRunner::new(
+            test_guests::qwen38_tiny(),
+            forja_cpu::CpuBackend::new(),
+            forja_host::Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27)
+                .with_command_limits(limit, forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
+            crate::qwen38::fixture("model.safetensors"),
+        )
+        .await?;
+        let declared = runner.describe().await?.serving.unwrap().batch_shapes;
+        assert_eq!(
+            declared
+                .iter()
+                .filter(|shape| shape.phase == BatchPhase::Verify)
+                .map(|shape| shape.tokens)
+                .collect::<Vec<_>>(),
+            if enabled { vec![2, 3] } else { vec![] }
+        );
+        runner
+            .load_with_selections(
+                None,
+                &forja_host::EngineLoadConfig {
+                    max_context: Some(64),
+                    paged_cache: true,
+                    kv_cache: forja_host::KvCacheFormat::F16,
+                    ..Default::default()
+                },
+            )
+            .await??;
+        assert_eq!(runner.metrics().live_graphs, if enabled { 12 } else { 10 });
+        let output = runner
+            .decode(EngineDecode {
+                phase: BatchPhase::Prompt,
+                tokens: Some(vec![1, 7, 32]),
+                start_pos: 0,
+                sampling: SamplingParams::default(),
+            })
+            .await??;
+        let token = u32::from_le_bytes(runner.read(&output.token).await?.try_into().unwrap());
+        if !enabled {
+            assert!(
+                runner
+                    .enqueue_batch_step(EngineBatch {
+                        shape: BatchShape {
+                            phase: BatchPhase::Verify,
+                            bucket: 1,
+                            tokens: 3,
+                            selection: BatchSelection::Combined
+                        },
+                        lanes: vec![Some(EngineBatchLane {
+                            slot: 0,
+                            tokens: Some(vec![token; 3]),
+                            start_pos: 3,
+                            sampling: SamplingParams::default()
+                        })],
+                    })
+                    .await?
+                    .is_err()
+            );
+            assert_eq!(
+                runner.checkpoint_state_lane(0)?.unwrap().position().tokens,
+                3
+            );
+        }
+        let output = runner
+            .decode(EngineDecode {
+                phase: BatchPhase::Decode,
+                tokens: Some(vec![token]),
+                start_pos: 3,
+                sampling: SamplingParams::default(),
+            })
+            .await??;
+        assert_eq!(runner.read(&output.token).await?.len(), 4);
+    }
+    Ok(())
+}

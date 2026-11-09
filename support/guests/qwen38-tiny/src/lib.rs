@@ -74,7 +74,7 @@ impl Engine for Tiny {
                 forja_sdk::PagedInputLayout {
                     vocab: 33,
                     prompt_tokens: context.min(64),
-                    verify_rows: qwen38::Qwen38::VERIFY_ROWS,
+                    verify_rows: qwen38::Qwen38::verify_rows(),
                 },
             )?);
             let layer = qwen38::Attention::load_paged(
@@ -94,7 +94,7 @@ impl Engine for Tiny {
             forja_sdk::PagedInputLayout {
                 vocab: 33,
                 prompt_tokens,
-                verify_rows: qwen38::Qwen38::VERIFY_ROWS,
+                verify_rows: qwen38::Qwen38::verify_rows(),
             },
         )?);
         if load.tunings.iter().any(|name| name == "decoder-fixture") {

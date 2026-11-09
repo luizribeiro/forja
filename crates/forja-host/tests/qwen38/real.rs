@@ -65,7 +65,8 @@ async fn load_profiled(
         20_000,
         128 * 1024 * 1024,
     )
-    .with_gpu_limits(Duration::from_secs(10), Duration::from_secs(3600));
+    .with_gpu_limits(Duration::from_secs(10), Duration::from_secs(3600))
+    .with_command_limits(8192, forja_core::DEFAULT_DISPATCH_WORK_LIMIT);
     let mut engine = forja_host::EngineRunner::new(
         &component,
         forja_metal::MetalBackend::new()?,

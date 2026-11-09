@@ -5,3 +5,6 @@ chat_format = "target/engines/qwen38-27b-4bit.metal-apple-m3-ultra.q4.chat-forma
 
 [serving]
 prefix-reuse = true
+
+[limits]
+dispatches_per_list = 8192

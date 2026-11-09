@@ -10,7 +10,15 @@ decode advances recurrent state one token at a time. Single-lane SDK calls decla
 `BatchPhase::Prompt` or `BatchPhase::Decode` explicitly. Prompt submissions start
 on a 64-token boundary. Serving supports decode buckets 1/2/4/8 with private
 recurrent state and token feedback per lane. Replay retains nine decode graphs,
-three prompt shapes (64/512/2,048) and one replaceable tail; bucket 8 runs eagerly.
+three prompt shapes (64/512/2,048) and one replaceable tail. With a recording
+quota of at least 8,192 dispatches it also declares and captures two verify
+shapes (one or two drafts); lower quotas serve plain decode. Bucket 8 supports
+combined decode and runs eagerly. Verification
+steps convolution, recurrent state, attention and sampling one row at a time with
+decode arithmetic. The standard q4 profile uses host prompt lookup with an
+eight-token minimum match and a maximum suffix of 32 tokens. The serving example
+explicitly enables draft mode with
+`limits.dispatches_per_list = 8192`; the host default stays at 4,096.
 Serving reuses exact canonical prompt prefixes with a 2 GiB snapshot ceiling.
 It saves every 4,096 tokens and the last full 64-token boundary before prompt end,
 then replays the entire suffix after the longest hit. The operator can lower
@@ -33,7 +41,7 @@ Run from the repository root inside `nix develop`:
 ```sh
 python3 engines/qwen38/download.py
 forja build qwen38-27b-4bit.metal-apple-m3-ultra.q4
-forja run --engine qwen38-27b-4bit.metal-apple-m3-ultra.q4 --prompt 'The capital of France is' --max-tokens 32 --temperature 0
+forja --set limits.dispatches_per_list=8192 run --engine qwen38-27b-4bit.metal-apple-m3-ultra.q4 --prompt 'The capital of France is' --max-tokens 32 --temperature 0
 forja --isolated -c engines/qwen38/serve.toml --set "model.model=\"$FORJA_MODELS/Qwen3.8-27B-4bit\"" serve
 ```
 
@@ -80,7 +88,8 @@ and underflow stay within `1e-5`; near-identity log decay (`-1e-7`) reaches
 Full-model long-text accuracy remains unqualified.
 
 Real-weight capacity checks reserve the full context under 48 GiB with replay
-off/on, count three state versions per lane, and preserve state across refusals.
+off/on, count three state versions per lane plus one shared verify spare, and
+preserve state across refusals.
 They populate 64 model tokens; the separate attention checks scan full long KV
 caches. These are correctness/capacity diagnostics, not benchmarks.
 

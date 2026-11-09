@@ -34,6 +34,16 @@ impl Qwen38 {
     /// Largest number of target rows in a single verify round.
     pub const VERIFY_ROWS: u32 = 3;
 
+    /// Returns the verify row budget admitted by the current host recording limit.
+    #[must_use]
+    pub fn verify_rows() -> u32 {
+        if forja_sdk::command_limits().dispatches_per_list >= 8192 {
+            Self::VERIFY_ROWS
+        } else {
+            0
+        }
+    }
+
     /// Returns the finite serving shapes; eight-lane combined decode executes eagerly.
     #[must_use]
     pub fn serving_shapes() -> Vec<forja_sdk::BatchShape> {
@@ -60,7 +70,7 @@ impl Qwen38 {
                 tokens,
                 selection: BatchSelection::Combined,
             }))
-            .chain((2..=Self::VERIFY_ROWS).map(|tokens| BatchShape {
+            .chain((2..=Self::verify_rows()).map(|tokens| BatchShape {
                 phase: BatchPhase::Verify,
                 bucket: 1,
                 tokens,

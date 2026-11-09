@@ -26,7 +26,7 @@ impl PagedModel {
             PagedInputLayout {
                 vocab: config.vocab,
                 prompt_tokens: context.min(2048),
-                verify_rows: crate::Qwen38::VERIFY_ROWS,
+                verify_rows: crate::Qwen38::verify_rows(),
             },
         )?);
         let choice = |site| {

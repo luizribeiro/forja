@@ -26,7 +26,8 @@ async fn runner_with_storage<B: forja_core::Backend + Send + Sync + 'static>(
     let mut runner = EngineRunner::new(
         test_guests::qwen38_tiny(),
         backend,
-        forja_host::Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27),
+        forja_host::Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27)
+            .with_command_limits(8192, forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
         fixture("model.safetensors"),
     )
     .await?;
