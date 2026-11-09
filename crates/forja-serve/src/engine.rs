@@ -1141,8 +1141,22 @@ where
         self.canonical_cache.is_some()
     }
 
-    pub(crate) const fn supports_continuous_batching(&self) -> bool {
+    /// Returns whether the engine declares continuous decode shapes.
+    #[must_use]
+    pub const fn supports_continuous_batching(&self) -> bool {
         !self.scheduler.decode_buckets.is_empty()
+    }
+
+    /// Returns whether profile lookup and an admitted verify shape are available.
+    #[must_use]
+    pub fn profile_lookup_available(&self) -> bool {
+        self.lookup_policy.is_some()
+            && self.info.serving.as_ref().is_some_and(|serving| {
+                serving
+                    .batch_shapes
+                    .iter()
+                    .any(|shape| shape.phase == forja_host::BatchPhase::Verify)
+            })
     }
 
     fn refresh_runtime_metrics(&mut self) {

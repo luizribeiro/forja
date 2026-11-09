@@ -302,7 +302,10 @@ async fn a_lookup_miss_preserves_the_plain_pipeline() -> Result<(), TestError> {
 
 #[tokio::test]
 async fn lookup_indexes_belong_to_the_request_even_at_equal_positions() -> Result<(), TestError> {
-    let mut engine = engine().await?.with_profile_lookup(&profile(2, 31));
+    let mut engine = engine().await?;
+    assert!(!engine.profile_lookup_available());
+    engine = engine.with_profile_lookup(&profile(2, 31));
+    assert!(engine.profile_lookup_available());
     let mut request = crate::engine::continuous::prefill::tests::request();
     request.tokens = matched_prompt(SamplingParams::default());
     request.prompt_tokens = u32::try_from(request.tokens.len())?;

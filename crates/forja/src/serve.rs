@@ -245,10 +245,35 @@ where
 {
     let PreparedLoad {
         profile,
-        mut load_config,
+        load_config,
         hashes,
         ..
     } = prepared;
+    completion_engine(
+        backend,
+        host_limits,
+        config,
+        profile,
+        load_config,
+        hashes,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn completion_engine<B>(
+    backend: B,
+    host_limits: forja_host::Limits,
+    config: &forja_config::HostConfig,
+    profile: Profile,
+    mut load_config: forja_host::EngineLoadConfig,
+    hashes: [String; 5],
+    lookup: bool,
+) -> Result<Loaded<forja_serve::ServingEngine<B>>, String>
+where
+    B: Backend + Send + Sync + 'static,
+{
     let tokenizer = Tokenizer::from_file(config.model.model.join("tokenizer.json"))
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let chat_format = forja_serve::ChatFormat::load(
@@ -293,7 +318,13 @@ where
         profile.workload().prefill_chunk.get(),
         identity,
     )
-    .map(|engine| engine.with_profile_lookup(&profile))
+    .map(|engine| {
+        if lookup {
+            engine.with_profile_lookup(&profile)
+        } else {
+            engine
+        }
+    })
     .and_then(|engine| engine.with_profile_prefixes(&profile))
     .map_err(|error| error.to_string())?;
     let retained_bytes = engine
