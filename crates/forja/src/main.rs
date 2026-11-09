@@ -11,6 +11,7 @@ mod benchmark;
 mod benchmark_record;
 mod benchmark_snapshot;
 mod benchmark_stats;
+mod benchmark_worker;
 mod calibration;
 #[cfg(any(target_os = "macos", test))]
 mod calibration_identity;
