@@ -560,3 +560,6 @@ fn read_batch_tokens(bytes: &[u8]) -> Result<Vec<u32>, GenerationError> {
 fn repeated_error(error: &GenerationError) -> GenerationError {
     GenerationError::unavailable(error.to_string())
 }
+
+#[cfg(test)]
+mod draft_support;

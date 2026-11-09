@@ -19,10 +19,18 @@ pub(in crate::engine::continuous) async fn engine_with_context(
     context: u32,
     chunk: u32,
 ) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
+    engine_with_component(context, chunk, test_guests::qwen38_tiny()).await
+}
+
+pub(in crate::engine::continuous) async fn engine_with_component(
+    context: u32,
+    chunk: u32,
+    component: &Path,
+) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
     let weights = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../forja-host/tests/fixtures/qwen38/model.safetensors");
     let mut runner = EngineRunner::new(
-        test_guests::qwen38_tiny(),
+        component,
         forja_cpu::CpuBackend::new(),
         Limits::new(1 << 30, 8, 1 << 30, 20_000, 1 << 27),
         weights,
