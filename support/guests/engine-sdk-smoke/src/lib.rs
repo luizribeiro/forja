@@ -344,21 +344,29 @@ impl ConstantEngine {
                 .slot();
             self.paged_graph = Some((
                 input.phase,
-                slot.capture(&[&parameter], input.phase, || {
-                    let inputs = slot
-                        .tensors()?
-                        .inputs
-                        .ok_or_else(|| forja_sdk::Error::loading("capture inputs are missing"))?;
-                    slot.token(0)?
-                        .copy_into(&mut inputs.selected.narrow(0, 0, 1)?)?;
-                    let _history = history
-                        .causal_convolution(&self.paged_value.reshape(&[1, 64])?, &weights)?;
-                    cache.append(&self.paged_key, &self.paged_value, &start)?;
-                    cache
-                        .attention(&self.paged_query, 1.0, &start, &end, &variant)?
-                        .reshape(&[64])?
-                        .narrow(0, 0, 4)
-                })?,
+                slot.capture(
+                    &[&parameter],
+                    BatchShape {
+                        phase: input.phase,
+                        bucket: 1,
+                        tokens: 1,
+                        selection: BatchSelection::Forward,
+                    },
+                    || {
+                        let inputs = slot.tensors()?.inputs.ok_or_else(|| {
+                            forja_sdk::Error::loading("capture inputs are missing")
+                        })?;
+                        slot.token(0)?
+                            .copy_into(&mut inputs.selected.narrow(0, 0, 1)?)?;
+                        let _history = history
+                            .causal_convolution(&self.paged_value.reshape(&[1, 64])?, &weights)?;
+                        cache.append(&self.paged_key, &self.paged_value, &start)?;
+                        cache
+                            .attention(&self.paged_query, 1.0, &start, &end, &variant)?
+                            .reshape(&[64])?
+                            .narrow(0, 0, 4)
+                    },
+                )?,
             ));
         }
         let (_, graph) = self

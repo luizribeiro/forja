@@ -109,7 +109,7 @@ impl PagedSlot<'_> {
     pub fn capture<T: crate::GraphResult>(
         &self,
         params: &[&crate::Param],
-        phase: crate::BatchPhase,
+        shape: crate::BatchShape,
         trace: impl FnOnce() -> Result<T>,
     ) -> Result<crate::Graph<T>> {
         crate::capture(params, || {
@@ -117,7 +117,28 @@ impl PagedSlot<'_> {
                 crate::sys::guest::paged_storage::capture_slot(
                     commands,
                     self.raw,
-                    phase == crate::BatchPhase::Prompt,
+                    match shape.phase {
+                        crate::BatchPhase::Prompt => {
+                            crate::sys::guest::paged_storage::CaptureKind::Prompt
+                        }
+                        crate::BatchPhase::Decode => {
+                            crate::sys::guest::paged_storage::CaptureKind::Decode(shape.bucket)
+                        }
+                        crate::BatchPhase::Verify => {
+                            crate::sys::guest::paged_storage::CaptureKind::Verify(shape.tokens)
+                        }
+                    },
+                    match shape.selection {
+                        crate::BatchSelection::Combined => {
+                            crate::sys::guest::paged_storage::CaptureSelection::Combined
+                        }
+                        crate::BatchSelection::Forward => {
+                            crate::sys::guest::paged_storage::CaptureSelection::Forward
+                        }
+                        crate::BatchSelection::Masked => {
+                            crate::sys::guest::paged_storage::CaptureSelection::Masked
+                        }
+                    },
                 )
                 .map_err(|error| Error::loading(format!("{error:?}")))
             })?;

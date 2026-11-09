@@ -175,6 +175,9 @@ impl Engine for Qwen38 {
             }
         }
         match input.phase {
+            forja_sdk::BatchPhase::Verify => {
+                Err(forja_sdk::Error::loading("verify is unsupported"))
+            }
             forja_sdk::BatchPhase::Prompt => {
                 self.model
                     .forward(&input.tokens, input.start_pos, input.taps)

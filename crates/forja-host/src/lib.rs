@@ -9230,9 +9230,14 @@ where
         &mut self,
         commands: Resource<CommandListEntry>,
         slot: Resource<BatchSlotEntry>,
-        prefill: bool,
+        kind: paged_storage::CaptureKind,
+        selection: paged_storage::CaptureSelection,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
-        std::future::ready(Ok(self.declare_slot_capture(&commands, &slot, prefill)))
+        std::future::ready(Ok(self.declare_slot_capture(
+            &commands,
+            &slot,
+            slot_capture::capture_shape(kind, selection),
+        )))
     }
 
     fn capture_tensors(
@@ -10184,6 +10189,37 @@ mod tests {
     include!("state/paged_lifecycle_tests.rs");
     include!("recovery_tests.rs");
 
+    impl<B: Backend + Send + Sync + 'static> Host<B> {
+        fn test_capture(
+            &mut self,
+            commands: &Resource<super::CommandListEntry>,
+            slot: &Resource<BatchSlotEntry>,
+            prefill: bool,
+        ) -> Result<(), compute::Error> {
+            self.declare_slot_capture(
+                commands,
+                slot,
+                BatchShape {
+                    selection: BatchSelection::Forward,
+                    ..test_capture_shape(prefill)
+                },
+            )
+        }
+    }
+
+    fn test_capture_shape(prefill: bool) -> BatchShape {
+        BatchShape {
+            phase: if prefill {
+                BatchPhase::Prompt
+            } else {
+                BatchPhase::Decode
+            },
+            bucket: 1,
+            tokens: 1,
+            selection: BatchSelection::Combined,
+        }
+    }
+
     const GENEROUS: Limits = Limits::new(u64::MAX, 8, u64::MAX, 32, u64::MAX);
     static NEXT_WEIGHT_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -10438,7 +10474,8 @@ mod tests {
             &mut host,
             Resource::new_borrow(commands.rep()),
             Resource::new_borrow(slot.rep()),
-            false,
+            paged_storage::CaptureKind::Decode(1),
+            paged_storage::CaptureSelection::Combined,
         )
         .await
         .unwrap()
@@ -10493,8 +10530,8 @@ mod tests {
     fn capture_context_refuses_phase_mismatch_and_reused_resource_ids() {
         let StateSlotFixture { mut host, slot, .. } = state_slot_fixture(CpuBackend::new());
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
-        assert!(host.declare_slot_capture(&commands, &slot, false).is_err());
+        host.test_capture(&commands, &slot, false).unwrap();
+        assert!(host.test_capture(&commands, &slot, false).is_err());
         let capture = host
             .table
             .get(&commands)
@@ -10553,7 +10590,7 @@ mod tests {
                 .unwrap();
         }
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         host.dispatch(
             &commands,
             compute::Op::Copy,
@@ -10653,7 +10690,7 @@ mod tests {
         } = state_slot_fixture(CpuBackend::new());
         let lists = [host.command_list().unwrap(), host.command_list().unwrap()];
         for list in &lists {
-            host.declare_slot_capture(list, &slot, false).unwrap();
+            host.test_capture(list, &slot, false).unwrap();
             host.record_slot_state(
                 list,
                 &slot,
@@ -11572,7 +11609,7 @@ mod tests {
             )
             .unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         host.record_slot_feedback(&commands, &slot, 0, &token)
             .unwrap();
         let graph = host.create_graph(commands).unwrap();
@@ -11717,7 +11754,7 @@ mod tests {
         host.write(&inputs.selected, &[2_u32, 3].map(u32::to_ne_bytes).concat())
             .unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         for lane in 0..2 {
             let token = host
                 .view(
@@ -12144,7 +12181,7 @@ mod tests {
         .unwrap();
         let output = bind_replay_space(host, &params, &[1, 2]);
         let invalid = host.command_list().unwrap();
-        host.declare_slot_capture(&invalid, slot, true).unwrap();
+        host.test_capture(&invalid, slot, true).unwrap();
         for (list, lane, ordinary, direction) in [
             (
                 &invalid,
@@ -12211,7 +12248,7 @@ mod tests {
         let selected = host.alloc(compute::Dtype::U32, &[1]).unwrap();
         host.write(&selected, &5_u32.to_ne_bytes()).unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, true).unwrap();
+        host.test_capture(&commands, &slot, true).unwrap();
         assert!(
             host.record_slot_state(
                 &commands,
@@ -12308,7 +12345,7 @@ mod tests {
         )
         .unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         let token = host
             .state_input_token_in_bank(slot.rep(), 0, Some(0))
             .unwrap();
@@ -12445,7 +12482,7 @@ mod tests {
             .unwrap();
         let result = host.alloc(compute::Dtype::U32, &[1, 1]).unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         host.dispatch(
             &commands,
             compute::Op::Copy,
@@ -12526,7 +12563,7 @@ mod tests {
         for scoped in [false, true] {
             let commands = host.command_list().unwrap();
             if scoped {
-                host.declare_slot_capture(&commands, &slot, false).unwrap();
+                host.test_capture(&commands, &slot, false).unwrap();
             }
             host.dispatch(
                 &commands,
@@ -12612,7 +12649,7 @@ mod tests {
             .unwrap();
         let output = host.alloc(compute::Dtype::F32, &[2, 33]).unwrap();
         let commands = host.command_list().unwrap();
-        host.declare_slot_capture(&commands, &slot, false).unwrap();
+        host.test_capture(&commands, &slot, false).unwrap();
         let pick = "matmul.gemv-transposed";
         let error = host
             .record_metal_variant(

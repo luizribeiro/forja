@@ -394,6 +394,7 @@ fn serving_info() -> proc_macro2::TokenStream {
                 phase: match shape.phase {
                     ::forja_sdk::BatchPhase::Prompt => bindings::exports::l9o::gpu::engine::BatchPhase::Prompt,
                     ::forja_sdk::BatchPhase::Decode => bindings::exports::l9o::gpu::engine::BatchPhase::Decode,
+                    ::forja_sdk::BatchPhase::Verify => bindings::exports::l9o::gpu::engine::BatchPhase::Verify,
                 },
                 bucket: shape.bucket,
                 tokens: shape.tokens,

@@ -98,7 +98,7 @@ impl<B: Backend + 'static> Host<B> {
         if commands
             .slot_capture
             .as_ref()
-            .is_some_and(|scope| scope.prefill)
+            .is_some_and(crate::slot_capture::SlotCapture::prefill)
             && commands.paged.iter().any(|usage| usage.lane != 0)
         {
             return Err(invalid_handle(
@@ -121,7 +121,7 @@ impl<B: Backend + 'static> Host<B> {
                 )
                 .map_err(invalid_handle)?;
             if source.slot != scope.slot
-                || (scope.prefill && source.lane != 0)
+                || (scope.prefill() && source.lane != 0)
                 || usize::try_from(source.lane).map_err(invalid_handle)? >= slot.binding.lanes.len()
                 || entry.tensor.layout().element_count() != 1
                 || entry.tensor.is_writable()

@@ -27,6 +27,7 @@ impl Catalog {
                 .filter(|shape| match shape.phase {
                     BatchPhase::Decode => shape.bucket <= 4,
                     BatchPhase::Prompt => shape.tokens <= context,
+                    BatchPhase::Verify => false,
                 })
             {
                 catalog
@@ -49,7 +50,7 @@ impl Catalog {
             .tokens
             .checked_sub(1)
             .ok_or_else(|| Error::loading("captured span is empty"))?;
-        set.slot().capture(&refs, shape.phase, || {
+        set.slot().capture(&refs, shape, || {
             let starts = params
                 .iter()
                 .map(|parameter| Dim::from(parameter.at(0)))

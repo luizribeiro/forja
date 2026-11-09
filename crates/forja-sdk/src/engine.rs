@@ -42,6 +42,8 @@ pub enum BatchPhase {
     Prompt,
     /// Single-token generation.
     Decode,
+    /// Target evaluation of host-staged speculative rows.
+    Verify,
 }
 
 /// Work performed by one serving graph.

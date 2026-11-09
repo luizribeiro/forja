@@ -1,8 +1,8 @@
 mod rows;
 
 use crate::{
-    Backend, BatchSlotEntry, CommandListEntry, Host, PagedBinding, SharedStateTrace, compute,
-    invalid_handle, state::StateCharge,
+    Backend, BatchPhase, BatchSelection, BatchShape, BatchSlotEntry, CommandListEntry, Host,
+    PagedBinding, SharedStateTrace, compute, invalid_handle, state::StateCharge,
 };
 use std::sync::{Arc, Weak, atomic::Ordering};
 use wasmtime::component::Resource;
@@ -10,7 +10,7 @@ use wasmtime::component::Resource;
 #[derive(Clone, Debug)]
 pub(crate) struct SlotCapture {
     pub(crate) slot: u32,
-    pub(crate) prefill: bool,
+    pub(crate) shape: BatchShape,
     binding: Weak<PagedBinding>,
     pub(crate) trace: SharedStateTrace,
     _charge: Arc<StateCharge>,
@@ -29,14 +29,40 @@ impl PromptReplayLane {
     }
 }
 
+pub(crate) fn capture_shape(
+    kind: crate::paged_storage::CaptureKind,
+    selection: crate::paged_storage::CaptureSelection,
+) -> BatchShape {
+    use crate::paged_storage::{CaptureKind, CaptureSelection};
+    let (phase, bucket, tokens) = match kind {
+        CaptureKind::Prompt => (BatchPhase::Prompt, 1, 1),
+        CaptureKind::Decode(bucket) => (BatchPhase::Decode, bucket, 1),
+        CaptureKind::Verify(rows) => (BatchPhase::Verify, 1, rows),
+    };
+    BatchShape {
+        phase,
+        bucket,
+        tokens,
+        selection: match selection {
+            CaptureSelection::Combined => BatchSelection::Combined,
+            CaptureSelection::Forward => BatchSelection::Forward,
+            CaptureSelection::Masked => BatchSelection::Masked,
+        },
+    }
+}
+
 impl SlotCapture {
+    pub(crate) fn prefill(&self) -> bool {
+        self.shape.phase == BatchPhase::Prompt
+    }
+
     pub(crate) fn prompt_lane<B: Backend + 'static>(
         &self,
         host: &Host<B>,
         numerical: bool,
     ) -> Result<Option<PromptReplayLane>, compute::Error> {
         self.validate(host, numerical)?;
-        if !self.prefill {
+        if !self.prefill() {
             return Ok(None);
         }
         let slot = host
@@ -77,7 +103,7 @@ impl SlotCapture {
                 && inputs.banks[slot.active_bank]
                     .prompt_phase
                     .load(Ordering::Acquire)
-                    != self.prefill)
+                    != self.prefill())
         {
             return Err(invalid_handle(
                 "capture slot identity or numerical phase differs",
@@ -96,7 +122,7 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         &mut self,
         commands: &Resource<CommandListEntry>,
         slot: &Resource<BatchSlotEntry>,
-        prefill: bool,
+        shape: BatchShape,
     ) -> Result<(), compute::Error> {
         let entry = self.table.get(commands).map_err(invalid_handle)?;
         if !entry.recorded.is_empty() || entry.slot_capture.is_some() {
@@ -128,7 +154,7 @@ impl<B: Backend + Send + Sync + 'static> Host<B> {
         entry.protected.extend(buffers);
         entry.slot_capture = Some(SlotCapture {
             slot: slot.rep(),
-            prefill,
+            shape,
             binding,
             trace: trace.share(),
             _charge: charge,
@@ -166,8 +192,8 @@ impl<B: Backend + 'static> Host<B> {
             if capture.slot != usage.slot
                 || usage.active
                 || usage.bank != 0
-                || (capture.prefill && usage.lane != 0)
-                || (!capture.prefill && usage.tokens != 1)
+                || (capture.prefill() && usage.lane != 0)
+                || (!capture.prefill() && usage.tokens != 1)
             {
                 return Err(invalid_handle(
                     "state work differs from its capture declaration",
@@ -186,5 +212,36 @@ impl<B: Backend + 'static> Host<B> {
             .get_mut(&usage.slot)
             .ok_or_else(|| invalid_handle("state slot is missing"))?;
         action(state.commands(usage.bank, usage.lane, usage.active)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paged_storage::{CaptureKind, CaptureSelection};
+
+    #[test]
+    fn capture_kinds_preserve_geometry_and_selection() {
+        for (kind, phase, bucket, tokens) in [
+            (CaptureKind::Prompt, BatchPhase::Prompt, 1, 1),
+            (CaptureKind::Decode(4), BatchPhase::Decode, 4, 1),
+            (CaptureKind::Verify(3), BatchPhase::Verify, 1, 3),
+        ] {
+            for (selection, expected) in [
+                (CaptureSelection::Combined, BatchSelection::Combined),
+                (CaptureSelection::Forward, BatchSelection::Forward),
+                (CaptureSelection::Masked, BatchSelection::Masked),
+            ] {
+                assert_eq!(
+                    capture_shape(kind, selection),
+                    BatchShape {
+                        phase,
+                        bucket,
+                        tokens,
+                        selection: expected,
+                    }
+                );
+            }
+        }
     }
 }

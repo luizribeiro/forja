@@ -59,7 +59,18 @@ interface paged-storage {
     delta-rule-block,
   }
 
-  capture-slot: func(cmds: borrow<command-list>, slot: borrow<batch-slot>, prefill: bool) -> result<_, error>;
+  variant capture-kind {
+    prompt,
+    decode(u32),
+    verify(u32),
+  }
+  enum capture-selection {
+    combined,
+    forward,
+    masked,
+  }
+
+  capture-slot: func(cmds: borrow<command-list>, slot: borrow<batch-slot>, kind: capture-kind, selection: capture-selection) -> result<_, error>;
   capture-tensors: func(cmds: borrow<command-list>, slot: borrow<batch-slot>) -> result<slot-tensors, error>;
   capture-token: func(cmds: borrow<command-list>, slot: borrow<batch-slot>, lane: u32) -> result<tensor, error>;
 
