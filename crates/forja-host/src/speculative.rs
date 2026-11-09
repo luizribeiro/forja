@@ -1,6 +1,31 @@
 //! CPU policy for exact speculative decoding.
 
+use crate::{BatchPhase, BatchSelection, BatchShape, MAX_VERIFY_ROWS};
 use std::num::NonZeroU64;
+
+/// Selects the largest declared verify shape fitting real drafts and the budget.
+///
+/// No fitting shape, including no lookup match, means plain decode; no padding
+/// is synthesized. Equal-token shapes use the last entry in declaration order.
+#[must_use]
+pub fn select_verify_shape(
+    shapes: &[BatchShape],
+    real_drafts: u64,
+    budget: VerifyBudget,
+) -> Option<BatchShape> {
+    let cap = budget.draft_cap().min(real_drafts);
+    shapes
+        .iter()
+        .copied()
+        .filter(|shape| {
+            shape.phase == BatchPhase::Verify
+                && shape.selection == BatchSelection::Combined
+                && shape.bucket == 1
+                && (2..=MAX_VERIFY_ROWS).contains(&shape.tokens)
+                && u64::from(shape.tokens - 1) <= cap
+        })
+        .max_by_key(|shape| shape.tokens)
+}
 
 /// Checked limits shared by shape selection and acceptance for one round.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +79,61 @@ impl VerifyBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shape(tokens: u32) -> BatchShape {
+        BatchShape {
+            phase: BatchPhase::Verify,
+            bucket: 1,
+            tokens,
+            selection: BatchSelection::Combined,
+        }
+    }
+
+    #[test]
+    fn shape_selection_uses_only_declared_shapes_without_padding() {
+        for (real, rule, left, expected) in [
+            (7, 2, 33, Some(3)),
+            (1, 2, 33, Some(2)),
+            (0, 2, 33, None),
+            (7, 1, 33, Some(2)),
+            (7, 0, 33, None),
+            (7, 2, 1, None),
+        ] {
+            let budget = VerifyBudget::new(4097, rule, left, 8192, 8192).unwrap();
+            assert_eq!(
+                select_verify_shape(&[shape(3), shape(2)], real, budget),
+                expected.map(shape)
+            );
+        }
+        let budget = VerifyBudget::new(4097, 2, 33, 8192, 8192).unwrap();
+        assert_eq!(select_verify_shape(&[shape(3)], 1, budget), None);
+    }
+
+    #[test]
+    fn shape_selection_refuses_unsupported_catalog_entries() {
+        for (phase, selection, bucket, tokens) in [
+            (BatchPhase::Verify, BatchSelection::Combined, 1, 1),
+            (BatchPhase::Verify, BatchSelection::Combined, 1, 9),
+            (BatchPhase::Verify, BatchSelection::Combined, 2, 3),
+            (BatchPhase::Decode, BatchSelection::Combined, 1, 3),
+            (BatchPhase::Verify, BatchSelection::Masked, 1, 3),
+        ] {
+            let budget = VerifyBudget::new(4097, 2, 33, 8192, 8192).unwrap();
+            assert_eq!(
+                select_verify_shape(
+                    &[BatchShape {
+                        phase,
+                        bucket,
+                        tokens,
+                        selection
+                    }],
+                    7,
+                    budget
+                ),
+                None
+            );
+        }
+    }
 
     #[test]
     fn budgets_clamp_each_limit_with_checked_absolute_headroom() {
