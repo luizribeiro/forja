@@ -1310,6 +1310,38 @@ impl GraphTemplate {
             })
     }
 
+    /// Returns the effective key interval of each reachable arm at a dispatch index.
+    ///
+    /// Fixed selections and missing indices return `None`. Intervals include the rule key's
+    /// row offset and follow the order of [`Self::backend_dispatch_candidates`].
+    ///
+    /// # Errors
+    /// Returns an error if a rule key exceeds its parameter's checked range.
+    #[doc(hidden)]
+    pub fn dispatch_rule_intervals(
+        &self,
+        index: usize,
+    ) -> Result<Option<Vec<RangeInclusive<u32>>>, GraphError> {
+        let Some(TemplateDispatch::Rule { key, arms, .. }) = self.dispatches.get(index) else {
+            return Ok(None);
+        };
+        let range = key.range(&self.space)?;
+        let mut lo = *range.start();
+        let mut intervals = Vec::new();
+        for (hi, _) in arms {
+            if lo > *hi {
+                continue;
+            }
+            let hi = (*hi).min(*range.end());
+            intervals.push(lo..=hi);
+            if hi == *range.end() {
+                break;
+            }
+            lo = hi.checked_add(1).ok_or(ParamError::ArithmeticOverflow)?;
+        }
+        Ok(Some(intervals))
+    }
+
     /// Instantiates a backend-preparation candidate for each fixed selection and reachable rule arm.
     #[doc(hidden)]
     pub fn backend_dispatch_candidates(&self) -> Result<Vec<(usize, bool, Dispatch)>, GraphError> {
@@ -2176,6 +2208,11 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(
+            graph.dispatch_rule_intervals(0).unwrap(),
+            Some(vec![1..=7, 8..=33])
+        );
+        assert_eq!(graph.dispatch_rule_intervals(1).unwrap(), None);
         let at_seven = graph.instantiate(&space.values(vec![7]).unwrap()).unwrap();
         let at_eight = graph.instantiate(&space.values(vec![8]).unwrap()).unwrap();
         assert_eq!(
@@ -2256,6 +2293,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn effective_rule_intervals_clip_unreachable_arms_without_overflow() {
+        for (range, offset, bounds, expected) in [
+            (7..=33, 2, vec![7, 10, 35], vec![9..=10, 11..=35]),
+            (
+                u32::MAX - 1..=u32::MAX,
+                0,
+                vec![u32::MAX],
+                std::iter::once(u32::MAX - 1..=u32::MAX).collect(),
+            ),
+        ] {
+            let space = ParamSpace::new(vec![range]).unwrap();
+            let mut graph = GraphTemplate::new(space, GraphLimits::default());
+            record_copy_rule(
+                &mut graph,
+                RuleKey {
+                    parameter: 0,
+                    row_offset: offset,
+                },
+                &bounds,
+            )
+            .unwrap();
+            assert_eq!(graph.dispatch_rule_intervals(0).unwrap(), Some(expected));
+        }
+        let space = ParamSpace::new(Vec::new()).unwrap();
+        let mut graph = GraphTemplate::new(space, GraphLimits::default());
+        graph
+            .dispatch(
+                Op::Copy,
+                &[&tensor(1, &[7]).into()],
+                &tensor(2, &[7]).into(),
+            )
+            .unwrap();
+        assert_eq!(graph.dispatch_rule_intervals(0).unwrap(), None);
     }
 
     #[test]
