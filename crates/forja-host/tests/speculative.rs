@@ -1,5 +1,3 @@
-#[path = "speculative/cpu.rs"]
-mod cpu;
 #[path = "speculative/request.rs"]
 mod request;
 use crate::common::draft::{TestDrafter, assert_draft_exact};

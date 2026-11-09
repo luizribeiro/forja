@@ -8,7 +8,7 @@ trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/source"
 tar -C "$repository" -cf - \
   Cargo.toml Cargo.lock chat-formats \
-  crates support/forja-testing support/golden-fixtures \
+  crates support/forja-testing support/forja-draft-testing support/golden-fixtures \
   engines/olmoe engines/qwen3 engines/qwen3-coder engines/qwen38 engines/smollm2 \
   support/guests support/test-guests wit \
   | tar -C "$scratch/source" -xf -

@@ -1,0 +1,15 @@
+[package]
+name = "forja-draft-testing"
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+forja-core = { path = "../../crates/forja-core" }
+forja-cpu = { path = "../../crates/forja-cpu" }
+forja-host = { path = "../../crates/forja-host" }
+
+[lints]
+workspace = true

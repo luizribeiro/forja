@@ -865,12 +865,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "forja-draft-testing"
+version = "0.0.0"
+dependencies = [
+ "forja-core",
+ "forja-cpu",
+ "forja-host",
+]
+
+[[package]]
 name = "forja-host"
 version = "0.0.0"
 dependencies = [
  "forja-config",
  "forja-core",
  "forja-cpu",
+ "forja-draft-testing",
  "forja-metal",
  "forja-program-conversions",
  "forja-sampling",
@@ -961,6 +971,7 @@ dependencies = [
  "forja-config",
  "forja-core",
  "forja-cpu",
+ "forja-draft-testing",
  "forja-host",
  "llguidance",
  "serde",

@@ -12,6 +12,7 @@ members = [
   "chat-formats/*",
   "crates/*",
   "support/forja-testing",
+  "support/forja-draft-testing",
   "support/golden-fixtures",
   "support/test-guests",
 ]

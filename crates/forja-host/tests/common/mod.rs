@@ -3,7 +3,7 @@ use std::{error::Error, fs, path::Path};
 use forja_config::read_profile;
 use forja_host::{EngineLoadConfig, FixedVariantPick, VariantPickArm, VariantRulePick};
 
-pub mod draft;
+pub use forja_draft_testing as draft;
 
 pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>> {
     let profile = read_profile(&fs::read(component)?)?;

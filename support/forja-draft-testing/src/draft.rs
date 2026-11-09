@@ -1,15 +1,25 @@
 use forja_host::{SamplingParams, speculative::VerifyCut};
 
+/// Deterministic proposals for exact target-stream tests.
 #[derive(Clone, Copy, Debug)]
 pub enum TestDrafter {
+    /// Always follows its own proposed prefix.
     Oracle,
+    /// Always changes the target selection.
     Adversary,
+    /// Matches only the requested leading rows.
     OraclePrefix(usize),
+    /// Changes the first row, then follows the resulting prefix.
     WrongFirstRightSecond,
+    /// Continues a seeded pseudo-random sequence.
     Random(u64),
 }
 
 impl TestDrafter {
+    /// Proposes tokens against the target evaluated on each proposed prefix.
+    ///
+    /// # Panics
+    /// Panics on an invalid fixture or a failed CPU operation.
     pub fn propose(
         &mut self,
         prefix: &[u32],
@@ -108,15 +118,25 @@ fn random_drafts_are_seeded_in_range_and_continue_across_rounds() {
         assert_eq!(split, expected);
     }
 }
+/// Observable output and paths from one fresh request.
 #[derive(Default, Debug)]
 pub struct Trace {
+    /// Selected output stream.
     pub tokens: Vec<u32>,
+    /// Accepted draft counts in verify order.
     pub accepted: Vec<u32>,
+    /// Verify row counts in execution order.
     pub shapes: Vec<u32>,
+    /// Ordinary decode steps.
     pub plain: usize,
+    /// Terminal token boundary, if reached.
     pub cut: Option<VerifyCut>,
 }
 
+/// Compares fresh plain and draft traces across supported sampling modes.
+///
+/// # Panics
+/// Panics when paths, oracle acceptance or output streams differ.
 pub fn assert_draft_exact(
     verify_expected: bool,
     mut run: impl FnMut(SamplingParams, Option<TestDrafter>) -> Trace,

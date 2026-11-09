@@ -1,5 +1,5 @@
-use super::cpu::Target;
 use crate::common::draft::{TestDrafter, Trace};
+use forja_draft_testing::Target;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, SamplingParams,
     speculative::{VerifyAcceptance, VerifyBudget, VerifyCut, select_verify_shape},
