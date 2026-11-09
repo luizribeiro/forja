@@ -250,7 +250,7 @@ mod verification;
 fn serving_catalog_preserves_eager_bucket_and_tail_budgets() {
     use forja_sdk::{BatchPhase, BatchSelection};
     let shapes = qwen38::Qwen38::serving_shapes();
-    assert_eq!(shapes.len(), 13);
+    assert_eq!(shapes.len(), 13 + verification::verify_graphs());
     for bucket in [1, 2, 4, 8] {
         let decode = shapes
             .iter()
@@ -284,11 +284,24 @@ fn serving_catalog_preserves_eager_bucket_and_tail_budgets() {
             .iter()
             .all(|shape| shape.bucket == 1 && shape.selection == BatchSelection::Combined)
     );
+    let verify = shapes
+        .iter()
+        .filter(|shape| shape.phase == BatchPhase::Verify)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        verify.iter().map(|shape| shape.tokens).collect::<Vec<_>>(),
+        (2..=qwen38::Qwen38::VERIFY_ROWS).collect::<Vec<_>>()
+    );
+    assert!(
+        verify
+            .iter()
+            .all(|shape| shape.bucket == 1 && shape.selection == BatchSelection::Combined)
+    );
     let retained = shapes
         .iter()
         .filter(|shape| shape.phase == BatchPhase::Prompt || shape.bucket <= 4)
         .collect::<Vec<_>>();
-    assert_eq!(retained.len() + 1, 13);
+    assert_eq!(retained.len() + 1, 13 + verification::verify_graphs());
     assert!(retained.iter().all(|shape| shape.bucket <= 4));
 }
 
@@ -383,7 +396,10 @@ fn component_metadata_declares_the_text_only_batched_contract() -> Result<(), Bo
             .iter()
             .all(|plane| plane.elements_per_token == 1024 && plane.alignment == 256)
     );
-    assert_eq!(serving.batch_shapes.len(), 13);
+    assert_eq!(
+        serving.batch_shapes.len(),
+        13 + verification::verify_graphs()
+    );
     assert_eq!(profile.workload().prefill_chunk.get(), 2048);
     assert_eq!(
         profile

@@ -123,7 +123,7 @@ fn expand_engine(item: &ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
 fn engine_step_impl() -> proc_macro2::TokenStream {
     quote! {
             async fn step(input: StepIn) -> ::std::result::Result<StepOut, compute::Error> {
-                let phase = phase(input.phase)?;
+                let phase = prompt_or_decode_phase(input.phase)?;
                 let tokens = token_tensor(&input.tokens)?;
                 let output = with_engine(|engine| {
                     <ExportedEngine as ::forja_sdk::Engine>::step(
@@ -192,7 +192,7 @@ fn engine_guest_impl() -> proc_macro2::TokenStream {
             #step
 
             async fn decode(input: DecodeIn) -> ::std::result::Result<DecodeOut, compute::Error> {
-                let phase = phase(input.phase)?;
+                let phase = prompt_or_decode_phase(input.phase)?;
                 let tokens = input.tokens.as_deref().map(token_tensor).transpose()?;
                 let output = with_engine(|engine| {
                     <ExportedEngine as ::forja_sdk::Engine>::decode(
@@ -357,8 +357,16 @@ fn engine_batch_helpers() -> proc_macro2::TokenStream {
             Ok(match value {
                 bindings::exports::l9o::gpu::engine::BatchPhase::Prompt => ::forja_sdk::BatchPhase::Prompt,
                 bindings::exports::l9o::gpu::engine::BatchPhase::Decode => ::forja_sdk::BatchPhase::Decode,
-                bindings::exports::l9o::gpu::engine::BatchPhase::Verify => return Err(compute::Error::OpSignature("verify is unsupported".into())),
+                bindings::exports::l9o::gpu::engine::BatchPhase::Verify => ::forja_sdk::BatchPhase::Verify,
             })
+        }
+
+        fn prompt_or_decode_phase(value: bindings::exports::l9o::gpu::engine::BatchPhase) -> ::std::result::Result<::forja_sdk::BatchPhase, compute::Error> {
+            let phase = phase(value)?;
+            if phase == ::forja_sdk::BatchPhase::Verify {
+                return Err(compute::Error::OpSignature("verify is unsupported".into()));
+            }
+            Ok(phase)
         }
 
         fn batch_shape(
@@ -415,7 +423,7 @@ fn engine_decode_phases() -> proc_macro2::TokenStream {
             start_pos: u32,
             phase_value: bindings::exports::l9o::gpu::engine::BatchPhase,
         ) -> ::std::result::Result<compute::Tensor, compute::Error> {
-            let phase = phase(phase_value)?;
+            let phase = prompt_or_decode_phase(phase_value)?;
             let tokens = tokens.as_deref().map(token_tensor).transpose()?;
             let logits = with_engine(|engine| {
                 <ExportedEngine as ::forja_sdk::Engine>::begin_decode(

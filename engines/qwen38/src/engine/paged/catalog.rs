@@ -88,6 +88,23 @@ impl Catalog {
         input: &forja_sdk::BatchInput<'_>,
         selection: bool,
     ) -> Result<forja_sdk::BatchOutput> {
+        if input.shape.phase == BatchPhase::Verify {
+            let lane = input
+                .lanes
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or_else(|| Error::loading("verify lane is missing"))?;
+            if !self.replay(input.shape, &[lane.start_pos])? {
+                super::verify::record(
+                    model,
+                    input.shape.tokens,
+                    &lane.start_pos.into(),
+                    lane.slot,
+                )?;
+                forja_sdk::eval()?;
+            }
+            return super::verify::output(model, input.shape.tokens);
+        }
         let prompt = input.shape.phase == BatchPhase::Prompt;
         let mut shape = input.shape;
         let base = if prompt {

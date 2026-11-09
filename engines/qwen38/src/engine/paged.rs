@@ -1,4 +1,5 @@
 mod catalog;
+mod verify;
 pub(super) use catalog::Catalog;
 
 use crate::Model;

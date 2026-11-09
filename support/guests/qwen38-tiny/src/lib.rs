@@ -13,7 +13,7 @@ enum Tiny {
     Full(qwen38::Qwen38),
     Recurrent(qwen38::DeltaNet),
     Decoder(qwen38::DecoderLayer),
-    Attention(qwen38::Attention),
+    Attention(qwen38::Attention, std::rc::Rc<forja_sdk::PagedCacheSet>),
 }
 
 fn full_config(load: &EngineLoadConfig) -> qwen38::Config {
@@ -65,14 +65,26 @@ impl Engine for Tiny {
         }
         if load.tunings.iter().any(|name| name == "attention-fixture") {
             let context = load.max_context.unwrap_or(64);
-            return qwen38::Attention::load_paged(
+            let cache = std::rc::Rc::new(pool.cache_set_with_state(
+                1,
+                &[forja_sdk::PagedStateDescriptor {
+                    dtype: forja_sdk::DType::F32,
+                    shape: vec![1, 1],
+                }],
+                forja_sdk::PagedInputLayout {
+                    vocab: 33,
+                    prompt_tokens: context.min(64),
+                    verify_rows: qwen38::Qwen38::VERIFY_ROWS,
+                },
+            )?);
+            let layer = qwen38::Attention::load_paged(
                 &weights.scoped("language_model.model.layers.3.self_attn"),
                 qwen38::Config::tiny(),
-                std::rc::Rc::new(pool.cache_set(1)?),
+                std::rc::Rc::clone(&cache),
                 0,
                 forja_sdk::Tensor::constant(&(0..context).collect::<Vec<_>>(), &[context])?,
-            )
-            .map(Self::Attention);
+            )?;
+            return Ok(Self::Attention(layer, cache));
         }
         let prompt_tokens = load.max_context.unwrap_or(64).min(64);
         let config = qwen38::Config::tiny();
@@ -82,7 +94,7 @@ impl Engine for Tiny {
             forja_sdk::PagedInputLayout {
                 vocab: 33,
                 prompt_tokens,
-                verify_rows: 0,
+                verify_rows: qwen38::Qwen38::VERIFY_ROWS,
             },
         )?);
         if load.tunings.iter().any(|name| name == "decoder-fixture") {
@@ -106,10 +118,14 @@ impl Engine for Tiny {
     fn step(&mut self, input: StepInput) -> Result<StepOutput> {
         match self {
             Self::Full(engine) => engine.step(input),
-            Self::Attention(layer) => {
+            Self::Attention(layer, cache) => {
                 let values = input.tokens.to_vec()?;
                 let rows = u32::try_from(values.len())
                     .map_err(|_| forja_sdk::Error::loading("fixture rows overflow"))?;
+                drop(cache.state_at(0, 0)?.causal_convolution(
+                    &forja_sdk::Tensor::<f32>::zeros(&[rows, 1])?,
+                    &forja_sdk::Tensor::<f32>::zeros(&[2, 1])?,
+                )?);
                 let x = values
                     .into_iter()
                     .flat_map(|token| [forja_sdk::bf16::from_f64(f64::from(token)); 64])
@@ -216,7 +232,7 @@ impl Engine for Tiny {
     fn decode(&mut self, input: DecodeInput) -> Result<DecodeOutput> {
         match self {
             Self::Full(engine) => engine.decode(input),
-            Self::Recurrent(_) | Self::Decoder(_) | Self::Attention(_) => {
+            Self::Recurrent(_) | Self::Decoder(_) | Self::Attention(..) => {
                 Err(forja_sdk::Error::loading("recurrent fixture uses step"))
             }
         }

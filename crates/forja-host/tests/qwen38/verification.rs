@@ -5,6 +5,10 @@ use golden_fixtures::{
 };
 use qwen38::{Config, Model};
 
+pub(super) fn verify_graphs() -> usize {
+    usize::try_from(qwen38::Qwen38::VERIFY_ROWS - 1).unwrap()
+}
+
 pub(super) fn tiny_load() -> EngineLoadConfig {
     EngineLoadConfig {
         max_context: Some(64),

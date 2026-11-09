@@ -31,6 +31,9 @@ pub struct Qwen38 {
     feedback: Feedback,
 }
 impl Qwen38 {
+    /// Largest number of target rows in a single verify round.
+    pub const VERIFY_ROWS: u32 = 2;
+
     /// Returns the finite serving shapes; eight-lane combined decode executes eagerly.
     #[must_use]
     pub fn serving_shapes() -> Vec<forja_sdk::BatchShape> {
@@ -53,6 +56,12 @@ impl Qwen38 {
             .filter(|shape| shape.bucket != 8 || shape.selection == BatchSelection::Combined)
             .chain([64, 512, 2048].map(|tokens| BatchShape {
                 phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens,
+                selection: BatchSelection::Combined,
+            }))
+            .chain((2..=Self::VERIFY_ROWS).map(|tokens| BatchShape {
+                phase: BatchPhase::Verify,
                 bucket: 1,
                 tokens,
                 selection: BatchSelection::Combined,

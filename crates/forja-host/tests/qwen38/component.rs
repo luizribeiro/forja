@@ -15,6 +15,7 @@ async fn tiny_component_matches_teacher_forced_transformers() -> Result<(), Box<
             &forja_host::EngineLoadConfig {
                 max_context: Some(64),
                 replay: false,
+                paged_cache: true,
                 kv_cache: forja_host::KvCacheFormat::F16,
                 ..forja_host::EngineLoadConfig::default()
             },
