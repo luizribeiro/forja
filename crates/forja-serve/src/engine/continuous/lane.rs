@@ -58,6 +58,7 @@ pub(super) struct BatchLane {
     pub(super) pending_token: u32,
     pub(super) draft_mode: crate::draft::DraftMode,
     pub(super) draft_refused: bool,
+    pub(super) drafting: crate::DraftMetrics,
     pub(super) draft_probe_position: Option<u32>,
     lookup: Option<crate::PromptLookup>,
     pub(super) position: u32,
@@ -102,6 +103,7 @@ impl BatchLane {
             pending_token,
             draft_mode: crate::draft::DraftMode::Plain,
             draft_refused: false,
+            drafting: crate::DraftMetrics::default(),
             draft_probe_position: None,
             lookup: None,
             position: request.prompt_tokens,
@@ -284,6 +286,11 @@ impl BatchLane {
             .and_then(|constraint| constraint.parser);
         let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
         let reason = crate::engine::tool_finish_reason(reason, &tool_call);
+        self.drafting.exit(match reason {
+            FinishReason::Length => "max-tokens",
+            FinishReason::Stop => "stop-or-eos",
+            FinishReason::ToolCalls => "tool-call",
+        });
         Ok(Completion {
             text: self.text.clone(),
             tool_calls: tool_call,
@@ -294,6 +301,7 @@ impl BatchLane {
                 completion_tokens: self.consumed,
             },
             token_ids: self.token_ids.clone(),
+            drafting: self.drafting.clone(),
         })
     }
 

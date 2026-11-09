@@ -12,6 +12,7 @@ use crate::{FinishReason, GenerationError, ServingEngine, draft::DraftMode};
 
 pub(super) struct Candidate {
     fed: FedDrafts<'static>,
+    entry_reason: &'static str,
 }
 
 pub(super) fn wants_draft_drain(available: bool, exclusive: bool, active: &[BatchLane]) -> bool {
@@ -42,6 +43,11 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         }
         lane.draft_probe_position = Some(lane.position);
         let (position, sampling) = (lane.position, lane.sampling);
+        let entry_reason = if self.drafter.is_some() {
+            "external-proposal"
+        } else {
+            "prompt-lookup-match"
+        };
         let (source, prefix) =
             lane.lane_source(self.drafter.as_deref_mut(), self.lookup_policy.as_ref())?;
         let mut proposal = source.propose(prefix, position, sampling);
@@ -55,6 +61,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         proposal.truncate_invalid_tokens(self.info.vocab);
         Some(Candidate {
             fed: select_verify_shape(shapes, &proposal.tokens, budget)?.into_owned(),
+            entry_reason,
         })
     }
 
@@ -64,6 +71,9 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         exclusive: bool,
     ) -> bool {
         if active.len() != 1 {
+            for lane in active {
+                lane.drafting.exit("concurrency");
+            }
             return false;
         }
         let wanted = wants_draft_drain(self.has_drafter(), exclusive, active);
@@ -82,6 +92,7 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             };
             match reserved {
                 Ok(true) => {
+                    lane.drafting.enter(candidate.entry_reason);
                     lane.draft_mode = DraftMode::Drafting;
                     match self.run_draft_round(&mut lane, candidate).await {
                         Ok(Some(reason)) => self.finish_batch_lane(lane, reason).await,
@@ -98,6 +109,11 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
             }
         }
         if lane.draft_mode != DraftMode::Plain {
+            lane.drafting.exit(if exclusive {
+                "lookup-ended"
+            } else {
+                "admission"
+            });
             lane.draft_mode = DraftMode::Exiting;
             match self.runner.try_release_draft_lane(lane.slot) {
                 Ok(true) => {
@@ -151,9 +167,14 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
     async fn verify_tokens(
         &mut self,
         lane: &mut BatchLane,
-        Candidate { fed }: Candidate,
+        Candidate { fed, .. }: Candidate,
     ) -> Result<(u32, Option<FinishReason>), GenerationError> {
         let shape = fed.shape();
+        self.runner
+            .wait_for_queued_submissions()
+            .await
+            .map_err(draft_error)?;
+        let gpu_before = self.runner.metrics().gpu_time;
         let mut tokens = vec![lane.pending_token];
         tokens.extend_from_slice(fed.tokens());
         let output = self
@@ -186,6 +207,9 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 return Err(self.abandon_output(output, error).await);
             }
         };
+        if let Err(error) = self.runner.wait_for_queued_submissions().await {
+            return Err(self.abandon_output(output, draft_error(error)).await);
+        }
         let decision = match VerifyAcceptance::new(fed, &samples, self.info.vocab) {
             Ok(acceptance) => {
                 lane.accept_verified(
@@ -225,6 +249,9 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         self.runner
             .publish_verified_batch(output, &decision)
             .map_err(draft_error)?;
+        let gpu_elapsed = self.runner.metrics().gpu_time.saturating_sub(gpu_before);
+        let gpu_ns = u64::try_from(gpu_elapsed.as_nanos()).unwrap_or(u64::MAX);
+        lane.drafting.round(shape.tokens - 1, accepted, gpu_ns);
         lane.pending_token = decision.pending();
         #[cfg(test)]
         if let Some(barrier) = &self.batch_test_barrier {

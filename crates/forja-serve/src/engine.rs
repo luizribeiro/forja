@@ -444,6 +444,8 @@ pub struct Completion {
     pub finish_reason: FinishReason,
     /// Request token counts.
     pub usage: Usage,
+    /// Request-local draft/verify observations.
+    pub drafting: crate::DraftMetrics,
     pub(crate) token_ids: Vec<u32>,
 }
 
@@ -1732,6 +1734,7 @@ fn finish_completion(
         finish_reason,
         usage,
         token_ids,
+        drafting: crate::DraftMetrics::default(),
     })
 }
 

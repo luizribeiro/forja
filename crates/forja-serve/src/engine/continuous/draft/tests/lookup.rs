@@ -342,6 +342,10 @@ async fn zero_acceptance_exits_even_when_the_new_suffix_has_a_continuation() -> 
     let mut active = vec![lane];
     assert!(engine.advance_drafting(&mut active, true).await);
     assert_eq!(*barrier.verified.lock().unwrap(), [(3, 0)]);
+    assert_eq!(active[0].drafting.rounds, 1);
+    assert_eq!(active[0].drafting.acceptance_by_depth[&0], 1);
+    assert_eq!(active[0].drafting.k_eff[&2], 1);
+    assert_eq!(active[0].drafting.episodes_entered, 1);
     let mut fresh = PromptLookup::new(profile.prompt_lookup().unwrap().clone());
     let proposal = fresh.propose(
         active[0].ledger().tokens(),
@@ -351,6 +355,7 @@ async fn zero_acceptance_exits_even_when_the_new_suffix_has_a_continuation() -> 
     assert_eq!(proposal.tokens, [0, 0]);
     assert!(!engine.advance_drafting(&mut active, true).await);
     assert_eq!(active[0].draft_mode, DraftMode::Plain);
+    assert_eq!(active[0].drafting.episodes_exited["zero-acceptance"], 1);
     engine.runner.prepare_paged_lane(1, None, 1)?;
     assert!(engine.runner.try_reserve_draft_lane(1)?);
     assert!(engine.runner.try_release_draft_lane(1)?);

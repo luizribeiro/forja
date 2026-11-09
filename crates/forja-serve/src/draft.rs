@@ -1,4 +1,6 @@
+mod metrics;
 use forja_host::SamplingParams;
+pub use metrics::DraftMetrics;
 
 mod lookup;
 pub use lookup::PromptLookup;

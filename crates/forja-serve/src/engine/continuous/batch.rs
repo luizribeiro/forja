@@ -344,6 +344,7 @@ where
                 .await;
                 continue;
             };
+            lane.drafting.decode(0);
             match lane
                 .accept_tokens(&[token], &self.chat_info.stop_token_ids, &mut self.metrics)
                 .await

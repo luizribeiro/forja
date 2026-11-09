@@ -106,6 +106,7 @@ mod tests {
                 completion_tokens: 3,
             },
             token_ids: vec![1, 2, 3],
+            drafting: crate::DraftMetrics::default(),
         }
     }
 

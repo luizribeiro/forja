@@ -1742,6 +1742,7 @@ mod tests {
                 completion_tokens: 1,
             },
             token_ids: vec![1],
+            drafting: crate::DraftMetrics::default(),
         }
     }
 
@@ -1995,6 +1996,7 @@ mod tests {
                         completion_tokens: 1,
                     },
                     token_ids: vec![1],
+                    drafting: crate::DraftMetrics::default(),
                 })
             })
         }
@@ -2309,6 +2311,7 @@ mod tests {
                 completion_tokens: 2,
             },
             token_ids: vec![1, 2],
+            drafting: crate::DraftMetrics::default(),
         };
         tracing::subscriber::with_default(subscriber, || {
             log_completion(3, 7, "/v1/completions", "model", &completion);
