@@ -7,8 +7,8 @@ use forja_host::{
 
 use super::{CompletionSink, PreparedRequest};
 use crate::engine::{
-    BoundaryAction, BoundaryState, GenerationError, ToolParser, advance_speculative_constraint,
-    finish_tool_parser, parse_tool_piece,
+    BoundaryState, GenerationError, ToolParser, advance_speculative_constraint, finish_tool_parser,
+    parse_tool_piece,
 };
 use crate::guidance::GuidanceSession;
 use crate::metrics::{ServingMetrics, observe, observe_phase};
@@ -240,10 +240,10 @@ impl BatchLane {
                 started.elapsed(),
             );
         }
-        if matches!(action, BoundaryAction::Stop) {
+        if matches!(action, Some(VerifyCut::Stop)) {
             return Ok(Some(FinishReason::Stop));
         }
-        if matches!(action, BoundaryAction::Activate) {
+        if matches!(action, Some(VerifyCut::Activate)) {
             return Err(GenerationError::new("unexpected constraint activation"));
         }
         if self.consumed >= self.params.max_tokens {
@@ -319,6 +319,7 @@ impl BatchLane {
 
 #[cfg(test)]
 mod tests {
+    mod boundary;
     use super::*;
 
     fn streaming_lane(stops: &[&str]) -> (BatchLane, mpsc::Receiver<crate::GenerationEvent>) {

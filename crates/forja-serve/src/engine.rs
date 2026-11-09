@@ -16,7 +16,7 @@ use forja_config::{Choice, HostConfig, Unbounded};
 use forja_core::{Backend, correction_sampling_seed};
 use forja_host::{
     BatchPhase, BatchSelection, EngineBeginDecode, EngineDecode, EngineDecodeOutput, EngineInfo,
-    EngineRunner, EngineTensor, SamplingParams,
+    EngineRunner, EngineTensor, SamplingParams, speculative::VerifyCut,
 };
 use tokenizers::Tokenizer;
 use tokio::sync::{Notify, mpsc};
@@ -1600,10 +1600,10 @@ where
                         started.elapsed(),
                     );
                 }
-                if matches!(action, BoundaryAction::Stop) {
+                if matches!(action, Some(VerifyCut::Stop)) {
                     return Ok(FinishReason::Stop);
                 }
-                if matches!(action, BoundaryAction::Activate) && consumed < params.max_tokens {
+                if matches!(action, Some(VerifyCut::Activate)) && consumed < params.max_tokens {
                     let parser_started = Instant::now();
                     let (session, mask) = activate_tool_boundary(
                         &mut pipeline,
@@ -1901,12 +1901,6 @@ impl DecodePipeline {
     }
 }
 
-enum BoundaryAction {
-    Continue,
-    Stop,
-    Activate,
-}
-
 struct BoundaryState {
     trigger: Option<TokenMatcher>,
     matcher: StopMatcher,
@@ -1938,13 +1932,13 @@ impl BoundaryState {
         text: &mut String,
         sender: Option<&mpsc::Sender<GenerationEvent>>,
         control: &GenerationControl,
-    ) -> Result<BoundaryAction, GenerationError> {
+    ) -> Result<Option<VerifyCut>, GenerationError> {
         let activated = self
             .trigger
             .as_mut()
             .is_some_and(|matcher| matcher.push(token));
         let Some(piece) = piece else {
-            return Ok(BoundaryAction::Continue);
+            return Ok(None);
         };
         let output = self
             .matcher
@@ -1957,11 +1951,11 @@ impl BoundaryState {
             {
                 send_event(sender, GenerationEvent::Content(output.text), control).await?;
             }
-            Ok(BoundaryAction::Activate)
+            Ok(Some(VerifyCut::Activate))
         } else if emit_output(text, output, sender, control).await? {
-            Ok(BoundaryAction::Stop)
+            Ok(Some(VerifyCut::Stop))
         } else {
-            Ok(BoundaryAction::Continue)
+            Ok(None)
         }
     }
 
@@ -3159,8 +3153,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(matches!(ordinary_action, BoundaryAction::Continue));
-            assert!(matches!(lazy_action, BoundaryAction::Continue));
+            assert!(ordinary_action.is_none());
+            assert!(lazy_action.is_none());
         }
         ordinary
             .finish(&mut ordinary_text, None, &control)
