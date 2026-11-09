@@ -903,7 +903,11 @@ impl RuleKey {
             .ok_or(ParamError::ArithmeticOverflow)
     }
 
-    fn range(self, space: &ParamSpace) -> Result<RangeInclusive<u32>, GraphError> {
+    /// Returns this key's inclusive range over the declared parameter space.
+    ///
+    /// # Errors
+    /// Refuses absent parameters and shifted bounds that exceed `u32`.
+    pub fn range(self, space: &ParamSpace) -> Result<RangeInclusive<u32>, GraphError> {
         let range = space
             .ranges()
             .get(usize::from(self.parameter))
@@ -2034,6 +2038,36 @@ mod tests {
             * DType::F32.byte_size();
         let layout = Layout::contiguous(DType::F32, 0, shape.to_vec(), bytes).unwrap();
         Tensor::from_allocation(BufferId::new(1, buffer, bytes), layout, true).unwrap()
+    }
+
+    #[test]
+    fn public_rule_key_ranges_refuse_unknown_parameters_and_overflow() {
+        let space = ParamSpace::new(std::iter::once(7..=33).collect()).unwrap();
+        assert_eq!(
+            RuleKey {
+                parameter: 0,
+                row_offset: 2
+            }
+            .range(&space)
+            .unwrap(),
+            9..=35
+        );
+        assert!(
+            RuleKey {
+                parameter: 1,
+                row_offset: 0
+            }
+            .range(&space)
+            .is_err()
+        );
+        assert!(
+            RuleKey {
+                parameter: 0,
+                row_offset: u32::MAX
+            }
+            .range(&space)
+            .is_err()
+        );
     }
 
     #[test]
