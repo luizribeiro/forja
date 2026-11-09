@@ -492,6 +492,7 @@ pub struct ServingEngine<B: Backend + Send + Sync + 'static> {
     metrics: ServingMetrics,
     config_generation: u64,
     scheduler: SchedulerConfig,
+    drafter: Option<Box<dyn crate::DraftSource>>,
     #[cfg(test)]
     batch_test_barrier: Option<Arc<BatchTestBarrier>>,
 }
@@ -1047,9 +1048,17 @@ where
             metrics: ServingMetrics::default(),
             config_generation: 0,
             scheduler,
+            drafter: None,
             #[cfg(test)]
             batch_test_barrier: None,
         })
+    }
+
+    /// Supplies host proposals for sole-lane, unconstrained verify decoding.
+    #[must_use]
+    pub fn with_drafter(mut self, drafter: impl crate::DraftSource + 'static) -> Self {
+        self.drafter = Some(Box::new(drafter));
+        self
     }
 
     #[cfg(test)]
