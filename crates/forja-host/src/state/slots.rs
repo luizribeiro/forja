@@ -52,6 +52,10 @@ impl<B: Backend> StateSlots<B> {
         super::StateTrace::new(&self.storage, &self.chain_access(rows)?, self.lanes.len())
     }
 
+    pub(crate) fn plane_buffers(&self) -> impl Iterator<Item = forja_core::BufferId> + '_ {
+        self.storage.planes.iter().map(forja_core::Tensor::buffer)
+    }
+
     pub(crate) fn plane_count(&self) -> usize {
         self.storage.planes.len()
     }

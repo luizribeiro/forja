@@ -12613,7 +12613,7 @@ mod tests {
         }
     }
 
-    fn verify_input_fixture<B: Backend + 'static>(
+    pub(super) fn verify_input_fixture<B: Backend + 'static>(
         backend: B,
         rows: u32,
         lanes: u32,

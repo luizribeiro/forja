@@ -47,16 +47,20 @@ enum ArithmeticResource {
         start: u64,
         end: u64,
     },
+    Plane(BufferId),
 }
 
 struct CaptureResources {
     weights: HashSet<BufferId>,
+    planes: HashSet<BufferId>,
 }
 
 impl CaptureResources {
     fn key(&self, tensor: &Tensor) -> Option<ArithmeticResource> {
         let buffer = tensor.buffer();
-        if self.weights.contains(&buffer) {
+        if self.planes.contains(&buffer) {
+            Some(ArithmeticResource::Plane(buffer))
+        } else if self.weights.contains(&buffer) {
             let span = tensor.layout().byte_span();
             Some(ArithmeticResource::Weight {
                 buffer,
@@ -70,6 +74,7 @@ impl CaptureResources {
 
     fn reads(&self, dispatch: &Dispatch) -> Vec<ArithmeticResource> {
         let mut resources = Vec::new();
+        // Paged append kernels read their read/write plane outputs as well as ordinary inputs.
         for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
             if let Some(key) = self.key(tensor)
                 && !resources.contains(&key)
@@ -158,21 +163,42 @@ impl<B: Backend + 'static> Host<B> {
             slot.decode_arithmetic = None;
         }
     }
-    fn capture_resources(entry: &CommandListEntry) -> CaptureResources {
-        CaptureResources {
+    fn capture_resources(
+        &self,
+        slot: u32,
+        entry: &CommandListEntry,
+    ) -> Result<CaptureResources, compute::Error> {
+        let mut planes = self
+            .state_slots
+            .get(&slot)
+            .ok_or_else(|| invalid_handle("capture state slot is missing"))?
+            .plane_buffers()
+            .collect::<HashSet<_>>();
+        for handle in &self
+            .table
+            .get(&Resource::<BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?
+            .planes
+        {
+            planes.insert(self.entry(&Resource::new_borrow(*handle))?.tensor.buffer());
+        }
+        Ok(CaptureResources {
             weights: entry
                 .retained
                 .iter()
                 .filter(|entry| !matches!(entry.buffer.kind, BufferKind::Allocated { .. }))
                 .map(|entry| entry.tensor.buffer())
                 .collect(),
-        }
+            planes,
+        })
     }
     fn arithmetic_dispatches(
+        &self,
+        slot: u32,
         graph: &GraphTemplate,
         entry: &CommandListEntry,
     ) -> Result<Vec<ArithmeticDispatch>, compute::Error> {
-        let resources = Self::capture_resources(entry);
+        let resources = self.capture_resources(slot, entry)?;
         let candidates = graph
             .backend_dispatch_candidates()
             .map_err(|error| graph_error(&error))?;
@@ -216,7 +242,7 @@ impl<B: Backend + 'static> Host<B> {
         if slot.decode_arithmetic.is_some() {
             return Ok(None);
         }
-        let dispatches = Self::arithmetic_dispatches(graph, entry)?;
+        let dispatches = self.arithmetic_dispatches(scope.slot, graph, entry)?;
         let summary = ArithmeticSummary { dispatches };
         let bytes = summary.byte_size()?;
         let charge = StateCharge::reserve(
@@ -250,7 +276,15 @@ mod tests {
             false,
         );
         let entry = host.table.get(&commands).unwrap();
-        let resources = Host::<forja_cpu::CpuBackend>::capture_resources(entry);
+        let resources = CaptureResources {
+            weights: entry
+                .retained
+                .iter()
+                .filter(|entry| !matches!(entry.buffer.kind, BufferKind::Allocated { .. }))
+                .map(|entry| entry.tensor.buffer())
+                .collect(),
+            planes: HashSet::new(),
+        };
         let alias = host
             .view(&weights[0], crate::compute::ViewOp::Permute(vec![0]))
             .unwrap();
@@ -263,5 +297,47 @@ mod tests {
             resources.key(&host.entry(&weights[1]).unwrap().tensor)
         );
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn capture_binding_recognizes_actual_state_and_paged_planes() {
+        let (mut host, _pool, slot) =
+            crate::tests::verify_input_fixture(forja_cpu::CpuBackend::new(), 3, 1);
+        let commands = host.command_list().unwrap();
+        let state = host.state_slots[&slot.rep()]
+            .plane_buffers()
+            .next()
+            .unwrap();
+        let page = host
+            .entry(&Resource::new_borrow(
+                host.table.get(&slot).unwrap().planes[0],
+            ))
+            .unwrap()
+            .tensor
+            .buffer();
+        let entry = host.table.get(&commands).unwrap();
+        let resources = host.capture_resources(slot.rep(), entry).unwrap();
+        let view = |buffer, offset| {
+            host.backend
+                .tensor(
+                    buffer,
+                    forja_core::Layout::new(
+                        forja_core::DType::F32,
+                        offset,
+                        vec![7],
+                        vec![1],
+                        buffer.byte_len(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            resources.key(&view(state, 0)).unwrap(),
+            resources.key(&view(state, 7)).unwrap()
+        );
+        assert_ne!(
+            resources.key(&view(state, 0)).unwrap(),
+            resources.key(&view(page, 0)).unwrap()
+        );
     }
 }
