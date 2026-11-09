@@ -1,4 +1,5 @@
 mod engine;
+mod observed;
 mod options;
 mod record;
 mod sample;
@@ -15,9 +16,7 @@ use serde_json::{Value, json};
 use std::{error::Error, fs, io::Write as _, time::Instant};
 use tokenizers::Tokenizer;
 
-#[cfg(test)]
-use options::Mode;
-pub(crate) use options::Options;
+pub(crate) use options::{Mode, Options};
 
 pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box<dyn Error>> {
     if options.json.exists() {
@@ -122,6 +121,16 @@ async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
 
 fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Error>> {
     record::decorate(&mut document)?;
+    if options.mode == Mode::Draft {
+        let path = options
+            .plain_record
+            .as_ref()
+            .ok_or("draft mode requires a plain record")?;
+        let plain = serde_json::from_slice(&fs::read(path)?)?;
+        crate::completion_stream::assert_matches(&plain, &document)?;
+        document["stream_check"] =
+            json!({"status":"pass", "plain_record_hash":record::hash(&plain)?});
+    }
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

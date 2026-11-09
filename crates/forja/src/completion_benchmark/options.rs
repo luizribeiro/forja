@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub(crate) enum Mode {
     #[default]
     Plain,
+    Draft,
 }
 
 #[derive(Clone, Debug, PartialEq, clap::Args)]
@@ -30,6 +31,9 @@ pub(crate) struct Options {
     /// Decode normally or enable the embedded profile's prompt-lookup policy.
     #[arg(long, value_enum, default_value_t = Mode::Plain)]
     pub mode: Mode,
+    /// Plain record with identical workload, sampling and configuration.
+    #[arg(long, required_if_eq("mode", "draft"))]
+    pub plain_record: Option<PathBuf>,
     /// Reuse a separately prepared prompt prefix before each measured request.
     #[arg(long)]
     pub cached: bool,
@@ -78,6 +82,8 @@ mod tests {
         assert_eq!(options.reps, 5);
         let mut draft = arguments;
         draft.extend(["--mode", "draft"].map(str::to_owned));
-        assert!(Parser::try_parse_from(draft).is_err());
+        assert!(Parser::try_parse_from(draft.clone()).is_err());
+        draft.extend(["--plain-record", "plain.json"].map(str::to_owned));
+        assert!(Parser::try_parse_from(draft).is_ok());
     }
 }

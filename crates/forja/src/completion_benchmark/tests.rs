@@ -59,6 +59,7 @@ fn fixture() -> Result<(std::path::PathBuf, Options, DevConfig), Box<dyn Error>>
         group: "regular".to_owned(),
         row: Vec::new(),
         mode: Mode::Plain,
+        plain_record: None,
         cached: false,
         reps: 1,
         warmups: 1,
@@ -69,6 +70,67 @@ fn fixture() -> Result<(std::path::PathBuf, Options, DevConfig), Box<dyn Error>>
     config.paths.scratch = root.join("scratch");
     config.limits.dispatches_per_list = forja_config::Unbounded::Limited(8192);
     Ok((root, options, config))
+}
+
+#[tokio::test]
+async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(), Box<dyn Error>> {
+    let (root, mut options, config) = fixture()?;
+    run(&options, &config).await?;
+    let document: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
+    assert_eq!(document["results"][0]["rounds"], 0);
+    assert_eq!(document["results"][0]["k"], 0);
+    assert_eq!(document["results"][0]["drafter"]["identity"], "none");
+    options.mode = Mode::Draft;
+    options.plain_record = Some(options.json.clone());
+    options.json = root.join("draft.json");
+    run(&options, &config).await?;
+    let draft: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
+    assert_eq!(draft["results"][0]["k"], 2);
+    let warmup = &draft["results"][0]["warmup"];
+    assert_eq!(warmup["concurrency"], 1);
+    assert_eq!(warmup["output_tokens_per_lane"], 12);
+    assert!(warmup["observed_rounds"].as_u64().unwrap() > 0);
+    assert_eq!(
+        warmup["output_tokens_per_lane"],
+        document["results"][0]["warmup"]["output_tokens_per_lane"]
+    );
+
+    assert!(draft["results"][0]["rounds"].as_u64().unwrap() > 0);
+    assert!(
+        draft["results"][0]["mean_accepted_per_round"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert_eq!(
+        draft["results"][0]["token_stream_hashes"],
+        document["results"][0]["token_stream_hashes"]
+    );
+    assert_eq!(draft["config_hash"], document["config_hash"]);
+    assert_ne!(draft["perf_hash"], document["perf_hash"]);
+    assert_eq!(draft["stream_check"]["status"], "pass");
+    assert_eq!(
+        draft["results"][0]["drafter"]["identity"],
+        "host-prompt-lookup"
+    );
+    if let Some(destination) = std::env::var_os("FORJA_BENCH_FIXTURE_RECORDS") {
+        fs::create_dir_all(&destination)?;
+        for name in ["plain.json", "draft.json"] {
+            fs::copy(
+                root.join(name),
+                std::path::Path::new(&destination).join(name),
+            )?;
+        }
+    }
+    assert!(
+        run(&options, &config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("overwrite")
+    );
+    fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -85,25 +147,6 @@ async fn completion_loading_uses_the_validated_profile() -> Result<(), Box<dyn E
     )
     .await?;
     session.close().await?;
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn plain_completion_records_preserve_request_observations() -> Result<(), Box<dyn Error>> {
-    let (root, options, config) = fixture()?;
-    run(&options, &config).await?;
-    let document: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
-    assert_eq!(document["results"][0]["rounds"], 0);
-    assert_eq!(document["results"][0]["k"], 0);
-    assert_eq!(document["results"][0]["drafter"]["identity"], "none");
-    assert!(
-        run(&options, &config)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("overwrite")
-    );
     fs::remove_dir_all(root)?;
     Ok(())
 }

@@ -4,7 +4,7 @@ use forja_config::{DevConfig, HostConfig, Profile};
 use forja_core::Backend;
 use forja_serve::{CompletionSession, ServingEngine};
 
-use super::Options;
+use super::{Mode, Options};
 
 pub(super) async fn load<B: Backend + Send + Sync + 'static>(
     backend: B,
@@ -35,11 +35,14 @@ pub(super) async fn load<B: Backend + Send + Sync + 'static>(
         profile.clone(),
         crate::engine::engine_load_config(&options.engine, &config.engine)?,
         [engine?, profile_hash?, weights?, tokenizer?, chat?],
-        false,
+        options.mode == Mode::Draft,
     )
     .await?;
     if !loaded.service.supports_continuous_batching() {
         return Err("completion benchmarks require continuous decode".into());
+    }
+    if options.mode == Mode::Draft && !loaded.service.profile_lookup_available() {
+        return Err("draft mode requires profile lookup and admitted Verify shapes; check dispatches_per_list".into());
     }
     Ok(CompletionSession::new(loaded.service))
 }

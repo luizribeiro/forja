@@ -25,8 +25,8 @@ pub(super) struct RowRecord {
     pub verify_gpu_seconds: f64,
     pub identity: Value,
     pub prompt_source_sha256: String,
-    pub k: u32,
-    pub drafter: Value,
+    #[serde(flatten)]
+    pub draft: super::observed::DraftState,
     pub token_stream_hashes: Vec<String>,
     pub minimum_speedup: f64,
     pub finish_reasons: std::collections::BTreeMap<String, u64>,
@@ -100,12 +100,6 @@ impl RowRecord {
             prompt_tokens,
         } = context;
         let policy = &inputs["lookup_policy"];
-        if policy["max-drafts"]
-            .as_u64()
-            .is_none_or(|cap| cap == 0 || cap > u64::from(u32::MAX))
-        {
-            return Err("missing or invalid max-drafts".into());
-        }
         Ok(Self {
             mean_accepted_per_round: observations.mean_accepted(),
             verify_gpu_seconds: Duration::from_nanos(observations.verify_gpu_ns).as_secs_f64(),
@@ -119,8 +113,7 @@ impl RowRecord {
                     .ok_or("suite has no parent")?
                     .join(&row.prompt),
             )?,
-            k: 0,
-            drafter: json!({"identity":"none", "policy":policy,"policy_sha256":record::hash(&policy)?}),
+            draft: super::observed::DraftState::new(&observations, options.mode, policy)?,
             warmup,
             observations,
             token_stream_hashes: hashes,
