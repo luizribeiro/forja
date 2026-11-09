@@ -1,20 +1,84 @@
 //! CPU policy for exact speculative decoding.
 
-use crate::{BatchPhase, BatchSelection, BatchShape, MAX_VERIFY_ROWS};
+use crate::{BatchPhase, BatchSelection, BatchShape, MAX_VERIFY_ROWS, compute, invalid_handle};
 use std::num::NonZeroU64;
 
-/// Selects the largest declared verify shape fitting real drafts and the budget.
+/// The exact immutable draft prefix selected for staging with the pending token.
+#[derive(Debug)]
+pub struct FedDrafts<'a> {
+    shape: BatchShape,
+    tokens: &'a [u32],
+    budget: VerifyBudget,
+}
+
+impl<'a> FedDrafts<'a> {
+    /// Declared verify shape to run with this draft prefix.
+    #[must_use]
+    pub const fn shape(&self) -> BatchShape {
+        self.shape
+    }
+
+    /// Tokens to stage immediately after the pending input token.
+    #[must_use]
+    pub const fn tokens(&self) -> &'a [u32] {
+        self.tokens
+    }
+
+    /// The same checked budget used to select this prefix.
+    #[must_use]
+    pub const fn budget(&self) -> VerifyBudget {
+        self.budget
+    }
+}
+
+/// Counts consecutive drafts equal to the target's own selected tokens.
+///
+/// Target row `i` must have sampled with the lane's seed at fed position `n+i`,
+/// exactly as plain decode. Its selection is used directly at every temperature.
+///
+/// # Errors
+///
+/// Refuses unsupported row counts, missing/extra target rows, or any target
+/// sample outside `vocab`, including discarded rows. Drafts are the immutable
+/// prefix selected for feeding, without padding or a replacement draft list.
+pub fn exact_match_prefix(
+    fed: &FedDrafts<'_>,
+    target_samples: &[u32],
+    vocab: u32,
+) -> Result<u32, compute::Error> {
+    let rows = u32::try_from(target_samples.len()).map_err(invalid_handle)?;
+    if !(2..=MAX_VERIFY_ROWS).contains(&rows) || fed.tokens.len() != target_samples.len() - 1 {
+        return Err(invalid_handle(
+            "verify samples must contain one more row than drafts",
+        ));
+    }
+    if target_samples.iter().any(|token| *token >= vocab) {
+        return Err(invalid_handle(
+            "verify target sample is outside the vocabulary",
+        ));
+    }
+    u32::try_from(
+        fed.tokens
+            .iter()
+            .zip(target_samples)
+            .take_while(|(draft, target)| draft == target)
+            .count(),
+    )
+    .map_err(invalid_handle)
+}
+
+/// Selects a declared verify shape with the exact draft prefix it will feed.
 ///
 /// No fitting shape, including no lookup match, means plain decode; no padding
 /// is synthesized. Equal-token shapes use the last entry in declaration order.
 #[must_use]
-pub fn select_verify_shape(
+pub fn select_verify_shape<'a>(
     shapes: &[BatchShape],
-    real_drafts: u64,
+    drafts: &'a [u32],
     budget: VerifyBudget,
-) -> Option<BatchShape> {
-    let cap = budget.draft_cap().min(real_drafts);
-    shapes
+) -> Option<FedDrafts<'a>> {
+    let cap = budget.draft_cap().min(u64::try_from(drafts.len()).ok()?);
+    let shape = shapes
         .iter()
         .copied()
         .filter(|shape| {
@@ -24,7 +88,13 @@ pub fn select_verify_shape(
                 && (2..=MAX_VERIFY_ROWS).contains(&shape.tokens)
                 && u64::from(shape.tokens - 1) <= cap
         })
-        .max_by_key(|shape| shape.tokens)
+        .max_by_key(|shape| shape.tokens)?;
+    let count = usize::try_from(shape.tokens - 1).ok()?;
+    Some(FedDrafts {
+        shape,
+        tokens: &drafts[..count],
+        budget,
+    })
 }
 
 /// Checked limits shared by shape selection and acceptance for one round.
@@ -80,6 +150,70 @@ impl VerifyBudget {
 mod tests {
     use super::*;
 
+    fn fed_drafts(drafts: &[u32], left: u64) -> FedDrafts<'_> {
+        let budget = VerifyBudget::new(4097, MAX_VERIFY_ROWS, left, 8192, 8192).unwrap();
+        let shapes = [shape(2), shape(3), shape(MAX_VERIFY_ROWS)];
+        select_verify_shape(&shapes, drafts, budget).unwrap()
+    }
+
+    #[test]
+    fn acceptance_ends_at_the_first_mismatch_for_every_match_pattern() {
+        for k in [1, 2, 7] {
+            let drafts: Vec<u32> = (1..=k).collect();
+            for pattern in 0..(1_u32 << k) {
+                let mut target: Vec<u32> = drafts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, draft)| {
+                        if pattern & (1 << i) == 0 {
+                            *draft
+                        } else {
+                            4097
+                        }
+                    })
+                    .collect();
+                target.push(33);
+                assert_eq!(
+                    exact_match_prefix(&fed_drafts(&drafts, 33), &target, 4098).unwrap(),
+                    pattern.trailing_zeros().min(k)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acceptance_refuses_missing_bonus_rows_and_unsupported_extents() {
+        let fed = fed_drafts(&[7], 33);
+        for target in [vec![], vec![7], vec![7, 33, 1], vec![7; 9]] {
+            assert!(exact_match_prefix(&fed, &target, 4098).is_err());
+        }
+    }
+
+    #[test]
+    fn acceptance_uses_the_clamped_fed_prefix() {
+        let available = [7, 33, 4097];
+        let budget = VerifyBudget::new(4097, 1, 33, 8192, 8192).unwrap();
+        let fed = select_verify_shape(&[shape(3), shape(2)], &available, budget).unwrap();
+        assert_eq!(fed.shape(), shape(2));
+        assert_eq!(fed.tokens(), [7]);
+        assert_eq!(exact_match_prefix(&fed, &[7, 1], 4098).unwrap(), 1);
+        assert!(exact_match_prefix(&fed, &[7, 33, 1], 4098).is_err());
+    }
+
+    #[test]
+    fn acceptance_refuses_out_of_vocab_target_samples_in_every_row() {
+        let fed = fed_drafts(&[7, 33], 33);
+        for target in [
+            [4098, 33, 1],
+            [7, 4098, 1],
+            [7, 33, 4098],
+            [1, 33, u32::MAX],
+        ] {
+            assert!(exact_match_prefix(&fed, &target, 4098).is_err());
+        }
+        assert!(exact_match_prefix(&fed, &[7, 33, 1], 0).is_err());
+    }
+
     fn shape(tokens: u32) -> BatchShape {
         BatchShape {
             phase: BatchPhase::Verify,
@@ -101,12 +235,13 @@ mod tests {
         ] {
             let budget = VerifyBudget::new(4097, rule, left, 8192, 8192).unwrap();
             assert_eq!(
-                select_verify_shape(&[shape(3), shape(2)], real, budget),
+                select_verify_shape(&[shape(3), shape(2)], &[7; 7][..real], budget)
+                    .map(|fed| fed.shape()),
                 expected.map(shape)
             );
         }
         let budget = VerifyBudget::new(4097, 2, 33, 8192, 8192).unwrap();
-        assert_eq!(select_verify_shape(&[shape(3)], 1, budget), None);
+        assert!(select_verify_shape(&[shape(3)], &[7], budget).is_none());
     }
 
     #[test]
@@ -119,7 +254,7 @@ mod tests {
             (BatchPhase::Verify, BatchSelection::Masked, 1, 3),
         ] {
             let budget = VerifyBudget::new(4097, 2, 33, 8192, 8192).unwrap();
-            assert_eq!(
+            assert!(
                 select_verify_shape(
                     &[BatchShape {
                         phase,
@@ -127,10 +262,10 @@ mod tests {
                         tokens,
                         selection
                     }],
-                    7,
+                    &[7; 7],
                     budget
-                ),
-                None
+                )
+                .is_none()
             );
         }
     }
