@@ -34,13 +34,23 @@ impl<'a> FedDrafts<'a> {
 /// Why a verified output prefix ends before plain decoding can continue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VerifyCut {
+    /// A stop token or a stop string completed at this token.
+    Stop,
+    /// The target selected an end-of-sequence token.
+    Eos,
     /// The request exhausted its output token allowance.
     MaxTokens,
 }
 
-/// Exact target output, including the final sampled, unfed pending token.
+/// Verified tokens awaiting their one token-boundary scan.
 #[derive(Debug)]
 pub struct VerifyAcceptance<'a> {
+    decision: VerifyDecision<'a>,
+}
+
+/// Scanned target output, including the final sampled, unfed pending token.
+#[derive(Debug)]
+pub struct VerifyDecision<'a> {
     tokens: &'a [u32],
     accepted: u32,
     cut: Option<VerifyCut>,
@@ -69,12 +79,49 @@ impl<'a> VerifyAcceptance<'a> {
         let accepted = u64::from(matched).min(left - 1);
         let index = usize::try_from(accepted).map_err(invalid_handle)?;
         Ok(Self {
-            tokens: &target_samples[..=index],
-            accepted: u32::try_from(accepted).map_err(invalid_handle)?,
-            cut: (left <= u64::from(matched) + 1).then_some(VerifyCut::MaxTokens),
+            decision: VerifyDecision {
+                tokens: &target_samples[..=index],
+                accepted: u32::try_from(accepted).map_err(invalid_handle)?,
+                cut: (left <= u64::from(matched) + 1).then_some(VerifyCut::MaxTokens),
+            },
         })
     }
 
+    /// Scans output in order, cutting at the first boundary, including its token.
+    ///
+    /// The callback uses the request's detokenizer and boundary state. It never
+    /// sees a rejected draft's successor or a token beyond the output budget.
+    /// Stop/EOS at the last permitted token takes precedence over `MaxTokens`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates callback errors without returning a decision to publish.
+    ///
+    /// ```compile_fail
+    /// use forja_host::speculative::VerifyAcceptance;
+    /// fn scan_twice(acceptance: VerifyAcceptance<'_>) {
+    ///     let decision = acceptance.scan(|_| Ok::<_, ()>(None)).unwrap();
+    ///     let _ = decision.scan(|_| Ok::<_, ()>(None));
+    /// }
+    /// ```
+    pub fn scan<E>(
+        self,
+        mut boundary: impl FnMut(u32) -> Result<Option<VerifyCut>, E>,
+    ) -> Result<VerifyDecision<'a>, E> {
+        let mut decision = self.decision;
+        for (index, row) in (0..=decision.accepted).enumerate() {
+            if let Some(cut) = boundary(decision.tokens[index])? {
+                decision.tokens = &decision.tokens[..=index];
+                decision.accepted = row;
+                decision.cut = Some(cut);
+                break;
+            }
+        }
+        Ok(decision)
+    }
+}
+
+impl<'a> VerifyDecision<'a> {
     /// Tokens to account for, with stop text suppression left to the detokenizer.
     #[must_use]
     pub const fn tokens(&self) -> &'a [u32] {
@@ -222,13 +269,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_and_eos_cut_at_each_row_before_length_without_scanning_the_tail() {
+        use VerifyCut::{Eos, MaxTokens, Stop};
+        let target = [7, 33, 4097];
+        for (reason, row, left, end, expected) in [
+            (Stop, 0, 7, 0, Stop),
+            (Stop, 1, 7, 1, Stop),
+            (Stop, 2, 7, 2, Stop),
+            (Eos, 0, 7, 0, Eos),
+            (Eos, 1, 7, 1, Eos),
+            (Eos, 2, 7, 2, Eos),
+            (Stop, 1, 2, 1, Stop),
+            (Eos, 2, 3, 2, Eos),
+            (Stop, 2, 2, 1, MaxTokens),
+            (Eos, 2, 2, 1, MaxTokens),
+        ] {
+            let fed = fed_drafts(&target[..2], left);
+            let rows = fed.tokens().len() + 1;
+            let mut seen = Vec::new();
+            let output = VerifyAcceptance::new(fed, &target[..rows], 4098)
+                .unwrap()
+                .scan(|token| {
+                    seen.push(token);
+                    Ok::<_, ()>((token == target[row]).then_some(reason))
+                })
+                .unwrap();
+            assert_eq!(output.accepted(), u32::try_from(end).unwrap());
+            assert_eq!(output.pending(), target[end]);
+            assert_eq!(output.tokens(), &target[..=end]);
+            assert_eq!(seen, output.tokens());
+            assert_eq!(output.cut(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn scan_never_observes_unaccepted_successors_and_propagates_errors() {
+        let output = VerifyAcceptance::new(fed_drafts(&[7, 1], 7), &[7, 33, 4097], 4098)
+            .unwrap()
+            .scan(|token| {
+                assert_ne!(token, 4097);
+                Ok::<_, ()>(None)
+            })
+            .unwrap();
+        assert_eq!(output.tokens(), [7, 33]);
+        assert_eq!(output.cut(), None);
+        let mut seen = Vec::new();
+        let error = VerifyAcceptance::new(fed_drafts(&[7, 1], 7), &[7, 33, 4097], 4098)
+            .unwrap()
+            .scan(|token| {
+                seen.push(token);
+                Err::<Option<VerifyCut>, _>("decode failed")
+            })
+            .unwrap_err();
+        assert_eq!(error, "decode failed");
+        assert_eq!(seen, [7]);
+    }
+
+    #[test]
     fn accepted_output_includes_exactly_one_pending_target_sample() {
         let drafts = [7, 33];
         for (target, expected) in [([4097, 33, 1], 0_u32), ([7, 4097, 1], 1), ([7, 33, 1], 2)] {
             for left in 2..=7 {
                 let fed = fed_drafts(&drafts, left);
                 let rows = fed.tokens().len() + 1;
-                let output = VerifyAcceptance::new(fed, &target[..rows], 4098).unwrap();
+                let output = VerifyAcceptance::new(fed, &target[..rows], 4098)
+                    .unwrap()
+                    .scan(|_| Ok::<_, ()>(None))
+                    .unwrap();
                 let accepted = u64::from(expected).min(left - 1);
                 let index = usize::try_from(accepted).unwrap();
                 assert_eq!(output.accepted(), u32::try_from(accepted).unwrap());
@@ -248,7 +355,10 @@ mod tests {
         let left = u64::from(u32::MAX) + 2;
         let fed = fed_drafts(&target[..target.len() - 1], left);
         assert_eq!(fed.budget().max_tokens_left(), left);
-        let output = VerifyAcceptance::new(fed, &target, 33).unwrap();
+        let output = VerifyAcceptance::new(fed, &target, 33)
+            .unwrap()
+            .scan(|_| Ok::<_, ()>(None))
+            .unwrap();
         assert_eq!(output.tokens(), target.as_slice());
         assert_eq!(output.accepted(), MAX_VERIFY_ROWS - 1);
         assert_eq!(output.pending(), 7);

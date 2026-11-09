@@ -126,6 +126,54 @@ impl StopMatcher {
 mod tests {
     use super::*;
 
+    #[test]
+    fn verified_output_stops_when_a_string_completes_across_rows() {
+        use forja_host::speculative::{
+            VerifyAcceptance, VerifyBudget, VerifyCut, select_verify_shape,
+        };
+        use forja_host::{BatchPhase, BatchSelection, BatchShape};
+
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(
+                [
+                    ("N".to_owned(), 0),
+                    ("D".to_owned(), 1),
+                    ("tail".to_owned(), 2),
+                ],
+                Vec::new(),
+            )
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let mut decoder = tokenizer.decode_stream(false);
+        let mut stops = matcher(&["END"]);
+        assert_eq!(stops.push(b"prefix E").unwrap().text, "prefix ");
+        let mut seen = Vec::new();
+        let budget = VerifyBudget::new(4097, 2, 3, 8192, 8192).unwrap();
+        let shape = BatchShape {
+            phase: BatchPhase::Verify,
+            bucket: 1,
+            tokens: 3,
+            selection: BatchSelection::Combined,
+        };
+        let fed = select_verify_shape(&[shape], &[0, 1], budget).unwrap();
+        let output = VerifyAcceptance::new(fed, &[0, 1, 2], 3)
+            .unwrap()
+            .scan(|token| {
+                seen.push(token);
+                let piece = decoder.step(token).unwrap().unwrap();
+                let output = stops.push(piece.as_bytes()).unwrap();
+                assert_eq!(output.text, "");
+                Ok::<_, ()>(output.matched.then_some(VerifyCut::Stop))
+            })
+            .unwrap();
+        assert_eq!(seen, [0, 1]);
+        assert_eq!(output.accepted(), 1);
+        assert_eq!(output.pending(), 1);
+        assert_eq!(output.cut(), Some(VerifyCut::Stop));
+    }
+
     fn matcher(stops: &[&str]) -> StopMatcher {
         StopMatcher::new(
             &stops
