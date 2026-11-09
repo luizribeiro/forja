@@ -8,7 +8,7 @@ use forja_host::{
 #[tokio::test]
 async fn verify_rows_match_decode_logits_samples_and_each_state_plane() -> Result<(), Box<dyn Error>>
 {
-    for replay in [false] {
+    for replay in [false, true] {
         let mut runner = runner(forja_cpu::CpuBackend::new(), replay).await?;
         let sampling = SamplingParams {
             temperature: 0.7,

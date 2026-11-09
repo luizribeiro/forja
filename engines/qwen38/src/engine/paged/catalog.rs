@@ -26,8 +26,7 @@ impl Catalog {
                 .into_iter()
                 .filter(|shape| match shape.phase {
                     BatchPhase::Decode => shape.bucket <= 4,
-                    BatchPhase::Prompt => shape.tokens <= context,
-                    BatchPhase::Verify => false,
+                    BatchPhase::Prompt | BatchPhase::Verify => shape.tokens <= context,
                 })
             {
                 catalog
@@ -55,6 +54,9 @@ impl Catalog {
                 .iter()
                 .map(|parameter| Dim::from(parameter.at(0)))
                 .collect::<Vec<_>>();
+            if shape.phase == BatchPhase::Verify {
+                return super::verify::record(model, shape.tokens, &starts[0], 0);
+            }
             if shape.phase == BatchPhase::Decode && shape.selection != BatchSelection::Masked {
                 super::forward_decode_rows(model, &starts)?;
             }
@@ -148,7 +150,7 @@ impl Catalog {
         if !self.enabled {
             return Ok(false);
         }
-        if shape.phase == BatchPhase::Decode {
+        if shape.phase != BatchPhase::Prompt {
             return self.replay(shape, positions);
         }
         let [start] = positions else {

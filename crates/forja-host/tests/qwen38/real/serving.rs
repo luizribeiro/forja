@@ -1,4 +1,5 @@
 use super::{Error, Runner, load_with};
+use crate::qwen38::verification::verify_graphs;
 use forja_host::{
     BatchPhase, BatchSelection, BatchShape, EngineBatch, EngineBatchLane, EngineDecode,
     SamplingParams,
@@ -50,7 +51,7 @@ async fn compare(bucket: u32) -> Result<(), Box<dyn Error>> {
     let expected = singles(&mut reference, bucket).await?;
     drop(reference);
     let (mut runner, _) = load_with(true, Some(64)).await?;
-    assert_eq!(runner.metrics().live_graphs, 10);
+    assert_eq!(runner.metrics().live_graphs, 10 + verify_graphs());
     for lane in 0..bucket {
         runner
             .prepare_paged_lane(lane, None, 0)
@@ -113,7 +114,7 @@ async fn compare(bucket: u32) -> Result<(), Box<dyn Error>> {
             assert_eq!(&tokens[lane * 4..(lane + 1) * 4], row.token);
         }
     }
-    assert_eq!(runner.metrics().live_graphs, 11);
+    assert_eq!(runner.metrics().live_graphs, 11 + verify_graphs());
     Ok(())
 }
 #[tokio::test]
@@ -136,7 +137,7 @@ async fn metal_real_eager_bucket_eight_matches_independent_single_lanes()
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Box<dyn Error>> {
     let (mut runner, _) = load_with(true, None).await?;
-    assert_eq!(runner.metrics().live_graphs, 12);
+    assert_eq!(runner.metrics().live_graphs, 12 + verify_graphs());
     let mut expected = None;
     for _ in 0..2 {
         let mut rows = Vec::new();
@@ -163,7 +164,7 @@ async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Bo
         } else {
             expected = Some(rows);
         }
-        assert_eq!(runner.metrics().live_graphs, 13);
+        assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
         assert!(runner.metrics().live_bytes <= 48 * 1024 * 1024 * 1024);
     }
     Ok(())
@@ -215,6 +216,6 @@ async fn metal_real_long_prompt_replays_within_production_submission_limits()
             .tokens,
         4098
     );
-    assert_eq!(runner.metrics().live_graphs, 13);
+    assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
     Ok(())
 }

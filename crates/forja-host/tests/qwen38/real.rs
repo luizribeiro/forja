@@ -172,3 +172,6 @@ async fn metal_real_feedback_and_reset_match_explicit_tokens() -> Result<(), Box
     );
     Ok(())
 }
+
+#[path = "real/verify.rs"]
+mod verify;

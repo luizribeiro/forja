@@ -1,3 +1,4 @@
+use crate::qwen38::verification::verify_graphs;
 #[path = "batches/joins.rs"]
 mod joins;
 
@@ -77,7 +78,10 @@ async fn batch(
     expected: &[Vec<Row>],
 ) -> Result<(), Box<dyn Error>> {
     let mut runner = runner(CpuBackend::new(), replay).await?;
-    assert_eq!(runner.metrics().live_graphs, if replay { 10 } else { 0 });
+    assert_eq!(
+        runner.metrics().live_graphs,
+        if replay { 10 + verify_graphs() } else { 0 }
+    );
     for lane in 0..bucket {
         runner.prepare_paged_lane(lane, None, 0)?;
         runner.prepare_paged_lane(lane, None, 64)?;

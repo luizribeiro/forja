@@ -1,11 +1,12 @@
 use super::{Error, fixture, runner_with_context, verification};
+use crate::qwen38::verification::verify_graphs;
 use forja_host::{BatchPhase, EngineDecode, SamplingParams};
 use forja_sdk::{DecodeInput, Engine, Tensor, Weights};
 
 #[tokio::test]
 async fn prompt_catalog_replays_base_shapes_and_replaces_one_tail() -> Result<(), Box<dyn Error>> {
     let mut runner = runner_with_context(forja_cpu::CpuBackend::new(), true, 2048).await?;
-    assert_eq!(runner.metrics().live_graphs, 12);
+    assert_eq!(runner.metrics().live_graphs, 12 + verify_graphs());
     let weights = Weights::open(fixture("model.safetensors"))?;
     let mut load = verification::tiny_load();
     load.max_context = Some(2048);
@@ -44,9 +45,12 @@ async fn prompt_catalog_replays_base_shapes_and_replaces_one_tail() -> Result<()
                 .flat_map(u32::to_le_bytes)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(runner.metrics().live_graphs, 13);
+        assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
     }
-    assert_eq!(runner.metrics().prepared_graphs, 16);
+    assert_eq!(
+        runner.metrics().prepared_graphs,
+        16 + u64::try_from(verify_graphs())?
+    );
     Ok(())
 }
 
@@ -128,7 +132,7 @@ async fn prompt_forward_reuses_capture_without_exposing_combined_feedback()
                 .tokens,
             65
         );
-        assert_eq!(runner.metrics().live_graphs, 11);
+        assert_eq!(runner.metrics().live_graphs, 11 + verify_graphs());
     }
     Ok(())
 }
