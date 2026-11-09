@@ -9,6 +9,7 @@ pub use forja_sampling::{PackedMask, TokenIds};
 pub use prompt::PromptChunking;
 
 mod capture_alloc;
+mod capture_equivalence;
 mod feedback;
 #[cfg(test)]
 mod fuzz_tests;
@@ -3712,6 +3713,7 @@ pub struct PagedSequenceEntry;
 
 /// Host-owned state behind an opaque guest batch-slot resource.
 pub struct BatchSlotEntry {
+    decode_arithmetic: Option<capture_equivalence::DecodeReference>,
     input_layout: Option<paged_storage::StateInputLayout>,
     inputs: Option<state_inputs::StateInputs>,
     binding: Arc<PagedBinding>,
@@ -4262,6 +4264,7 @@ impl<B: Backend + 'static> Host<B> {
         cleanup.push(backing.generations);
         cleanup.extend(backing.metadata.into_iter().flatten());
         let slot = match self.table.push(BatchSlotEntry {
+            decode_arithmetic: None,
             input_layout: None,
             inputs: None,
             binding,
@@ -6730,6 +6733,23 @@ impl<B: Backend + 'static> Host<B> {
         graph: GraphTemplate,
         entry: &mut CommandListEntry,
         captured_state: &mut [hybrid::CapturedState],
+    ) -> Result<
+        (
+            PreparedGraph,
+            Option<capture_equivalence::CapturedArithmetic>,
+        ),
+        compute::Error,
+    > {
+        let arithmetic = self.capture_arithmetic(&graph, entry)?;
+        self.prepare_captured_graph_memory(graph, entry, captured_state)
+            .map(|graph| (graph, arithmetic))
+    }
+
+    fn prepare_captured_graph_memory(
+        &mut self,
+        graph: GraphTemplate,
+        entry: &mut CommandListEntry,
+        captured_state: &mut [hybrid::CapturedState],
     ) -> Result<PreparedGraph, compute::Error> {
         let reachable = entry
             .retained
@@ -6874,7 +6894,7 @@ impl<B: Backend + 'static> Host<B> {
             Ok(()) => self.prepare_captured_graph(graph, &mut entry, &mut captured_state),
             Err(error) => Err(graph_error(&error)),
         };
-        let graph = match graph {
+        let (graph, arithmetic) = match graph {
             Ok(graph) => graph,
             Err(error) => {
                 self.release_retained(entry.retained)?;
@@ -6909,6 +6929,7 @@ impl<B: Backend + 'static> Host<B> {
                 return Err(invalid_handle(error));
             }
         };
+        self.cache_capture_arithmetic(arithmetic, resource.rep())?;
         self.prepared_graphs.fetch_add(1, Ordering::AcqRel);
         self.graph_preparation_time_ns
             .fetch_add(duration_ns(started.elapsed()), Ordering::AcqRel);
@@ -10191,6 +10212,7 @@ mod tests {
 
     include!("state/paged_lifecycle_tests.rs");
     include!("recovery_tests.rs");
+    include!("capture_equivalence/capture_tests.rs");
     include!("capture_equivalence/test_support.rs");
 
     impl<B: Backend + Send + Sync + 'static> Host<B> {

@@ -104,6 +104,7 @@ impl PagedSlot<'_> {
     /// Captures slot operations with inactive state and replay-bound ordinary inputs.
     ///
     /// The kind and selection must match the serving catalog.
+    /// Capture bucket-one combined decode on this slot before capturing verify.
     ///
     /// # Errors
     /// Refuses nested capture, pending lazy work, incompatible parameters or host quota.
