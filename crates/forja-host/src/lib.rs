@@ -23,6 +23,7 @@ mod native;
 mod recovery;
 mod selection_attempt;
 pub use selection_attempt::SelectionAttempt;
+mod serving_verify;
 mod slot_capture;
 pub mod speculative;
 mod state;
