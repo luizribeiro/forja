@@ -45,6 +45,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &guest_target_dir,
         &["-p", "metal-variant-smoke"],
     )?;
+    let verify_target = main_target_dir.join("verify-guest-build");
+    forja_build::build_component(
+        &guest_manifest,
+        &verify_target,
+        &["-p", "engine-smoke", "--features", "verify"],
+    )?;
+    let verify_path = out_dir.join("verify-smoke.wasm");
+    fs::copy(
+        verify_target.join("wasm32-wasip2/release/engine_smoke.wasm"),
+        &verify_path,
+    )?;
+    emit_guest_path("VERIFY_SMOKE_COMPONENT", &verify_path);
     let tiny_target = main_target_dir.join("qwen38-tiny-build");
     forja_build::build_component(
         &repository.join("support/guests/qwen38-tiny/Cargo.toml"),

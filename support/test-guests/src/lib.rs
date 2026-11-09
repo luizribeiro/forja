@@ -33,6 +33,12 @@ pub fn engine_smoke() -> &'static Path {
     Path::new(env!("ENGINE_SMOKE_COMPONENT"))
 }
 
+/// Returns the protected-state engine with exact row-wise target sampling.
+#[must_use]
+pub fn verify_smoke() -> &'static Path {
+    Path::new(env!("VERIFY_SMOKE_COMPONENT"))
+}
+
 /// Returns the path to the SDK-exported engine component.
 #[must_use]
 pub fn engine_sdk_smoke() -> &'static Path {

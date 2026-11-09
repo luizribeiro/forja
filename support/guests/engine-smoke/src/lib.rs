@@ -20,6 +20,9 @@ thread_local! {
     static FEEDBACK: std::cell::RefCell<[u32; 2]> = const { std::cell::RefCell::new([0; 2]) };
 }
 
+#[cfg(feature = "verify")]
+mod verify;
+
 struct Component;
 
 impl Guest for Component {
@@ -61,6 +64,16 @@ impl Guest for Component {
                         tokens: 16,
                         selection: BatchSelection::Combined,
                     }])
+                    .chain(
+                        (2..=3)
+                            .filter(|_| cfg!(feature = "verify"))
+                            .map(|tokens| BatchShape {
+                                phase: BatchPhase::Verify,
+                                bucket: 1,
+                                tokens,
+                                selection: BatchSelection::Combined,
+                            }),
+                    )
                     .collect(),
             }),
         }
@@ -71,6 +84,9 @@ impl Guest for Component {
         pool: Option<&l9o::gpu::paged_storage::PagePool>,
         _config: LoadConfig,
     ) -> Result<(), Error> {
+        #[cfg(feature = "verify")]
+        let slot = pool.map(verify::open).transpose()?;
+        #[cfg(not(feature = "verify"))]
         let slot = pool.map(|pool| pool.open_slot(1)).transpose()?;
         PAGED_SLOT.with(|state| *state.borrow_mut() = slot);
         FEEDBACK.with(|feedback| *feedback.borrow_mut() = [0; 2]);
@@ -161,19 +177,26 @@ impl Guest for Component {
         slot: &l9o::gpu::paged_storage::BatchSlot,
         input: BatchIn,
     ) -> Result<BatchOut, Error> {
-        if input.lanes.iter().flatten().any(|lane| {
-            lane.tokens
-                .as_ref()
-                .and_then(|tokens| tokens.first())
-                .copied()
-                == Some(u32::MAX)
-        }) {
-            loop {
-                std::hint::spin_loop();
-            }
+        #[cfg(feature = "verify")]
+        {
+            verify::run(slot, input).await
         }
-        touch_paged_slot(slot, &input).await?;
-        batch_output(input)
+        #[cfg(not(feature = "verify"))]
+        {
+            if input.lanes.iter().flatten().any(|lane| {
+                lane.tokens
+                    .as_ref()
+                    .and_then(|tokens| tokens.first())
+                    .copied()
+                    == Some(u32::MAX)
+            }) {
+                loop {
+                    std::hint::spin_loop();
+                }
+            }
+            touch_paged_slot(slot, &input).await?;
+            batch_output(input)
+        }
     }
 
     async fn batch_forward(

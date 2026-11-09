@@ -46,3 +46,16 @@ pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>>
             .collect(),
     })
 }
+
+/// Creates the protected raw-component sampling fixture without loading it.
+pub async fn verify_runner() -> wasmtime::Result<forja_host::EngineRunner<forja_cpu::CpuBackend>> {
+    let weights =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen38/model.safetensors");
+    forja_host::EngineRunner::new(
+        test_guests::verify_smoke(),
+        forja_cpu::CpuBackend::new(),
+        forja_host::Limits::new(1 << 24, 8, 1 << 20, 128, 1 << 20),
+        weights,
+    )
+    .await
+}

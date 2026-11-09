@@ -27,3 +27,6 @@ mod toy_mlp;
 
 #[path = "../qwen38.rs"]
 mod qwen38;
+
+#[path = "../verify_fixture.rs"]
+mod verify_fixture;
