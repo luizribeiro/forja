@@ -1,8 +1,11 @@
+use crate::BufferKind;
 use crate::{
     Backend, BatchPhase, BatchSelection, BatchSlotEntry, CommandListEntry, Host, compute,
     graph_error, invalid_handle, state::StateCharge,
 };
+use forja_core::{BufferId, Tensor};
 use forja_core::{Dispatch, GraphTemplate, Op, OperationKind, program::ProgramHash};
+use std::collections::HashSet;
 use std::{mem::Discriminant, sync::Arc};
 use wasmtime::component::Resource;
 
@@ -37,9 +40,51 @@ impl Arithmetic {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArithmeticResource {
+    Weight {
+        buffer: BufferId,
+        start: u64,
+        end: u64,
+    },
+}
+
+struct CaptureResources {
+    weights: HashSet<BufferId>,
+}
+
+impl CaptureResources {
+    fn key(&self, tensor: &Tensor) -> Option<ArithmeticResource> {
+        let buffer = tensor.buffer();
+        if self.weights.contains(&buffer) {
+            let span = tensor.layout().byte_span();
+            Some(ArithmeticResource::Weight {
+                buffer,
+                start: span.start,
+                end: span.end,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn reads(&self, dispatch: &Dispatch) -> Vec<ArithmeticResource> {
+        let mut resources = Vec::new();
+        for tensor in dispatch.inputs().iter().chain(dispatch.outputs()) {
+            if let Some(key) = self.key(tensor)
+                && !resources.contains(&key)
+            {
+                resources.push(key);
+            }
+        }
+        resources
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct ArithmeticDispatch {
     arithmetic: Arithmetic,
+    resources: Vec<ArithmeticResource>,
 }
 
 #[derive(Debug)]
@@ -55,11 +100,22 @@ pub(crate) struct ArithmeticSummary {
 }
 impl ArithmeticSummary {
     fn byte_size(&self) -> Result<u64, compute::Error> {
-        u64::try_from(self.dispatches.capacity())
-            .ok()
-            .and_then(|count| count.checked_mul(size_of::<ArithmeticDispatch>() as u64))
-            .and_then(|bytes| bytes.checked_add(size_of::<DecodeReference>() as u64))
-            .ok_or_else(|| invalid_handle("arithmetic summary size overflowed"))
+        let dispatches = &self.dispatches;
+        let bytes = dispatches
+            .iter()
+            .try_fold(size_of::<DecodeReference>() as u64, |sum, dispatch| {
+                u64::try_from(dispatch.resources.capacity())
+                    .ok()?
+                    .checked_mul(size_of::<ArithmeticResource>() as u64)?
+                    .checked_add(sum)
+            })
+            .and_then(|bytes| {
+                u64::try_from(dispatches.capacity())
+                    .ok()?
+                    .checked_mul(size_of::<ArithmeticDispatch>() as u64)?
+                    .checked_add(bytes)
+            });
+        bytes.ok_or_else(|| invalid_handle("arithmetic summary size overflowed"))
     }
 }
 pub(crate) struct CapturedArithmetic {
@@ -102,10 +158,21 @@ impl<B: Backend + 'static> Host<B> {
             slot.decode_arithmetic = None;
         }
     }
+    fn capture_resources(entry: &CommandListEntry) -> CaptureResources {
+        CaptureResources {
+            weights: entry
+                .retained
+                .iter()
+                .filter(|entry| !matches!(entry.buffer.kind, BufferKind::Allocated { .. }))
+                .map(|entry| entry.tensor.buffer())
+                .collect(),
+        }
+    }
     fn arithmetic_dispatches(
         graph: &GraphTemplate,
         entry: &CommandListEntry,
     ) -> Result<Vec<ArithmeticDispatch>, compute::Error> {
+        let resources = Self::capture_resources(entry);
         let candidates = graph
             .backend_dispatch_candidates()
             .map_err(|error| graph_error(&error))?;
@@ -113,8 +180,10 @@ impl<B: Backend + 'static> Host<B> {
             .into_iter()
             .map(|(index, _, dispatch)| {
                 let _ = (index, entry);
+                let reads = resources.reads(&dispatch);
                 Ok(ArithmeticDispatch {
                     arithmetic: Arithmetic::of(&dispatch),
+                    resources: reads,
                 })
             })
             .collect()
@@ -161,5 +230,38 @@ impl<B: Backend + 'static> Host<B> {
             summary,
             charge: Arc::new(charge),
         }))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn weight_resource_metadata_distinguishes_regions_and_preserves_aliases() {
+        let mut host = Host::new(
+            forja_cpu::CpuBackend::new(),
+            crate::Limits::new(65536, 64, 4096, 16, 4096),
+        );
+        let (path, weights) = crate::tests::open_test_capture_weights(&mut host);
+        let commands = host.command_list().unwrap();
+        crate::tests::record_test_weight_operations(
+            &mut host,
+            &commands,
+            &[weights[0].rep(), weights[1].rep()],
+            false,
+        );
+        let entry = host.table.get(&commands).unwrap();
+        let resources = Host::<forja_cpu::CpuBackend>::capture_resources(entry);
+        let alias = host
+            .view(&weights[0], crate::compute::ViewOp::Permute(vec![0]))
+            .unwrap();
+        assert_eq!(
+            resources.key(&host.entry(&weights[0]).unwrap().tensor),
+            resources.key(&host.entry(&alias).unwrap().tensor)
+        );
+        assert_ne!(
+            resources.key(&host.entry(&weights[0]).unwrap().tensor),
+            resources.key(&host.entry(&weights[1]).unwrap().tensor)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

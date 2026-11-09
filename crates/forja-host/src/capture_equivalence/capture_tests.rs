@@ -120,3 +120,48 @@ fn only_a_live_combined_decode_capture_supplies_the_reference() {
     host.drop_graph(graph).unwrap();
     assert!(capture_arithmetic_copy(&mut host, &slot, verify).is_err());
 }
+
+pub(super) fn open_test_capture_weights(
+    host: &mut Host<CpuBackend>,
+) -> (std::path::PathBuf, [Resource<TensorEntry>; 3]) {
+    let mut header = br#"{"left":{"dtype":"F32","shape":[7],"data_offsets":[0,28]},"right":{"dtype":"F32","shape":[7],"data_offsets":[28,56]},"unseen":{"dtype":"F32","shape":[7],"data_offsets":[56,84]}}"#.to_vec();
+    while !(header.len() + 8).is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(1_f32.to_le_bytes().repeat(21));
+    let path = std::env::temp_dir().join(format!(
+        "forja-capture-weights-{}-{}",
+        std::process::id(),
+        NEXT_WEIGHT_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&path, bytes).unwrap();
+    host.grants = Grants::new().with_weights("capture", &path);
+    let source = host.open_weights("capture").unwrap();
+    (
+        path,
+        ["left", "right", "unseen"].map(|name| host.weight_tensor(&source, name).unwrap()),
+    )
+}
+
+pub(super) fn record_test_weight_operations(
+    host: &mut Host<CpuBackend>,
+    commands: &Resource<super::CommandListEntry>,
+    weights: &[u32],
+    swap: bool,
+) {
+    for (index, weight) in weights.iter().enumerate() {
+        let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+        let (op, inputs) = if (index == 0) ^ swap {
+            (compute::Op::Copy, vec![Resource::new_borrow(*weight)])
+        } else {
+            (
+                compute::Op::RmsNorm(1e-6),
+                vec![Resource::new_borrow(*weight), Resource::new_borrow(*weight)],
+            )
+        };
+        host.dispatch(commands, op, &inputs, &output).unwrap();
+        host.drop_tensor(output).unwrap();
+    }
+}
