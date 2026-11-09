@@ -91,6 +91,48 @@ impl crate::TensorEntry {
 }
 
 impl<B: Backend + 'static> Host<B> {
+    pub(crate) fn validate_decode_output_roles(
+        &self,
+        slot: u32,
+        dispatches: &[(usize, bool, forja_core::Dispatch)],
+    ) -> Result<(), compute::Error> {
+        let slot = self
+            .table
+            .get(&wasmtime::component::Resource::<crate::BatchSlotEntry>::new_borrow(slot))
+            .map_err(invalid_handle)?;
+        let bank = &slot
+            .inputs
+            .as_ref()
+            .ok_or_else(|| invalid_handle("decode reference inputs are missing"))?
+            .banks[0];
+        for handle in [bank.logits, bank.selected] {
+            let role = &self
+                .entry(&wasmtime::component::Resource::new_borrow(handle))?
+                .tensor;
+            let mut shape = role.layout().shape().to_vec();
+            shape[0] = 1;
+            let layout = forja_core::Layout::new(
+                role.layout().dtype(),
+                role.layout().offset(),
+                shape,
+                role.layout().strides().to_vec(),
+                role.buffer().byte_len(),
+            )
+            .map_err(crate::guest_error)?;
+            if !dispatches.iter().any(|(_, _, dispatch)| {
+                dispatch
+                    .outputs()
+                    .iter()
+                    .any(|output| output.buffer() == role.buffer() && output.layout() == &layout)
+            }) {
+                return Err(invalid_handle(
+                    "decode reference must write the slot logits and selected output roles",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_slot_capture_roles(
         &self,
         commands: &crate::CommandListEntry,

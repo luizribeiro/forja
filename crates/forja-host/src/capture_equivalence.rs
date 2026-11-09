@@ -230,6 +230,9 @@ impl<B: Backend + 'static> Host<B> {
         let candidates = graph
             .backend_dispatch_candidates()
             .map_err(|error| graph_error(&error))?;
+        if baseline {
+            self.validate_decode_output_roles(slot, &candidates)?;
+        }
         candidates
             .into_iter()
             .map(|(index, _, dispatch)| {

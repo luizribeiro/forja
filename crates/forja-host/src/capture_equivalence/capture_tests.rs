@@ -218,3 +218,31 @@ fn decode_reference_rejects_shifted_or_foreign_rule_parameters() {
         assert_eq!(result.is_ok(), accepted);
     }
 }
+
+#[test]
+fn decode_reference_requires_both_real_output_roles() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    for omit in [0, 1] {
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, test_capture_shape(false))
+            .unwrap();
+        record_test_output_roles(&mut host, &commands, &slot, Some(omit));
+        assert!(host.create_graph(commands).is_err());
+        assert!(host.table.get(&slot).unwrap().decode_arithmetic.is_none());
+    }
+}
+
+#[test]
+fn decode_reference_requires_real_output_roles() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    assert!(
+        capture_arithmetic_body(
+            &mut host,
+            &slot,
+            test_capture_shape(false),
+            Some(compute::Op::Copy),
+            false
+        )
+        .is_err()
+    );
+}
