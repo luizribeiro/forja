@@ -1,0 +1,4 @@
+<|im_start|>user
+Generate a JSONL test dataset with twelve distinct support tickets. Each line needs id, category, priority, summary, and resolved fields in that order. Cover billing, account access, delivery delays, and damaged items. Use varied natural-language summaries and include both resolved and unresolved tickets. Output only JSON objects, without markdown or commentary.
+<|im_end|>
+<|im_start|>assistant

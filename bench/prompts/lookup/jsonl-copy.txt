@@ -1,0 +1,12 @@
+<|im_start|>user
+Copy this audit export exactly, changing only the status of item job-104 from queued to complete. Output JSONL only, with the same field order and one object per line.
+{"id":"job-101","owner":"analytics","status":"complete","attempts":1,"region":"east","retained":true}
+{"id":"job-102","owner":"billing","status":"complete","attempts":2,"region":"west","retained":true}
+{"id":"job-103","owner":"search","status":"running","attempts":1,"region":"east","retained":false}
+{"id":"job-104","owner":"analytics","status":"queued","attempts":0,"region":"west","retained":true}
+{"id":"job-105","owner":"billing","status":"queued","attempts":0,"region":"east","retained":true}
+{"id":"job-106","owner":"search","status":"complete","attempts":1,"region":"west","retained":false}
+{"id":"job-107","owner":"analytics","status":"running","attempts":2,"region":"east","retained":true}
+{"id":"job-108","owner":"billing","status":"complete","attempts":1,"region":"west","retained":true}
+<|im_end|>
+<|im_start|>assistant

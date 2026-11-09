@@ -1,0 +1,4 @@
+<|im_start|>user
+I maintain a community repair workshop with six volunteers. We open on Saturdays, have a small budget, and keep losing track of which donated tools need repairs. Suggest a practical intake and labeling process that someone can run with a paper notebook. Include how to handle tools that cannot safely be repaired and how to avoid promising a completion date too early.
+<|im_end|>
+<|im_start|>assistant

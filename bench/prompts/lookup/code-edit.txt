@@ -1,0 +1,31 @@
+<|im_start|>user
+Change the default retry delay from 100 to 250 milliseconds. Return the complete file, preserving every other line. Do not use markdown fences.
+
+from dataclasses import dataclass
+from typing import Callable
+import time
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    attempts: int = 3
+    delay_ms: int = 100
+    max_delay_ms: int = 2000
+
+def retry(operation: Callable, policy: RetryPolicy):
+    delay = policy.delay_ms
+    for attempt in range(policy.attempts):
+        try:
+            return operation()
+        except TimeoutError:
+            if attempt + 1 == policy.attempts:
+                raise
+            time.sleep(delay / 1000)
+            delay = min(delay * 2, policy.max_delay_ms)
+
+def download(client, name: str) -> bytes:
+    return retry(lambda: client.get(name), RetryPolicy())
+
+def upload(client, name: str, content: bytes):
+    return retry(lambda: client.put(name, content), RetryPolicy(attempts=5))
+<|im_end|>
+<|im_start|>assistant
