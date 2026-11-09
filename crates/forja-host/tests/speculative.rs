@@ -1,5 +1,7 @@
 #[path = "speculative/request.rs"]
 mod request;
+#[path = "speculative/serving.rs"]
+mod serving;
 use crate::common::draft::{TestDrafter, assert_draft_exact};
 use forja_host::speculative::VerifyCut;
 use request::Request;
