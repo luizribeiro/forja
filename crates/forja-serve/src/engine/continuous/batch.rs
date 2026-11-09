@@ -11,11 +11,13 @@ use forja_host::{
 };
 use tokio::sync::mpsc;
 
+use super::draft::{reset_draft_refusals, wants_draft_drain};
 use super::lane::BatchLane;
 use super::prefill::PendingPrefill;
 use super::{
     PreparedRequest, RequestEnvelope, batch_admission_error, read_batch_tokens, repeated_error,
 };
+use crate::draft::DraftMode;
 use crate::engine::{GenerationError, ServingEngine};
 use crate::scheduler::{Admission, RequestId, SchedulerPolicy};
 use crate::{FinishReason, http::ServiceCommand, metrics::observe_phase};
@@ -86,19 +88,38 @@ where
         let mut prefilling = BTreeMap::new();
         let mut next_id = 0_u64;
         let mut current = None;
+        let mut draft_active_count = 0;
         loop {
             if current.is_none() {
                 self.remove_unsubmitted_cancellations(&mut active);
-                self.admit_pending(
-                    receiver,
-                    pending,
-                    &active,
-                    &mut prefilling,
-                    &mut waiting,
-                    &mut policy,
-                    &mut next_id,
-                )
-                .await;
+            }
+            if active.len() != draft_active_count {
+                reset_draft_refusals(&mut active);
+                draft_active_count = active.len();
+            }
+            if current.is_none() {
+                if drain_pending(receiver, pending) {
+                    reset_draft_refusals(&mut active);
+                }
+                let exclusive = pending.is_empty() && waiting.is_empty() && prefilling.is_empty();
+                if self.advance_drafting(&mut active, exclusive).await {
+                    continue;
+                }
+                if active
+                    .iter()
+                    .all(|lane| lane.draft_mode == DraftMode::Plain)
+                {
+                    self.admit_pending(
+                        receiver,
+                        pending,
+                        &active,
+                        &mut prefilling,
+                        &mut waiting,
+                        &mut policy,
+                        &mut next_id,
+                    )
+                    .await;
+                }
                 if !active.is_empty()
                     && active.iter().all(BatchLane::is_constrained)
                     && !prefilling.is_empty()
@@ -158,14 +179,24 @@ where
                 barrier.pause_once().await;
             }
             Self::mark_submitted_cancellations(&mut batch, &mut active);
-            drain_pending(receiver, pending);
+            if drain_pending(receiver, pending) {
+                reset_draft_refusals(&mut active);
+            }
             let admission_waiting = active.iter().any(BatchLane::is_constrained)
                 || !waiting.is_empty()
                 || !prefilling.is_empty()
                 || pending
                     .front()
                     .is_some_and(|request| !request.requires_serial_path());
-            let next = if admission_waiting {
+            let draft_draining = active
+                .iter()
+                .any(|lane| lane.draft_mode != DraftMode::Plain)
+                || (wants_draft_drain(
+                    self.drafter.is_some(),
+                    !admission_waiting && pending.is_empty(),
+                    &active,
+                ) && self.draft_candidate(&mut active[0]).is_some());
+            let next = if admission_waiting || draft_draining {
                 Ok(None)
             } else {
                 self.submit_successor(&policy, &active, &batch).await
@@ -188,6 +219,14 @@ where
                     continue;
                 }
             };
+            #[cfg(test)]
+            if successor.is_some()
+                && let Some(barrier) = &self.batch_test_barrier
+            {
+                barrier
+                    .pipelined_batches
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
             #[cfg(test)]
             if batch.lanes.len() >= 2
                 && successor.is_some()
@@ -243,7 +282,7 @@ where
                 &tokens,
             )
             .await;
-            if successor.is_none() {
+            if successor.is_none() && !draft_draining {
                 #[cfg(test)]
                 if successor.is_some()
                     && let Some(barrier) = &self.batch_test_barrier
@@ -365,6 +404,17 @@ where
     ) -> Result<Option<PendingBatch>, GenerationError> {
         if lanes.is_empty() {
             return Ok(None);
+        }
+        #[cfg(test)]
+        if lanes
+            .iter()
+            .any(|lane| lane.draft_mode == DraftMode::Exiting)
+            && let Some(barrier) = &self.batch_test_barrier
+        {
+            assert_eq!(lanes.len(), 1);
+            barrier
+                .draft_exit_steps
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         let shape = self.decode_shape(policy, lanes)?;
         let checkpoints = self.checkpoint_lanes(lanes)?;
@@ -1076,10 +1126,13 @@ where
 fn drain_pending(
     receiver: &mut mpsc::Receiver<ServiceCommand>,
     pending: &mut VecDeque<RequestEnvelope>,
-) {
+) -> bool {
+    let mut arrived = false;
     while let Ok(command) = receiver.try_recv() {
         pending.push_back(RequestEnvelope::from_command(command));
+        arrived = true;
     }
+    arrived
 }
 
 fn reservations_fit(

@@ -93,7 +93,20 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
                 }
             }
         }
-
+        if lane.draft_mode != DraftMode::Plain {
+            lane.draft_mode = DraftMode::Exiting;
+            match self.runner.try_release_draft_lane(lane.slot) {
+                Ok(true) => {
+                    lane.draft_mode = DraftMode::Plain;
+                    reset_draft_refusals(std::slice::from_mut(&mut lane));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.fail_batch_lane(lane, draft_error(error));
+                    return true;
+                }
+            }
+        }
         active.push(lane);
         false
     }
