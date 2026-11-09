@@ -97,7 +97,7 @@ struct ArithmeticDispatch {
 #[derive(Debug)]
 pub(crate) struct DecodeReference {
     graph: u32,
-    _summary: ArithmeticSummary,
+    summary: ArithmeticSummary,
     _charge: Arc<StateCharge>,
 }
 
@@ -124,6 +124,58 @@ impl ArithmeticSummary {
             });
         bytes.ok_or_else(|| invalid_handle("arithmetic summary size overflowed"))
     }
+}
+
+fn validate_equivalence(
+    candidate: &[ArithmeticDispatch],
+    decode: &[ArithmeticDispatch],
+) -> Result<(), compute::Error> {
+    for dispatch in candidate {
+        if dispatch.arithmetic.kind == OperationKind::DeltaRuleBlock {
+            return Err(invalid_handle("verify capture cannot use delta-rule-block"));
+        }
+        let compatible = if dispatch.resources.is_empty() {
+            covered_by_decode(dispatch, decode, None)
+        } else {
+            dispatch
+                .resources
+                .iter()
+                .all(|resource| covered_by_decode(dispatch, decode, Some(resource)))
+        };
+        if !compatible {
+            return Err(invalid_handle(
+                "verify arithmetic differs from bucket-one decode",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn covered_by_decode(
+    dispatch: &ArithmeticDispatch,
+    decode: &[ArithmeticDispatch],
+    resource: Option<&ArithmeticResource>,
+) -> bool {
+    let mut intervals = decode
+        .iter()
+        .filter(|reference| {
+            reference.arithmetic == dispatch.arithmetic
+                && resource.map_or_else(
+                    || reference.resources.is_empty(),
+                    |resource| reference.resources.contains(resource),
+                )
+        })
+        .map(|reference| reference.positions.clone())
+        .collect::<Vec<_>>();
+    intervals.sort_unstable_by_key(|interval| *interval.start());
+    let mut next = u64::from(*dispatch.positions.start());
+    for interval in intervals {
+        if u64::from(*interval.start()) > next {
+            break;
+        }
+        next = next.max(u64::from(*interval.end()) + 1);
+    }
+    next > u64::from(*dispatch.positions.end())
 }
 
 fn fixed_positions(
@@ -157,7 +209,7 @@ impl<B: Backend + 'static> Host<B> {
                 .map_err(invalid_handle)?
                 .decode_arithmetic = Some(DecodeReference {
                 graph,
-                _summary: arithmetic.summary,
+                summary: arithmetic.summary,
                 _charge: arithmetic.charge,
             });
         }
@@ -291,10 +343,11 @@ impl<B: Backend + 'static> Host<B> {
                 "verify capture requires prior bucket-one combined decode",
             ));
         }
-        if slot.decode_arithmetic.is_some() {
+        let dispatches = self.arithmetic_dispatches(scope.slot, graph, entry)?;
+        if let Some(reference) = &slot.decode_arithmetic {
+            validate_equivalence(&dispatches, &reference.summary.dispatches)?;
             return Ok(None);
         }
-        let dispatches = self.arithmetic_dispatches(scope.slot, graph, entry)?;
         let summary = ArithmeticSummary { dispatches };
         let bytes = summary.byte_size()?;
         let charge = StateCharge::reserve(
@@ -313,6 +366,19 @@ impl<B: Backend + 'static> Host<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn row(class: &'static str, positions: RangeInclusive<u32>) -> ArithmeticDispatch {
+        ArithmeticDispatch {
+            arithmetic: Arithmetic {
+                kind: OperationKind::Matmul,
+                operation: std::mem::discriminant(&Op::Matmul),
+                class: Some(class),
+                program: None,
+                epilogue: None,
+            },
+            positions,
+            resources: Vec::new(),
+        }
+    }
     #[test]
     fn weight_resource_metadata_distinguishes_regions_and_preserves_aliases() {
         let mut host = Host::new(
@@ -395,11 +461,50 @@ mod tests {
     #[test]
     fn fixed_verify_dispatch_covers_the_next_rule_key() {
         let space = forja_core::ParamSpace::new(std::iter::once(509..=509).collect()).unwrap();
-        assert_eq!(fixed_positions(Some(&space), 1).unwrap(), 509..=509);
-        assert_eq!(fixed_positions(Some(&space), 2).unwrap(), 509..=510);
+        let decode = [row("low", 0..=509), row("high", 510..=1022)];
+        let mut fixed = row("low", fixed_positions(Some(&space), 1).unwrap());
+        validate_equivalence(&[fixed.clone()], &decode).unwrap();
+        fixed.positions = fixed_positions(Some(&space), 2).unwrap();
+        assert_eq!(fixed.positions, 509..=510);
+        assert!(validate_equivalence(&[fixed], &decode).is_err());
         let end =
             forja_core::ParamSpace::new(std::iter::once(u32::MAX..=u32::MAX).collect()).unwrap();
         assert!(fixed_positions(Some(&end), 2).is_err());
         assert_eq!(fixed_positions(None, 3).unwrap(), 0..=u32::MAX);
+    }
+    #[test]
+    fn equivalence_checks_each_rule_interval_including_boundaries() {
+        let decode = [row("low", 0..=7), row("high", 8..=33)];
+        for (candidate, expected) in [
+            (vec![row("low", 7..=7), row("high", 8..=33)], true),
+            (vec![row("low", 0..=8)], false),
+            (vec![row("high", 0..=7), row("low", 8..=33)], false),
+            (vec![row("low", 0..=6), row("unrelated", 7..=7)], false),
+            (vec![row("high", 33..=34)], false),
+        ] {
+            assert_eq!(validate_equivalence(&candidate, &decode).is_ok(), expected);
+        }
+        validate_equivalence(
+            &[row("same", u32::MAX..=u32::MAX)],
+            &[row("same", 0..=u32::MAX)],
+        )
+        .unwrap();
+        assert!(
+            validate_equivalence(
+                &[row("same", 0..=33)],
+                &[row("same", 0..=7), row("same", 9..=33)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn block_updates_are_refused_even_when_the_reference_matches() {
+        let mut block = row("same", 0..=33);
+        block.arithmetic.kind = OperationKind::DeltaRuleBlock;
+        assert!(validate_equivalence(std::slice::from_ref(&block), &[block.clone()]).is_err());
+        let mut other = row("same", 0..=33);
+        other.arithmetic.operation = std::mem::discriminant(&Op::Copy);
+        assert!(validate_equivalence(&[other], &[row("same", 0..=33)]).is_err());
     }
 }

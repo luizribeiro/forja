@@ -246,3 +246,145 @@ fn decode_reference_requires_real_output_roles() {
         .is_err()
     );
 }
+
+#[test]
+fn later_decode_capture_cannot_add_unmatched_arithmetic() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    let shape = test_capture_shape(false);
+    let reference = capture_arithmetic_copy(&mut host, &slot, shape).unwrap();
+    let commands = host.command_list().unwrap();
+    host.declare_slot_capture(&commands, &slot, shape).unwrap();
+    record_test_decode_roles(&mut host, &commands, &slot);
+    let input = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+    let output = host.alloc(compute::Dtype::F32, &[7]).unwrap();
+    let kernel = host
+        .create_kernel(doubling_program(2.0), unary_f32_signature(1))
+        .unwrap();
+    host.dispatch_kernel(&commands, &kernel, &[input], &[output])
+        .unwrap();
+    assert!(host.create_graph(commands).is_err());
+    host.drop_graph(reference).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_verify_capture_compares_every_rule_arm_at_its_key() {
+    let (mut host, _pool, slot) =
+        verify_input_fixture(forja_metal::MetalBackend::new().unwrap(), 3, 1);
+    let (params, inputs, output) = metal_symbolic_matmul(&mut host);
+    let decode = test_capture_shape(false);
+    let steel = "matmul.steel-64x64x16-2x2";
+    let portable = "matmul.portable";
+    for (shape, picks, accepted) in [
+        (decode, [steel, portable], true),
+        (
+            BatchShape {
+                phase: BatchPhase::Verify,
+                tokens: 3,
+                ..decode
+            },
+            [steel, portable],
+            true,
+        ),
+        (
+            BatchShape {
+                phase: BatchPhase::Verify,
+                tokens: 3,
+                ..decode
+            },
+            [portable, steel],
+            false,
+        ),
+    ] {
+        let commands = host.command_list().unwrap();
+        host.declare_slot_capture(&commands, &slot, shape).unwrap();
+        let arms = [2, 3]
+            .into_iter()
+            .zip(picks)
+            .map(
+                |(key, name)| super::metal_bindings::l9o::gpu::metal_variants::Arm {
+                    lo: key,
+                    hi: key,
+                    name: name.to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        host.record_metal_variant_rule(
+            &commands,
+            &params,
+            0,
+            &arms,
+            compute::Op::Matmul,
+            &borrowed_tensors(&inputs),
+            &[Resource::new_borrow(output.rep())],
+        )
+        .unwrap();
+        if shape.phase == BatchPhase::Decode {
+            record_test_decode_roles(&mut host, &commands, &slot);
+        }
+        let result = host.create_graph(commands);
+        assert_eq!(result.is_ok(), accepted);
+        if shape.phase != BatchPhase::Decode
+            && let Ok(graph) = result
+        {
+            host.drop_graph(graph).unwrap();
+        }
+    }
+}
+
+fn capture_weight_operations(
+    host: &mut Host<CpuBackend>,
+    slot: &Resource<BatchSlotEntry>,
+    shape: BatchShape,
+    weights: &[u32],
+    swap: bool,
+) -> Result<Resource<super::GraphEntry>, compute::Error> {
+    let commands = host.command_list().unwrap();
+    host.declare_slot_capture(&commands, slot, shape).unwrap();
+    record_test_weight_operations(host, &commands, weights, swap);
+    if shape.phase == BatchPhase::Decode {
+        record_test_decode_roles(host, &commands, slot);
+    }
+    host.create_graph(commands)
+}
+
+#[test]
+fn verify_capture_matches_arithmetic_to_weight_regions_without_exemptions() {
+    let (mut host, _pool, slot) = verify_input_fixture(CpuBackend::new(), 3, 1);
+    let (path, weights) = open_test_capture_weights(&mut host);
+    assert_eq!(
+        host.entry(&weights[0]).unwrap().tensor.buffer(),
+        host.entry(&weights[1]).unwrap().tensor.buffer()
+    );
+    let alias = host
+        .view(&weights[0], compute::ViewOp::Permute(vec![0]))
+        .unwrap();
+    let decode = test_capture_shape(false);
+    let graph = capture_weight_operations(
+        &mut host,
+        &slot,
+        decode,
+        &[weights[0].rep(), weights[1].rep()],
+        false,
+    )
+    .unwrap();
+    let reference = graph;
+    let verify = BatchShape {
+        phase: BatchPhase::Verify,
+        tokens: 3,
+        ..decode
+    };
+    for (handles, swap, accepted) in [
+        (vec![alias.rep(), weights[1].rep()], false, true),
+        (vec![weights[0].rep(), weights[1].rep()], true, false),
+        (vec![weights[2].rep()], false, false),
+    ] {
+        let result = capture_weight_operations(&mut host, &slot, verify, &handles, swap);
+        assert_eq!(result.is_ok(), accepted);
+        if let Ok(graph) = result {
+            host.drop_graph(graph).unwrap();
+        }
+    }
+    host.drop_graph(reference).unwrap();
+    fs::remove_file(path).unwrap();
+}

@@ -12678,7 +12678,16 @@ mod tests {
             .unwrap();
         let output = host.alloc(compute::Dtype::F32, &[2, 33]).unwrap();
         let commands = host.command_list().unwrap();
-        host.test_capture(&commands, &slot, false).unwrap();
+        host.declare_slot_capture(
+            &commands,
+            &slot,
+            BatchShape {
+                phase: BatchPhase::Verify,
+                tokens: 2,
+                ..test_capture_shape(false)
+            },
+        )
+        .unwrap();
         let pick = "matmul.gemv-transposed";
         let error = host
             .record_metal_variant(
@@ -12712,18 +12721,35 @@ mod tests {
             };
             let input_row = host.view(&Resource::new_borrow(left), slice(7)).unwrap();
             let output_row = host.view(&output, slice(33)).unwrap();
-            host.record_metal_variant(
-                &commands,
-                compute::Op::Matmul,
-                &[input_row, Resource::new_borrow(right.rep())],
-                &[output_row],
-                pick,
-            )
-            .unwrap();
+            let baseline = if row == 0 {
+                let baseline = host.command_list().unwrap();
+                host.declare_slot_capture(&baseline, &slot, test_capture_shape(false))
+                    .unwrap();
+                record_test_decode_roles(&mut host, &baseline, &slot);
+                Some(baseline)
+            } else {
+                None
+            };
+            for list in baseline.iter().chain(std::iter::once(&commands)) {
+                host.record_metal_variant(
+                    list,
+                    compute::Op::Matmul,
+                    &[
+                        Resource::new_borrow(input_row.rep()),
+                        Resource::new_borrow(right.rep()),
+                    ],
+                    &[Resource::new_borrow(output_row.rep())],
+                    pick,
+                )
+                .unwrap();
+            }
+            if let Some(baseline) = baseline {
+                host.create_graph(baseline).unwrap();
+            }
         }
         assert_eq!(host.table.get(&commands).unwrap().recorded.len(), 2);
         host.create_graph(commands).unwrap();
-        assert_eq!(host.engine_metrics().live_graphs, 1);
+        assert_eq!(host.engine_metrics().live_graphs, 2);
     }
 
     #[test]
