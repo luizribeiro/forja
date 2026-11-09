@@ -430,6 +430,41 @@ fn multi_token_stop_strings_match_plain_decode_for_every_test_drafter() {
 }
 
 #[tokio::test]
+async fn lazy_constraint_and_tool_lanes_never_consult_the_draft_source() -> Result<(), TestError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut engine = engine().await?.with_drafter(source(Arc::clone(&calls)));
+    for tools in [false, true] {
+        let mut request = crate::engine::continuous::prefill::tests::request();
+        if tools {
+            request.request_params.tools = Some(Vec::new());
+        } else {
+            request.constraint = Some(crate::engine::ConstraintPlan {
+                grammar: r#"start: "a""#.to_owned(),
+                trigger: "ab".to_owned(),
+                trigger_tokens: vec![0, 1],
+                forced: false,
+                tools: Vec::new(),
+                selected: None,
+                parallel: true,
+            });
+        }
+        let mut lane = BatchLane::new(
+            request,
+            0,
+            0,
+            0,
+            SamplingParams::default(),
+            engine.tokenizer()?,
+            None,
+        );
+        assert!(!lane.is_constrained());
+        assert!(engine.draft_candidate(&mut lane).is_none());
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn unexpected_verify_activation_rolls_back_without_publication() -> Result<(), TestError> {
     let mut engine = engine().await?.with_drafter(source(Arc::default()));
     let mut prepared = prepared_lane(&mut engine, 7, 0).await?;

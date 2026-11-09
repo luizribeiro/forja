@@ -77,6 +77,7 @@ pub(super) struct BatchLane {
     ledger: PrefixLedger,
     constraint: Option<BatchConstraint>,
     prefix_reuse: bool,
+    plain_only: bool,
 }
 
 pub(super) struct BatchConstraint {
@@ -106,6 +107,7 @@ impl BatchLane {
                 + u64::from(request.params.max_tokens),
             sampling,
             control: request.control,
+            plain_only: request.constraint.is_some() || request.request_params.tools.is_some(),
             boundary: BoundaryState::new(&request.params.stops, None),
             decoder: Detokenizer::spawn(tokenizer, constraint.is_none()),
             ledger: PrefixLedger::new(request.tokens),
@@ -280,6 +282,10 @@ impl BatchLane {
 
     pub(super) fn needs_successor(&self) -> bool {
         self.remaining_tokens() > 1
+    }
+
+    pub(super) fn can_draft(&self) -> bool {
+        !self.plain_only && !self.is_constrained()
     }
 
     pub(super) const fn is_constrained(&self) -> bool {

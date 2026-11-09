@@ -16,7 +16,7 @@ pub(super) struct Candidate {
 
 pub(super) fn wants_draft_drain(available: bool, exclusive: bool, active: &[BatchLane]) -> bool {
     matches!(active, [lane] if available && exclusive && !lane.draft_refused
-        && lane.draft_mode != DraftMode::Exiting && !lane.is_constrained()
+        && lane.draft_mode != DraftMode::Exiting && lane.can_draft()
         && !lane.control.is_cancelled() && lane.draft_probe_position != Some(lane.position))
 }
 
