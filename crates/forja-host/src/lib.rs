@@ -3903,7 +3903,7 @@ enum RecordedDispatch {
         op: TemplateOp,
         inputs: Vec<TemplateTensor>,
         outputs: Vec<TemplateTensor>,
-        parameter: u8,
+        key: forja_core::RuleKey,
         arms: Vec<(u32, BackendDispatchData)>,
     },
     Program {
@@ -3966,12 +3966,12 @@ fn record_graph_dispatch(
             op,
             inputs,
             outputs,
-            parameter,
+            key,
             arms,
         } => {
             let inputs = inputs.iter().collect::<Vec<_>>();
             let outputs = outputs.iter().collect::<Vec<_>>();
-            graph.dispatch_variant_rule_many(*op, &inputs, &outputs, *parameter, arms.clone())
+            graph.dispatch_variant_rule_many(*op, &inputs, &outputs, *key, arms.clone())
         }
         RecordedDispatch::Program {
             program,
@@ -7296,6 +7296,7 @@ impl<B: Backend + 'static> Host<B> {
         commands: &Resource<CommandListEntry>,
         params: &Resource<ParamsEntry>,
         parameter: u8,
+        row_offset: u32,
         arms: &[paged_storage::VariantArm],
     ) -> Result<(), compute::Error> {
         if arms.len() > MAX_VARIANT_RULE_ARMS {
@@ -7310,14 +7311,28 @@ impl<B: Backend + 'static> Host<B> {
             .map_err(invalid_handle)?
             .space
             .clone();
-        let rule = forja_core::VariantRule::new(
-            &space,
+        let key = forja_core::RuleKey {
             parameter,
-            arms.iter()
-                .map(|arm| RuleArm::new(arm.lo, arm.hi, &arm.name))
-                .collect(),
-        )
-        .map_err(|error| variant_error(&error))?;
+            row_offset,
+        };
+        key.range(&space).map_err(|error| graph_error(&error))?;
+        let raw_arms = arms
+            .iter()
+            .map(|arm| {
+                let raw = |value: u32| {
+                    u64::from(value)
+                        .checked_sub(u64::from(row_offset))
+                        .and_then(|value| u32::try_from(value).ok())
+                };
+                let lo = raw(arm.lo);
+                let hi = raw(arm.hi);
+                lo.zip(hi)
+                    .map(|(lo, hi)| RuleArm::new(lo, hi, &arm.name))
+                    .ok_or_else(|| invalid_handle("paged rule arm precedes its row offset"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let rule = forja_core::VariantRule::new(&space, parameter, raw_arms)
+            .map_err(|error| variant_error(&error))?;
         let variants = {
             let entry = self.table.get(commands).map_err(invalid_handle)?;
             validate_variant_rule_space(entry.space.clone(), &space)?;
@@ -7329,11 +7344,15 @@ impl<B: Backend + 'static> Host<B> {
             else {
                 return Err(guest_error(BackendError::InvalidInput));
             };
-            if !matches!(
-                template_operation_kind(*op),
-                forja_core::OperationKind::PagedSdpa | forja_core::OperationKind::PagedSdpaAppend
-            ) {
-                return Err(guest_error(BackendError::InvalidInput));
+            let q_start = match op {
+                TemplateOp::PagedSdpa { q_start, .. }
+                | TemplateOp::PagedSdpaAppend { q_start, .. } => *q_start,
+                _ => return Err(guest_error(BackendError::InvalidInput)),
+            };
+            if q_start != forja_core::Affine::parameter(parameter, row_offset, 1) {
+                return Err(invalid_handle(
+                    "paged rule key differs from the attention query start",
+                ));
             }
             self.metal_backend()?
                 .validate_variant_rule(
@@ -7362,12 +7381,14 @@ impl<B: Backend + 'static> Host<B> {
             op,
             inputs,
             outputs,
-            parameter,
-            arms: rule
-                .arms()
+            key: forja_core::RuleKey {
+                parameter,
+                row_offset,
+            },
+            arms: arms
                 .iter()
                 .zip(variants)
-                .map(|(arm, variant)| (arm.hi(), BackendDispatchData::new(variant)))
+                .map(|(arm, variant)| (arm.hi, BackendDispatchData::new(variant)))
                 .collect(),
         });
         entry.parameterized = true;
@@ -7561,7 +7582,7 @@ impl<B: Backend + 'static> Host<B> {
             op,
             inputs,
             outputs,
-            parameter,
+            key: parameter.into(),
             arms: rule
                 .arms()
                 .iter()
@@ -9472,13 +9493,15 @@ where
         commands: Resource<CommandListEntry>,
         params: Resource<ParamsEntry>,
         parameter: u8,
+        row_offset: u32,
         arms: Vec<paged_storage::VariantArm>,
     ) -> impl Future<Output = wasmtime::Result<Result<(), compute::Error>>> + Send {
         #[cfg(target_os = "macos")]
-        let result = self.select_paged_variant_rule(&commands, &params, parameter, &arms);
+        let result =
+            self.select_paged_variant_rule(&commands, &params, parameter, row_offset, &arms);
         #[cfg(not(target_os = "macos"))]
         let result = {
-            let _ = (commands, params, parameter, arms);
+            let _ = (commands, params, parameter, row_offset, arms);
             Err(compute::Error::OpSignature(
                 "Metal variants are unavailable".to_owned(),
             ))
@@ -16280,6 +16303,115 @@ mod tests {
             ),
             Err(compute::Error::OpSignature(_))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn paged_rule_arms(row_offset: u32) -> [paged_storage::VariantArm; 2] {
+        [
+            paged_storage::VariantArm {
+                lo: row_offset,
+                hi: row_offset + 1,
+                name: "paged-sdpa.vector-gqa-two-pass-32".into(),
+            },
+            paged_storage::VariantArm {
+                lo: row_offset + 2,
+                hi: row_offset + 3,
+                name: "paged-sdpa.vector-gqa-two-pass".into(),
+            },
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_paged_rule_transport_retains_shifted_keys_and_refuses_bad_bounds() {
+        use forja_core::RuleKey;
+        let mut host = Host::new(forja_metal::MetalBackend::new().unwrap(), GENEROUS);
+        let pool = insert_test_pool_with_width(&mut host, 2, 16, 128);
+        let slot = host.open_paged_slot(&pool, 2).unwrap();
+        host.bind_paged_request(pool.rep(), None, 8).unwrap();
+        host.begin_paged_append(pool.rep(), 0, 8).unwrap();
+        let params = host
+            .params(vec![compute::ParamRange { lo: 0, hi: 3 }])
+            .unwrap();
+        let query = bind_replay_space(&mut host, &params, &[1, 1, 128]);
+        let output = host.alloc(compute::Dtype::F32, &[1, 1, 128]).unwrap();
+        for row_offset in [0, 1, 2] {
+            let commands = host.command_list().unwrap();
+            host.record_paged_attention(
+                &commands,
+                &slot,
+                0,
+                &query,
+                &output,
+                &paged_storage::SdpaCfg {
+                    key_plane: 0,
+                    value_plane: 1,
+                    scale: 1.0,
+                    causal: true,
+                    q_start: wit_affine(Some(0), 1, row_offset),
+                    key_length: wit_affine(Some(0), 1, row_offset + 1),
+                    algorithm: String::new(),
+                },
+                None,
+            )
+            .unwrap();
+            let arms = paged_rule_arms(row_offset);
+            for (parameter, offset) in [(1, row_offset), (0, u32::MAX), (0, row_offset + 1)] {
+                assert!(
+                    host.select_paged_variant_rule(&commands, &params, parameter, offset, &arms)
+                        .is_err()
+                );
+                assert!(matches!(
+                    host.table.get(&commands).unwrap().recorded.last(),
+                    Some(super::RecordedDispatch::Operation { .. })
+                ));
+            }
+            let wrong_offset = u32::from(row_offset == 0);
+            let shifted = paged_rule_arms(wrong_offset);
+            let error = host
+                .select_paged_variant_rule(&commands, &params, 0, wrong_offset, &shifted)
+                .unwrap_err();
+            assert!(
+                matches!(error, compute::Error::InvalidHandle(message) if message.contains("attention query start"))
+            );
+            assert!(matches!(
+                host.table.get(&commands).unwrap().recorded.last(),
+                Some(super::RecordedDispatch::Operation { .. })
+            ));
+            let mut gap = arms.clone();
+            gap[1].lo += 1;
+            assert!(
+                host.select_paged_variant_rule(&commands, &params, 0, row_offset, &gap)
+                    .is_err()
+            );
+            host.select_paged_variant_rule(&commands, &params, 0, row_offset, &arms)
+                .unwrap();
+            let graph = host.create_graph(commands).unwrap();
+            let template = host.table.get(&graph).unwrap().graph.template();
+            assert_eq!(
+                template.dispatch_rule_key(0),
+                Some(RuleKey {
+                    parameter: 0,
+                    row_offset
+                })
+            );
+            for (position, name) in [
+                (1, "paged-sdpa.vector-gqa-two-pass-32"),
+                (2, "paged-sdpa.vector-gqa-two-pass"),
+            ] {
+                let commands = template
+                    .instantiate(&template.values(vec![position]).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    commands.dispatches()[0]
+                        .backend_data::<forja_metal::ValidatedVariant>()
+                        .unwrap()
+                        .name(),
+                    name
+                );
+            }
+            host.drop_graph(graph).unwrap();
+        }
     }
 
     #[cfg(target_os = "macos")]

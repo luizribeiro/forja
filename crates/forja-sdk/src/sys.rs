@@ -1756,7 +1756,7 @@ pub(crate) fn select_paged_sdpa_variant_rule(
             name: arm.name.clone(),
         })
         .collect::<Vec<_>>();
-    guest::paged_storage::select_paged_sdpa_variant_rule(commands, params, parameter, &arms)
+    guest::paged_storage::select_paged_sdpa_variant_rule(commands, params, parameter, 0, &arms)
         .map_err(|error| Error::new(format!("{error:?}")))
 }
 

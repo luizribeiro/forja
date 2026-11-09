@@ -135,6 +135,7 @@ interface paged-storage {
     cmds: borrow<command-list>,
     space: borrow<params>,
     parameter: u8,
+    row-offset: u32,
     arms: list<variant-arm>,
   ) -> result<_, error>;
 
