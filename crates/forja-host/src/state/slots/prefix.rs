@@ -24,12 +24,12 @@ impl<B: Backend> StateSlots<B> {
         };
         let length = u64::try_from(prompt.tokens().len()).map_err(invalid_handle)?;
         let start = u64::from(start);
-        if phase == crate::BatchPhase::Decode {
+        if phase != crate::BatchPhase::Prompt {
             return if start >= length {
                 Ok(())
             } else {
                 Err(invalid_handle(
-                    "decode cannot replace canonical prompt input",
+                    "continuation cannot replace canonical prompt input",
                 ))
             };
         }
@@ -98,6 +98,24 @@ mod tests {
         DType, HybridPrefixNamespace, PagedLayout, PagedPlane, StateLayout, StatePlane,
     };
     use std::num::NonZeroU32;
+    fn assert_continuation_boundary(slots: &StateSlots<forja_cpu::CpuBackend>) {
+        for phase in [crate::BatchPhase::Decode, crate::BatchPhase::Verify] {
+            for start in [0, 64, 128] {
+                assert!(
+                    slots
+                        .validate_prompt_input(0, phase, start, Some(&[0, 1]))
+                        .is_err()
+                );
+            }
+            slots
+                .validate_prompt_input(0, phase, 129, Some(&[0, 1]))
+                .unwrap();
+            slots
+                .validate_prompt_input(0, phase, 4097, Some(&[0, 1, 2]))
+                .unwrap();
+        }
+    }
+
     #[test]
     fn slot_prompt_provenance_ends_before_the_prompt_tail() {
         let host = Host::new(
@@ -163,6 +181,7 @@ mod tests {
         slots
             .validate_prompt_input(0, crate::BatchPhase::Decode, 129, None)
             .unwrap();
+        assert_continuation_boundary(&slots);
         let weights = host.backend.alloc(DType::F32, &[4, 7]).unwrap();
         let mut end = 0;
         for rows in [64, 64, 1] {
