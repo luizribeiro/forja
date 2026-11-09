@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod chat_format;
+mod completion_session;
 mod draft;
 mod engine;
 mod generation;
@@ -21,6 +22,7 @@ mod tool_output;
 pub use chat_format::{
     ChatEvent, ChatFormat, ChatFormatLimits, ChatInfo, GrammarOutput, SamplingDefaults,
 };
+pub use completion_session::CompletionSession;
 pub use draft::{DraftMetrics, DraftProposal, DraftSource, PromptLookup};
 pub use engine::{
     Completion, FinishReason, GenerationControl, GenerationError, GenerationEvent, PrefilledPrompt,

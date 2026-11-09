@@ -48,6 +48,12 @@ pub struct ServingMetrics {
 }
 
 impl ServingMetrics {
+    /// Returns completed GPU execution time across all phases.
+    #[must_use]
+    pub const fn gpu_time(&self) -> Duration {
+        Duration::from_nanos(self.gpu_time_ns)
+    }
+
     /// Renders current bounded aggregates in Prometheus text format.
     #[must_use]
     pub fn prometheus(&self, live: bool, ready: bool) -> String {

@@ -241,7 +241,7 @@ where
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActorError {
+pub(crate) enum ActorError {
     Full,
     Closed,
 }
@@ -307,7 +307,7 @@ impl ServiceCommand {
     }
 }
 
-struct ServiceActor<S> {
+pub(crate) struct ServiceActor<S> {
     sender: mpsc::Sender<ServiceCommand>,
     metrics: Arc<StdMutex<ServingMetrics>>,
     marker: std::marker::PhantomData<fn() -> S>,
@@ -329,7 +329,10 @@ impl<S: ChatService> ServiceActor<S> {
         Self::spawn_tracked(service, capacity).0
     }
 
-    fn spawn_tracked(service: S, capacity: usize) -> (Self, tokio::task::JoinHandle<()>) {
+    pub(crate) fn spawn_tracked(
+        service: S,
+        capacity: usize,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
         let (sender, receiver) = mpsc::channel::<ServiceCommand>(capacity.max(1));
         let metrics = Arc::new(StdMutex::new(service.metrics()));
         let actor_metrics = Arc::clone(&metrics);
@@ -370,7 +373,7 @@ impl<S: ChatService> ServiceActor<S> {
         self.complete_with_policy(test_policy(), request, control)
     }
 
-    fn complete_text_with_policy(
+    pub(crate) fn complete_text_with_policy(
         &self,
         policy: AdmissionPolicy,
         request: CompletionRequest,
@@ -468,7 +471,7 @@ impl<S: ChatService> ServiceActor<S> {
             .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?
     }
 
-    async fn quiesce(&self) -> Result<(), GenerationError> {
+    pub(crate) async fn quiesce(&self) -> Result<(), GenerationError> {
         let (reply, receiver) = oneshot::channel();
         self.send(ServiceCommand::Quiesce { reply })
             .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?;
@@ -477,7 +480,7 @@ impl<S: ChatService> ServiceActor<S> {
             .map_err(|_| GenerationError::unavailable("serving scheduler stopped"))?
     }
 
-    fn metrics(&self) -> ServingMetrics {
+    pub(crate) fn metrics(&self) -> ServingMetrics {
         self.metrics
             .lock()
             .map_or_else(|_| ServingMetrics::default(), |metrics| metrics.clone())
@@ -1945,6 +1948,29 @@ mod tests {
         let metrics = actor.metrics().prometheus(true, true);
         assert!(metrics.contains("forja_queue_seconds_count 1\n"));
         assert!(metrics.contains("forja_scheduler_seconds_count 1\n"));
+    }
+
+    #[tokio::test]
+    async fn completion_session_uses_the_actor_and_drains_before_close() {
+        let session = crate::CompletionSession::new(Smoke);
+        assert_eq!(
+            session.checkpoint().await.unwrap().gpu_time(),
+            Duration::ZERO
+        );
+        let request = CompletionRequest {
+            model: "smoke".to_owned(),
+            prompt: "hello".to_owned(),
+            params: crate::CompletionParams::default(),
+        };
+        let outputs = session.complete_texts(vec![request]).await.unwrap();
+        assert_eq!(outputs[0].token_ids(), [1]);
+        assert!(
+            session
+                .metrics()
+                .prometheus(true, true)
+                .contains("forja_queue_seconds_count 1\n")
+        );
+        session.close().await.unwrap();
     }
 
     struct DeadlineSmoke {
