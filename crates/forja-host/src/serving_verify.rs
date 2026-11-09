@@ -1,5 +1,6 @@
-#[allow(dead_code)]
 mod publication;
+pub(crate) use publication::VerifyPublication;
+
 use crate::{EngineRunner, Host, compute};
 use forja_core::Backend;
 

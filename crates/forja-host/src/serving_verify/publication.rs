@@ -3,6 +3,7 @@ use crate::{
 };
 use forja_core::{Backend, StateTransaction};
 use wasmtime::component::Resource;
+mod accepted;
 mod paged;
 #[cfg(test)]
 mod tests;

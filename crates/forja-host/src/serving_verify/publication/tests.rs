@@ -2,8 +2,8 @@ use super::*;
 use crate::{BatchSelection, BatchShape, EngineBatchLane, SamplingParams, StateAction};
 use forja_core::SequenceCheckpoint;
 use forja_cpu::CpuBackend;
-
 mod kv;
+mod protected;
 
 struct Fixture {
     host: Host<CpuBackend>,
@@ -132,7 +132,7 @@ impl Fixture {
 #[test]
 fn constructors_bind_the_active_physical_lane_and_transaction() {
     for protected in [false, true] {
-        let mut fixture = Fixture::new(3, protected);
+        let fixture = Fixture::new(3, protected);
         assert_eq!(fixture.publication.lane, 1);
         assert_eq!(fixture.publication.rows, 3);
         assert_eq!(fixture.publication.state.is_some(), protected);
@@ -140,10 +140,6 @@ fn constructors_bind_the_active_physical_lane_and_transaction() {
             fixture.host.state_slots.contains_key(&fixture.slot.rep()),
             protected
         );
-        assert_eq!(fixture.logical_len(), 3);
-        if protected {
-            fixture.finish();
-        }
         fixture.rollback();
     }
 }

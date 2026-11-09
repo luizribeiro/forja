@@ -452,10 +452,11 @@ pub struct EngineBatchSelect {
 /// Device-resident outputs from one homogeneous engine batch.
 #[derive(Debug)]
 pub struct EngineBatchOutput {
-    /// Logits with shape `[bucket, vocab]`.
+    /// Logits indexed by lane for prompt/decode, or by row for verify.
     pub logits: EngineTensor,
-    /// Selected tokens with shape `[bucket]`.
+    /// Selected tokens with the same row count as the logits.
     pub tokens: EngineTensor,
+    verify: Option<serving_verify::VerifyPublication>,
 }
 
 /// Scheduler-owned lane boundary retained until acceptance or drained retirement.
@@ -2220,6 +2221,7 @@ where
         }
         self.output_handles = handles;
         Ok(Ok(EngineBatchOutput {
+            verify: None,
             logits: EngineTensor {
                 handle: output.logits.rep(),
                 runner_id: self.id,
@@ -2276,10 +2278,10 @@ where
             Ok(checkpoints) => checkpoints,
             Err(error) => return Ok(Err(error)),
         };
-        if let Err(error) = self.store.data_mut().advance_paged_batch_bank(slot) {
-            self.rollback_batch_appends(pool, &mut checkpoints)?;
-            return Ok(Err(error));
-        }
+        let verify = match self.prepare_verify_publication(pool, slot, &input, &mut checkpoints) {
+            Ok(verify) => verify,
+            Err(error) => return Ok(Err(error)),
+        };
         let rows = input.shape.output_rows();
         let wit_input = input.into();
         self.set_guest_deadline();
@@ -2322,6 +2324,7 @@ where
             self.output_handles.extend(handles);
         }
         Ok(Ok(EngineBatchOutput {
+            verify,
             logits: EngineTensor {
                 handle: logits.rep(),
                 runner_id: self.id,
@@ -3081,7 +3084,7 @@ where
     }
 
     fn release_batch_output(&mut self, output: EngineBatchOutput) -> Result<(), compute::Error> {
-        let EngineBatchOutput { logits, tokens } = output;
+        let EngineBatchOutput { logits, tokens, .. } = output;
         let handles = [logits.handle, tokens.handle];
         self.output_handles
             .retain(|handle| !handles.contains(handle));
