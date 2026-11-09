@@ -674,6 +674,19 @@ impl<B: Backend> StateSlots<B> {
         u64::try_from(self.commands(bank, lane, active)?.chain_len()).map_err(invalid_handle)
     }
 
+    pub(crate) fn transaction(
+        &self,
+        bank: usize,
+        lane: usize,
+    ) -> Result<forja_core::StateTransaction, compute::Error> {
+        self.banks
+            .get(bank)
+            .and_then(|bank| bank.get(lane))
+            .and_then(Option::as_ref)
+            .map(|record| record.transaction.clone())
+            .ok_or_else(|| invalid_handle("state transaction is not admitted"))
+    }
+
     pub(crate) fn sequence_handle(
         &self,
         lane: usize,

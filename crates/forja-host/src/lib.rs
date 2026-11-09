@@ -12686,6 +12686,15 @@ mod tests {
         rows: u32,
         lanes: u32,
     ) -> (Host<B>, Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
+        verify_input_fixture_with_plane(backend, rows, lanes, vec![7])
+    }
+
+    pub(super) fn verify_input_fixture_with_plane<B: Backend + 'static>(
+        backend: B,
+        rows: u32,
+        lanes: u32,
+        shape: Vec<u32>,
+    ) -> (Host<B>, Resource<PagePoolEntry>, Resource<BatchSlotEntry>) {
         let mut host = Host::new(backend, GENEROUS);
         host.limits.live_tensor_handles = 128;
         let pool = insert_test_pool(&mut host, 2, 33);
@@ -12715,7 +12724,7 @@ mod tests {
                 2,
                 vec![paged_storage::StatePlaneDescriptor {
                     dtype: compute::Dtype::F32,
-                    shape: vec![7],
+                    shape,
                 }],
                 inputs,
             )

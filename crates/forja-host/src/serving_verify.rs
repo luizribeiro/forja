@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod publication;
 use crate::{EngineRunner, Host, compute};
 use forja_core::Backend;
 
