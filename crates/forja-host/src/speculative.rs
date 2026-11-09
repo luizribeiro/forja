@@ -1,17 +1,17 @@
 //! CPU policy for exact speculative decoding.
 
 use crate::{BatchPhase, BatchSelection, BatchShape, MAX_VERIFY_ROWS, compute, invalid_handle};
-use std::num::NonZeroU64;
+use std::{borrow::Cow, num::NonZeroU64};
 
 /// The exact immutable draft prefix selected for staging with the pending token.
 #[derive(Debug)]
 pub struct FedDrafts<'a> {
     shape: BatchShape,
-    tokens: &'a [u32],
+    tokens: Cow<'a, [u32]>,
     budget: VerifyBudget,
 }
 
-impl<'a> FedDrafts<'a> {
+impl FedDrafts<'_> {
     /// Declared verify shape to run with this draft prefix.
     #[must_use]
     pub const fn shape(&self) -> BatchShape {
@@ -20,8 +20,18 @@ impl<'a> FedDrafts<'a> {
 
     /// Tokens to stage immediately after the pending input token.
     #[must_use]
-    pub const fn tokens(&self) -> &'a [u32] {
-        self.tokens
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Retains this selected prefix independently of its proposal buffer.
+    #[must_use]
+    pub fn into_owned(self) -> FedDrafts<'static> {
+        FedDrafts {
+            shape: self.shape,
+            tokens: Cow::Owned(self.tokens.into_owned()),
+            budget: self.budget,
+        }
     }
 
     /// The same checked budget used to select this prefix.
@@ -214,7 +224,7 @@ pub fn select_verify_shape<'a>(
     let count = usize::try_from(shape.tokens - 1).ok()?;
     Some(FedDrafts {
         shape,
-        tokens: &drafts[..count],
+        tokens: Cow::Borrowed(&drafts[..count]),
         budget,
     })
 }
@@ -271,6 +281,25 @@ impl VerifyBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_prefix_preserves_its_shape_budget_and_acceptance() {
+        let fed = {
+            let tokens = [7, 33];
+            fed_drafts(&tokens, 7).into_owned()
+        };
+        assert_eq!(fed.shape(), shape(3));
+        assert_eq!(fed.tokens(), [7, 33]);
+        assert_eq!(fed.budget().max_tokens_left(), 7);
+        assert_eq!(
+            VerifyAcceptance::new(fed, &[7, 1, 2], 4098)
+                .unwrap()
+                .scan(|_| Ok::<_, ()>(None))
+                .unwrap()
+                .accepted(),
+            1
+        );
+    }
 
     #[test]
     fn stop_and_eos_cut_at_each_row_before_length_without_scanning_the_tail() {
