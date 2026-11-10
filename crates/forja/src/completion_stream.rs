@@ -1,6 +1,18 @@
+mod provenance;
+#[cfg(test)]
+pub(crate) mod tests;
+
 use std::{error::Error, fs, path::PathBuf};
 
 use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Comparison {
+    #[default]
+    Candidate,
+    BaselineVsCandidate,
+}
 
 #[derive(Debug, PartialEq, clap::Args)]
 pub(crate) struct Options {
@@ -16,12 +28,20 @@ pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
     assert_matches(
         &serde_json::from_slice(&fs::read(&options.plain)?)?,
         &serde_json::from_slice(&fs::read(&options.draft)?)?,
+        Comparison::Candidate,
     )?;
-    println!("token streams match");
+    println!(
+        "token streams match; comparison={}",
+        serde_json::to_string(&Comparison::Candidate)?
+    );
     Ok(())
 }
 
-pub(crate) fn assert_matches(plain: &Value, draft: &Value) -> Result<(), String> {
+pub(crate) fn assert_matches(
+    plain: &Value,
+    draft: &Value,
+    comparison: Comparison,
+) -> Result<(), String> {
     for (record, mode) in [(plain, "plain"), (draft, "draft")] {
         if record["kind"] != "completion-benchmark"
             || record["schema_version"] != 1
@@ -35,7 +55,9 @@ pub(crate) fn assert_matches(plain: &Value, draft: &Value) -> Result<(), String>
             ));
         }
     }
-    if plain["stream_config"] != draft["stream_config"] {
+    provenance::compare(plain, draft, comparison)?;
+    if provenance::stream_config(plain, comparison) != provenance::stream_config(draft, comparison)
+    {
         return Err("plain/draft stream configuration differs".to_owned());
     }
     let rows = |record: &Value| {
@@ -92,46 +114,4 @@ fn valid_hash(value: &Value) -> bool {
         .as_str()
         .and_then(|hash| hash.strip_prefix("sha256:"))
         .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refuses_mismatches_and_missing_exactness_evidence() {
-        let plain = serde_json::json!({"kind":"completion-benchmark", "schema_version":1,
-            "mode":"plain", "stream_config":{"engine":"component", "sampling":"greedy"},
-            "results":[{"identity":{"seed":42,"prompt_sha256":format!("sha256:{}", "b".repeat(64)),"concurrency":1,"reps":1},
-                "token_stream_hashes":[format!("sha256:{}", "a".repeat(64))]}]});
-        let mut draft = plain.clone();
-        draft["mode"] = "draft".into();
-        assert_matches(&plain, &draft).unwrap();
-        for field in ["seed", "prompt_sha256", "reps", "concurrency"] {
-            let mut incomplete = plain.clone();
-            incomplete["results"][0]["identity"][field] = Value::Null;
-            let mut other = incomplete.clone();
-            other["mode"] = "draft".into();
-            assert!(assert_matches(&incomplete, &other).is_err());
-        }
-        let mut uncovered = draft.clone();
-        uncovered["results"][0]["identity"]["concurrency"] = 4.into();
-        let mut baseline = uncovered.clone();
-        baseline["mode"] = "plain".into();
-        assert!(assert_matches(&baseline, &uncovered).is_err());
-        for pointer in [
-            "/mode",
-            "/stream_config/engine",
-            "/stream_config/sampling",
-            "/results/0/identity/seed",
-            "/results/0/identity/prompt_sha256",
-            "/results/0/identity/reps",
-            "/results/0/identity/concurrency",
-            "/results/0/token_stream_hashes/0",
-        ] {
-            let mut changed = draft.clone();
-            *changed.pointer_mut(pointer).unwrap() = Value::Null;
-            assert!(assert_matches(&plain, &changed).is_err(), "{pointer}");
-        }
-    }
 }

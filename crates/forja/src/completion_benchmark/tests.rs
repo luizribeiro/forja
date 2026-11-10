@@ -90,7 +90,12 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
     options.mode = Mode::Draft;
     options.plain_record = Some(options.json.clone());
     options.json = root.join("draft.json");
-    run(&options, &config).await?;
+    let outcome = run(&options, &config).await;
+    if crate::provenance::dirty() {
+        assert!(outcome.unwrap_err().to_string().contains("dirty"));
+    } else {
+        outcome?;
+    }
     let draft: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
     assert_eq!(draft["results"][0]["k"], 2);
     let warmup = &draft["results"][0]["warmup"];
@@ -115,7 +120,14 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
     );
     assert_eq!(draft["config_hash"], document["config_hash"]);
     assert_ne!(draft["perf_hash"], document["perf_hash"]);
-    assert_eq!(draft["stream_check"]["status"], "pass");
+    assert_eq!(
+        draft["stream_check"]["status"],
+        if crate::provenance::dirty() {
+            "failed"
+        } else {
+            "pass"
+        }
+    );
     assert_eq!(
         draft["results"][0]["drafter"]["identity"],
         "host-prompt-lookup"
@@ -152,19 +164,14 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
 #[test]
 fn a_stream_mismatch_keeps_a_failed_record_and_returns_an_error() -> Result<(), Box<dyn Error>> {
     let (root, mut options, _) = fixture()?;
-    let plain = json!({"kind":"completion-benchmark","schema_version":1,"mode":"plain",
-        "stream_config":{"sampling":"greedy"}, "measurement_mode":{"execution":"scheduled-request-groups"},
-        "results":[{"identity":{"seed":42,"prompt_sha256":format!("sha256:{}", "c".repeat(64)),"concurrency":1,"reps":1},
-            "token_stream_hashes":[format!("sha256:{}", "a".repeat(64))],
-            "samples":[{"wall_seconds":1.0,"decode_wall_seconds":1.0,"gpu_seconds":0.0,
-                "plain_gpu_seconds":0.0,"verify_gpu_seconds":0.0}]}]});
+    let (plain, _) = crate::completion_stream::tests::pair();
     fs::write(&options.json, serde_json::to_vec(&plain)?)?;
     options.mode = Mode::Draft;
     options.plain_record = Some(options.json.clone());
     options.json = root.join("failed.json");
     let mut draft = plain;
     draft["mode"] = json!("draft");
-    draft["results"][0]["token_stream_hashes"][0] = json!(format!("sha256:{}", "b".repeat(64)));
+    draft["results"][0]["token_stream_hashes"][0] = json!(format!("sha256:{}", "d".repeat(64)));
     assert!(
         write_record(&options, draft)
             .unwrap_err()
