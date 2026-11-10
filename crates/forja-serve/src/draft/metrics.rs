@@ -18,7 +18,7 @@ pub struct DraftMetrics {
     /// Exits indexed by the event that ended the episode.
     pub episodes_exited: BTreeMap<String, u64>,
     /// Wall time from prompt completion through the terminal decode boundary.
-    pub decode_wall_ns: u64,
+    pub max_decode_wall_ns: u64,
     /// GPU time for completed verify calls, excluding plain and prompt work.
     pub verify_gpu_ns: u64,
     #[serde(skip)]
@@ -40,6 +40,21 @@ impl DraftMetrics {
             .map(|(&depth, &count)| f64::from(depth) * count as f64)
             .sum::<f64>()
             / self.rounds as f64
+    }
+
+    /// Accumulates counts and GPU work; retains the maximum request decode span.
+    pub fn merge(&mut self, other: &Self) {
+        self.rounds = self.rounds.saturating_add(other.rounds);
+        self.episodes_entered = self.episodes_entered.saturating_add(other.episodes_entered);
+        self.verify_gpu_ns = self.verify_gpu_ns.saturating_add(other.verify_gpu_ns);
+        self.max_decode_wall_ns = self.max_decode_wall_ns.max(other.max_decode_wall_ns);
+        merge_counts(&mut self.acceptance_by_depth, &other.acceptance_by_depth);
+        merge_counts(&mut self.k_eff, &other.k_eff);
+        merge_counts(
+            &mut self.episode_entry_reasons,
+            &other.episode_entry_reasons,
+        );
+        merge_counts(&mut self.episodes_exited, &other.episodes_exited);
     }
 
     pub(crate) fn enter(&mut self, reason: &str) {
@@ -83,9 +98,40 @@ impl DraftMetrics {
     }
 }
 
+fn merge_counts<K: Ord + Clone>(target: &mut BTreeMap<K, u64>, source: &BTreeMap<K, u64>) {
+    for (key, count) in source {
+        let total = target.entry(key.clone()).or_default();
+        *total = total.saturating_add(*count);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merging_requests_preserves_round_weighting_and_episode_totals() {
+        let mut first = DraftMetrics::default();
+        first.enter("prompt-lookup-match");
+        first.round(2, 2, 7);
+        first.exit("stop-or-eos");
+        let mut second = DraftMetrics::default();
+        second.enter("prompt-lookup-match");
+        second.round(1, 0, 11);
+        second.round(1, 1, 13);
+        second.exit("max-tokens");
+        first.max_decode_wall_ns = 11;
+        second.max_decode_wall_ns = 7;
+        first.merge(&second);
+        assert_eq!(first.max_decode_wall_ns, 11);
+        assert_eq!(first.rounds, 3);
+        assert_eq!(first.mean_accepted(), 1.0);
+        assert_eq!(first.episodes_entered, 2);
+        assert_eq!(first.episode_entry_reasons["prompt-lookup-match"], 2);
+        assert_eq!(first.episodes_exited.values().sum::<u64>(), 2);
+        assert_eq!(first.verify_gpu_ns, 31);
+        assert_eq!(first.k_eff, BTreeMap::from([(1, 2), (2, 1)]));
+    }
 
     #[test]
     fn terminal_cuts_keep_their_episode_exit_reason() {

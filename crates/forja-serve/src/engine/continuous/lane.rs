@@ -288,7 +288,7 @@ impl BatchLane {
             .and_then(|constraint| constraint.parser);
         let tool_call = finish_tool_parser(&Ok(reason), parser).await?;
         let reason = crate::engine::tool_finish_reason(reason, &tool_call);
-        self.drafting.decode_wall_ns =
+        self.drafting.max_decode_wall_ns =
             u64::try_from(self.decode_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.drafting.exit(match reason {
             FinishReason::Length => "max-tokens",
@@ -441,7 +441,7 @@ mod tests {
         assert!(!lane.needs_successor());
         let completion = lane.completion(FinishReason::Length).await.unwrap();
         assert_eq!(completion.usage.completion_tokens, 7);
-        assert!(completion.drafting.decode_wall_ns > 0);
+        assert!(completion.drafting.max_decode_wall_ns > 0);
         assert_eq!(completion.token_ids, [0, 1, 0, 1, 1, 0, 1]);
         assert_eq!(completion.text, "ababbab");
     }
