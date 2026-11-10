@@ -88,3 +88,29 @@ async fn completion_loading_uses_the_validated_profile() -> Result<(), Box<dyn E
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn initialization_admits_the_requested_lane_group() -> Result<(), Box<dyn Error>> {
+    let (root, options, config) = fixture()?;
+    let (profile, _, inputs) = prepare(&options, &config)?;
+    let session = engine::load(
+        forja_cpu::CpuBackend::new(),
+        crate::engine::limits(&config.limits)?,
+        &options,
+        &config,
+        &profile,
+        &inputs,
+    )
+    .await?;
+    let request = serde_json::from_value(
+        json!({"model":profile.model().id,"prompt":"abcd".repeat(8),"max_tokens":12,"temperature":0.0,"seed":42}),
+    )?;
+    let warmup = warmup::run(&session, request, 1, 4, 32).await?;
+    assert_eq!(warmup.groups, 1);
+    assert_eq!(warmup.concurrency, 4);
+    assert_eq!(warmup.output_tokens_per_lane, 12);
+    assert_eq!(warmup.full_prompt_requests, 4);
+    session.close().await?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

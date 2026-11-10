@@ -36,7 +36,7 @@ pub(crate) struct Options {
     /// Independent whole request-group repetitions.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
     pub reps: u32,
-    /// Bounded two-token initialization requests per fresh runner.
+    /// Warm-up groups with the row concurrency and enough output for lookup.
     #[arg(long, default_value_t = 1)]
     pub warmups: u32,
     /// New record destination; existing files are refused.
