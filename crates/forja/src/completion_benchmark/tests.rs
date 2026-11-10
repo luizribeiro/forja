@@ -90,27 +90,20 @@ async fn completion_loading_uses_the_validated_profile() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
-async fn scheduled_groups_retain_completion_observations() -> Result<(), Box<dyn Error>> {
+async fn plain_completion_records_preserve_request_observations() -> Result<(), Box<dyn Error>> {
     let (root, options, config) = fixture()?;
-    let (profile, suite, inputs) = prepare(&options, &config)?;
-    let session = engine::load(
-        forja_cpu::CpuBackend::new(),
-        crate::engine::limits(&config.limits)?,
-        &options,
-        &config,
-        &profile,
-        &inputs,
-    )
-    .await?;
-    let mut document = measure(
-        &options, &config, &profile, &suite, &inputs, &session, "CPU",
-    )
-    .await?;
-    record::decorate(&mut document)?;
+    run(&options, &config).await?;
+    let document: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
     assert_eq!(document["results"][0]["rounds"], 0);
     assert_eq!(document["results"][0]["k"], 0);
     assert_eq!(document["results"][0]["drafter"]["identity"], "none");
-    session.close().await?;
+    assert!(
+        run(&options, &config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("overwrite")
+    );
     fs::remove_dir_all(root)?;
     Ok(())
 }

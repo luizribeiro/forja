@@ -15,7 +15,6 @@ mod benchmark_worker;
 mod calibration;
 #[cfg(any(target_os = "macos", test))]
 mod calibration_identity;
-#[cfg(test)]
 mod completion_benchmark;
 mod completion_stream;
 mod config_show;
@@ -120,6 +119,9 @@ fn run(command: args::Command) -> Result<(), Box<dyn Error>> {
         .enable_time()
         .build()?;
     match command {
+        args::Command::BenchCompletion(options, config) => {
+            runtime.block_on(completion_benchmark::run(&options, &config))
+        }
         args::Command::Bench(options) => runtime.block_on(benchmark::run(&options)),
         args::Command::BenchCheckStreams(_) => unreachable!("stream checks return before runtime"),
         args::Command::BenchHttp(_) => unreachable!("HTTP benchmarks own their client process"),

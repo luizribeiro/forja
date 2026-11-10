@@ -11,10 +11,60 @@ mod workload;
 use forja_config::{BackendKind, DevConfig, Profile};
 use forja_serve::{ChatService, CompletionRequest, CompletionSession};
 use golden_fixtures::sha256_file;
-pub(crate) use options::{Mode, Options};
 use serde_json::{Value, json};
-use std::{error::Error, fs, time::Instant};
+use std::{error::Error, fs, io::Write as _, time::Instant};
 use tokenizers::Tokenizer;
+
+#[cfg(test)]
+use options::Mode;
+pub(crate) use options::Options;
+
+pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box<dyn Error>> {
+    if options.json.exists() {
+        return Err("refusing to overwrite a benchmark record".into());
+    }
+    let (profile, suite, identities) = prepare(options, config)?;
+    match config.backend.kind {
+        BackendKind::Cpu => {
+            execute(
+                forja_cpu::CpuBackend::new(),
+                crate::engine::limits(&config.limits)?,
+                "CPU",
+                options,
+                config,
+                &profile,
+                &suite,
+                &identities,
+            )
+            .await
+        }
+        BackendKind::Metal => {
+            #[cfg(target_os = "macos")]
+            {
+                let metal = config.backend.metal.resolve();
+                let (backend, live) = crate::engine::metal_backend(
+                    metal.graph_replay,
+                    config.backend.metal.pool_capacity,
+                    &config.limits,
+                )?;
+                let device = backend.device_name();
+                execute(
+                    backend,
+                    crate::engine::limits_for_live_bytes(&config.limits, live)?,
+                    &device,
+                    options,
+                    config,
+                    &profile,
+                    &suite,
+                    &identities,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err("Metal completion benchmarks require macOS".into());
+        }
+    }
+}
 
 fn prepare(
     options: &Options,
@@ -49,6 +99,37 @@ fn prepare(
         "tokenizer_sha256":sha256_file(options.model.join("tokenizer.json"))?,
         "chat_format_sha256":sha256_file(&options.chat_format)?, "lookup_policy":policy});
     Ok((profile, suite, identities))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
+    backend: B,
+    limits: forja_host::Limits,
+    device: &str,
+    options: &Options,
+    config: &DevConfig,
+    profile: &Profile,
+    suite: &workload::Suite,
+    inputs: &Value,
+) -> Result<(), Box<dyn Error>> {
+    let session = engine::load(backend, limits, options, config, profile, inputs).await?;
+    let result = measure(options, config, profile, suite, inputs, &session, device).await;
+    let cleanup = session.close().await;
+    let document = result?;
+    cleanup?;
+    write_record(options, document)
+}
+
+fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Error>> {
+    record::decorate(&mut document)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&options.json)?;
+    serde_json::to_writer_pretty(&mut output, &document)?;
+    output.write_all(b"\n")?;
+    eprintln!("completion record written; mode={:?}", options.mode);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

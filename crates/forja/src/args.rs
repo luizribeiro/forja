@@ -288,6 +288,8 @@ enum HttpMode {
     Http(Box<crate::http_benchmark::Options>),
     /// Assert identical token streams in compatible plain and draft records.
     CheckStreams(crate::completion_stream::Options),
+    /// Measure real prompts through the serving scheduler.
+    Completion(Box<crate::completion_benchmark::Options>),
 }
 
 #[derive(Args)]
@@ -362,6 +364,7 @@ pub(crate) enum Command {
     Bench(Bench),
     BenchHttp(crate::http_benchmark::Options),
     BenchCheckStreams(crate::completion_stream::Options),
+    BenchCompletion(crate::completion_benchmark::Options, Box<DevConfig>),
     BenchKernel(crate::kernel_benchmark::Options, Box<DevConfig>),
     BenchSnapshot(crate::benchmark_snapshot::Options, Box<DevConfig>),
     Build(Build),
@@ -599,6 +602,9 @@ fn parse_with(
         ParsedCommand::Bench(mut options) if options.http.is_some() => match options.http.take() {
             Some(HttpMode::Http(http)) => Command::BenchHttp(*http),
             Some(HttpMode::CheckStreams(options)) => Command::BenchCheckStreams(options),
+            Some(HttpMode::Completion(options)) => {
+                Command::BenchCompletion(*options, Box::new(layered.config))
+            }
             None => {
                 return Err(Cli::command().error(
                     clap::error::ErrorKind::MissingSubcommand,
@@ -712,6 +718,12 @@ fn load_record(path: &PathBuf) -> Result<(PathBuf, Recorded), clap::Error> {
             format!("{}: invalid benchmark record: {error}", path.display()),
         )
     })?;
+    if value.get("kind").is_some() {
+        return Err(Cli::command().error(
+            clap::error::ErrorKind::ValueValidation,
+            "this record kind cannot be rerun as a synthetic benchmark",
+        ));
+    }
     let schema_version = value["schema_version"].as_u64().unwrap_or_default();
     if !(1..=u64::from(SCHEMA_VERSION)).contains(&schema_version) {
         return Err(Cli::command().error(
@@ -3008,5 +3020,26 @@ fixtures = "/fixtures"
             assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
             assert!(help.to_string().contains("--model"));
         }
+    }
+    #[test]
+    fn completion_records_cannot_be_rerun_as_synthetic_workloads() {
+        let directory = forja_testing::temporary_directory("record-kind").unwrap();
+        let path = directory.join("completion.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "kind":"completion-benchmark", "schema_version":1, "inputs":[], "results":[],
+                "provenance":{"commit":"fixture"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            load_record(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("record kind")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }
