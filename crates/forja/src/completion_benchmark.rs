@@ -50,6 +50,87 @@ fn prepare(
         "chat_format_sha256":sha256_file(&options.chat_format)?, "lookup_policy":policy});
     Ok((profile, suite, identities))
 }
+
+#[allow(clippy::too_many_arguments)]
+async fn measure<S: ChatService>(
+    options: &Options,
+    config: &DevConfig,
+    profile: &Profile,
+    suite: &workload::Suite,
+    inputs: &Value,
+    session: &CompletionSession<S>,
+    device: &str,
+) -> Result<Value, Box<dyn Error>> {
+    let tokenizer = Tokenizer::from_file(options.model.join("tokenizer.json"))
+        .map_err(|error| format!("cannot load tokenizer: {error}"))?;
+    let root = options
+        .suite
+        .parent()
+        .ok_or("suite has no parent directory")?;
+    let padding = fs::read_to_string(root.join(&suite.padding))?;
+    let mut results = Vec::new();
+    for row in &suite.rows {
+        let source = fs::read_to_string(root.join(&row.prompt))?;
+        let prompt = workload::render(
+            &tokenizer,
+            &source,
+            &padding,
+            row.context_tokens,
+            (&suite.padding_prefix, &suite.padding_suffix),
+        )?;
+        let prompt_tokens = tokenizer
+            .encode(prompt.as_str(), false)
+            .map_err(|error| error.to_string())?
+            .len();
+        if prompt_tokens
+            .checked_add(usize::try_from(row.output_tokens)?)
+            .ok_or("context overflow")?
+            > usize::try_from(profile.workload().max_context.get())?
+        {
+            return Err(format!("{} exceeds the profile context", row.name).into());
+        }
+        results.push(measure_row(session, options, inputs, row, &prompt, prompt_tokens).await?);
+    }
+    let mut measured_config = config.clone();
+    measured_config.bench.reps =
+        std::num::NonZeroU32::new(options.reps).ok_or("repetitions must be positive")?;
+    measured_config.bench.warmups = options.warmups;
+    measured_config.backend.metal.graph_replay =
+        forja_config::Choice::Fixed(config.backend.metal.resolve().graph_replay);
+    let mut effective = toml::Value::try_from(&measured_config)?;
+    effective
+        .as_table_mut()
+        .ok_or("invalid benchmark config")?
+        .remove("paths");
+    effective["verify"]
+        .as_table_mut()
+        .ok_or("invalid verify config")?
+        .remove("fixtures");
+    let policy = &inputs["lookup_policy"];
+    let mut host = serde_json::to_value(engine::host_config(options, config))?;
+    host.as_object_mut()
+        .ok_or("invalid host config")?
+        .remove("model");
+    let toml_config = toml::to_string(&effective)?;
+    Ok(
+        json!({"schema_version":1, "kind":"completion-benchmark", "implementation":"forja", "mode":options.mode,
+        "inputs":[inputs], "config":toml_config,
+        "stream_config":{"inputs":inputs, "config":effective, "host_config":host, "cached":options.cached, "policy":policy,
+            "suite_sha256":sha256_file(&options.suite)?, "padding_sha256":sha256_file(root.join(&suite.padding))?,
+            "reps":options.reps,"warmups":options.warmups},
+        "provenance":{"commit":crate::provenance::commit(),"dirty":crate::provenance::dirty(),
+            "binary_sha256":sha256_file(std::env::current_exe()?)?, "build_environment":crate::provenance::BUILD_ENVIRONMENT,
+            "machine":crate::benchmark::command_output("hostname", &[])?, "os":std::env::consts::OS,
+            "os_version":crate::benchmark::command_output("sw_vers", &["-productVersion"])?,
+            "os_build":crate::benchmark::command_output("sw_vers", &["-buildVersion"])?, "device":device},
+        "source":suite.source, "context_semantics":suite.context_semantics,
+        "measurement_mode":{"sampling":"fixed", "execution":"scheduled-request-groups", "decoding":options.mode,
+            "reps":options.reps,"warmups":options.warmups,"raw_samples":true,"cache_state":if options.cached {"prefix-reuse-enabled"} else {"fresh-request"}},
+        "timing_semantics":"Wall samples cover a whole request group. Decode wall is the maximum lane decode span. Plain GPU includes prompt work and excludes Verify. Whole request groups are the independent trials.",
+        "results":results}),
+    )
+}
+
 async fn measure_row<S: ChatService>(
     session: &CompletionSession<S>,
     options: &Options,

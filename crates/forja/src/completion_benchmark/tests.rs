@@ -90,6 +90,32 @@ async fn completion_loading_uses_the_validated_profile() -> Result<(), Box<dyn E
 }
 
 #[tokio::test]
+async fn scheduled_groups_retain_completion_observations() -> Result<(), Box<dyn Error>> {
+    let (root, options, config) = fixture()?;
+    let (profile, suite, inputs) = prepare(&options, &config)?;
+    let session = engine::load(
+        forja_cpu::CpuBackend::new(),
+        crate::engine::limits(&config.limits)?,
+        &options,
+        &config,
+        &profile,
+        &inputs,
+    )
+    .await?;
+    let mut document = measure(
+        &options, &config, &profile, &suite, &inputs, &session, "CPU",
+    )
+    .await?;
+    record::decorate(&mut document)?;
+    assert_eq!(document["results"][0]["rounds"], 0);
+    assert_eq!(document["results"][0]["k"], 0);
+    assert_eq!(document["results"][0]["drafter"]["identity"], "none");
+    session.close().await?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn initialization_admits_the_requested_lane_group() -> Result<(), Box<dyn Error>> {
     let (root, options, config) = fixture()?;
     let (profile, _, inputs) = prepare(&options, &config)?;
@@ -178,28 +204,6 @@ fn row_metadata_requires_a_declared_draft_cap() -> Result<(), Box<dyn Error>> {
         )
         .is_err()
     );
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn scheduled_rows_retain_full_completion_groups() -> Result<(), Box<dyn Error>> {
-    let (root, options, config) = fixture()?;
-    let (profile, suite, inputs) = prepare(&options, &config)?;
-    let session = engine::load(
-        forja_cpu::CpuBackend::new(),
-        crate::engine::limits(&config.limits)?,
-        &options,
-        &config,
-        &profile,
-        &inputs,
-    )
-    .await?;
-    let prompt = fs::read_to_string(root.join("prompt.txt"))?;
-    let row = measure_row(&session, &options, &inputs, &suite.rows[0], &prompt, 32).await?;
-    assert_eq!(row["samples"][0]["output_tokens"], json!([7]));
-    assert_eq!(row["warmup"]["output_tokens_per_lane"], 12);
-    session.close().await?;
     fs::remove_dir_all(root)?;
     Ok(())
 }
