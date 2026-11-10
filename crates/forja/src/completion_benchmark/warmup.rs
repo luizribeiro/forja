@@ -20,13 +20,23 @@ pub(super) async fn run<S: ChatService>(
     prompt_tokens: usize,
 ) -> Result<Warmup, Box<dyn Error>> {
     let mut observed_rounds = 0_u64;
+    let mut completed_requests = 0_u64;
     for _ in 0..groups {
         let requests = vec![request.clone(); usize::try_from(concurrency)?];
         for completion in session.complete_texts(requests).await? {
+            completed_requests = completed_requests
+                .checked_add(1)
+                .ok_or("warm-up request overflow")?;
             observed_rounds = observed_rounds
                 .checked_add(completion.drafting.rounds)
                 .ok_or("warm-up round overflow")?;
         }
+    }
+    let expected = u64::from(groups)
+        .checked_mul(u64::from(concurrency))
+        .ok_or("warm-up count overflow")?;
+    if completed_requests != expected {
+        return Err("incomplete warm-up group".into());
     }
     Ok(Warmup {
         groups,
@@ -37,9 +47,7 @@ pub(super) async fn run<S: ChatService>(
             .max_tokens
             .ok_or("missing warm-up output budget")?,
         observed_rounds,
-        full_prompt_requests: u64::from(groups)
-            .checked_mul(u64::from(concurrency))
-            .ok_or("warm-up count overflow")?,
+        full_prompt_requests: completed_requests,
     })
 }
 

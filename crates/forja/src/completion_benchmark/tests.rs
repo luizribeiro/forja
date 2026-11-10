@@ -134,6 +134,24 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
 }
 
 #[tokio::test]
+async fn warmup_and_measurement_complete_the_same_lane_group() -> Result<(), Box<dyn Error>> {
+    let (root, options, config) = fixture()?;
+    let mut suite: Value = serde_json::from_slice(&fs::read(&options.suite)?)?;
+    suite["rows"][0]["concurrency"] = 4.into();
+    suite["rows"][0]["minimum_speedup"] = 0.98.into();
+    fs::write(&options.suite, serde_json::to_vec(&suite)?)?;
+    run(&options, &config).await?;
+    let record: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
+    let row = &record["results"][0];
+    assert_eq!(row["warmup"]["concurrency"], 4);
+    assert_eq!(row["warmup"]["full_prompt_requests"], 4);
+    assert_eq!(row["samples"][0]["output_tokens"], json!([7, 7, 7, 7]));
+    assert_eq!(row["finish_reasons"]["length"], 4);
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completion_loading_uses_the_validated_profile() -> Result<(), Box<dyn Error>> {
     let (root, options, config) = fixture()?;
     let (profile, _, inputs) = prepare(&options, &config)?;
