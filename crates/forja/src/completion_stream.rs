@@ -1,4 +1,5 @@
 mod provenance;
+mod rows;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -78,6 +79,8 @@ pub(crate) fn assert_matches(
         if !plain["identity"].is_object() || plain["identity"] != draft["identity"] {
             return Err("plain/draft seed, prompt or workload differs".to_owned());
         }
+        rows::validate_samples(plain)?;
+        rows::validate_samples(draft)?;
         if hashes(plain)? != hashes(draft)? {
             return Err(format!(
                 "token-stream hash mismatch for {}",

@@ -81,6 +81,24 @@ fn provenance_comparison_requires_explicit_baseline_labelling() {
 }
 
 #[test]
+fn short_outputs_and_nonpositive_decode_spans_are_refused_on_either_side() {
+    let (plain, draft) = pair();
+    for (pointer, value) in [
+        ("/results/0/samples/0/output_tokens/0", json!(7)),
+        ("/results/0/samples/0/finish_reasons/0", json!("stop")),
+        ("/results/0/samples/0/prompt_tokens/0", json!(4096)),
+        ("/results/0/samples/0/decode_wall_seconds", json!(0.0)),
+    ] {
+        let mut changed = draft.clone();
+        *changed.pointer_mut(pointer).unwrap() = value.clone();
+        assert!(assert_matches(&plain, &changed, Comparison::Candidate).is_err());
+        let mut changed_plain = plain.clone();
+        *changed_plain.pointer_mut(pointer).unwrap() = value;
+        assert!(assert_matches(&changed_plain, &draft, Comparison::Candidate).is_err());
+    }
+}
+
+#[test]
 fn command_reads_records_and_propagates_validation_and_io_errors() {
     let root = forja_testing::temporary_directory("stream-command").unwrap();
     let (plain, mut draft) = pair();
