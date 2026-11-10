@@ -25,6 +25,8 @@ pub(super) struct Row {
     pub name: String,
     pub group: String,
     pub prompt: String,
+    #[serde(default)]
+    pub prompt_suffix: String,
     pub context_tokens: usize,
     pub output_tokens: u32,
     pub concurrency: u32,

@@ -185,7 +185,8 @@ async fn measure<S: ChatService>(
     let padding = fs::read_to_string(root.join(&suite.padding))?;
     let mut results = Vec::new();
     for row in &suite.rows {
-        let source = fs::read_to_string(root.join(&row.prompt))?;
+        let mut source = fs::read_to_string(root.join(&row.prompt))?;
+        source.push_str(&row.prompt_suffix);
         let prompt = workload::render(
             &tokenizer,
             &source,
