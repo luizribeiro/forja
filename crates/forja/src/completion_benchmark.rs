@@ -1,4 +1,5 @@
 mod engine;
+mod environment;
 mod observed;
 mod options;
 mod record;
@@ -173,6 +174,8 @@ async fn measure<S: ChatService>(
     session: &CompletionSession<S>,
     device: &str,
 ) -> Result<Value, Box<dyn Error>> {
+    let started = Instant::now();
+    let load_before = environment::capture("BEFORE BENCHMARK")?;
     let tokenizer = Tokenizer::from_file(options.model.join("tokenizer.json"))
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let root = options
@@ -218,6 +221,14 @@ async fn measure<S: ChatService>(
         .as_table_mut()
         .ok_or("invalid verify config")?
         .remove("fixtures");
+    let load_after = environment::capture("AFTER BENCHMARK")?;
+    let provenance = environment::provenance(
+        device,
+        config.backend.kind,
+        &load_before,
+        &load_after,
+        started.elapsed(),
+    )?;
     let policy = &inputs["lookup_policy"];
     let mut host = serde_json::to_value(engine::host_config(options, config))?;
     host.as_object_mut()
@@ -230,11 +241,7 @@ async fn measure<S: ChatService>(
         "stream_config":{"inputs":inputs, "config":effective, "host_config":host, "cached":options.cached, "policy":policy,
             "suite_sha256":sha256_file(&options.suite)?, "padding_sha256":sha256_file(root.join(&suite.padding))?,
             "reps":options.reps,"warmups":options.warmups},
-        "provenance":{"commit":crate::provenance::commit(),"dirty":crate::provenance::dirty(),
-            "binary_sha256":sha256_file(std::env::current_exe()?)?, "build_environment":crate::provenance::BUILD_ENVIRONMENT,
-            "machine":crate::benchmark::command_output("hostname", &[])?, "os":std::env::consts::OS,
-            "os_version":crate::benchmark::command_output("sw_vers", &["-productVersion"])?,
-            "os_build":crate::benchmark::command_output("sw_vers", &["-buildVersion"])?, "device":device},
+        "provenance":provenance,
         "source":suite.source, "context_semantics":suite.context_semantics,
         "measurement_mode":{"sampling":"fixed", "early_stop":false, "explicit_no_early_stop":options.measurement.no_early_stop,
             "explicit_raw_samples":options.measurement.raw_samples, "execution":"scheduled-request-groups", "decoding":options.mode,

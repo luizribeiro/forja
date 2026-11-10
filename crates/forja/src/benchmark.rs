@@ -3258,7 +3258,7 @@ pub(crate) fn command_output(program: &str, arguments: &[&str]) -> Result<String
     Ok(value)
 }
 
-fn gpu_core_count() -> Result<u64, Box<dyn Error>> {
+pub(crate) fn gpu_core_count() -> Result<u64, Box<dyn Error>> {
     let output = command_output("system_profiler", &["SPDisplaysDataType", "-json"])?;
     let report: serde_json::Value = serde_json::from_str(&output)?;
     report["SPDisplaysDataType"]

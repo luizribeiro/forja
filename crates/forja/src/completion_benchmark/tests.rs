@@ -82,6 +82,9 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
     run(&options, &config).await?;
     let document: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
     assert_eq!(document["results"][0]["rounds"], 0);
+    assert!(document["provenance"]["date"].is_string());
+    assert!(document["provenance"]["os_version"].is_string());
+    assert!(document["provenance"]["machine_load"].is_object());
     assert_eq!(document["results"][0]["k"], 0);
     assert_eq!(document["results"][0]["drafter"]["identity"], "none");
     options.mode = Mode::Draft;
