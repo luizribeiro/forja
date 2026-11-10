@@ -1,4 +1,4 @@
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 mod batch;
 mod paged;
 use crate::{Config, DecoderLayer, quant::Affine};

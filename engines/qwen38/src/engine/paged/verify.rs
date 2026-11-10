@@ -1,5 +1,5 @@
 use crate::Model;
-use forja_sdk::{BatchPhase, Dim, Error, PagedVerifyTensors, Result};
+use forja_sdk::{Dim, Error, PagedVerifyTensors, Result};
 
 fn inputs(model: &Model) -> Result<PagedVerifyTensors> {
     super::inputs(model)?
@@ -15,16 +15,19 @@ pub(super) fn record(model: &mut Model, rows: u32, start: &Dim, lane: u32) -> Re
     let (_, shared) = super::inputs(model)?;
     let inputs = inputs(model)?;
     let words = shared.allow.shape()[1];
-    for row in 0..rows {
-        let position = start.clone().checked_add(row)?;
+    let starts = (0..rows)
+        .map(|row| start.clone().checked_add(row))
+        .collect::<Result<Vec<_>>>()?;
+    let tokens = inputs
+        .tokens
+        .narrow(0, start.clone().replay_constant(0), rows)?;
+    let lanes = vec![lane; starts.len()];
+    model
+        .forward_decode_rows(&tokens, &starts, &lanes)?
+        .copy_into(&mut inputs.logits.narrow(0, 0, rows)?)?;
+    for (row, position) in (0..rows).zip(starts) {
         let anchor = position.clone().replay_constant(row);
-        let token = inputs.tokens.narrow(0, anchor.clone(), 1)?;
-        let output = model.forward_paged(&token, &position, lane, BatchPhase::Decode, false)?;
-        let mut logits = inputs.logits.narrow(0, anchor.clone(), 1)?;
-        output
-            .logits
-            .reshape(logits.shape())?
-            .copy_into(&mut logits)?;
+        let logits = inputs.logits.narrow(0, anchor.clone(), 1)?;
         logits
             .sample_masked(
                 &shared.sampling.narrow(0, lane, 1)?.reshape(&[5])?,

@@ -2,7 +2,7 @@ mod catalog;
 mod verify;
 pub(super) use catalog::Catalog;
 
-use crate::Model;
+use crate::{Model, Qwen38};
 use forja_sdk::{BatchPhase, Dim, Error, PagedCacheSet, PagedInputTensors, Result, Tensor};
 use std::rc::Rc;
 
@@ -43,16 +43,21 @@ fn forward_decode_rows(model: &mut Model, starts: &[Dim]) -> Result<()> {
     let (set, inputs) = inputs(model)?;
     let batch =
         u32::try_from(starts.len()).map_err(|_| Error::loading("decode lane count exceeds u32"))?;
+    let mut lanes = [0; Qwen38::MAX_DECODE_ROWS as usize];
+    let lanes = lanes
+        .get_mut(..starts.len())
+        .ok_or_else(|| Error::loading("decode lane count exceeds serving buckets"))?;
     let tokens = Tensor::<u32>::zeros(&[batch])?;
-    for (lane, start) in starts.iter().enumerate() {
-        let lane = u32::try_from(lane).map_err(|_| Error::loading("decode lane exceeds u32"))?;
+    for (row, start) in starts.iter().enumerate() {
+        let lane = u32::try_from(row).map_err(|_| Error::loading("decode lane exceeds u32"))?;
+        lanes[row] = lane;
         set.slot()
             .token(lane)?
             .narrow(0, start.clone().replay_constant(0), 1)?
             .copy_into(&mut tokens.narrow(0, lane, 1)?)?;
     }
     model
-        .forward_decode_rows(&tokens, starts)?
+        .forward_decode_rows(&tokens, starts, lanes)?
         .copy_into(&mut inputs.logits.narrow(0, 0, batch)?)?;
     Ok(())
 }

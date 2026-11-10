@@ -15,7 +15,7 @@ impl DeltaNet {
         if input.shape() != [batch, c.hidden]
             || !(1..=8).contains(&batch)
             || lanes.iter().any(|lane| *lane >= 8)
-            || lanes.windows(2).any(|pair| pair[0] >= pair[1])
+            || lanes.windows(2).any(|pair| pair[0] > pair[1])
             || !self.carry.is_slotted()
         {
             return Err(Error::loading("invalid recurrent lane rows"));

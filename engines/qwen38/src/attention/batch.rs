@@ -18,7 +18,7 @@ impl Attention {
             || positions.shape() != [batch]
             || starts.len() != lanes.len()
             || lanes.iter().any(|lane| *lane >= 8)
-            || lanes.windows(2).any(|pair| pair[0] >= pair[1])
+            || lanes.windows(2).any(|pair| pair[0] > pair[1])
         {
             return Err(Error::loading("invalid attention lane rows"));
         }

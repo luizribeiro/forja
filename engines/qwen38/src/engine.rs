@@ -31,6 +31,9 @@ pub struct Qwen38 {
     feedback: Feedback,
 }
 impl Qwen38 {
+    pub(crate) const DECODE_BUCKETS: [u32; 4] = [1, 2, 4, 8];
+    pub(crate) const MAX_DECODE_ROWS: u32 = Self::DECODE_BUCKETS[Self::DECODE_BUCKETS.len() - 1];
+
     /// Largest number of target rows in a single verify round.
     pub const VERIFY_ROWS: u32 = 3;
 
@@ -48,7 +51,7 @@ impl Qwen38 {
     #[must_use]
     pub fn serving_shapes() -> Vec<forja_sdk::BatchShape> {
         use forja_sdk::{BatchPhase, BatchSelection, BatchShape};
-        [1, 2, 4, 8]
+        Self::DECODE_BUCKETS
             .into_iter()
             .flat_map(|bucket| {
                 [
@@ -63,7 +66,9 @@ impl Qwen38 {
                     selection,
                 })
             })
-            .filter(|shape| shape.bucket != 8 || shape.selection == BatchSelection::Combined)
+            .filter(|shape| {
+                shape.bucket != Self::MAX_DECODE_ROWS || shape.selection == BatchSelection::Combined
+            })
             .chain([64, 512, 2048].map(|tokens| BatchShape {
                 phase: BatchPhase::Prompt,
                 bucket: 1,
