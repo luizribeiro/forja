@@ -167,4 +167,41 @@ mod tests {
         assert!(render(&tokenizer, prompt, "", 33, ("header ", "footer ")).is_err());
         assert!(render(&tokenizer, prompt, "history ", 3, ("header ", "footer ")).is_err());
     }
+    #[test]
+    fn lookup_prompt_boundaries_match_the_pinned_chat_component() -> Result<(), Box<dyn Error>> {
+        let suite_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/suites/prompt-lookup.json");
+        let suite = Suite::load(&suite_path, &[], "regular")?;
+        let mut format = forja_serve::ChatFormat::load(
+            test_guests::qwen38_chat_format(),
+            forja_serve::ChatFormatLimits::default(),
+        )?;
+        let mut checked = BTreeSet::new();
+        for row in suite.rows {
+            if !checked.insert(row.prompt.clone()) {
+                continue;
+            }
+            let mut source = fs::read_to_string(
+                suite_path
+                    .parent()
+                    .ok_or("missing suite root")?
+                    .join(&row.prompt),
+            )?;
+            source.push_str(&row.prompt_suffix);
+            let (_, body) = source
+                .split_once("<|im_start|>user\n")
+                .ok_or("missing user boundary")?;
+            let (content, _) = body
+                .split_once("<|im_end|>\n")
+                .ok_or("missing end boundary")?;
+            let messages = serde_json::json!([{"role":"user","content":content}]);
+            let options = serde_json::json!({"add_generation_prompt":true,"chat_template_kwargs":{"enable_thinking":row.name.starts_with("thinking-")}});
+            let rendered = format
+                .render(&messages.to_string(), "null", &options.to_string())?
+                .map_err(|error| format!("chat rendering failed: {error}"))?;
+            assert_eq!(rendered, source, "{}", row.prompt);
+        }
+        assert_eq!(checked.len(), 6);
+        Ok(())
+    }
 }

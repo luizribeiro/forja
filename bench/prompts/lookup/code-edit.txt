@@ -26,6 +26,8 @@ def download(client, name: str) -> bytes:
     return retry(lambda: client.get(name), RetryPolicy())
 
 def upload(client, name: str, content: bytes):
-    return retry(lambda: client.put(name, content), RetryPolicy(attempts=5))
-<|im_end|>
+    return retry(lambda: client.put(name, content), RetryPolicy(attempts=5))<|im_end|>
 <|im_start|>assistant
+<think>
+
+</think>

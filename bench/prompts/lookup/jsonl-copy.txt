@@ -7,6 +7,8 @@ Copy this audit export exactly, changing only the status of item job-104 from qu
 {"id":"job-105","owner":"billing","status":"queued","attempts":0,"region":"east","retained":true}
 {"id":"job-106","owner":"search","status":"complete","attempts":1,"region":"west","retained":false}
 {"id":"job-107","owner":"analytics","status":"running","attempts":2,"region":"east","retained":true}
-{"id":"job-108","owner":"billing","status":"complete","attempts":1,"region":"west","retained":true}
-<|im_end|>
+{"id":"job-108","owner":"billing","status":"complete","attempts":1,"region":"west","retained":true}<|im_end|>
 <|im_start|>assistant
+<think>
+
+</think>

@@ -26,6 +26,19 @@ def test_lookup_workloads_preserve_thresholds_and_separate_long_context():
     assert all(row["concurrency"] == 4 for row in rows if row["name"].startswith("c4-"))
 
 
+def test_generation_boundaries_keep_copy_tasks_outside_thinking():
+    suite = json.loads(SUITE.read_text())
+    assert suite["padding_prefix"] == "<|im_start|>system\n"
+    assert suite["padding_suffix"] == "<|im_end|>\n"
+    for task in ["code-edit", "jsonl-copy", "code", "chat", "jsonl-generate"]:
+        prompt = (SUITE.parent / f"../prompts/lookup/{task}.txt").read_text()
+        suffixes = {row["prompt_suffix"] for row in suite["rows"] if Path(row["prompt"]).stem == task}
+        assert suffixes == {"\n"}
+        assert (prompt + "\n").endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    thinking = (SUITE.parent / "../prompts/lookup/thinking.txt").read_text()
+    assert thinking.endswith("<|im_start|>assistant\n<think>\n")
+
+
 def test_padding_is_varied_and_reproducible():
     from generate_lookup_padding import render
     corpus = (SUITE.parent / json.loads(SUITE.read_text())["padding"]).read_text()

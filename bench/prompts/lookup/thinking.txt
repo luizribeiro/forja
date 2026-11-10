@@ -1,5 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
 <|im_start|>user
-A library has three rooms and needs to schedule four workshops on Saturday. Each workshop lasts two hours. The electronics workshop needs the only room with grounded benches; the sewing workshop must finish before the children's workshop begins because they share an instructor. The building opens at 9 and closes at 15, with a one-hour lunch break at 12. Can all four workshops fit? Explain your assumptions, show a feasible timetable if possible, and check the room and instructor conflicts.
-<|im_end|>
+A library has three rooms and needs to schedule four workshops on Saturday. Each workshop lasts two hours. The electronics workshop needs the only room with grounded benches; the sewing workshop must finish before the children's workshop begins because they share an instructor. The building opens at 9 and closes at 15, with a one-hour lunch break at 12. Can all four workshops fit? Explain your assumptions, show a feasible timetable if possible, and check the room and instructor conflicts.<|im_end|>
 <|im_start|>assistant
 <think>
