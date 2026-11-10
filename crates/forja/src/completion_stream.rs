@@ -22,17 +22,20 @@ pub(crate) struct Options {
     /// Draft-mode completion benchmark record to check.
     #[arg(long)]
     pub(crate) draft: PathBuf,
+    /// Require candidate identity or explicitly compare a labelled baseline.
+    #[arg(long, value_enum, default_value_t = Comparison::Candidate)]
+    pub(crate) comparison: Comparison,
 }
 
 pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
     assert_matches(
         &serde_json::from_slice(&fs::read(&options.plain)?)?,
         &serde_json::from_slice(&fs::read(&options.draft)?)?,
-        Comparison::Candidate,
+        options.comparison,
     )?;
     println!(
         "token streams match; comparison={}",
-        serde_json::to_string(&Comparison::Candidate)?
+        serde_json::to_string(&options.comparison)?
     );
     Ok(())
 }

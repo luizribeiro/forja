@@ -146,13 +146,10 @@ fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Er
             .as_ref()
             .ok_or("draft mode requires a plain record")?;
         let plain = serde_json::from_slice(&fs::read(path)?)?;
-        let check = crate::completion_stream::assert_matches(
-            &plain,
-            &document,
-            crate::completion_stream::Comparison::Candidate,
-        );
+        let check =
+            crate::completion_stream::assert_matches(&plain, &document, options.stream_comparison);
         document["stream_check"] = json!({"status":if check.is_ok() {"pass"} else {"failed"},
-            "comparison":crate::completion_stream::Comparison::Candidate, "plain_record_hash":record::hash(&plain)?, "error":check.as_ref().err()});
+            "comparison":options.stream_comparison, "plain_record_hash":record::hash(&plain)?, "error":check.as_ref().err()});
         check
     } else {
         Ok(())

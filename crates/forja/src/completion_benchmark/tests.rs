@@ -60,6 +60,7 @@ fn fixture() -> Result<(std::path::PathBuf, Options, DevConfig), Box<dyn Error>>
         row: Vec::new(),
         mode: Mode::Plain,
         plain_record: None,
+        stream_comparison: crate::completion_stream::Comparison::Candidate,
         cached: false,
         measurement: options::Measurement {
             raw_samples: true,

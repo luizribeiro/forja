@@ -79,3 +79,27 @@ fn provenance_comparison_requires_explicit_baseline_labelling() {
         assert!(assert_matches(&changed_plain, &draft, Comparison::BaselineVsCandidate).is_err());
     }
 }
+
+#[test]
+fn command_reads_records_and_propagates_validation_and_io_errors() {
+    let root = forja_testing::temporary_directory("stream-command").unwrap();
+    let (plain, mut draft) = pair();
+    let mut options = Options {
+        plain: root.join("plain.json"),
+        draft: root.join("draft.json"),
+        comparison: Comparison::Candidate,
+    };
+    fs::write(&options.plain, serde_json::to_vec(&plain).unwrap()).unwrap();
+    fs::write(&options.draft, serde_json::to_vec(&draft).unwrap()).unwrap();
+    run(&options).unwrap();
+    draft["provenance"]["binary_sha256"] = json!("d".repeat(64));
+    fs::write(&options.draft, serde_json::to_vec(&draft).unwrap()).unwrap();
+    assert!(run(&options).is_err());
+    options.comparison = Comparison::BaselineVsCandidate;
+    run(&options).unwrap();
+    fs::write(&options.draft, b"invalid JSON").unwrap();
+    assert!(run(&options).is_err());
+    fs::remove_file(&options.draft).unwrap();
+    assert!(run(&options).is_err());
+    fs::remove_dir_all(root).unwrap();
+}

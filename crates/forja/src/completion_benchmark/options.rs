@@ -34,6 +34,9 @@ pub(crate) struct Options {
     /// Plain record with identical workload, sampling and configuration.
     #[arg(long, required_if_eq("mode", "draft"))]
     pub plain_record: Option<PathBuf>,
+    /// Identity required for the plain/draft stream assertion.
+    #[arg(long, value_enum, default_value_t = crate::completion_stream::Comparison::Candidate)]
+    pub stream_comparison: crate::completion_stream::Comparison,
     /// Reuse a separately prepared prompt prefix before each measured request.
     #[arg(long)]
     pub cached: bool,
