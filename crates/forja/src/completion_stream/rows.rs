@@ -1,5 +1,22 @@
 use serde_json::Value;
 
+pub(crate) fn assert_improvement_drafted(row: &Value) -> Result<(), String> {
+    let minimum = row["minimum_speedup"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or("missing row speedup threshold")?;
+    let rounds = row["rounds"]
+        .as_u64()
+        .ok_or("missing observed draft rounds")?;
+    if minimum > 1.0 && rounds == 0 {
+        return Err(format!(
+            "improvement row {} never entered drafting",
+            row["identity"]["name"]
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_samples(row: &Value) -> Result<(), String> {
     let identity = &row["identity"];
     let concurrency = identity["concurrency"]
@@ -44,4 +61,21 @@ pub(super) fn validate_samples(row: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn improvement_claims_require_actual_verify_rounds() {
+        let mut row =
+            serde_json::json!({"identity":{"name":"copy"},"minimum_speedup":1.15,"rounds":0});
+        assert!(super::assert_improvement_drafted(&row).is_err());
+        row["minimum_speedup"] = 0.98.into();
+        super::assert_improvement_drafted(&row).unwrap();
+        row["minimum_speedup"] = 1.15.into();
+        row["rounds"] = 1.into();
+        super::assert_improvement_drafted(&row).unwrap();
+        row["rounds"] = serde_json::Value::Null;
+        assert!(super::assert_improvement_drafted(&row).is_err());
+    }
 }

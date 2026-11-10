@@ -2,6 +2,7 @@ mod provenance;
 mod rows;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) use rows::assert_improvement_drafted;
 
 use std::{error::Error, fs, path::PathBuf};
 
@@ -81,6 +82,7 @@ pub(crate) fn assert_matches(
         }
         rows::validate_samples(plain)?;
         rows::validate_samples(draft)?;
+        assert_improvement_drafted(draft)?;
         if hashes(plain)? != hashes(draft)? {
             return Err(format!(
                 "token-stream hash mismatch for {}",
