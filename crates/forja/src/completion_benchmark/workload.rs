@@ -29,6 +29,7 @@ pub(super) struct Row {
     pub prompt_suffix: String,
     pub context_tokens: usize,
     pub output_tokens: u32,
+    pub min_output_tokens: u32,
     pub concurrency: u32,
     pub temperature: f32,
     pub seed: u64,
@@ -50,7 +51,8 @@ impl Suite {
         let mut found = BTreeSet::new();
         for row in &suite.rows {
             if !found.insert(row.name.as_str())
-                || row.output_tokens == 0
+                || row.min_output_tokens == 0
+                || row.min_output_tokens > row.output_tokens
                 || row.concurrency == 0
                 || !row.temperature.is_finite()
                 || row.temperature < 0.0

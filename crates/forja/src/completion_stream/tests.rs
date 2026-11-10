@@ -9,9 +9,9 @@ pub(crate) fn pair() -> (Value, Value) {
         "stream_config":{"inputs":{"engine_sha256":"engine","profile_hash":"profile","weights_sha256":"weights"},"sampling":"greedy"},
         "measurement_mode":{"execution":"scheduled-request-groups"},
         "results":[{"identity":{"name":"control","seed":42,"prompt_sha256":format!("sha256:{}", "c".repeat(64)),
-            "prompt_tokens":4097,"output_tokens":256,"concurrency":1,"reps":1},"rounds":0,"minimum_speedup":0.98,
+            "prompt_tokens":4097,"output_tokens":256,"min_output_tokens":128,"concurrency":1,"reps":1},"rounds":0,"minimum_speedup":0.98,
             "token_stream_hashes":[format!("sha256:{}", "b".repeat(64))],
-            "samples":[{"repetition":0,"wall_seconds":1.0,"decode_wall_seconds":1.0,"gpu_seconds":0.0,
+            "samples":[{"repetition":0,"wall_seconds":1.0,"decode_wall_seconds":1.0,"decode_tokens_per_second":256.0,"gpu_seconds":0.0,
                 "plain_gpu_seconds":0.0,"verify_gpu_seconds":0.0,"prompt_tokens":[4097],"output_tokens":[256],"finish_reasons":["length"]}]}]});
     let mut draft = plain.clone();
     draft["mode"] = "draft".into();
@@ -85,7 +85,7 @@ fn short_outputs_and_nonpositive_decode_spans_are_refused_on_either_side() {
     let (plain, draft) = pair();
     for (pointer, value) in [
         ("/results/0/samples/0/output_tokens/0", json!(7)),
-        ("/results/0/samples/0/finish_reasons/0", json!("stop")),
+        ("/results/0/samples/0/finish_reasons/0", json!("tool_calls")),
         ("/results/0/samples/0/prompt_tokens/0", json!(4096)),
         ("/results/0/samples/0/decode_wall_seconds", json!(0.0)),
     ] {
@@ -120,4 +120,23 @@ fn command_reads_records_and_propagates_validation_and_io_errors() {
     fs::remove_file(&options.draft).unwrap();
     assert!(run(&options).is_err());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn natural_stop_streams_still_require_identical_hashes_and_minima() {
+    let (mut plain, _) = pair();
+    plain["results"][0]["samples"][0]["output_tokens"][0] = json!(128);
+    plain["results"][0]["samples"][0]["finish_reasons"][0] = json!("stop");
+    let mut draft = plain.clone();
+    draft["mode"] = json!("draft");
+    assert_matches(&plain, &draft, Comparison::Candidate).unwrap();
+    for minimum in [json!(0), json!(257), Value::Null] {
+        let mut invalid = plain.clone();
+        invalid["results"][0]["identity"]["min_output_tokens"] = minimum;
+        let mut other = invalid.clone();
+        other["mode"] = json!("draft");
+        assert!(assert_matches(&invalid, &other, Comparison::Candidate).is_err());
+    }
+    draft["results"][0]["token_stream_hashes"][0] = json!(format!("sha256:{}", "d".repeat(64)));
+    assert!(assert_matches(&plain, &draft, Comparison::Candidate).is_err());
 }

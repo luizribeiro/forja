@@ -538,8 +538,13 @@ Decode wall spans start after prompt completion; whole-group wall time includes
 prompt execution. Repetitions are whole request groups, with raw windows and
 median/95% confidence intervals. Token hashes use little-endian u32 IDs;
 `output_digest` binds the ordered request hashes without logits. Records retain
-finish reasons and output counts; shortened outputs, non-length finishes and
-prompt-token counts differing from service usage are refused. Decode spans must
+finish reasons, actual output counts and each row's declared `min_output_tokens`.
+A length finish requires the requested maximum; natural stop/EOS requires at least
+that minimum and at most the maximum. The current text fixtures require 128 tokens
+from file edits, copied/generated JSONL and explanatory replies; one-token prompt
+rows require one. Refusals report every request's actual count and finish reason.
+Prompt-token counts differing from service usage are refused. Decode throughput
+uses actual generated tokens divided by decode wall; EOS is never ignored. Decode spans must
 be positive. c4 and prompt rows gate **only on group wall time**; their decode
 spans are diagnostic. Single-lane generation rows gate on decode wall time.
 

@@ -2,7 +2,7 @@ mod provenance;
 mod rows;
 #[cfg(test)]
 pub(crate) mod tests;
-pub(crate) use rows::assert_improvement_drafted;
+pub(crate) use rows::{assert_improvement_drafted, valid_output};
 
 use std::{error::Error, fs, path::PathBuf};
 

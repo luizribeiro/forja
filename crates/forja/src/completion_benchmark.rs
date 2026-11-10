@@ -261,11 +261,10 @@ async fn measure_row<S: ChatService>(
     prompt: &str,
     prompt_tokens: usize,
 ) -> Result<Value, Box<dyn Error>> {
-    let policy = &inputs["lookup_policy"];
     let model = inputs["model"]["id"]
         .as_str()
         .ok_or("missing model identity")?;
-    let warmup_tokens = warmup::output_tokens(policy, row.output_tokens)?;
+    let warmup_tokens = warmup::output_tokens(&inputs["lookup_policy"], row.output_tokens)?;
     let request = |output| {
         serde_json::from_value::<CompletionRequest>(json!({"model":model,
         "prompt":prompt,"max_tokens":output,"temperature":row.temperature,"seed":row.seed,"top_p":1.0,"top_k":0}))
@@ -300,13 +299,20 @@ async fn measure_row<S: ChatService>(
             .checked_sub(gpu_before)
             .ok_or("GPU counter moved backwards")?;
         let mut verify = 0_u64;
+        let output_tokens = sample::output_counts(
+            completions
+                .iter()
+                .map(|c| (c.usage.completion_tokens, c.token_ids())),
+        )
+        .map_err(|error| format!("row {} repetition {repetition}: {error}", row.name))?;
+        sample::validate_usage(
+            completions.iter().map(|c| (c.usage, c.finish_reason)),
+            prompt_tokens,
+            row.min_output_tokens,
+            row.output_tokens,
+        )
+        .map_err(|error| format!("row {} repetition {repetition}: {error}", row.name))?;
         for completion in &completions {
-            sample::validate_usage(
-                completion.usage,
-                completion.finish_reason,
-                prompt_tokens,
-                row.output_tokens,
-            )?;
             hashes.push(crate::benchmark_record::output_digest(
                 completion.token_ids(),
                 &[],
@@ -327,6 +333,7 @@ async fn measure_row<S: ChatService>(
             gpu_seconds: gpu.as_secs_f64(),
             measurement_window: [window_start, window_start + wall],
             decode_wall_seconds: timing.decode,
+            decode_tokens_per_second: timing.throughput(output_tokens.iter().copied()),
             verify_gpu_seconds: timing.verify,
             plain_gpu_seconds: timing.plain,
             prompt_tokens: completions.iter().map(|c| c.usage.prompt_tokens).collect(),
@@ -335,10 +342,7 @@ async fn measure_row<S: ChatService>(
                 .iter()
                 .map(|c| sample::finish_name(c.finish_reason).to_owned())
                 .collect(),
-            output_tokens: completions
-                .iter()
-                .map(|c| c.usage.completion_tokens)
-                .collect(),
+            output_tokens,
         });
     }
     let result = sample::RowRecord::new(

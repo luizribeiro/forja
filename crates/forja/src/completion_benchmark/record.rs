@@ -34,6 +34,7 @@ pub(super) fn decorate(document: &mut serde_json::Value) -> Result<(), Box<dyn E
         for field in [
             "wall_seconds",
             "decode_wall_seconds",
+            "decode_tokens_per_second",
             "gpu_seconds",
             "plain_gpu_seconds",
             "verify_gpu_seconds",
@@ -75,7 +76,7 @@ mod tests {
         let mut plain = json!({"mode":"plain", "stream_config":{"seed":42},
             "measurement_mode":{"execution":"scheduled-request-groups"},
             "results":[{"identity":{"prompt_sha256":"prompt"},"token_stream_hashes":["tokens"],
-                "samples":[{"wall_seconds":5.0,"decode_wall_seconds":4.0,"gpu_seconds":1.0,
+                "samples":[{"wall_seconds":5.0,"decode_wall_seconds":4.0,"decode_tokens_per_second":32.0,"gpu_seconds":1.0,
                     "plain_gpu_seconds":0.9,"verify_gpu_seconds":0.1}]}]});
         decorate(&mut plain).unwrap();
         for field in ["binary_sha256", "clean_source", "device"] {

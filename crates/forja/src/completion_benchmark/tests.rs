@@ -47,7 +47,7 @@ fn fixture() -> Result<(std::path::PathBuf, Options, DevConfig), Box<dyn Error>>
         serde_json::to_vec(
             &json!({"schema_version":1,"source":"deterministic CPU fixture","target":"fixture",
         "padding":"padding.txt","context_semantics":"natural prompt","policy":{"min_match":8,"max_suffix":32,"max_drafts":2},
-        "rows":[{"name":"copy","group":"regular","prompt":"prompt.txt","context_tokens":0,"output_tokens":7,
+        "rows":[{"name":"copy","group":"regular","prompt":"prompt.txt","context_tokens":0,"output_tokens":7,"min_output_tokens":7,
             "concurrency":1,"temperature":0.0,"seed":42,"minimum_speedup":1.15}]}),
         )?,
     )?;
@@ -83,6 +83,15 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
     run(&options, &config).await?;
     let document: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
     assert_eq!(document["results"][0]["rounds"], 0);
+    assert_eq!(document["results"][0]["identity"]["min_output_tokens"], 7);
+    let sample = &document["results"][0]["samples"][0];
+    assert!(
+        (sample["decode_tokens_per_second"].as_f64().unwrap()
+            * sample["decode_wall_seconds"].as_f64().unwrap()
+            - 7.0)
+            .abs()
+            < 1e-9
+    );
     assert!(document["provenance"]["date"].is_string());
     assert!(document["provenance"]["os_version"].is_string());
     assert!(document["provenance"]["machine_load"].is_object());
@@ -280,6 +289,7 @@ fn row_metadata_requires_a_declared_draft_cap() -> Result<(), Box<dyn Error>> {
             gpu_seconds: 0.0,
             measurement_window: [0.0, 1.0],
             decode_wall_seconds: 1.0,
+            decode_tokens_per_second: 7.0,
             verify_gpu_seconds: 0.0,
             plain_gpu_seconds: 0.0,
             prompt_tokens: vec![32],
@@ -316,6 +326,19 @@ fn row_metadata_requires_a_declared_draft_cap() -> Result<(), Box<dyn Error>> {
         )
         .is_err()
     );
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn workload_minima_must_be_positive_and_within_the_output_budget() -> Result<(), Box<dyn Error>> {
+    let (root, options, config) = fixture()?;
+    let mut suite: Value = serde_json::from_slice(&fs::read(&options.suite)?)?;
+    for minimum in [json!(0), json!(8), Value::Null] {
+        suite["rows"][0]["min_output_tokens"] = minimum;
+        fs::write(&options.suite, serde_json::to_vec(&suite)?)?;
+        assert!(prepare(&options, &config).is_err());
+    }
     fs::remove_dir_all(root)?;
     Ok(())
 }

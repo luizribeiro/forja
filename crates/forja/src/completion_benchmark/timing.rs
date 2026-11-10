@@ -22,6 +22,10 @@ impl Timing {
             plain: plain.as_secs_f64(),
         })
     }
+
+    pub fn throughput(&self, output_tokens: impl Iterator<Item = u32>) -> f64 {
+        output_tokens.map(f64::from).sum::<f64>() / self.decode
+    }
 }
 
 #[cfg(test)]
@@ -37,6 +41,7 @@ mod tests {
         )
         .unwrap();
         assert!((timing.decode - 7.0).abs() < f64::EPSILON);
+        assert!((timing.throughput([128, 33].into_iter()) - 23.0).abs() < f64::EPSILON);
         assert!((timing.verify - 2.0).abs() < f64::EPSILON);
         assert!((timing.plain - 9.0).abs() < f64::EPSILON);
         assert!(Timing::new(&[1], Duration::ZERO, 1).is_err());
