@@ -114,3 +114,70 @@ async fn initialization_admits_the_requested_lane_group() -> Result<(), Box<dyn 
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn row_metadata_requires_a_declared_draft_cap() -> Result<(), Box<dyn Error>> {
+    let (root, options, config) = fixture()?;
+    let (_, suite, inputs) = prepare(&options, &config)?;
+    let prompt = fs::read_to_string(root.join("prompt.txt"))?;
+    let context = sample::RowContext {
+        options: &options,
+        inputs: &inputs,
+        row: &suite.rows[0],
+        prompt: &prompt,
+        prompt_tokens: 32,
+    };
+    let warmup = || warmup::Warmup {
+        groups: 1,
+        concurrency: 1,
+        prompt_tokens_per_lane: 32,
+        output_tokens_per_lane: 12,
+        observed_rounds: 0,
+        full_prompt_requests: 1,
+    };
+    let samples = || {
+        vec![sample::Sample {
+            repetition: 0,
+            wall_seconds: 1.0,
+            gpu_seconds: 0.0,
+            measurement_window: [0.0, 1.0],
+            decode_wall_seconds: 1.0,
+            verify_gpu_seconds: 0.0,
+            plain_gpu_seconds: 0.0,
+            prompt_tokens: vec![32],
+            cached_tokens: vec![0],
+            output_tokens: vec![7],
+            finish_reasons: vec!["length".to_owned()],
+        }]
+    };
+    let row = sample::RowRecord::new(
+        context,
+        forja_serve::DraftMetrics::default(),
+        samples(),
+        Vec::new(),
+        warmup(),
+    )?;
+    assert_eq!(row.output_counts[&7], 1);
+    assert_eq!(row.finish_reasons["length"], 1);
+    let mut missing = inputs.clone();
+    missing["lookup_policy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max-drafts");
+    let invalid = sample::RowContext {
+        inputs: &missing,
+        ..context
+    };
+    assert!(
+        sample::RowRecord::new(
+            invalid,
+            forja_serve::DraftMetrics::default(),
+            samples(),
+            Vec::new(),
+            warmup()
+        )
+        .is_err()
+    );
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

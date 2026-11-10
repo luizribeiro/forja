@@ -1,6 +1,7 @@
 mod engine;
 mod options;
 mod record;
+mod sample;
 #[cfg(test)]
 mod tests;
 mod timing;
@@ -45,6 +46,6 @@ fn prepare(
     let identities = json!({"engine_sha256":sha256_file(&options.engine)?, "profile_hash":profile.sha256()?, "profile_family":profile.family(), "model":profile.model(), "numerics":profile.numerics(),
         "weights_sha256":profile.model().weights_sha256, "model_revision":profile.model().revision,
         "tokenizer_sha256":sha256_file(options.model.join("tokenizer.json"))?,
-        "chat_format_sha256":sha256_file(&options.chat_format)?});
+        "chat_format_sha256":sha256_file(&options.chat_format)?, "lookup_policy":policy});
     Ok((profile, suite, identities))
 }
