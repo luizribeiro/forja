@@ -3,6 +3,7 @@ mod options;
 mod record;
 #[cfg(test)]
 mod tests;
+mod timing;
 mod workload;
 
 use forja_config::{BackendKind, DevConfig, Profile};
