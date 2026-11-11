@@ -86,6 +86,7 @@ fn qwen38_declares_lookup_without_changing_its_weight_identity() {
     .unwrap();
     let policy = profile.prompt_lookup().unwrap();
     assert_eq!(policy.match_lengths(), 8..=32);
+    assert_eq!(policy.start_drafts(), 1);
     assert_eq!(
         (policy.cap(0), policy.cap(32767), policy.cap(32768)),
         (2, 2, 0)
