@@ -50,11 +50,15 @@ pub(super) fn compare(plain: &Value, draft: &Value, comparison: Comparison) -> R
 
 pub(super) fn stream_config(record: &Value, comparison: Comparison) -> Value {
     let mut config = record["stream_config"].clone();
-    if comparison == Comparison::BaselineVsCandidate
-        && let Some(inputs) = config["inputs"].as_object_mut()
-    {
-        inputs.remove("engine_sha256");
-        inputs.remove("profile_hash");
+    if comparison == Comparison::BaselineVsCandidate {
+        if let Some(inputs) = config["inputs"].as_object_mut() {
+            inputs.remove("engine_sha256");
+            inputs.remove("profile_hash");
+            inputs.remove("lookup_policy");
+        }
+        if let Some(fields) = config.as_object_mut() {
+            fields.remove("policy");
+        }
     }
     config
 }

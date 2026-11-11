@@ -566,8 +566,9 @@ same binary and source. To compare a frozen baseline with a candidate explicitly
 forja bench check-streams --comparison baseline-vs-candidate --plain baseline.json --draft candidate.json
 ```
 
-That mode permits source, binary, component and profile hashes to differ; model,
-tokenizer, chat format, policy, effective settings, device and OS must match.
+That mode permits source, binary, component, profile hashes and lookup policies to
+differ; model, tokenizer, chat format, sampling, effective settings, device and OS
+must match. Both modes require identical output token streams.
 `bench completion --stream-comparison baseline-vs-candidate` labels its automatic
 assertion likewise. Prepare a compatible clean plain reference before starting
 workers, including when startup or leg order puts the draft worker first.

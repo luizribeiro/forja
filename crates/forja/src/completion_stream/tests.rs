@@ -81,6 +81,37 @@ fn provenance_comparison_requires_explicit_baseline_labelling() {
 }
 
 #[test]
+fn lookup_policy_changes_require_baseline_labelling_and_matching_streams() {
+    let (mut plain, mut draft) = pair();
+    let policy = json!({"min-match":8,"max-suffix":32,"max-drafts":2});
+    for record in [&mut plain, &mut draft] {
+        record["stream_config"]["policy"] = policy.clone();
+        record["stream_config"]["inputs"]["lookup_policy"] = policy.clone();
+    }
+    let locations = [
+        "/stream_config/policy",
+        "/stream_config/inputs/lookup_policy",
+    ];
+    for changed_locations in [&locations[..1], &locations[1..], &locations[..]] {
+        let mut changed_policy = draft.clone();
+        for pointer in changed_locations {
+            changed_policy.pointer_mut(pointer).unwrap()["start-drafts"] = json!(1);
+        }
+        assert!(assert_matches(&plain, &changed_policy, Comparison::Candidate).is_err());
+        assert_matches(&plain, &changed_policy, Comparison::BaselineVsCandidate).unwrap();
+        for pointer in [
+            "/stream_config/sampling",
+            "/stream_config/inputs/weights_sha256",
+            "/results/0/token_stream_hashes/0",
+        ] {
+            let mut changed = changed_policy.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("different");
+            assert!(assert_matches(&plain, &changed, Comparison::BaselineVsCandidate).is_err());
+        }
+    }
+}
+
+#[test]
 fn short_outputs_and_nonpositive_decode_spans_are_refused_on_either_side() {
     let (plain, draft) = pair();
     for (pointer, value) in [
