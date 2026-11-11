@@ -51,6 +51,12 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         let (source, prefix) =
             lane.lane_source(self.drafter.as_deref_mut(), self.lookup_policy.as_ref())?;
         let mut proposal = source.propose(prefix, position, sampling);
+        if self.drafter.is_none()
+            && !lane.drafting.episode_active
+            && let Some(policy) = &self.lookup_policy
+        {
+            proposal.rule_cap = proposal.rule_cap.min(policy.start_drafts());
+        }
         let budget = VerifyBudget::new(
             u64::from(lane.position),
             proposal.rule_cap,
