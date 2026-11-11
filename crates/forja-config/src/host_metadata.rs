@@ -85,6 +85,7 @@ pub const HOST_LEAVES: &[(&str, ReloadClass)] = &[
     ("model.profile", ReloadClass::Model),
     ("model.model", ReloadClass::Model),
     ("model.chat_format", ReloadClass::Model),
+    ("serving.prompt_lookup", ReloadClass::Model),
     ("serving.prefix-reuse", ReloadClass::Live),
     ("serving.max_context", ReloadClass::Model),
     ("serving.max_active_sequences", ReloadClass::Live),
@@ -181,6 +182,18 @@ mod tests {
             Some(ReloadClass::Live)
         );
         assert_eq!(host_reload_class("request.unknown"), None);
+    }
+
+    #[test]
+    fn prompt_lookup_defaults_on_and_can_be_disabled_on_model_reload() {
+        let previous: crate::HostConfig = toml::from_str("").unwrap();
+        assert!(previous.serving.prompt_lookup);
+        let candidate: crate::HostConfig =
+            toml::from_str("[serving]\nprompt_lookup = false\n").unwrap();
+        assert!(!candidate.serving.prompt_lookup);
+        let diff = HostConfigDiff::between(&previous, &candidate).unwrap();
+        assert_eq!(diff.model, ["serving.prompt_lookup"]);
+        assert!(diff.live.is_empty() && diff.restart.is_empty());
     }
 
     #[test]

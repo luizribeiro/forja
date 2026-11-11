@@ -27,6 +27,40 @@ enum LookupCase {
 }
 
 #[test]
+fn default_lookup_respects_the_host_opt_out_and_profile_context_cap() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (opt_out, last, verifies) in [(false, 31, true), (true, 31, false), (false, 0, false)] {
+        assert_draft_exact(ExactnessChecks::source(verifies), |sampling, enabled| {
+            runtime.block_on(async {
+                let mut engine = engine().await.unwrap();
+                assert!(engine.config.serving.prompt_lookup);
+                if opt_out {
+                    engine.config.serving.prompt_lookup = false;
+                }
+                if enabled.is_some() {
+                    engine = engine.with_profile_lookup(&profile(2, last));
+                    assert_eq!(engine.profile_lookup_available(), !opt_out);
+                }
+                let trace = Box::pin(direct::run_engine(
+                    engine,
+                    sampling,
+                    direct::Case {
+                        prompt: matched_prompt(sampling),
+                        max_tokens: 7,
+                        stop_token: None,
+                        stop_text: None,
+                    },
+                ))
+                .await
+                .unwrap();
+                assert_eq!(!trace.shapes.is_empty(), enabled.is_some() && verifies);
+                trace
+            })
+        });
+    }
+}
+
+#[test]
 fn lookup_boundaries_and_mixed_rounds_match_plain_decode() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for case in [

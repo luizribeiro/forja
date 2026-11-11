@@ -1072,9 +1072,13 @@ where
     }
 
     /// Configures lane-owned lookup sources from the guest profile declaration.
+    /// The host's `serving.prompt_lookup` setting can disable them.
     #[must_use]
     pub fn with_profile_lookup(mut self, profile: &forja_config::Profile) -> Self {
-        self.lookup_policy = profile.prompt_lookup().cloned();
+        self.lookup_policy = profile
+            .prompt_lookup()
+            .filter(|_| self.config.serving.prompt_lookup)
+            .cloned();
         self
     }
 

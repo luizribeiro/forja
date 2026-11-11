@@ -90,6 +90,8 @@ impl<'de> Deserialize<'de> for HostConfig {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Serving {
+    /// Use the engine profile's prompt lookup for sole, unconstrained requests.
+    pub prompt_lookup: bool,
     /// Reuse matching prefixes retained by a paged KV cache.
     #[serde(rename = "prefix-reuse")]
     pub prefix_reuse: bool,
@@ -120,6 +122,7 @@ pub struct Serving {
 impl Default for Serving {
     fn default() -> Self {
         Self {
+            prompt_lookup: true,
             prefix_reuse: true,
             max_context: Choice::Auto,
             max_active_sequences: Choice::Auto,
