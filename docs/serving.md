@@ -51,6 +51,11 @@ directories; the dev shell defaults it to `~/.cache/forja/models`.
    with a bus error. Replace a model by loading a new immutable directory and
    letting existing references drain.
 
+Profiles declaring prompt lookup enable it by default for a single active,
+unconstrained request, within their own context caps and admitted Verify shapes.
+Set `serving.prompt_lookup = false` to disable it; changing this setting reloads
+the model. See the engine README for measured workloads and caveats.
+
 The host bounds Metal compilation with `limits.pipeline_compilations` (256 attempts
 per backend lifetime) and `limits.compile_budget` (`"60s"` compiler wall time
 per engine load). Cache hits cost no attempts; failed compiles

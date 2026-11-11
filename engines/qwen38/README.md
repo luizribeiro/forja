@@ -59,6 +59,44 @@ The weights and pinned template retain their upstream Apache-2.0 license.
 The companion [chat format](../../chat-formats/qwen38/) supports non-thinking text
 chat with string content. Tools, images and videos are unsupported.
 
+## Prompt lookup
+
+Host prompt lookup is enabled by default for profiles declaring a lookup policy.
+It proposes tokens from matching suffixes in the request's accepted history and
+verifies them with the target model before committing them. The default q4
+profile matches 8–32 tokens and proposes up to two tokens per round. It engages
+only for one active, unconstrained request when Verify fits the host limits,
+within the profile's context cap; drafting is disabled at 32K and beyond.
+Set `--set serving.prompt_lookup=false` on `forja serve` to opt out.
+`forja bench completion --mode plain` keeps plain decoding explicit.
+
+Regular measurements compare lookup with plain decoding in the same frozen
+binary SHA256 `887da03e8741…` at source `3fd4bc49`, component `38b94d70f271…`,
+profile file `2ad8e5893e2d…`, using model revision
+`10c35caafbb80f7dc6a7a432cdd11af10a6d4818` on Apple M3 Ultra (80 GPU cores,
+512 GiB), macOS 27.0.1 build 26A434.
+All 17 rows ran 30 randomized ABBA/BAAB blocks with a fresh worker pair per
+block and randomized startup order; all 1,020 stream checks matched. The table
+shows decode-wall speed ratios and rowwise 95% calibrated sign-test intervals.
+
+| Workload | Lookup/plain ratio [95% CI] |
+| --- | ---: |
+| Code edit, short | 1.214 [1.212, 1.215] |
+| Code edit, 4K | 1.210 [1.209, 1.211] |
+| Greedy JSONL copy, short | 1.207 [1.206, 1.209] |
+| Greedy JSONL copy, 4K | 1.203 [1.202, 1.204] |
+| Seeded JSONL copy | 1.144 [1.144, 1.146] |
+
+The release decision accepts these results with a 1.14× bar for seeded copy.
+Ordinary, concurrent and prompt rows meet the 0.98× bar except short ordinary
+code: 0.9820 [0.9797, 0.9833], inconclusive against that bar and accepted as a known
+caveat. The original reports retain their automated `history-collected` verdicts
+where applicable; verified noise/drift protection was unavailable. Completion
+benchmarks have no accepted-record importer, so the original records, wall/GPU
+observations and full artifact identities remain at
+`~/docs/forja/evidence/e/gate/` (`setup.json`, `summary.json`, `regular/`).
+No 32K measurements are included.
+
 ## Numerical validation
 
 Independent Transformers 5.17.0 CPU fixtures use the same dequantized q4 bytes,
