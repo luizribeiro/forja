@@ -512,11 +512,6 @@ A mismatched token stream fails the command and retains a record marked
 forja bench check-streams --plain plain.json --draft draft.json
 ```
 
-A profile may set `[prompt-lookup].start-drafts` to limit the first round of each
-lookup episode. It must be between one and `max-drafts`; omission uses `max-drafts`.
-The full context-dependent cap becomes available after a round accepts a draft.
-A zero-acceptance round or an episode exit restores the starting cap.
-
 `bench/suites/prompt-lookup.json` defines the original prompt fixtures, their
 sources, fixed seeds and thresholds. Padding uses 256 distinct synthetic background
 documents from unrelated survey/catalogue topics; its deterministic generator

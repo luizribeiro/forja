@@ -19,41 +19,6 @@ fn profile(k: u32, last: u32) -> forja_config::Profile {
     serde_json::from_value(value).unwrap()
 }
 
-fn with_start(policy: &forja_config::Profile, start: u32) -> forja_config::Profile {
-    let mut value = serde_json::to_value(policy).unwrap();
-    value["prompt-lookup"]["start-drafts"] = serde_json::json!(start);
-    serde_json::from_value(value).unwrap()
-}
-
-#[tokio::test]
-async fn episode_start_cap_expands_after_acceptance_and_resets_on_exit() -> Result<(), TestError> {
-    let policy = with_start(&profile(2, 127), 1);
-    let mut engine = super::super::super::prefill::tests::engine_with_component(
-        128,
-        16,
-        test_guests::verify_smoke(),
-    )
-    .await?
-    .with_profile_lookup(&policy);
-    let mut request = crate::engine::continuous::prefill::tests::request();
-    request.tokens = copied_prompt(SamplingParams::default(), 8);
-    request.prompt_tokens = u32::try_from(request.tokens.len())?;
-    request.params.max_tokens = 17;
-    let lane = prepare_request(&mut engine, request, 0).await?;
-    let barrier = Arc::new(BatchTestBarrier::passive());
-    engine.set_batch_test_barrier(Arc::clone(&barrier));
-    let mut active = vec![lane];
-    assert!(engine.advance_drafting(&mut active, true).await);
-    assert!(engine.advance_drafting(&mut active, true).await);
-    assert_eq!(*barrier.verified.lock().unwrap(), [(2, 1), (3, 2)]);
-    active.push(prepared_lane(&mut engine, 17, 1).await?);
-    assert!(!engine.advance_drafting(&mut active, true).await);
-    active.pop();
-    let candidate = engine.draft_candidate(&mut active[0]).unwrap();
-    assert_eq!(candidate.fed.shape().tokens, 2);
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum LookupCase {
     Periodic,
@@ -284,22 +249,12 @@ fn assert_context_cap(
 #[test]
 fn real_lookup_rounds_match_plain_streams_and_serving_observables() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    for (k, start) in [
-        (1, None),
-        (2, None),
-        (1, Some(1)),
-        (2, Some(1)),
-        (1, Some(2)),
-        (2, Some(2)),
-    ] {
+    for k in [1, 2] {
         assert_draft_exact(true, |sampling, enabled| {
             runtime.block_on(async {
                 let mut engine = engine().await.unwrap();
-                let policy = profile(k, 17);
-                let policy =
-                    start.map_or_else(|| policy.clone(), |start| with_start(&policy, start));
                 if enabled.is_some() {
-                    engine = engine.with_profile_lookup(&policy);
+                    engine = engine.with_profile_lookup(&profile(k, 17));
                 }
                 let trace = Box::pin(direct::run_engine(
                     engine,
@@ -314,9 +269,8 @@ fn real_lookup_rounds_match_plain_streams_and_serving_observables() {
                 .await
                 .unwrap();
                 if enabled.is_some() {
-                    let count = k.min(policy.prompt_lookup().unwrap().start_drafts());
-                    assert_eq!(trace.shapes, [count + 1]);
-                    assert_eq!(trace.accepted, [count]);
+                    assert_eq!(trace.shapes, [k + 1]);
+                    assert_eq!(trace.accepted, [k]);
                     assert!(trace.plain > 0);
                 }
                 trace
@@ -371,17 +325,9 @@ async fn lookup_indexes_belong_to_the_request_even_at_equal_positions() -> Resul
 #[tokio::test]
 async fn zero_acceptance_exits_even_when_the_new_suffix_has_a_continuation() -> Result<(), TestError>
 {
-    zero_acceptance_reentry(None).await?;
-    zero_acceptance_reentry(Some(1)).await?;
-    zero_acceptance_reentry(Some(2)).await
-}
-
-async fn zero_acceptance_reentry(start: Option<u32>) -> Result<(), TestError> {
     use crate::{DraftSource, PromptLookup};
-    let policy = profile(2, 31);
-    let policy = start.map_or_else(|| policy.clone(), |start| with_start(&policy, start));
-    let k = policy.prompt_lookup().unwrap().start_drafts();
-    let mut engine = engine().await?.with_profile_lookup(&policy);
+    let profile = profile(2, 31);
+    let mut engine = engine().await?.with_profile_lookup(&profile);
     let pattern = [0, 0, 0, 1, 2, 3, 1, 2];
     let mut request = crate::engine::continuous::prefill::tests::request();
     request.tokens = pattern
@@ -398,12 +344,12 @@ async fn zero_acceptance_reentry(start: Option<u32>) -> Result<(), TestError> {
     engine.set_batch_test_barrier(Arc::clone(&barrier));
     let mut active = vec![lane];
     assert!(engine.advance_drafting(&mut active, true).await);
-    assert_eq!(*barrier.verified.lock().unwrap(), [(k + 1, 0)]);
+    assert_eq!(*barrier.verified.lock().unwrap(), [(3, 0)]);
     assert_eq!(active[0].drafting.rounds, 1);
     assert_eq!(active[0].drafting.acceptance_by_depth[&0], 1);
-    assert_eq!(active[0].drafting.k_eff[&k], 1);
+    assert_eq!(active[0].drafting.k_eff[&2], 1);
     assert_eq!(active[0].drafting.episodes_entered, 1);
-    let mut fresh = PromptLookup::new(policy.prompt_lookup().unwrap().clone());
+    let mut fresh = PromptLookup::new(profile.prompt_lookup().unwrap().clone());
     let proposal = fresh.propose(
         active[0].ledger().tokens(),
         active[0].position,
@@ -427,10 +373,7 @@ async fn zero_acceptance_reentry(start: Option<u32>) -> Result<(), TestError> {
         active[0].sampling,
     );
     let candidate = engine.draft_candidate(&mut active[0]).unwrap();
-    assert_eq!(
-        candidate.fed.tokens(),
-        &expected.tokens[..usize::try_from(k)?]
-    );
-    assert_eq!(candidate.fed.shape().tokens, k + 1);
+    assert_eq!(candidate.fed.tokens(), expected.tokens);
+    assert_eq!(candidate.fed.shape().tokens, 3);
     Ok(())
 }

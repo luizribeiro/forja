@@ -14,8 +14,6 @@ struct LookupData {
     min_match: usize,
     max_suffix: usize,
     max_drafts: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    start_drafts: Option<u32>,
     k_rule: Vec<LookupCap>,
 }
 
@@ -32,12 +30,6 @@ pub struct LookupCap {
 }
 
 impl LookupPolicy {
-    /// Returns the draft cap before an episode has accepted a draft.
-    #[must_use]
-    pub fn start_drafts(&self) -> u32 {
-        self.0.start_drafts.unwrap_or(self.0.max_drafts)
-    }
-
     /// Returns the inclusive range of suffix lengths searched.
     #[must_use]
     pub fn match_lengths(&self) -> std::ops::RangeInclusive<usize> {
@@ -74,14 +66,6 @@ impl<'de> Deserialize<'de> for LookupPolicy {
                 "lookup requires positive max-drafts and 1..=64 context arms",
             ));
         }
-        if data
-            .start_drafts
-            .is_some_and(|start| start == 0 || start > data.max_drafts)
-        {
-            return Err(de::Error::custom(
-                "lookup start-drafts must satisfy 1 <= start-drafts <= max-drafts",
-            ));
-        }
         let mut next = 0_u64;
         for arm in &data.k_rule {
             if u64::from(arm.lo) != next || arm.lo > arm.hi || arm.k > data.max_drafts {
@@ -104,24 +88,6 @@ impl<'de> Deserialize<'de> for LookupPolicy {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn episode_start_cap_defaults_to_the_full_cap_and_rejects_invalid_values() {
-        let mut data = json!({"min-match": 8, "max-suffix": 32, "max-drafts": 2,
-            "k-rule": [{"lo": 0, "hi": 32, "k": 2}]});
-        let policy: LookupPolicy = serde_json::from_value(data.clone()).unwrap();
-        assert_eq!(policy.start_drafts(), 2);
-        assert_eq!(serde_json::to_value(policy).unwrap(), data);
-        for start in 0..=3 {
-            data["start-drafts"] = json!(start);
-            let result = serde_json::from_value::<LookupPolicy>(data.clone());
-            if (1..=2).contains(&start) {
-                assert_eq!(result.unwrap().start_drafts(), start);
-            } else {
-                assert!(result.is_err());
-            }
-        }
-    }
 
     #[test]
     fn policy_caps_context_without_gaps_or_unbounded_match_work() {

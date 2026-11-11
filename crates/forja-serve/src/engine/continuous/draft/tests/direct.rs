@@ -79,12 +79,10 @@ pub(super) async fn run_engine(
     while lane.remaining_tokens() != 0 {
         let finish = if let Some(candidate) = engine.draft_candidate(&mut lane) {
             assert!(engine.runner.try_reserve_draft_lane(0)?);
-            lane.drafting.enter(candidate.entry_reason);
             lane.draft_mode = DraftMode::Drafting;
             verified_finish = true;
             engine.run_draft_round(&mut lane, candidate).await?
         } else {
-            lane.drafting.exit("lookup-ended");
             plain += 1;
             verified_finish = false;
             plain_step(&mut engine, &mut lane).await?
