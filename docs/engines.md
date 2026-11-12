@@ -150,3 +150,24 @@ scheduler turn, then publishes one complete image. A new request or cancellation
 discards unfinished work. The same snapshot and live-byte ceilings apply.
 Profile variant identities conservatively refine the numerical reduction classes
 in the artifact namespace.
+
+## Context-dependent prompt pieces
+
+Profiles may declare a root `prompt-chunks` array. Each entry has an inclusive
+`through` endpoint for the resulting context and a positive `tokens` maximum.
+Endpoints increase through `workload.max-context`; token maxima never increase
+and cannot exceed `workload.prefill-chunk`. For example:
+
+```toml
+prompt-chunks = [
+  { through = 16384, tokens = 512 },
+  { through = 32768, tokens = 128 },
+]
+```
+
+The guest author chooses these values from conservative work forecasts. The host
+validates the declaration and enforces it before calling the guest for native or
+batched prompts. A piece crossing an endpoint uses the later, smaller maximum.
+Numerical prompt-block alignment still applies. Serving, generation and benchmark
+planners use the same bounds. Without a declaration, existing guest chunk planning
+applies. This option cannot raise host GPU budgets or completion deadlines.

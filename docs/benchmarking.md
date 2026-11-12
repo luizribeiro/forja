@@ -381,6 +381,16 @@ serving lane with an engine-declared prompt bucket. Every step is retained. Add
 `--prefix-context N` to measure only the suffix; cache preparation is reported
 separately from the timed GPU phase.
 
+Kernel diagnostic records also retain a separate precise work profile with raw
+per-dispatch and buffer forecasts, intervals and calibration. This extra submission
+is excluded from the diagnostic's regular samples.
+
+Use `--mode decode --selection forward` or `--selection masked` to measure the
+corresponding entry separately; setup and completion run outside that interval.
+Use `--mode verify --step-tokens 3` to measure a declared target verification
+shape, including target sampling. The engine must declare that shape under the
+selected dispatch quota. These profiles are diagnostics, not benchmark records.
+
 Use `--mode decode --context 8192` for a decode step with populated KV.
 Add `--batch-size 4` to profile a declared paged decode bucket with private state
 and populated KV per lane; the report counts all measured lane tokens. Context

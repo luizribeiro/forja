@@ -10,7 +10,7 @@ decode advances recurrent state one token at a time. Single-lane SDK calls decla
 `BatchPhase::Prompt` or `BatchPhase::Decode` explicitly. Prompt submissions start
 on a 64-token boundary. Serving supports decode buckets 1/2/4/8 with private
 recurrent state and token feedback per lane. Replay retains nine decode graphs,
-three prompt shapes (64/512/2,048) and one replaceable tail. With a recording
+four prompt shapes (64/128/512/2,048) and one replaceable tail. With a recording
 quota of at least 8,192 dispatches it also declares and captures two verify
 shapes (one or two drafts); lower quotas serve plain decode. Bucket 8 supports
 combined decode and runs eagerly. Verification
@@ -29,7 +29,11 @@ The next turn replays any remaining partial block.
 
 The `qwen38-27b-4bit.metal-apple-m3-ultra.q4-long` profile declares 262,144 tokens
 with F16 KV. The operator may lower `serving.max_context`. Prompt scratch remains
-bounded by 2,048 tokens. The automatic live quota remains 48 GiB; admission counts
+bounded by 2,048 tokens. Profile `prompt-chunks` bounds actual pieces to 512
+through 32,768 context tokens and 128 afterward. The standard q4 profile uses
+512 through its 32,768-token limit. The F32 KV profile uses 512 through 16,384
+and 128 afterward. These guest declarations keep each submission within the
+host's cumulative forecast budget. The automatic live quota remains 48 GiB; admission counts
 weights, KV backing, state versions, tables, graphs and retained scratch. Long
 requests can reduce concurrency or be refused. Profile capacity is not an
 accuracy or performance claim.
