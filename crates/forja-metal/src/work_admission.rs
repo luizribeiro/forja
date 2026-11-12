@@ -287,13 +287,6 @@ pub(super) fn predict(
             )
             || d.bound_program()
                 .is_some_and(|p| p.program().program().kind == ProgramKind::Row));
-    let scattered = matches!(d.op(), Op::GatherMatmul | Op::GatherQuantMatmul { .. })
-        || d.inputs().iter().any(|t| {
-            t.layout()
-                .strides()
-                .last()
-                .is_some_and(|&stride| stride != 1)
-        });
     rates
         .predict(
             total,
@@ -301,7 +294,7 @@ pub(super) fn predict(
             cooperative,
             launches,
             (groups, threads),
-            if scattered {
+            if scattered_reads(d) {
                 MemoryAccess::Scattered
             } else if matches!(
                 schedule,
@@ -315,6 +308,31 @@ pub(super) fn predict(
             },
         )
         .ok_or(BackendError::InvalidInput)
+}
+
+fn scattered_reads(dispatch: &Dispatch) -> bool {
+    use crate::variants::MetalVariant;
+    let transposed = matches!(
+        crate::encoding::selected_variant(dispatch),
+        Some(
+            MetalVariant::MatmulGemvTransposed
+                | MetalVariant::MatmulSteel64x64x16_2x2
+                | MetalVariant::MatmulSteel64x64x16_1x2
+                | MetalVariant::MatmulSteel64x32x32_2x2
+                | MetalVariant::MatmulSteel32x64x16_1x2
+        )
+    );
+    matches!(
+        dispatch.op(),
+        Op::GatherMatmul | Op::GatherQuantMatmul { .. }
+    ) || dispatch.inputs().iter().enumerate().any(|(index, tensor)| {
+        let layout = tensor.layout();
+        let dense_transpose = transposed
+            && index == 1
+            && layout.shape().len() == 2
+            && layout.strides() == [1, u64::from(layout.shape()[0])];
+        layout.strides().last().is_some_and(|&stride| stride != 1) && !dense_transpose
+    })
 }
 
 fn tiled_input_footprint(dispatch: &Dispatch) -> Option<u64> {
@@ -352,6 +370,31 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dense_transposed_matrix_loaders_are_coalesced_in_their_physical_order() {
+        use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability, ViewOp};
+        let cpu = forja_cpu::CpuBackend::new();
+        for (rows, name) in [
+            (1, "matmul.gemv-transposed"),
+            (33, "matmul.steel-64x64x16-2x2"),
+        ] {
+            let x = cpu.alloc(DType::F32, &[rows, 128]).unwrap();
+            let w = cpu.alloc(DType::F32, &[33, 128]).unwrap();
+            let w = cpu.view(&w, ViewOp::Permute(vec![1, 0])).unwrap();
+            let out = cpu.alloc(DType::F32, &[rows, 33]).unwrap();
+            let mut commands = CommandList::new();
+            commands.dispatch(Op::Matmul, &[&x, &w], &out).unwrap();
+            let dispatch = commands.last_dispatch().unwrap();
+            assert!(scattered_reads(dispatch));
+            let pick =
+                crate::variants::resolve(dispatch, name, &[DeviceCapability::Metal4]).unwrap();
+            let dispatch = dispatch
+                .clone()
+                .with_backend_data(BackendDispatchData::new(pick));
+            assert!(!scattered_reads(&dispatch));
+        }
+    }
+
     #[test]
     fn tile_reread_pricing_requires_a_validated_coalesced_schedule() {
         use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability};
