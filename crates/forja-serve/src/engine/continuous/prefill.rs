@@ -274,9 +274,6 @@ where
         prefill: &mut PendingPrefill,
         budget: u32,
     ) -> Result<bool, GenerationError> {
-        if self.scheduler.prefill_chunk_multiple.is_some() && self.canonical_cache.is_none() {
-            return self.advance_batch_prefill_piece(prefill, budget).await;
-        }
         let piece = if self.scheduler.prefill_chunk_multiple.is_some() {
             budget
         } else {

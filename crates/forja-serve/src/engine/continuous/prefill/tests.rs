@@ -27,6 +27,15 @@ pub(in crate::engine::continuous) async fn engine_with_component(
     chunk: u32,
     component: &Path,
 ) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
+    engine_with_prompt_limits(context, chunk, component, None).await
+}
+
+async fn engine_with_prompt_limits(
+    context: u32,
+    chunk: u32,
+    component: &Path,
+    prompt_chunks: Option<std::sync::Arc<forja_core::PromptChunkPolicy>>,
+) -> Result<ServingEngine<forja_cpu::CpuBackend>, TestError> {
     let weights = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../forja-host/tests/fixtures/qwen38/model.safetensors");
     let mut runner = EngineRunner::new(
@@ -45,6 +54,7 @@ pub(in crate::engine::continuous) async fn engine_with_component(
                 replay: true,
                 paged_cache: true,
                 kv_cache: KvCacheFormat::F16,
+                prompt_chunks,
                 ..Default::default()
             },
         )
@@ -73,6 +83,26 @@ pub(in crate::engine::continuous) async fn engine_with_component(
         chunk,
         crate::PrefixIdentity::new(["engine", "profile", "weights", "tokenizer", "chat"])?,
     )?)
+}
+
+#[tokio::test]
+async fn profile_prompt_limits_consume_the_entire_offered_budget() -> Result<(), TestError> {
+    let policy = forja_core::PromptChunkPolicy::new(vec![(128, 64)], 128, 128)?;
+    let mut engine = engine_with_prompt_limits(
+        128,
+        64,
+        test_guests::qwen38_tiny(),
+        Some(std::sync::Arc::new(policy)),
+    )
+    .await?;
+    let mut prefill = engine
+        .begin_batch_prefill(request(), 0)
+        .await
+        .map_err(|(_, error)| error)?;
+    assert!(engine.advance_batch_prefill(&mut prefill, 128).await?);
+    assert_eq!((prefill.position, prefill.consumed), (65, 65));
+    assert!(prefill.selected.is_some());
+    Ok(())
 }
 
 pub(in crate::engine::continuous) fn request() -> PreparedRequest {
