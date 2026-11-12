@@ -11,6 +11,11 @@ pub enum MemoryAccess {
     Coalesced,
     /// Strided or indexed accesses priced at the scattered-read rate.
     Scattered,
+    /// Repeated coalesced tile reads within a bounded live input footprint.
+    Reused {
+        /// Bytes of simultaneously live input data.
+        footprint: u64,
+    },
 }
 
 /// Positive finite device rates for GPU work admission, independent of model identity.
@@ -54,12 +59,38 @@ impl WorkRates {
         if launches == 0 {
             return None;
         }
-        let [read, copy, gather, matrix, scalar, sfu, launch] = self.rates;
+        let [read, copy, gather, ..] = self.rates;
         let bytes = cost.read_bytes.checked_add(cost.write_bytes)?;
         let memory = match access {
-            MemoryAccess::Coalesced => (cost.read_bytes as f64 / read).max(bytes as f64 / copy),
+            MemoryAccess::Coalesced | MemoryAccess::Reused { .. } => {
+                (cost.read_bytes as f64 / read).max(bytes as f64 / copy)
+            }
             MemoryAccess::Scattered => bytes as f64 / gather,
         };
+        self.predict_memory(cost, launches, memory)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn predict_reused(
+        self,
+        cost: KernelCost,
+        launches: u64,
+        footprint: u64,
+        rate: f64,
+    ) -> Option<Duration> {
+        let unique = footprint.min(cost.read_bytes);
+        let repeated = cost.read_bytes.checked_sub(unique)?;
+        let [read, copy, ..] = self.rates;
+        let cold = (unique as f64 / read).max(unique.checked_add(cost.write_bytes)? as f64 / copy);
+        self.predict_memory(cost, launches, cold + repeated as f64 / rate)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn predict_memory(self, cost: KernelCost, launches: u64, memory: f64) -> Option<Duration> {
+        if launches == 0 {
+            return None;
+        }
+        let [_, _, _, matrix, scalar, sfu, launch] = self.rates;
         let scalar_ops = cost.scalar_ops.checked_sub(cost.sfu_ops)?;
         let arithmetic =
             cost.flops as f64 / matrix + scalar_ops as f64 / scalar + cost.sfu_ops as f64 / sfu;
@@ -239,6 +270,53 @@ mod tests {
     }
 
     #[test]
+    fn repeated_reads_pay_cold_traffic_and_respect_the_calibrated_footprint() {
+        let rate = WorkRates::new(100.0, 100.0, 10.0, 1000.0, 1000.0, 1000.0, 0.01).unwrap();
+        let observation = WorkObservation {
+            name: "read".into(),
+            kernel: "read".into(),
+            units: 100,
+            gpu: Duration::from_secs(1),
+        };
+        let calibration =
+            WorkCalibration::new([rate; 3], 0.1, 128, 10.0, vec![observation], Duration::ZERO)
+                .unwrap()
+                .with_reused_read(100, 1000.0)
+                .unwrap();
+        let total = KernelCost {
+            read_bytes: 200,
+            ..KernelCost::default()
+        };
+        let predict = |access| {
+            calibration
+                .predict(total, KernelCost::default(), false, 1, (1, 1), access)
+                .unwrap()
+        };
+        assert_eq!(
+            predict(MemoryAccess::Reused { footprint: 100 }),
+            Duration::from_secs_f64(1.21)
+        );
+        assert_eq!(
+            predict(MemoryAccess::Reused { footprint: 101 }),
+            predict(MemoryAccess::Coalesced)
+        );
+        assert_eq!(
+            predict(MemoryAccess::Scattered),
+            Duration::from_secs_f64(20.11)
+        );
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(calibration.clone().with_reused_read(100, invalid).is_none());
+        }
+        assert!(calibration.clone().with_reused_read(0, 100.0).is_none());
+        let record = calibration.cache_record("read-source");
+        let reused = WorkCalibration::from_cache_record(&record, "read-source").unwrap();
+        assert_eq!(reused.reused_read, calibration.reused_read);
+        let mut record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        record["calibration"]["reused_read"]["bytes_per_second"] = serde_json::json!(0);
+        assert!(WorkCalibration::from_cache_record(&record.to_string(), "read-source").is_none());
+    }
+
+    #[test]
     fn cached_calibration_requires_exact_identity_and_valid_rates() {
         let rate = WorkRates::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.01).unwrap();
         let calibration = WorkCalibration::new(
@@ -318,6 +396,7 @@ pub struct WorkCalibration {
     dependent_read: f64,
     observations: Vec<WorkObservation>,
     reserve: Duration,
+    reused_read: Option<(u64, f64)>,
     reused: bool,
 }
 impl WorkCalibration {
@@ -345,9 +424,20 @@ impl WorkCalibration {
             dependent_read,
             observations,
             reserve,
+            reused_read: None,
             reused: false,
         })
     }
+    /// Adds a measured coalesced reread rate, restricted to its calibrated footprint.
+    #[must_use]
+    pub fn with_reused_read(mut self, footprint: u64, bytes_per_second: f64) -> Option<Self> {
+        if footprint == 0 || !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+            return None;
+        }
+        self.reused_read = Some((footprint, bytes_per_second));
+        Some(self)
+    }
+
     /// Returns the independently calibrated allowance for cold command-buffer startup.
     #[must_use]
     pub const fn command_buffer_reserve(&self) -> Duration {
@@ -366,7 +456,14 @@ impl WorkCalibration {
         geometry: (u64, u64),
         access: MemoryAccess,
     ) -> Option<Duration> {
-        let aggregate = self.rates[0].predict(total, launches.max(1), access)?;
+        let aggregate = match (access, self.reused_read) {
+            (MemoryAccess::Reused { footprint }, Some((capacity, rate)))
+                if footprint <= capacity =>
+            {
+                self.rates[0].predict_reused(total, launches.max(1), footprint, rate)?
+            }
+            _ => self.rates[0].predict(total, launches.max(1), access)?,
+        };
         critical.read_bytes = critical
             .read_bytes
             .checked_sub(critical.metadata_read_bytes)?;
@@ -388,6 +485,7 @@ impl WorkCalibration {
         serde_json::json!({"kind":"admission calibration, not model throughput", "reused":self.reused,
             "rate_policy":"zero warmups; half steady rates per identical workload; twice worst launch/group latency and within-probe GPU spread",
             "command_buffer_reserve_seconds":self.reserve.as_secs_f64(),
+            "reused_read": self.reused_read.map(|(bytes, rate)| serde_json::json!({"footprint_bytes":bytes,"bytes_per_second":rate})),
             "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
             "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
             "dependent_read_bytes_per_second":self.dependent_read,
@@ -443,6 +541,12 @@ impl WorkCalibration {
             observations,
             Duration::try_from_secs_f64(value["command_buffer_reserve_seconds"].as_f64()?).ok()?,
         )?;
+        if !value["reused_read"].is_null() {
+            result = result.with_reused_read(
+                value["reused_read"]["footprint_bytes"].as_u64()?,
+                value["reused_read"]["bytes_per_second"].as_f64()?,
+            )?;
+        }
         result.reused = true;
         Some(result)
     }
