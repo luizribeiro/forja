@@ -368,12 +368,33 @@ mod tests {
             }],
             Duration::from_millis(7),
         )
+        .unwrap()
+        .with_launch_floor(Duration::from_millis(25))
         .unwrap();
+        assert!(
+            calibration
+                .clone()
+                .with_launch_floor(Duration::ZERO)
+                .is_none()
+        );
+        assert_eq!(
+            calibration.predict(
+                KernelCost::default(),
+                KernelCost::default(),
+                false,
+                2,
+                (0, 0),
+                MemoryAccess::Coalesced
+            ),
+            Some(Duration::from_millis(50))
+        );
         let record = calibration.cache_record("device/source/OS");
         let reused = WorkCalibration::from_cache_record(&record, "device/source/OS").unwrap();
         assert_eq!(reused.observations, calibration.observations);
         assert_eq!(reused.rates, calibration.rates);
         assert_eq!(reused.command_buffer_reserve(), Duration::from_millis(7));
+        assert_eq!(reused.launch_floor, calibration.launch_floor);
+        assert_eq!(reused.json()["host_launch_floor_seconds"], 0.025);
         assert!(reused.reused);
         assert!(WorkCalibration::from_cache_record(&record, "device/source/other OS").is_none());
         assert!(WorkCalibration::from_cache_record(&record.replace("33", "0"), "other").is_none());
@@ -433,6 +454,7 @@ pub struct WorkCalibration {
     observations: Vec<WorkObservation>,
     reserve: Duration,
     reused_read: Option<(u64, f64)>,
+    launch_floor: Option<Duration>,
     reused: bool,
 }
 impl WorkCalibration {
@@ -461,6 +483,7 @@ impl WorkCalibration {
             observations,
             reserve,
             reused_read: None,
+            launch_floor: None,
             reused: false,
         })
     }
@@ -471,6 +494,20 @@ impl WorkCalibration {
             return None;
         }
         self.reused_read = Some((footprint, bytes_per_second));
+        Some(self)
+    }
+
+    /// Applies a positive host scheduling allowance to each physical launch.
+    /// Raw device observations remain unchanged.
+    #[must_use]
+    pub fn with_launch_floor(mut self, floor: Duration) -> Option<Self> {
+        if floor.is_zero() {
+            return None;
+        }
+        for rate in &mut self.rates {
+            rate.rates[6] = rate.rates[6].max(floor.as_secs_f64());
+        }
+        self.launch_floor = Some(floor);
         Some(self)
     }
 
@@ -521,6 +558,7 @@ impl WorkCalibration {
         serde_json::json!({"kind":"admission calibration, not model throughput", "reused":self.reused,
             "rate_policy":"zero warmups; half steady rates per identical workload; twice worst launch/group latency and within-probe GPU spread",
             "command_buffer_reserve_seconds":self.reserve.as_secs_f64(),
+            "host_launch_floor_seconds":self.launch_floor.map(|d| d.as_secs_f64()),
             "reused_read": self.reused_read.map(|(bytes, rate)| serde_json::json!({"footprint_bytes":bytes,"bytes_per_second":rate})),
             "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
             "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
@@ -581,6 +619,11 @@ impl WorkCalibration {
             result = result.with_reused_read(
                 value["reused_read"]["footprint_bytes"].as_u64()?,
                 value["reused_read"]["bytes_per_second"].as_f64()?,
+            )?;
+        }
+        if !value["host_launch_floor_seconds"].is_null() {
+            result = result.with_launch_floor(
+                Duration::try_from_secs_f64(value["host_launch_floor_seconds"].as_f64()?).ok()?,
             )?;
         }
         result.reused = true;

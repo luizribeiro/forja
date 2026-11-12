@@ -70,7 +70,10 @@ device calibration and the actual encoded launch schedule. With
 the default ten-second deadline, forecasts are limited to two seconds per dispatch
 and command buffer and eight seconds per submission. Shorter host deadlines lower
 these ceilings and bound waits for resources. Engine components cannot raise them.
-Each buffer also pays a calibrated startup reserve. Admission calibrates cold and
+Each buffer also pays a calibrated startup reserve. Every physical launch pays
+at least a 250 µs host scheduling allowance, or the larger calibrated launch and
+mixed-workload jitter bound. This allowance is a safety policy, not a measured
+kernel latency; profiles record it separately from raw calibration observations. Admission calibrates cold and
 warm device observations, retains their raw rates, and reuses an exact source,
 device and OS-build match for at most one hour under
 `~/Library/Caches/forja/work-admission/`. Removing that directory forces calibration
