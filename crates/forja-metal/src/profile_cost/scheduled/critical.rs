@@ -15,6 +15,9 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
         return super::state::costs(dispatch).map(|(_, critical)| critical);
     }
     let total = super::of(dispatch)?;
+    if let Some(cost) = matrix_tile(dispatch, total) {
+        return Some(cost);
+    }
     let output = dispatch.output().layout();
     let width = u64::from(output.shape().last().copied().unwrap_or(1)).max(1);
     let elements = output.element_count().max(1);
@@ -93,11 +96,63 @@ pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
     cost.checked_add(super::route_setup(dispatch)?)
 }
 
+fn matrix_tile(dispatch: &Dispatch, total: KernelCost) -> Option<KernelCost> {
+    if !matches!(dispatch.op(), Op::Matmul | Op::QuantMatmul { .. }) {
+        return None;
+    }
+    let tile = crate::variants::selected_cost_model(dispatch).tile;
+    let [rows, columns] = dispatch.output().layout().shape() else {
+        return None;
+    };
+    if tile[0] == 0 || tile[1] == 0 {
+        return None;
+    }
+    let groups = u64::from(*rows)
+        .div_ceil(u64::from(tile[0]))
+        .checked_mul(u64::from(*columns).div_ceil(u64::from(tile[1])))?;
+    Some(KernelCost {
+        read_bytes: total.read_bytes.div_ceil(groups),
+        write_bytes: total.write_bytes.div_ceil(groups),
+        flops: total.flops.div_ceil(groups),
+        scalar_ops: total.scalar_ops.div_ceil(groups),
+        sfu_ops: total.sfu_ops.div_ceil(groups),
+        ..KernelCost::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use forja_core::{CommandList, DType, StateStep};
     use forja_cpu::CpuBackend;
+
+    #[test]
+    fn tiled_matrix_critical_work_retains_a_complete_cooperative_tile() {
+        use forja_core::{BackendDispatchData, DeviceCapability};
+        let cpu = CpuBackend::new();
+        for (rows, columns, inner) in [(7, 33, 4097), (512, 192, 576), (512, 2048, 1024)] {
+            let left = cpu.alloc(DType::F32, &[rows, inner]).unwrap();
+            let right = cpu.alloc(DType::F32, &[inner, columns]).unwrap();
+            let output = cpu.alloc(DType::F32, &[rows, columns]).unwrap();
+            let mut commands = CommandList::new();
+            commands
+                .dispatch(Op::Matmul, &[&left, &right], &output)
+                .unwrap();
+            let selected = crate::variants::resolve(
+                commands.last_dispatch().unwrap(),
+                "matmul.steel-32x64x16-1x2",
+                &[DeviceCapability::Metal4],
+            )
+            .unwrap();
+            commands.set_last_backend_data(BackendDispatchData::new(selected));
+            let dispatch = commands.last_dispatch().unwrap();
+            let total = super::super::of(dispatch).unwrap();
+            let critical = of(dispatch).unwrap();
+            let groups = u64::from(rows).div_ceil(32) * u64::from(columns).div_ceil(64);
+            assert_eq!(critical.flops, total.flops.div_ceil(groups));
+            assert_eq!(critical.read_bytes, total.read_bytes.div_ceil(groups));
+        }
+    }
 
     #[test]
     fn a_single_row_path_cannot_repeat_the_whole_dispatch_address_work() {
