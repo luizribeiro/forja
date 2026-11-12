@@ -176,6 +176,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
         rates.with_reused_read(crate::work_calibration::REUSED_READ_BYTES, reused_read)
     })
     .and_then(|rates| rates.with_launch_floor(Duration::from_micros(250)))
+    .and_then(|rates| rates.with_serial_cooperative_margin(1.25))
     .ok_or(BackendError::InvalidInput)
 }
 

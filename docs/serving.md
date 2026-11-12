@@ -73,7 +73,11 @@ these ceilings and bound waits for resources. Engine components cannot raise the
 Each buffer also pays a calibrated startup reserve. Every physical launch pays
 at least a 250 µs host scheduling allowance, or the larger calibrated launch and
 mixed-workload jitter bound. This allowance is a safety policy, not a measured
-kernel latency; profiles record it separately from raw calibration observations. Admission calibrates cold and
+kernel latency; profiles record it separately from raw calibration observations.
+Aggregate resource estimates use half measured rates. Cooperative critical paths
+sum memory and arithmetic time with a recorded 1.25 margin over measured rates;
+this serial sum includes their synchronization phases without a second overlap
+allowance. Admission calibrates cold and
 warm device observations, retains their raw rates, and reuses an exact source,
 device and OS-build match for at most one hour under
 `~/Library/Caches/forja/work-admission/`. Removing that directory forces calibration

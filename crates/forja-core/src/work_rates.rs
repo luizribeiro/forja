@@ -58,6 +58,17 @@ impl WorkRates {
         launches: u64,
         access: MemoryAccess,
     ) -> Option<Duration> {
+        self.predict_with_margin(cost, launches, access, None)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn predict_with_margin(
+        self,
+        cost: KernelCost,
+        launches: u64,
+        access: MemoryAccess,
+        serial_margin: Option<f64>,
+    ) -> Option<Duration> {
         if launches == 0 {
             return None;
         }
@@ -73,7 +84,8 @@ impl WorkRates {
             cost,
             launches,
             memory,
-            matches!(access, MemoryAccess::Phased),
+            matches!(access, MemoryAccess::Phased) || serial_margin.is_some(),
+            serial_margin.map_or(1.0, |margin| margin / 2.0),
         )
     }
 
@@ -89,7 +101,7 @@ impl WorkRates {
         let repeated = cost.read_bytes.checked_sub(unique)?;
         let [read, copy, ..] = self.rates;
         let cold = (unique as f64 / read).max(unique.checked_add(cost.write_bytes)? as f64 / copy);
-        self.predict_memory(cost, launches, cold + repeated as f64 / rate, false)
+        self.predict_memory(cost, launches, cold + repeated as f64 / rate, false, 1.0)
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -99,6 +111,7 @@ impl WorkRates {
         launches: u64,
         memory: f64,
         phased: bool,
+        resource_scale: f64,
     ) -> Option<Duration> {
         if launches == 0 {
             return None;
@@ -112,7 +125,7 @@ impl WorkRates {
         } else {
             memory.max(arithmetic)
         };
-        let seconds = resources + launches as f64 * launch;
+        let seconds = resources * resource_scale + launches as f64 * launch;
         Duration::try_from_secs_f64(seconds)
             .ok()
             .filter(|time| !time.is_zero())
@@ -353,6 +366,42 @@ mod tests {
     }
 
     #[test]
+    fn cooperative_serial_margin_sums_resources_without_scaling_launches() {
+        let rate = WorkRates::new(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0).unwrap();
+        let critical = KernelCost {
+            read_bytes: 1,
+            scalar_ops: 1,
+            ..KernelCost::default()
+        };
+        assert_eq!(
+            rate.predict_with_margin(critical, 1, MemoryAccess::Coalesced, Some(1.25)),
+            Some(Duration::from_secs_f64(4.5))
+        );
+        let c = WorkCalibration::new(
+            [rate; 3],
+            0.1,
+            128,
+            1.0,
+            vec![WorkObservation {
+                name: "raw".into(),
+                kernel: "raw".into(),
+                units: 1,
+                gpu: Duration::from_secs(1),
+            }],
+            Duration::ZERO,
+        )
+        .unwrap();
+        for margin in [0.0, 0.5, f64::NAN, f64::INFINITY] {
+            assert!(c.clone().with_serial_cooperative_margin(margin).is_none());
+        }
+        let c = c.with_serial_cooperative_margin(1.25).unwrap();
+        let loaded =
+            WorkCalibration::from_cache_record(&c.cache_record("source"), "source").unwrap();
+        assert_eq!(loaded.serial_cooperative_margin, Some(1.25));
+        assert_eq!(loaded.observations, c.observations);
+    }
+
+    #[test]
     fn cached_calibration_requires_exact_identity_and_valid_rates() {
         let rate = WorkRates::new(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.01).unwrap();
         let calibration = WorkCalibration::new(
@@ -455,6 +504,7 @@ pub struct WorkCalibration {
     reserve: Duration,
     reused_read: Option<(u64, f64)>,
     launch_floor: Option<Duration>,
+    serial_cooperative_margin: Option<f64>,
     reused: bool,
 }
 impl WorkCalibration {
@@ -484,6 +534,7 @@ impl WorkCalibration {
             reserve,
             reused_read: None,
             launch_floor: None,
+            serial_cooperative_margin: None,
             reused: false,
         })
     }
@@ -494,6 +545,17 @@ impl WorkCalibration {
             return None;
         }
         self.reused_read = Some((footprint, bytes_per_second));
+        Some(self)
+    }
+
+    /// Prices cooperative critical paths by their serial resource sum.
+    /// Rates must be half measured rates; the finite margin must be at least one.
+    #[must_use]
+    pub fn with_serial_cooperative_margin(mut self, margin: f64) -> Option<Self> {
+        if !margin.is_finite() || margin < 1.0 {
+            return None;
+        }
+        self.serial_cooperative_margin = Some(margin);
         Some(self)
     }
 
@@ -541,10 +603,15 @@ impl WorkCalibration {
             .read_bytes
             .checked_sub(critical.metadata_read_bytes)?;
         let metadata = critical.metadata_read_bytes as f64 / self.dependent_read;
-        let critical = self.rates[if cooperative { 2 } else { 1 }].predict(
+        let critical = self.rates[if cooperative { 2 } else { 1 }].predict_with_margin(
             critical,
             launches.max(1),
             access,
+            if cooperative {
+                self.serial_cooperative_margin
+            } else {
+                None
+            },
         )?;
         let (groups, threads) = geometry;
         let units = groups.max(threads.div_ceil(self.group_threads));
@@ -559,6 +626,7 @@ impl WorkCalibration {
             "rate_policy":"zero warmups; half steady rates per identical workload; twice worst launch/group latency and within-probe GPU spread",
             "command_buffer_reserve_seconds":self.reserve.as_secs_f64(),
             "host_launch_floor_seconds":self.launch_floor.map(|d| d.as_secs_f64()),
+            "serial_cooperative_margin":self.serial_cooperative_margin,
             "reused_read": self.reused_read.map(|(bytes, rate)| serde_json::json!({"footprint_bytes":bytes,"bytes_per_second":rate})),
             "aggregate":self.rates[0].json(),"serial":self.rates[1].json(),
             "cooperative":self.rates[2].json(),"group_seconds":self.group_seconds, "group_reference_threads":self.group_threads,
@@ -625,6 +693,10 @@ impl WorkCalibration {
             result = result.with_launch_floor(
                 Duration::try_from_secs_f64(value["host_launch_floor_seconds"].as_f64()?).ok()?,
             )?;
+        }
+        if !value["serial_cooperative_margin"].is_null() {
+            result = result
+                .with_serial_cooperative_margin(value["serial_cooperative_margin"].as_f64()?)?;
         }
         result.reused = true;
         Some(result)
