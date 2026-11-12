@@ -650,6 +650,12 @@ impl MetalBackend {
         self.device.name().to_string()
     }
 
+    /// Returns the selected device family without running calibration probes.
+    #[must_use]
+    pub fn device_family(&self) -> &'static str {
+        gpu_family(&self.device)
+    }
+
     /// Renders the selectable algorithms available on this device as Markdown.
     #[must_use]
     pub fn variant_catalog_markdown(&self) -> String {

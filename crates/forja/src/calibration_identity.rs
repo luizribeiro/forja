@@ -5,9 +5,7 @@ use std::error::Error;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn identity() -> Result<Value, Box<dyn Error>> {
-    use forja_core::Backend;
     let backend = forja_metal::MetalBackend::new()?;
-    let device = backend.device_info()?;
     let displays: Value = serde_json::from_str(&crate::benchmark::command_output(
         "system_profiler",
         &["SPDisplaysDataType", "-json"],
@@ -22,8 +20,19 @@ pub(crate) fn identity() -> Result<Value, Box<dyn Error>> {
         .as_str()
         .ok_or("missing GPU core count")?
         .parse::<u32>()?;
+    let platform =
+        crate::benchmark::command_output("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"])?;
+    let machine_uuid = platform
+        .lines()
+        .find_map(|line| {
+            line.split_once("\"IOPlatformUUID\" = \"")?
+                .1
+                .strip_suffix('"')
+        })
+        .filter(|uuid| !uuid.is_empty())
+        .ok_or("missing machine identity")?;
     Ok(
-        json!({"name": backend.device_name(), "family": device.family,
+        json!({"name": backend.device_name(), "family": backend.device_family(), "machine_uuid": machine_uuid,
         "core_count": cores, "memory_bytes": forja_metal::MetalBackend::physical_memory_size()?,
         "os_version": crate::benchmark::command_output("sw_vers", &["-productVersion"])?,
         "os_build": crate::benchmark::command_output("sw_vers", &["-buildVersion"])?}),
@@ -49,6 +58,7 @@ mod tests {
         let identity = json!({"name":"test-device", "family":"test", "core_count": 7, "memory_bytes": 33, "os_version":"one", "os_build":"build-one"});
         for (key, replacement) in [
             ("name", json!("other-device")),
+            ("machine_uuid", json!("other-machine")),
             ("os_build", json!("build-two")),
             ("family", json!("other")),
             ("core_count", json!(8)),
