@@ -588,3 +588,39 @@ fn recurrent_profiles_declare_context_dependent_prompt_pieces() {
         assert_eq!(profile.workload().prefill_chunk.get(), 2048);
     }
 }
+
+#[test]
+fn routed_profiles_bound_prompt_pieces_at_every_declared_context() {
+    for (text, expected) in [
+        (
+            include_str!(
+                "../../../engines/qwen3-coder/profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.toml"
+            ),
+            16,
+        ),
+        (
+            include_str!(
+                "../../../engines/qwen3-coder/profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.kv-f32.toml"
+            ),
+            16,
+        ),
+        (
+            include_str!(
+                "../../../engines/qwen3-coder/profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.long-context.toml"
+            ),
+            16,
+        ),
+        (
+            include_str!(
+                "../../../engines/olmoe/profiles/olmoe-1b-7b-0924.metal-apple-m3-ultra.bf16.toml"
+            ),
+            64,
+        ),
+    ] {
+        let profile: Profile = toml::from_str(text).unwrap();
+        let policy = profile.prompt_chunk_policy().unwrap().unwrap();
+        let context = policy.arms().last().unwrap().0;
+        assert_eq!(policy.limit(0, 512), Ok(expected));
+        assert_eq!(policy.limit(context - 512, 512), Ok(expected));
+    }
+}

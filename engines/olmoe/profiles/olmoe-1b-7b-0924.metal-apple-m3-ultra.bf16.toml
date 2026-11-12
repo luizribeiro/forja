@@ -1,5 +1,6 @@
 schema-version = 1
 family = "olmoe"
+prompt-chunks = [{ through = 4096, tokens = 64 }]
 
 [model]
 id = "allenai/OLMoE-1B-7B-0924"

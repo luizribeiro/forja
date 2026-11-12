@@ -78,8 +78,11 @@ async fn assert_chunk_schedules(
     .with_guest_call_timeout(Duration::from_secs(300))
     .with_gpu_limits(Duration::from_secs(60), Duration::from_secs(3_600));
     let mut runner = runner_with_limits(test_guests::qwen3_coder(), limits).await?;
+    let mut config = load_config()?;
+    // Numerical invariance covers the engine's full chunk domain on an observational backend.
+    config.prompt_chunks = None;
     runner
-        .load_with_selections(Some(FULL_LAYERS), &load_config()?)
+        .load_with_selections(Some(FULL_LAYERS), &config)
         .await??;
     let prefix = if prefix_tokens == 0 {
         None
@@ -468,8 +471,8 @@ async fn metal_batch_graph_catalog_stays_within_limit() -> Result<(), Box<dyn Er
         }
     }
 
-    assert_eq!(runner.metrics().live_graphs, 2 + 2 + 4 * 3);
-    assert_eq!(runner.metrics().prepared_graphs, 2 + 2 + 4 * 3);
+    assert_eq!(runner.metrics().live_graphs, 1 + 2 + 4 * 3);
+    assert_eq!(runner.metrics().prepared_graphs, 1 + 2 + 4 * 3);
     Ok(())
 }
 
@@ -479,18 +482,27 @@ async fn populate_single_replay_catalog(
 ) -> Result<(), Box<dyn Error>> {
     let mut position = 0;
     for sequence in [9, 512, 2_048, 4_000] {
-        let output = runner
-            .step(EngineStep {
-                phase: forja_host::BatchPhase::Prompt,
-                tokens: vec![17; sequence],
-                start_pos: position,
-                taps: false,
-            })
-            .await??;
-        runner.read(&output.logits).await?;
-        position += u32::try_from(sequence)?;
+        let mut remaining = u32::try_from(sequence)?;
+        while remaining > 0 {
+            let count = runner.prompt_piece_limit(position, remaining)?;
+            let output = runner
+                .step(EngineStep {
+                    phase: forja_host::BatchPhase::Prompt,
+                    tokens: vec![17; usize::try_from(count)?],
+                    start_pos: position,
+                    taps: false,
+                })
+                .await??;
+            runner.read(&output.logits).await?;
+            position = position
+                .checked_add(count)
+                .ok_or("prompt position overflow")?;
+            remaining = remaining
+                .checked_sub(count)
+                .ok_or("prompt piece overflow")?;
+        }
     }
-    assert_eq!(runner.metrics().live_graphs, 2);
+    assert_eq!(runner.metrics().live_graphs, 1);
     let output = runner
         .step(EngineStep {
             phase: forja_host::BatchPhase::Prompt,
@@ -501,7 +513,7 @@ async fn populate_single_replay_catalog(
         .await??;
     runner.read(&output.logits).await?;
     position += 1;
-    assert_eq!(runner.metrics().live_graphs, 3);
+    assert_eq!(runner.metrics().live_graphs, 2);
     for sampling in [
         SamplingParams::default(),
         SamplingParams {
@@ -522,7 +534,7 @@ async fn populate_single_replay_catalog(
         runner.read(&output.token).await?;
         position += 1;
     }
-    assert_eq!(runner.metrics().live_graphs, 3);
+    assert_eq!(runner.metrics().live_graphs, 2);
     let logits = runner
         .begin_decode(EngineBeginDecode {
             phase: forja_host::BatchPhase::Decode,
@@ -540,7 +552,7 @@ async fn populate_single_replay_catalog(
         )
         .await??;
     runner.read_queued_token(output).await?;
-    assert_eq!(runner.metrics().live_graphs, 2 + 2);
+    assert_eq!(runner.metrics().live_graphs, 1 + 2);
     Ok(())
 }
 
