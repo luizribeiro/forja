@@ -121,6 +121,9 @@ pub(crate) fn costs(d: &Dispatch, schedule: AttentionSchedule) -> Option<(Kernel
     match schedule {
         AttentionSchedule::Tiled { query, key } => {
             let (bq, bk) = (u64::from(query), u64::from(key));
+            let bounded = d
+                .backend_data::<crate::ValidatedVariant>()
+                .is_some_and(|variant| variant.uses_bounded_attention());
             let (all, longest) = visits(&s, bq, bk)?;
             let tile_cost = |count: u64, rows: u64| -> Option<KernelCost> {
                 let pairs = count.checked_mul(bq)?.checked_mul(bk)?;
@@ -133,9 +136,21 @@ pub(crate) fn costs(d: &Dispatch, schedule: AttentionSchedule) -> Option<(Kernel
                     .div_ceil(4)
                     .checked_mul(32)?
                     .checked_add(loads.checked_mul(4)?)?;
+                let private = if bounded {
+                    count
+                        .checked_mul(bq)?
+                        .checked_mul(s.values)?
+                        .checked_mul(4 * 2)?
+                } else {
+                    0
+                };
                 Some(KernelCost {
+                    scratch_read_bytes: private,
+                    scratch_write_bytes: private,
                     read_bytes: kv
+                        .checked_add(private)?
                         .checked_add(rows.checked_mul(s.width)?.checked_mul(s.query_bytes)?)?,
+                    write_bytes: private,
                     kv_bytes: kv,
                     flops: pairs
                         .checked_mul(2)?
@@ -157,7 +172,9 @@ pub(crate) fn costs(d: &Dispatch, schedule: AttentionSchedule) -> Option<(Kernel
                     .checked_mul(bq)?,
             )?;
             critical = tile_cost(longest, bq)?;
-            critical.write_bytes = bq.checked_mul(s.values)?.checked_mul(s.output_bytes)?;
+            critical.write_bytes = critical
+                .write_bytes
+                .checked_add(bq.checked_mul(s.values)?.checked_mul(s.output_bytes)?)?;
         }
         AttentionSchedule::Vector {
             blocks,
@@ -366,6 +383,29 @@ mod tests {
         commands.set_last_backend_data(BackendDispatchData::new(pick));
         commands.into_dispatches().remove(0)
     }
+    #[test]
+    fn bounded_tiles_price_both_private_accumulator_updates_if_they_spill() {
+        let schedule = AttentionSchedule::Tiled { query: 16, key: 16 };
+        let bounded = dispatch_typed(24, 8, 128, 4097, "sdpa.steel-bounded", DType::F32);
+        let legacy = dispatch_typed(24, 8, 128, 4097, "sdpa.steel", DType::F32);
+        let (bounded, critical) = costs(&bounded, schedule).unwrap();
+        let (legacy, _) = costs(&legacy, schedule).unwrap();
+        assert_eq!(bounded.scratch_read_bytes, bounded.scratch_write_bytes);
+        assert!(bounded.scratch_read_bytes > 0);
+        assert_eq!(
+            bounded.read_bytes - legacy.read_bytes,
+            bounded.scratch_read_bytes
+        );
+        assert_eq!(
+            bounded.write_bytes - legacy.write_bytes,
+            bounded.scratch_write_bytes
+        );
+        assert_eq!(
+            critical.scratch_read_bytes,
+            4097_u64.div_ceil(16) * 16 * 128 * 8
+        );
+    }
+
     #[test]
     fn tiled_address_work_depends_on_values_rather_than_storage_bytes() {
         let schedule = AttentionSchedule::Tiled { query: 32, key: 16 };

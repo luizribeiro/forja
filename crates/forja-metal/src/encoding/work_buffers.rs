@@ -580,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn default_limits_admit_real_attention_chunks_after_query_splitting() {
+    fn default_limits_admit_bounded_attention_chunks_after_query_splitting() {
         let backend = enforcing_backend();
         for (heads, width, dtype, queries, keys, variant) in [
             (
@@ -592,14 +592,7 @@ mod tests {
                 "paged-sdpa.steel-half",
             ),
             (16, 128, DType::F16, 4096, 16384, "paged-sdpa.steel-half"),
-            (
-                16,
-                128,
-                DType::F16,
-                4096,
-                262_144,
-                "paged-sdpa.steel-bounded",
-            ),
+            (16, 128, DType::F16, 512, 262_144, "paged-sdpa.steel-half"),
             (
                 16,
                 128,
@@ -608,13 +601,13 @@ mod tests {
                 262_144,
                 "paged-sdpa.vector-gqa-two-pass-1024",
             ),
-            (24, 128, DType::F32, 1, 262_144, "paged-sdpa.steel-bounded"),
+            (24, 128, DType::F32, 1, 32768, "paged-sdpa.steel-bounded"),
             (
                 24,
                 256,
                 DType::F32,
                 1,
-                262_144,
+                32768,
                 "paged-sdpa.steel-bounded-256",
             ),
         ] {
@@ -669,12 +662,12 @@ mod tests {
                     prepared.reserve,
                     backend.work_limits,
                 )
-                .unwrap()
+                .unwrap_or_else(|error| panic!("{case:?}: {error:?}"))
             {
                 commands = split;
             } else {
                 break partition(&prepared.predictions, backend.work_limits, prepared.reserve)
-                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{case:?}: {error:?}"))
                     .len();
             }
         };
