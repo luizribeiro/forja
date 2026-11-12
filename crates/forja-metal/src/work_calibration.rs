@@ -1,4 +1,4 @@
-use forja_core::{Backend, BackendDispatchData, BackendError, CommandList, DType, Op};
+use forja_core::{Backend, BackendDispatchData, BackendError, CommandList, DType, Op, Submission};
 
 use crate::{CalibrationSample, MetalBackend};
 
@@ -255,6 +255,56 @@ impl MetalBackend {
         )
     }
 
+    pub(super) fn calibrate_profiled_launches(
+        &self,
+    ) -> Result<Vec<CalibrationSample>, BackendError> {
+        let input = self.alloc(DType::F32, &[128])?;
+        let output = self.alloc(DType::F32, &[128])?;
+        let measured = (|| {
+            self.write(&input, &[1.0_f32.to_le_bytes(); 128].concat())?;
+            let mut commands = CommandList::new();
+            for _ in 0..512 {
+                for probe in [WorkProbe::ScalarSerial, WorkProbe::SingleDispatch] {
+                    commands
+                        .dispatch_many_with_backend_data(
+                            Op::Copy,
+                            &[&input],
+                            &[&output],
+                            BackendDispatchData::new(probe),
+                        )
+                        .map_err(|_| BackendError::InvalidInput)?;
+                }
+            }
+            let submission = self.submit_profiled(commands)?;
+            submission.wait()?;
+            let profile = submission.profile().ok_or(BackendError::ExecutionFailed)?;
+            if profile.per_dispatch.len() != 1024 {
+                return Err(BackendError::ExecutionFailed);
+            }
+            let samples = profile
+                .per_dispatch
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !index.is_multiple_of(2))
+                .map(|(_, d)| CalibrationSample {
+                    name: "calibration_profiled_dispatch",
+                    kernel: WorkProbe::SingleDispatch.kernel(),
+                    arithmetic: None,
+                    independent_chains: 0,
+                    screening: false,
+                    units: 1,
+                    wall: d.gpu_time,
+                    gpu: d.gpu_time,
+                })
+                .collect::<Vec<_>>();
+            WorkProbe::SingleDispatch.verify(self, &output)?;
+            Ok(samples)
+        })();
+        self.release(&input)?;
+        self.release(&output)?;
+        measured
+    }
+
     fn calibrate_work_probes(
         &self,
         probes: &[WorkProbe],
@@ -354,6 +404,16 @@ mod tests {
             assert_eq!(Some(sample.units), probe.units());
             assert!(!sample.gpu.is_zero());
         }
+    }
+
+    #[test]
+    fn metal_profiled_launch_probe_retains_each_raw_interval() {
+        let backend = MetalBackend::new().unwrap();
+        let samples = backend.calibrate_profiled_launches().unwrap();
+        assert_eq!(samples.len(), 512);
+        assert!(samples.iter().all(|s| s.units == 1
+            && !s.gpu.is_zero()
+            && s.name == "calibration_profiled_dispatch"));
     }
 
     #[test]

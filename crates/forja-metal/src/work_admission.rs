@@ -80,6 +80,7 @@ pub(super) fn calibration(backend: &MetalBackend) -> Result<Arc<WorkCalibration>
             samples.extend(probe.calibrate_work(0, 6)?);
             samples.extend(probe.calibrate_compute_group(6)?);
             samples.extend(probe.calibrate_work_group(6)?);
+            samples.extend(probe.calibrate_profiled_launches()?);
             let rates = from_samples(&samples)?;
             if let Some(cache) = cache {
                 cache.write(&rates);
@@ -106,7 +107,12 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
         "calibration_mma_f16",
         "calibration_mma_bf16",
     ])?;
-    let launch = 1.0 / latency(&["dependent_dispatch", "calibration_single_dispatch"])?;
+    let launch = 1.0
+        / latency(&[
+            "dependent_dispatch",
+            "calibration_single_dispatch",
+            "calibration_profiled_dispatch",
+        ])?;
     let serial_read = rate(&["calibration_read_serial"])?;
     let dependent = rate(&["calibration_dependent_read"])?;
     let serial = rate(&["calibration_scalar_serial"])?;
