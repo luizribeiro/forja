@@ -25,6 +25,7 @@ pub(crate) enum Precision {
 pub(crate) enum ProfileMode {
     Decode,
     Prefill,
+    Verify,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, serde::Serialize)]
@@ -237,7 +238,7 @@ struct ProfileArgs {
     /// Tokens to populate before measuring a suffix prefill.
     #[arg(long, default_value_t = 0)]
     prefix_context: u32,
-    /// Prompt tokens per serving batch step.
+    /// Tokens per serving prefill or verification step.
     #[arg(long, value_parser = parse_positive)]
     step_tokens: Option<u32>,
     /// Inference phase to profile.
@@ -1440,10 +1441,10 @@ impl ProfileArgs {
                 "--prefix-context requires prefill mode and must be less than --context",
             ));
         }
-        if self.step_tokens.is_some() && self.mode != ProfileMode::Prefill {
+        if self.step_tokens.is_some() && self.mode == ProfileMode::Decode {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::ValueValidation,
-                "--step-tokens requires prefill mode",
+                "--step-tokens requires prefill or verify mode",
             ));
         }
         if self.batch_size > 1 && self.mode != ProfileMode::Decode {
@@ -1456,6 +1457,12 @@ impl ProfileArgs {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::ValueValidation,
                 "--selection requires decode mode",
+            ));
+        }
+        if self.mode == ProfileMode::Verify && self.step_tokens.is_none_or(|rows| rows < 2) {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "verify mode requires --step-tokens of at least two rows",
             ));
         }
         Ok(Profile {
@@ -1783,6 +1790,30 @@ mod tests {
         assert_eq!(options.warmups, 7);
         assert!(options.json);
         assert_eq!(options.scratch, PathBuf::from("target/forja-bench"));
+    }
+
+    #[test]
+    fn verify_profiles_require_a_multirow_step() {
+        let base = [
+            "--isolated",
+            "profile",
+            "--engine",
+            "engine.wasm",
+            "--model",
+            "/tmp",
+            "--context",
+            "512",
+            "--mode",
+            "verify",
+        ];
+        assert!(parse(base.map(str::to_owned)).is_err());
+        for rows in ["1", "2", "3"] {
+            let args = base
+                .into_iter()
+                .chain(["--step-tokens", rows])
+                .map(str::to_owned);
+            assert_eq!(parse(args).is_ok(), rows != "1");
+        }
     }
 
     #[test]

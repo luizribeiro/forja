@@ -133,6 +133,8 @@ pub(crate) struct Profile {
     #[serde(default)]
     pub(crate) batch_size: Option<u32>,
     #[serde(default)]
+    pub(crate) serving_step_tokens: Option<u32>,
+    #[serde(default)]
     pub(crate) cached_prefix_tokens: u64,
     #[serde(default)]
     pub(crate) measured_tokens: Option<u64>,
@@ -152,6 +154,10 @@ impl Profile {
     pub(crate) fn measured_count(&self) -> Option<u64> {
         if self.mode == "decode" {
             Some(u64::from(self.batch_size.unwrap_or(1))).filter(|count| *count > 0)
+        } else if self.mode == "verify" {
+            self.serving_step_tokens
+                .map(u64::from)
+                .filter(|rows| *rows >= 2)
         } else {
             self.tokens
                 .checked_sub(self.cached_prefix_tokens)
@@ -162,8 +168,8 @@ impl Profile {
     pub(crate) fn validate(&self) -> Result<(), Box<dyn Error>> {
         if self.schema_version != 2
             || self.tokens == 0
-            || (self.mode == "prefill" && self.batch_size.is_some_and(|size| size != 1))
-            || !matches!(self.mode.as_str(), "prefill" | "decode")
+            || (self.mode != "decode" && self.batch_size.is_some_and(|size| size != 1))
+            || !matches!(self.mode.as_str(), "prefill" | "decode" | "verify")
             || self.submissions.is_empty()
         {
             return Err("unsupported or empty profile; rerun forja profile --json".into());
@@ -172,7 +178,7 @@ impl Profile {
             .measured_count()
             .ok_or("invalid measured token range")?;
         if self.measured_tokens.is_some_and(|count| count != measured)
-            || (self.mode == "decode" && self.cached_prefix_tokens != 0)
+            || (self.mode != "prefill" && self.cached_prefix_tokens != 0)
             || !self.unprofiled.cache_setup.is_finite()
             || self.unprofiled.cache_setup < 0.0
         {

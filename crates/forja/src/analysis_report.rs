@@ -182,6 +182,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn verification_profiles_count_the_declared_target_rows() {
+        let (mut profile, _) = fixture();
+        profile.mode = "verify".into();
+        profile.serving_step_tokens = Some(3);
+        profile.batch_size = Some(1);
+        profile.cached_prefix_tokens = 0;
+        profile.measured_tokens = Some(3);
+        profile.validate().unwrap();
+        assert_eq!(profile.measured_count(), Some(3));
+        profile.serving_step_tokens = Some(1);
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
     fn admission_ratios_use_individual_raw_intervals_without_attribution_scaling() {
         use crate::analysis_input::BufferAdmission;
         let (mut profile, calibration) = fixture();

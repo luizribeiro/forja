@@ -10,6 +10,8 @@ mod profile_prefix;
 #[cfg(target_os = "macos")]
 mod profile_selection;
 #[cfg(target_os = "macos")]
+mod profile_verify;
+#[cfg(target_os = "macos")]
 mod resident;
 #[cfg(target_os = "macos")]
 mod timing;
@@ -213,6 +215,10 @@ pub(crate) async fn measure_token_profile(
     let exceeds_context = match options.mode {
         ProfileMode::Decode => options.context >= max_context,
         ProfileMode::Prefill => options.context > max_context,
+        ProfileMode::Verify => options
+            .context
+            .checked_add(options.step_tokens.unwrap_or(0))
+            .is_none_or(|end| end > max_context),
     };
     if exceeds_context {
         return Err("profile shape exceeds the engine context".into());
@@ -225,7 +231,7 @@ pub(crate) async fn measure_token_profile(
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     let token_count = match options.mode {
-        ProfileMode::Decode => options.context - 1,
+        ProfileMode::Decode | ProfileMode::Verify => options.context - 1,
         ProfileMode::Prefill => options.context,
     };
     let tokens = synthetic_tokens(token_count, info.vocab);
@@ -239,6 +245,9 @@ pub(crate) async fn measure_token_profile(
             seed: options.sampling.seed,
         },
     };
+    if options.mode == ProfileMode::Verify {
+        return profile_verify::measure(&mut runner, &info, &tokens, options, decode, device).await;
+    }
     if options.batch_size > 1 {
         return profile_batch::measure(&mut runner, &info, &tokens, options, device).await;
     }
@@ -485,9 +494,12 @@ async fn measure_profiled_phase(
             .await
         }
         ProfileMode::Decode => {
-            let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
+            let token = prepare_profile_context(runner, tokens, options.context, decode, 1).await?;
             runner.set_profiling(true);
             profile_selection::decode(runner, token, options, decode, true).await
+        }
+        ProfileMode::Verify => {
+            return Err("verify profiling requires a declared batch shape".into());
         }
     };
     runner.set_profiling(false);
@@ -512,9 +524,10 @@ async fn measure_profile_phase(
             .await
         }
         ProfileMode::Decode => {
-            let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
+            let token = prepare_profile_context(runner, tokens, options.context, decode, 1).await?;
             profile_selection::decode(runner, token, options, decode, false).await
         }
+        ProfileMode::Verify => Err("verify profiling requires a declared batch shape".into()),
     }
 }
 
@@ -2522,13 +2535,14 @@ async fn measure_profiles(
         let mut steps = Vec::with_capacity(reps);
         for repetition in 0..warmups.saturating_add(reps) {
             let unprofiled = if options.overlap && !options.host_argmax {
-                prepare_profile_context(runner, tokens, context_start, options).await?;
+                prepare_profile_context(runner, tokens, context_start, options, 1).await?;
                 measure_pipelined_profile_step(runner, context_start, options.sampling).await?
             } else {
-                let token = prepare_profile_context(runner, tokens, context_start, options).await?;
+                let token =
+                    prepare_profile_context(runner, tokens, context_start, options, 1).await?;
                 measure_decode_step(runner, token, context_start, options).await?
             };
-            let token = prepare_profile_context(runner, tokens, context_start, options).await?;
+            let token = prepare_profile_context(runner, tokens, context_start, options, 1).await?;
             runner.set_profiling(true);
             let profiled = measure_decode_step(runner, token, context_start, options).await;
             runner.set_profiling(false);
@@ -2600,6 +2614,7 @@ async fn prepare_profile_context(
     tokens: &[u32],
     context_start: usize,
     options: DecodeOptions,
+    headroom: usize,
 ) -> Result<u32, Box<dyn Error>> {
     let prefill = context_start
         .checked_sub(1)
@@ -2608,7 +2623,7 @@ async fn prepare_profile_context(
     prepare_benchmark_runner(
         runner,
         context_start
-            .checked_add(1)
+            .checked_add(headroom)
             .ok_or("profile context overflow")?,
     )?;
     let prompt = tokens
