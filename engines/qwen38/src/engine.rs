@@ -69,7 +69,7 @@ impl Qwen38 {
             .filter(|shape| {
                 shape.bucket != Self::MAX_DECODE_ROWS || shape.selection == BatchSelection::Combined
             })
-            .chain([64, 512, 2048].map(|tokens| BatchShape {
+            .chain([64, 128, 512, 2048].map(|tokens| BatchShape {
                 phase: BatchPhase::Prompt,
                 bucket: 1,
                 tokens,

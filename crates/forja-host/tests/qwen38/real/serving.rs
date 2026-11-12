@@ -137,7 +137,7 @@ async fn metal_real_eager_bucket_eight_matches_independent_single_lanes()
 #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
 async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Box<dyn Error>> {
     let (mut runner, _) = load_with(true, None).await?;
-    assert_eq!(runner.metrics().live_graphs, 12 + verify_graphs());
+    assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
     let mut expected = None;
     for _ in 0..2 {
         let mut rows = Vec::new();
@@ -164,7 +164,7 @@ async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Bo
         } else {
             expected = Some(rows);
         }
-        assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
+        assert_eq!(runner.metrics().live_graphs, 14 + verify_graphs());
         assert!(runner.metrics().live_bytes <= 48 * 1024 * 1024 * 1024);
     }
     Ok(())
@@ -216,6 +216,6 @@ async fn metal_real_long_prompt_replays_within_production_submission_limits()
             .tokens,
         4098
     );
-    assert_eq!(runner.metrics().live_graphs, 13 + verify_graphs());
+    assert_eq!(runner.metrics().live_graphs, 14 + verify_graphs());
     Ok(())
 }
