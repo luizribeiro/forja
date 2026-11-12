@@ -230,6 +230,7 @@ fn profile_load_config(
 ) -> Result<forja_host::EngineLoadConfig, String> {
     let selection = overrides.resolve(profile)?;
     Ok(forja_host::EngineLoadConfig {
+        prompt_chunks: profile.prompt_chunk_policy()?.map(std::sync::Arc::new),
         max_context: Some(profile.workload().max_context.get()),
         replay: overrides.replay,
         paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),

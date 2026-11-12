@@ -8,6 +8,7 @@ pub use forja_draft_testing as draft;
 pub fn load_config(component: &Path) -> Result<EngineLoadConfig, Box<dyn Error>> {
     let profile = read_profile(&fs::read(component)?)?;
     Ok(EngineLoadConfig {
+        prompt_chunks: profile.prompt_chunk_policy()?.map(std::sync::Arc::new),
         max_context: Some(profile.workload().max_context.get()),
         replay: true,
         paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),

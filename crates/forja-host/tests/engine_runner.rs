@@ -286,6 +286,7 @@ async fn passes_engine_selections_through_load_config() -> wasmtime::Result<()> 
     )
     .await?;
     let config = EngineLoadConfig {
+        prompt_chunks: None,
         max_context: Some(1_024),
         replay: true,
         paged_cache: false,

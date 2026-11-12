@@ -39,11 +39,11 @@ pub(crate) async fn run(
     logging: crate::logging::Controller,
 ) -> Result<(), Box<dyn Error>> {
     match options.config.backend.kind {
-        BackendKind::Cpu => run_factory(CpuFactory::default(), options, logging).await,
+        BackendKind::Cpu => Box::pin(run_factory(CpuFactory::default(), options, logging)).await,
         BackendKind::Metal => {
             #[cfg(target_os = "macos")]
             {
-                run_factory(MetalFactory::default(), options, logging).await
+                Box::pin(run_factory(MetalFactory::default(), options, logging)).await
             }
             #[cfg(not(target_os = "macos"))]
             Err("the Metal backend requires macOS".into())

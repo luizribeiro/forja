@@ -284,6 +284,8 @@ pub struct CachePlane {
 /// Effective engine-side selections supplied during load.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineLoadConfig {
+    /// Guest-profile limits on prompt pieces at each resulting context.
+    pub prompt_chunks: Option<Arc<forja_core::PromptChunkPolicy>>,
     /// Validated context length selected by the engine profile.
     pub max_context: Option<u32>,
     /// Whether the guest captures and replays reusable graphs.
@@ -300,9 +302,32 @@ pub struct EngineLoadConfig {
     pub variant_rule_picks: Vec<VariantRulePick>,
 }
 
+impl EngineLoadConfig {
+    fn validate_prompt_chunks(&self, info: &EngineInfo) -> Result<(), compute::Error> {
+        if let Some(policy) = &self.prompt_chunks
+            && (policy
+                .arms()
+                .last()
+                .is_none_or(|arm| self.max_context.is_none_or(|context| arm.0 < context))
+                || info.prompt_block_tokens.is_some_and(|block| {
+                    policy
+                        .arms()
+                        .iter()
+                        .any(|a| !a.1.is_multiple_of(block.get()))
+                }))
+        {
+            return Err(quota(
+                "prompt chunks conflict with the context or numerical block",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for EngineLoadConfig {
     fn default() -> Self {
         Self {
+            prompt_chunks: None,
             max_context: None,
             replay: true,
             paged_cache: false,
@@ -809,6 +834,7 @@ impl Drop for BackendTimer {
 
 /// An instantiated engine component and its host resources.
 pub struct EngineRunner<B: Backend + Send + Sync + 'static> {
+    prompt_chunks: Option<Arc<forja_core::PromptChunkPolicy>>,
     store: Store<Host<B>>,
     instance: engine_bindings::EngineComponent,
     id: u64,
@@ -1342,6 +1368,7 @@ where
         Ok(Self {
             store,
             instance,
+            prompt_chunks: None,
             id,
             info: None,
             loaded_num_hidden_layers: None,
@@ -1475,6 +1502,9 @@ where
         if let Err(error) = info.validate_verify_load(config) {
             return Ok(Err(error));
         }
+        if let Err(error) = config.validate_prompt_chunks(&info) {
+            return Ok(Err(error));
+        }
         let pool = if config.paged_cache {
             match self.bind_page_pool(&info, config.max_context, config.kv_cache) {
                 Ok(pool) => pool,
@@ -1559,6 +1589,7 @@ where
                 return Ok(Err(error));
             }
             self.loaded_num_hidden_layers = num_hidden_layers;
+            self.prompt_chunks.clone_from(&config.prompt_chunks);
         }
         result
     }
@@ -1743,6 +1774,44 @@ where
         Ok(())
     }
 
+    /// Clips a proposed prompt piece to the loaded guest profile's context limit.
+    /// # Errors
+    /// Refuses pieces outside the declared context or arithmetic overflow.
+    pub fn prompt_piece_limit(&self, start: u32, proposed: u32) -> Result<u32, compute::Error> {
+        self.prompt_chunks.as_ref().map_or(Ok(proposed), |policy| {
+            policy
+                .limit(start, proposed)
+                .map_err(|_| quota("prompt context exceeds its declaration"))
+        })
+    }
+
+    fn check_prompt_piece(
+        &self,
+        phase: BatchPhase,
+        start: u32,
+        count: u32,
+    ) -> Result<(), compute::Error> {
+        if phase == BatchPhase::Prompt && self.prompt_piece_limit(start, count)? != count {
+            return Err(quota("prompt piece exceeds its context-dependent limit"));
+        }
+        Ok(())
+    }
+
+    fn prompt_batch_lanes(
+        &self,
+        serving: &ServingInfo,
+        input: &EngineBatch,
+        selection: BatchSelection,
+        vocab: u32,
+    ) -> Result<Vec<u32>, compute::Error> {
+        for lane in input.lanes.iter().flatten() {
+            let count = u32::try_from(lane.tokens.as_ref().map_or(1, Vec::len))
+                .map_err(|_| quota("prompt piece exceeds u32"))?;
+            self.check_prompt_piece(input.shape.phase, lane.start_pos, count)?;
+        }
+        validate_batch_lanes(serving, input.shape, &input.lanes, selection, vocab)
+    }
+
     async fn prepare_single_append(
         &mut self,
         input: SingleInput<'_>,
@@ -1752,6 +1821,7 @@ where
             .tokens
             .map_or(Ok(1), |tokens| u32::try_from(tokens.len()))
             .map_err(|_| quota("token count exceeds u32"))?;
+        self.check_prompt_piece(input.phase, input.start, count)?;
         if let Some(pool) = self.page_pool {
             self.store.data().validate_canonical_input(
                 pool,
@@ -2018,16 +2088,11 @@ where
                 "engine does not declare batch serving".to_owned(),
             )));
         };
-        let appended = match validate_batch_lanes(
-            serving,
-            input.shape,
-            &input.lanes,
-            BatchSelection::Forward,
-            info.vocab,
-        ) {
-            Ok(appended) => appended,
-            Err(error) => return Ok(Err(error)),
-        };
+        let appended =
+            match self.prompt_batch_lanes(serving, &input, BatchSelection::Forward, info.vocab) {
+                Ok(appended) => appended,
+                Err(error) => return Ok(Err(error)),
+            };
         let Some(pool) = self.page_pool else {
             return Ok(Err(invalid_handle("batch serving requires a paged pool")));
         };
@@ -2251,16 +2316,11 @@ where
                 "engine does not declare batch serving".to_owned(),
             )));
         };
-        let appended = match validate_batch_lanes(
-            serving,
-            input.shape,
-            &input.lanes,
-            BatchSelection::Combined,
-            info.vocab,
-        ) {
-            Ok(appended) => appended,
-            Err(error) => return Ok(Err(error)),
-        };
+        let appended =
+            match self.prompt_batch_lanes(serving, &input, BatchSelection::Combined, info.vocab) {
+                Ok(appended) => appended,
+                Err(error) => return Ok(Err(error)),
+            };
         let Some(pool) = self.page_pool else {
             return Ok(Err(invalid_handle("batch serving requires a paged pool")));
         };
@@ -15649,6 +15709,71 @@ mod tests {
             );
             assert_eq!(first_f32(&runner.read(&decoded.logits).await.unwrap()), 4.0);
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_limits_refuse_before_guest_calls_without_charging_work() {
+        let weights = test_weight_file();
+        let mut runner = EngineRunner::new(
+            test_guests::engine_smoke(),
+            CpuBackend::new(),
+            GENEROUS,
+            &weights,
+        )
+        .await
+        .unwrap();
+        let config = super::EngineLoadConfig {
+            max_context: Some(16),
+            prompt_chunks: Some(Arc::new(
+                forja_core::PromptChunkPolicy::new(vec![(8, 4), (16, 1)], 16, 4).unwrap(),
+            )),
+            ..Default::default()
+        };
+        runner
+            .load_with_selections(None, &config)
+            .await
+            .unwrap()
+            .unwrap();
+        let before = runner.metrics().submissions;
+        let result = runner
+            .begin_decode(super::EngineBeginDecode {
+                phase: BatchPhase::Prompt,
+                tokens: Some(vec![1, 2]),
+                start_pos: 8,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(compute::Error::Quota(_))));
+        let batch = EngineBatch {
+            shape: BatchShape {
+                phase: BatchPhase::Prompt,
+                bucket: 1,
+                tokens: 4,
+                selection: BatchSelection::Combined,
+            },
+            lanes: vec![Some(EngineBatchLane {
+                slot: 0,
+                start_pos: 8,
+                tokens: Some(vec![1, 2]),
+                sampling: SamplingParams::default(),
+            })],
+        };
+        assert!(matches!(
+            runner.batch_step(batch).await.unwrap(),
+            Err(compute::Error::Quota(_))
+        ));
+        assert_eq!(runner.metrics().submissions, before);
+        assert_eq!(runner.prompt_piece_limit(6, 4).unwrap(), 1);
+        let info = runner.info.as_ref().unwrap();
+        let mut narrowed = config.clone();
+        narrowed.max_context = Some(8);
+        assert!(narrowed.validate_prompt_chunks(info).is_ok());
+        narrowed.max_context = Some(17);
+        assert!(narrowed.validate_prompt_chunks(info).is_err());
+        narrowed.max_context = None;
+        assert!(narrowed.validate_prompt_chunks(info).is_err());
+        assert!(runner.check_prompt_piece(BatchPhase::Prompt, 8, 1).is_ok());
+        assert!(runner.check_prompt_piece(BatchPhase::Decode, 8, 2).is_ok());
     }
 
     async fn assert_forward_selection_boundary_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
