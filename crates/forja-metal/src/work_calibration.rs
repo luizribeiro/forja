@@ -20,6 +20,7 @@ pub(super) enum WorkProbe {
     Sfu,
     Gather,
     ReusedRead,
+    SingleDispatch,
     ScalarSerial,
     SfuSerial,
     DependentRead,
@@ -33,11 +34,12 @@ pub(super) enum WorkProbe {
 }
 
 impl WorkProbe {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Scalar,
         Self::Sfu,
         Self::Gather,
         Self::ReusedRead,
+        Self::SingleDispatch,
         Self::ScalarSerial,
         Self::SfuSerial,
         Self::DependentRead,
@@ -58,6 +60,7 @@ impl WorkProbe {
             Self::Sfu => "calibration_sfu",
             Self::Gather => "calibration_gather",
             Self::ReusedRead => "calibration_reused_read",
+            Self::SingleDispatch => "calibration_single_dispatch",
             Self::ScalarSerial => "calibration_scalar_serial",
             Self::SfuSerial => "calibration_sfu_serial",
             Self::DependentRead => "calibration_dependent_read",
@@ -75,6 +78,7 @@ impl WorkProbe {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
             Self::ReusedRead => REUSED_ELEMENTS - 1,
+            Self::SingleDispatch => 1,
             Self::GroupDispatch => 16,
             Self::ReadSerial | Self::ReadGroup | Self::ReadWideGroup => SERIAL_READ_ELEMENTS,
             Self::ScalarWideGroup
@@ -95,7 +99,8 @@ impl WorkProbe {
             Self::Gather => GATHER_ELEMENTS,
             Self::ReusedRead => REUSED_ELEMENTS,
             Self::GroupDispatch => DISPATCH_GROUPS * crate::calibration::THREADS,
-            Self::ScalarWideGroup
+            Self::SingleDispatch
+            | Self::ScalarWideGroup
             | Self::SfuWideGroup
             | Self::ScalarSerial
             | Self::SfuSerial
@@ -134,6 +139,7 @@ impl WorkProbe {
             }
             Self::GroupDispatch => return Some(u64::from(DISPATCH_GROUPS)),
             Self::ReusedRead => return Some(REUSED_READ_BYTES * 32),
+            Self::SingleDispatch => return Some(1),
             Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
             Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
             Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),

@@ -106,7 +106,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
         "calibration_mma_f16",
         "calibration_mma_bf16",
     ])?;
-    let launch = 1.0 / latency(&["dependent_dispatch"])?;
+    let launch = 1.0 / latency(&["dependent_dispatch", "calibration_single_dispatch"])?;
     let serial_read = rate(&["calibration_read_serial"])?;
     let dependent = rate(&["calibration_dependent_read"])?;
     let serial = rate(&["calibration_scalar_serial"])?;
@@ -416,6 +416,35 @@ mod tests {
             ..sample
         });
         assert_eq!(startup_reserve(&samples), Ok(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn isolated_launch_latency_is_not_amortized_over_a_dispatch_chain() {
+        let sample = CalibrationSample {
+            name: "dependent_dispatch",
+            kernel: "copy",
+            arithmetic: None,
+            independent_chains: 0,
+            screening: false,
+            units: 512,
+            wall: Duration::from_millis(1),
+            gpu: Duration::from_millis(1),
+        };
+        let isolated = CalibrationSample {
+            name: "calibration_single_dispatch",
+            units: 1,
+            gpu: Duration::from_micros(33),
+            ..sample.clone()
+        };
+        assert_eq!(
+            1.0 / sample_rate(
+                &[sample, isolated],
+                &["dependent_dispatch", "calibration_single_dispatch"],
+                false
+            )
+            .unwrap(),
+            0.000_066
+        );
     }
 
     #[test]

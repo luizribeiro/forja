@@ -101,6 +101,12 @@ kernel void calibration_reused_read(device const float *input [[buffer(0)]],
     output[index] = sum / 32.0f;
 }
 
+kernel void calibration_single_dispatch(device const float *input [[buffer(0)]],
+                                        device float *output [[buffer(1)]],
+                                        uint index [[thread_position_in_grid]]) {
+    output[index] = input[index];
+}
+
 #define calibration_serial_kernel(name, expression, lanes) \
 kernel void name(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], \
                  uint index [[thread_position_in_grid]]) { \
