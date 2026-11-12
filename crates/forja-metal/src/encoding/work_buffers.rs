@@ -477,6 +477,109 @@ mod tests {
     }
 
     #[test]
+    fn concrete_graph_compositions_refuse_before_any_buffer_is_committed() {
+        use forja_core::Backend;
+        let _rates = crate::work_admission::TestCalibration::fast();
+        let backend = enforcing_backend();
+        let input = backend.alloc(DType::F32, &[7, 4097]).unwrap();
+        let output = backend.alloc(DType::F32, &[7, 4097]).unwrap();
+        let mut template = forja_core::GraphTemplate::new(
+            forja_core::ParamSpace::new(Vec::new()).unwrap(),
+            forja_core::GraphLimits::default(),
+        );
+        for _ in 0..3 {
+            template
+                .dispatch(Op::Copy, &[&input.clone().into()], &output.clone().into())
+                .unwrap();
+        }
+        let graph = backend.prepare_graph(template).unwrap();
+        let mut commands = CommandList::new();
+        commands.dispatch(Op::Copy, &[&input], &output).unwrap();
+        let prepared = backend
+            .prepare_commands::<false>(
+                commands,
+                None,
+                None,
+                ProfileTimestampGranularity::Precise,
+                None,
+                None,
+            )
+            .unwrap();
+        let unit = prepared.predictions[0];
+        let reserve = prepared.reserve;
+        drop(prepared);
+        let backend = backend.with_work_limits(
+            forja_core::GpuWorkLimits::new(
+                unit,
+                unit * 2 + reserve,
+                unit * 2 + reserve,
+                Duration::from_secs(10),
+                4,
+            )
+            .unwrap(),
+        );
+        let before = *backend.next_event_value.lock().unwrap();
+        assert!(matches!(
+            backend.replay(&graph, Vec::new()),
+            Err(BackendError::QuotaExceeded)
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), before);
+        backend.work_faults.check_backend().unwrap();
+    }
+
+    #[test]
+    fn graph_overrun_blocks_the_composition_without_disabling_other_graphs() {
+        use forja_core::Backend;
+        let _rates = crate::work_admission::TestCalibration::fast();
+        let backend = enforcing_backend();
+        let input = backend.alloc(DType::F32, &[33]).unwrap();
+        let output = backend.alloc(DType::F32, &[33]).unwrap();
+        let mut template = forja_core::GraphTemplate::new(
+            forja_core::ParamSpace::new(Vec::new()).unwrap(),
+            forja_core::GraphLimits::default(),
+        );
+        template
+            .dispatch(Op::Copy, &[&input.clone().into()], &output.clone().into())
+            .unwrap();
+        let graph = backend.prepare_graph(template.clone()).unwrap();
+        let first = backend
+            .replay_graph(&graph, Vec::new(), true, None)
+            .unwrap();
+        first.wait().unwrap();
+        let profile = first.profile().unwrap();
+        assert!(
+            profile
+                .buffer_admission
+                .iter()
+                .any(|b| b.gpu_time > b.predicted_gpu * 4)
+        );
+        let before = *backend.next_event_value.lock().unwrap();
+        let repeated = backend.prepare_graph(template).unwrap();
+        assert!(matches!(
+            backend.replay(&repeated, Vec::new()),
+            Err(BackendError::GpuPredictionExceeded { .. })
+        ));
+        assert_eq!(*backend.next_event_value.lock().unwrap(), before);
+        let mut unrelated = forja_core::GraphTemplate::new(
+            forja_core::ParamSpace::new(Vec::new()).unwrap(),
+            forja_core::GraphLimits::default(),
+        );
+        unrelated
+            .dispatch(
+                Op::RmsNorm { eps: 1e-5 },
+                &[&input.clone().into(), &input.into()],
+                &output.into(),
+            )
+            .unwrap();
+        backend
+            .replay(&backend.prepare_graph(unrelated).unwrap(), Vec::new())
+            .unwrap()
+            .wait()
+            .unwrap();
+        backend.work_faults.check_backend().unwrap();
+    }
+
+    #[test]
     fn default_limits_admit_real_attention_chunks_after_query_splitting() {
         let backend = enforcing_backend();
         for (heads, width, dtype, queries, keys, variant) in [
