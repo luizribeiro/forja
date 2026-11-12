@@ -5,6 +5,8 @@ mod critical;
 pub(crate) use critical::of as critical_path;
 mod row_program;
 mod sampling;
+#[cfg(test)]
+mod scratch_address_tests;
 mod state;
 
 pub(crate) fn of(dispatch: &Dispatch) -> Option<KernelCost> {
@@ -207,10 +209,22 @@ pub(super) fn address_elements(
         .read_bytes
         .checked_add(cost.write_bytes)?
         .checked_sub(scratch)?;
+    let (scratch_width, scratch_weight) = if matches!(
+        dispatch.op(),
+        Op::State(forja_core::StateOp::DeltaRuleBlock(_))
+    ) {
+        (4, 4)
+    } else {
+        (2, 32)
+    };
     cost.scalar_ops = cost
         .scalar_ops
         .checked_add(bytes.div_ceil(bytes_per_value).checked_mul(weight)?)?
-        .checked_add(scratch.div_ceil(2).checked_mul(weight.min(32))?)?;
+        .checked_add(
+            scratch
+                .div_ceil(scratch_width)
+                .checked_mul(weight.min(scratch_weight))?,
+        )?;
     Some(cost)
 }
 
