@@ -125,7 +125,7 @@ fn admission_records(profile: &Profile) -> Result<Vec<Value>, Box<dyn Error>> {
             buffers.push(json!({"submission":submission.index, "buffer":index,
                 "predicted_gpu_seconds":buffer.predicted_gpu_seconds, "reserve_seconds":buffer.reserve_seconds,
                 "measured_gpu_seconds":buffer.gpu_time_seconds, "measured_predicted_ratio":ratio,
-                "backstop_ratio":buffer.backstop_ratio, "exceeds_backstop":ratio > f64::from(buffer.backstop_ratio),
+                "backstop_ratio":buffer.backstop_ratio, "exceeds_backstop":buffer.backstop_ratio > 0 && ratio > f64::from(buffer.backstop_ratio),
                 "time_basis":"raw command-buffer counters; unscaled"}));
         }
     }
@@ -228,6 +228,16 @@ mod tests {
             .unwrap();
         assert_eq!(dispatch["measured_predicted_ratio"], 2.0);
         assert!(ranking::human(&row).contains("5.000x"));
+        profile.submissions[0].buffer_admission[0].backstop_ratio = 0;
+        let observational = report(&profile, &calibration, 0.8).unwrap();
+        assert_eq!(
+            observational["buffer_admission"][0]["measured_predicted_ratio"],
+            5.0
+        );
+        assert_eq!(
+            observational["buffer_admission"][0]["exceeds_backstop"],
+            false
+        );
         profile.submissions[0].buffer_admission[0].reserve_seconds = 2.0;
         assert!(profile.validate().is_err());
         profile.submissions[0].buffer_admission.clear();
