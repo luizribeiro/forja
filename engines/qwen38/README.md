@@ -31,7 +31,7 @@ The `qwen38-27b-4bit.metal-apple-m3-ultra.q4-long` profile declares 262,144 toke
 with F16 KV. The operator may lower `serving.max_context`. Prompt scratch remains
 bounded by 2,048 tokens. Profile `prompt-chunks` bounds actual pieces to 512
 through 32,768 context tokens and 128 afterward. The standard q4 profile uses
-512 through its 32,768-token limit. The F32 KV profile uses 512 through 16,384
+512 through its 32,768-token limit. The F32 KV profile uses 512 through 2,048
 and 128 afterward. These guest declarations keep each submission within the
 host's cumulative forecast budget. The automatic live quota remains 48 GiB; admission counts
 weights, KV backing, state versions, tables, graphs and retained scratch. Long

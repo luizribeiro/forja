@@ -1,6 +1,9 @@
 schema-version = 1
 family = "qwen3-coder"
-prompt-chunks = [{ through = 131072, tokens = 16 }]
+prompt-chunks = [
+  { through = 32768, tokens = 16 },
+  { through = 131072, tokens = 1 },
+]
 
 [model]
 id = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"

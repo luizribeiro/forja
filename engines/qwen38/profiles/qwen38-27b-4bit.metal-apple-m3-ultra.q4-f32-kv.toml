@@ -1,7 +1,7 @@
 schema-version = 1
 family = "qwen38"
 prompt-chunks = [
-  { through = 16384, tokens = 512 },
+  { through = 2048, tokens = 512 },
   { through = 32768, tokens = 128 },
 ]
 
