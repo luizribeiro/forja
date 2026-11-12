@@ -8,6 +8,8 @@ mod analysis_metrics;
 mod analysis_report;
 mod args;
 mod benchmark;
+#[cfg(target_os = "macos")]
+mod benchmark_guard;
 mod benchmark_record;
 mod benchmark_snapshot;
 mod benchmark_stats;

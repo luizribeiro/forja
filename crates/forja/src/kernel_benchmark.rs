@@ -61,12 +61,14 @@ pub(crate) fn run(
 #[cfg(target_os = "macos")]
 fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), Box<dyn Error>> {
     use forja_core::Submission;
+    crate::benchmark_guard::require_calibration()?;
     let shape: Shape = serde_json::from_slice(&fs::read(&options.shape)?)?;
     let (backend, live_bytes) = crate::engine::metal_backend(
         config.backend.metal.resolve().graph_replay,
         config.backend.metal.pool_capacity,
         &config.limits,
     )?;
+    let backend = crate::benchmark_guard::configure(backend)?;
     let dispatches = effective_dispatches(options)?;
     let sum_bytes = |specs: &[TensorShape]| {
         specs.iter().try_fold(0_u64, |total, tensor| {
@@ -127,6 +129,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .transpose()?
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
+        "roofline_guard": crate::benchmark_guard::record()?,
         "variant": options.variant, "serial": options.serial, "advance_position": options.advance_position, "operand_order": if options.advance_position {"consecutive"} else {"cyclic"}, "copies": options.copies.get(), "resident_operand_bytes": bytes,
         "state_steps": options.state_steps.get(), "row_chunk": options.row_chunk.map(std::num::NonZeroU32::get), "dispatches_per_sample": actual_dispatches, "primary_dispatches_per_sample": primary_dispatches, "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({

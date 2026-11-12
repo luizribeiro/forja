@@ -24,6 +24,10 @@ pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box
     if options.json.exists() {
         return Err("refusing to overwrite a benchmark record".into());
     }
+    #[cfg(target_os = "macos")]
+    if config.backend.kind == BackendKind::Metal {
+        crate::benchmark_guard::require_calibration()?;
+    }
     let started = Instant::now();
     let (profile, suite, identities) = prepare(options, config)?;
     match config.backend.kind {
@@ -50,6 +54,7 @@ pub(crate) async fn run(options: &Options, config: &DevConfig) -> Result<(), Box
                     config.backend.metal.pool_capacity,
                     &config.limits,
                 )?;
+                let backend = crate::benchmark_guard::configure(backend)?;
                 let device = backend.device_name();
                 execute(
                     backend,
@@ -128,6 +133,7 @@ async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
             write_record(
                 options,
                 measure(options, config, profile, suite, inputs, &session, device).await?,
+                config.backend.kind == BackendKind::Metal,
             )
         }
     }
@@ -138,7 +144,19 @@ async fn execute<B: forja_core::Backend + Send + Sync + 'static>(
     Ok(())
 }
 
-fn write_record(options: &Options, mut document: Value) -> Result<(), Box<dyn Error>> {
+fn write_record(
+    options: &Options,
+    mut document: Value,
+    guarded: bool,
+) -> Result<(), Box<dyn Error>> {
+    if guarded {
+        #[cfg(target_os = "macos")]
+        {
+            document["roofline_guard"] = crate::benchmark_guard::record()?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err("Metal benchmark guards require macOS".into());
+    }
     record::decorate(&mut document)?;
     let stream_check = if options.mode == Mode::Draft {
         let path = options

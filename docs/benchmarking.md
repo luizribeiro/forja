@@ -320,6 +320,33 @@ instruction throughput. Quantized matrix diagnostics also report compiled
 execution width, threadgroup limits and static threadgroup storage; these limits
 do not measure occupancy, register allocation or spills.
 
+Metal kernel and model benchmarks check each completed command buffer before
+writing a record. They require an existing calibration cache for the machine,
+GPU and OS build. Run `forja calibrate` before starting any benchmarks or workers;
+bench processes never create or refresh this calibration. Missing, corrupt or
+mismatched caches fail with the cache path and a `forja calibrate --force` remedy.
+Rates above the fastest raw calibration observation plus a **10% margin**
+are refused with an `impossible benchmark record` error.
+
+The arithmetic check counts unconditional dense matrix FLOPs against the fastest
+supported calibrated arithmetic. The bandwidth check uses the largest contiguous
+matrix, copy or argmax input **only when it exceeds the 512 MiB cache allowance**,
+subtracting that allowance from the guarded byte count. Inputs at or below
+512 MiB receive no bandwidth check. It never sums logical operand traffic across
+reused tensors. Small cached inputs, noncontiguous views and routed or masked work
+do not establish a physical bandwidth or arithmetic lower bound for this check.
+Unknown or overflowing dispatch costs are omitted from the lower bound. Graph
+summaries count only static dispatches and are cached across replay; dynamically
+instantiated contributions are omitted. Missing GPU timestamps skip buffer
+validation and increment `roofline_guard.buffers_without_gpu_timestamps` (a
+process-wide counter including warmups). The diagnostic's logical rates remain
+distinct from the guarded rates. Refusals suggest `forja calibrate --force` to
+refresh the calibration.
+
+`roofline_guard` records the limits, margin, cache allowance, calibration content
+hash, machine identity and calibration provenance. Raw observations remain in the
+calibration cache; `forja calibrate --json calibration.json` exports them.
+
 ## Choose the next optimization
 
 Calibration records include dependent scalar arithmetic, special-function and

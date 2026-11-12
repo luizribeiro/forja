@@ -36,7 +36,11 @@ pub(super) async fn run<S: ChatService>(
             super::measure(&sample, config, profile, suite, inputs, session, device).await?;
         document["worker"] = identity.clone();
         document["measurement_mode"]["execution"] = "resident-worker".into();
-        super::write_record(&sample, document)?;
+        super::write_record(
+            &sample,
+            document,
+            config.backend.kind == forja_config::BackendKind::Metal,
+        )?;
         let mut result = identity.clone();
         result["id"] = json!(request.id);
         result["wall_seconds"] = json!(started.elapsed().as_secs_f64());

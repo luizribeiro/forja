@@ -42,22 +42,8 @@ pub(crate) fn load_or_measure(options: &Options) -> Result<Value, Box<dyn Error>
     #[cfg(target_os = "macos")]
     {
         let identity = identity()?;
-        let root = options
-            .cache
-            .clone()
-            .or_else(|| {
-                std::env::var_os("XDG_CACHE_HOME")
-                    .map(PathBuf::from)
-                    .map(|path| path.join("forja/calibration"))
-            })
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|path| path.join(".cache/forja/calibration"))
-            })
-            .ok_or("calibration cache path unavailable")?;
-        fs::create_dir_all(&root)?;
-        let path = root.join(format!("{}.json", cache_key(&identity)));
+        let path = cache_path(options.cache.as_deref(), &identity)?;
+        fs::create_dir_all(path.parent().ok_or("calibration cache has no parent")?)?;
         if !options.force && path.exists() {
             let record: Value = serde_json::from_slice(&fs::read(&path)?)?;
             validate(&record, &identity)?;
@@ -70,6 +56,27 @@ pub(crate) fn load_or_measure(options: &Options) -> Result<Value, Box<dyn Error>
         fs::rename(temporary, path)?;
         Ok(record)
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn cache_path(
+    cache: Option<&std::path::Path>,
+    identity: &Value,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let root = cache
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("forja/calibration"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".cache/forja/calibration"))
+        })
+        .ok_or("calibration cache path unavailable")?;
+    Ok(root.join(format!("{}.json", cache_key(identity))))
 }
 
 const PROBES: &[&str] = &[

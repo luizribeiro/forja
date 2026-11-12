@@ -176,6 +176,8 @@ pub(crate) async fn run(options: &Bench) -> Result<(), Box<dyn Error>> {
         return adopt_report(options, path);
     }
     #[cfg(target_os = "macos")]
+    crate::benchmark_guard::require_calibration()?;
+    #[cfg(target_os = "macos")]
     return if options.mode.execution == crate::args::BenchExecution::ResidentWorker {
         resident::run(options).await
     } else {
@@ -582,6 +584,7 @@ async fn run_metal(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (results, device) = measure_points(options, &perf_keys, &perf_hashes, runners).await?;
+    let roofline_guard = crate::benchmark_guard::record()?;
     let load_after = machine_load::capture("AFTER BENCHMARK")?;
     check_strategy_outputs(&options.strategy_axes, &results)?;
     if options
@@ -599,6 +602,7 @@ async fn run_metal(
         let mut report = serde_json::json!({
             "schema_version": benchmark_record::SCHEMA_VERSION,
             "implementation": "forja",
+            "roofline_guard": roofline_guard,
             "measurement_mode": benchmark_record::measurement_mode(options),
             "provenance": {
                 "commit": commit,
@@ -1702,6 +1706,7 @@ async fn load_benchmark_runner(
 ) -> Result<(EngineRunner<forja_metal::MetalBackend>, EngineInfo, String), Box<dyn Error>> {
     let (backend, live_bytes) =
         crate::engine::metal_backend(point.graph_replay, options.pool_capacity, &options.limits)?;
+    let backend = crate::benchmark_guard::configure(backend)?;
     let device = backend.device_name();
     let mut runner = EngineRunner::new(
         component,

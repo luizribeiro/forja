@@ -174,7 +174,8 @@ async fn completion_records_prove_draft_streams_on_a_cpu_fixture() -> Result<(),
 #[test]
 fn a_stream_mismatch_keeps_a_failed_record_and_returns_an_error() -> Result<(), Box<dyn Error>> {
     let (root, mut options, _) = fixture()?;
-    let (plain, _) = crate::completion_stream::tests::pair();
+    let (mut plain, _) = crate::completion_stream::tests::pair();
+    plain["provenance"]["gpu_cores"] = json!(7);
     fs::write(&options.json, serde_json::to_vec(&plain)?)?;
     options.mode = Mode::Draft;
     options.plain_record = Some(options.json.clone());
@@ -183,13 +184,14 @@ fn a_stream_mismatch_keeps_a_failed_record_and_returns_an_error() -> Result<(), 
     draft["mode"] = json!("draft");
     draft["results"][0]["token_stream_hashes"][0] = json!(format!("sha256:{}", "d".repeat(64)));
     assert!(
-        write_record(&options, draft)
+        write_record(&options, draft, false)
             .unwrap_err()
             .to_string()
             .contains("token-stream hash")
     );
     let failed: Value = serde_json::from_slice(&fs::read(&options.json)?)?;
     assert_eq!(failed["stream_check"]["status"], "failed");
+    assert!(failed.get("roofline_guard").is_none());
     assert!(
         failed["stream_check"]["plain_record_hash"]
             .as_str()
