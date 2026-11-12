@@ -69,10 +69,13 @@ async fn prefill(
 ) -> Result<(), Box<dyn Error>> {
     runner.prepare_paged_lane(lane, None, 0)?;
     runner.prepare_paged_lane(lane, None, reserved)?;
-    for (index, chunk) in tokens.chunks(usize::try_from(shape.tokens)?).enumerate() {
-        let start = u32::try_from(index)?
-            .checked_mul(shape.tokens)
-            .ok_or("batch prompt offset overflow")?;
+    let pieces = super::prompt_submissions(
+        tokens,
+        0,
+        std::num::NonZeroUsize::new(usize::try_from(shape.tokens)?).ok_or("empty prompt shape")?,
+        |start, count| runner.prompt_piece_limit(start, count).map_err(Into::into),
+    )?;
+    for (start, chunk) in pieces {
         let output = runner
             .batch_step(EngineBatch {
                 shape,

@@ -142,12 +142,7 @@ where
     let sampling = sampling_params(options)?;
     let prompt_len = u32::try_from(prompt.len())?;
     let first = runner
-        .enqueue_decode(EngineDecode {
-            phase: forja_host::BatchPhase::Prompt,
-            tokens: Some(prompt),
-            start_pos: 0,
-            sampling,
-        })
+        .enqueue_prompt(&prompt, 0, sampling)
         .await?
         .map_err(|error| format!("engine decode failed: {error:?}"))?;
     let mut stream = tokenizer.decode_stream(true);

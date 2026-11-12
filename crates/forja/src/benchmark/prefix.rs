@@ -23,12 +23,7 @@ impl Prepared {
             return Err("prefix workers require authenticated paged storage".into());
         }
         let output = runner
-            .decode(EngineDecode {
-                phase: forja_host::BatchPhase::Prompt,
-                tokens: Some(prompt.to_vec()),
-                start_pos: 0,
-                sampling: options.sampling,
-            })
+            .enqueue_prompt(prompt, 0, options.sampling)
             .await?
             .map_err(|error| format!("prefix preparation failed: {error:?}"))?;
         let feedback = read_token(&runner.read(&output.token).await?)?;

@@ -2035,6 +2035,66 @@ where
             .await
     }
 
+    /// Ingests a prompt using the loaded profile's context-dependent pieces.
+    /// Earlier pieces complete before the final queued output is returned.
+    /// # Errors
+    /// Refuses empty or overflowing spans and propagates guest execution failures.
+    pub async fn enqueue_prompt(
+        &mut self,
+        tokens: &[u32],
+        start: u32,
+        sampling: SamplingParams,
+    ) -> wasmtime::Result<Result<EngineDecodeOutput, compute::Error>> {
+        let Some(end) = u32::try_from(tokens.len())
+            .ok()
+            .filter(|n| *n > 0)
+            .and_then(|n| start.checked_add(n))
+        else {
+            return Ok(Err(quota("prompt span is empty or exceeds u32")));
+        };
+        let mut position = start;
+        loop {
+            let remaining = end
+                .checked_sub(position)
+                .ok_or_else(|| wasmtime::Error::msg("prompt position exceeds its end"))?;
+            let count = match self.prompt_piece_limit(position, remaining) {
+                Ok(count) => count,
+                Err(error) => return Ok(Err(error)),
+            };
+            let offset = usize::try_from(
+                position
+                    .checked_sub(start)
+                    .ok_or_else(|| wasmtime::Error::msg("prompt position precedes its start"))?,
+            )?;
+            let count = usize::try_from(count)?;
+            let next_offset = offset
+                .checked_add(count)
+                .ok_or_else(|| wasmtime::Error::msg("prompt offset overflow"))?;
+            let piece = tokens
+                .get(offset..next_offset)
+                .ok_or_else(|| wasmtime::Error::msg("prompt piece exceeds its input"))?;
+            let output = match self
+                .enqueue_decode(EngineDecode {
+                    phase: BatchPhase::Prompt,
+                    tokens: Some(piece.to_vec()),
+                    start_pos: position,
+                    sampling,
+                })
+                .await?
+            {
+                Ok(output) => output,
+                Err(error) => return Ok(Err(error)),
+            };
+            position = position
+                .checked_add(u32::try_from(count)?)
+                .ok_or_else(|| wasmtime::Error::msg("prompt position overflow"))?;
+            if position == end {
+                return Ok(Ok(output));
+            }
+            self.read_queued_token(output).await?;
+        }
+    }
+
     /// Runs one homogeneous combined batch and retains its device tensors.
     /// # Errors
     ///
@@ -15776,6 +15836,41 @@ mod tests {
         assert!(narrowed.validate_prompt_chunks(info).is_err());
         assert!(runner.check_prompt_piece(BatchPhase::Prompt, 8, 1).is_ok());
         assert!(runner.check_prompt_piece(BatchPhase::Decode, 8, 2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn prompt_ingestion_advances_feedback_across_declared_pieces() {
+        let weights = test_weight_file();
+        let mut runner = EngineRunner::new(
+            test_guests::engine_sdk_smoke(),
+            CpuBackend::new(),
+            GENEROUS,
+            &weights,
+        )
+        .await
+        .unwrap();
+        let config = super::EngineLoadConfig {
+            max_context: Some(16),
+            paged_cache: true,
+            prompt_chunks: Some(Arc::new(
+                forja_core::PromptChunkPolicy::new(vec![(16, 1)], 16, 1).unwrap(),
+            )),
+            ..Default::default()
+        };
+        runner
+            .load_with_selections(None, &config)
+            .await
+            .unwrap()
+            .unwrap();
+        runner.prepare_paged_request(None, 8).unwrap();
+        let before = runner.metrics().submissions;
+        let output = runner
+            .enqueue_prompt(&[1; 6], 0, SamplingParams::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runner.read_queued_token(output).await.unwrap().len(), 4);
+        assert!(runner.metrics().submissions >= before + 6);
     }
 
     async fn assert_forward_selection_boundary_sdk<B: Backend + Send + Sync + 'static>(backend: B) {
