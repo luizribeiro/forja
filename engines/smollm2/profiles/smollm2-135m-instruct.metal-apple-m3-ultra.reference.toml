@@ -1,5 +1,6 @@
 schema-version = 1
 family = "smollm2"
+prompt-chunks = [{ through = 8192, tokens = 512 }]
 
 [model]
 id = "HuggingFaceTB/SmolLM2-135M-Instruct"

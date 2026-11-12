@@ -590,8 +590,14 @@ fn recurrent_profiles_declare_context_dependent_prompt_pieces() {
 }
 
 #[test]
-fn routed_profiles_bound_prompt_pieces_at_every_declared_context() {
+fn profiles_bound_prompt_pieces_at_every_declared_context() {
     for (text, expected) in [
+        (
+            include_str!(
+                "../../../engines/smollm2/profiles/smollm2-135m-instruct.metal-apple-m3-ultra.reference.toml"
+            ),
+            512,
+        ),
         (
             include_str!(
                 "../../../engines/qwen3-coder/profiles/qwen3-coder-30b-a3b-instruct-4bit.metal-apple-m3-ultra.q4.toml"
