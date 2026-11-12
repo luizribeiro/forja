@@ -123,6 +123,11 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
                 "gpu_seconds": submission.gpu_time().ok_or("GPU timing unavailable")?.as_secs_f64()}));
         }
     }
+    let profiled = backend.submit_profiled(commands.clone())?;
+    profiled.wait()?;
+    let work = profiled
+        .profile()
+        .ok_or("kernel work profile unavailable")?;
     let resources = commands
         .last_dispatch()
         .map(|dispatch| backend.kernel_resources(dispatch))
@@ -130,6 +135,7 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         .flatten();
     let report = serde_json::json!({"kind": "kernel-diagnostic", "model_benchmark": false,
         "roofline_guard": crate::benchmark_guard::record()?,
+        "work_profile": work_profile(&work),
         "variant": options.variant, "serial": options.serial, "advance_position": options.advance_position, "operand_order": if options.advance_position {"consecutive"} else {"cyclic"}, "copies": options.copies.get(), "resident_operand_bytes": bytes,
         "state_steps": options.state_steps.get(), "row_chunk": options.row_chunk.map(std::num::NonZeroU32::get), "dispatches_per_sample": actual_dispatches, "primary_dispatches_per_sample": primary_dispatches, "cost_per_dispatch": cost.map(forja_core::KernelCost::json), "shape": serde_json::from_slice::<serde_json::Value>(&fs::read(&options.shape)?)?,
         "pipeline_resources": resources.map(|resources| serde_json::json!({
@@ -151,6 +157,26 @@ fn run_metal(options: &Options, config: &forja_config::DevConfig) -> Result<(), 
         options.variant, options.reps
     );
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn work_profile(profile: &forja_core::SubmissionProfile) -> serde_json::Value {
+    serde_json::json!({
+        "basis": "separate precise diagnostic submission; excluded from benchmark samples",
+        "calibration": profile.work_calibration.as_ref().map(|rates| rates.json()),
+        "predicted_gpu_seconds": profile.predicted_gpu.as_secs_f64(),
+        "dispatches": profile.per_dispatch.iter().map(|d| serde_json::json!({
+            "kernel": d.kernel, "variant": d.variant, "physical_dispatches": d.physical_dispatches,
+            "scheduled_cost": d.scheduled_cost.json(), "critical_path_cost": d.critical_path_cost.json(),
+            "predicted_gpu_seconds": d.predicted_gpu.as_secs_f64(),
+            "gpu_time_seconds": d.gpu_time.as_secs_f64(),
+        })).collect::<Vec<_>>(),
+        "buffers": profile.buffer_admission.iter().map(|b| serde_json::json!({
+            "predicted_gpu_seconds": b.predicted_gpu.as_secs_f64(),
+            "reserve_seconds": b.reserve.as_secs_f64(), "gpu_time_seconds": b.gpu_time.as_secs_f64(),
+            "backstop_ratio": b.backstop_ratio,
+        })).collect::<Vec<_>>()
+    })
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -502,6 +528,24 @@ fn effective_dispatches(options: &Options) -> Result<std::num::NonZeroU32, Box<d
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn work_diagnostics_keep_raw_forecasts_and_buffer_intervals() {
+        let profile = forja_core::SubmissionProfile {
+            predicted_gpu: std::time::Duration::from_millis(20),
+            buffer_admission: vec![forja_core::CommandBufferProfile {
+                predicted_gpu: std::time::Duration::from_millis(20),
+                reserve: std::time::Duration::from_millis(3),
+                gpu_time: std::time::Duration::from_millis(7),
+                backstop_ratio: 4,
+            }],
+            ..forja_core::SubmissionProfile::default()
+        };
+        let record = work_profile(&profile);
+        assert_eq!(record["predicted_gpu_seconds"], 0.02);
+        assert_eq!(record["buffers"][0]["gpu_time_seconds"], 0.007);
+        assert_eq!(record["buffers"][0]["reserve_seconds"], 0.003);
+    }
+
     #[test]
     fn chained_state_inputs_require_the_complete_suffix() {
         for (kind, arity, source) in [("delta-rule", 9, 5), ("causal-depthwise-conv", 6, 2)] {
