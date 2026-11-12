@@ -175,15 +175,25 @@ async fn metal_real_full_catalog_replays_under_the_live_quota() -> Result<(), Bo
 async fn metal_real_long_prompt_replays_within_production_submission_limits()
 -> Result<(), Box<dyn Error>> {
     let (mut runner, _) = load_with(true, None).await?;
-    for start in [0, 2048] {
-        runner
-            .step(forja_host::EngineStep {
-                phase: BatchPhase::Prompt,
-                tokens: (0..2048).map(|row| 100 + row % 7).collect(),
-                start_pos: start,
-                taps: false,
-            })
-            .await??;
+    for start in [0_u32, 2048] {
+        let mut consumed = 0;
+        while consumed < 2048 {
+            let position = start
+                .checked_add(consumed)
+                .ok_or("prompt position overflow")?;
+            let count = runner.prompt_piece_limit(position, 2048 - consumed)?;
+            let end = consumed.checked_add(count).ok_or("prompt piece overflow")?;
+            let output = runner
+                .step(forja_host::EngineStep {
+                    phase: BatchPhase::Prompt,
+                    tokens: (consumed..end).map(|row| 100 + row % 7).collect(),
+                    start_pos: position,
+                    taps: false,
+                })
+                .await??;
+            runner.read(&output.logits).await?;
+            consumed = end;
+        }
     }
     for (phase, tokens, start_pos) in [
         (BatchPhase::Prompt, Some(vec![100]), 4096),

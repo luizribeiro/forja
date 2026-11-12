@@ -266,7 +266,7 @@ pub(crate) async fn measure_token_profile(
         measure_profile_phase(&mut runner, &tokens, options, decode).await?;
     }
     let baseline = measure_profile_phase(&mut runner, &tokens, options, decode).await?;
-    let profiled = measure_profiled_phase(&mut runner, &tokens, options, decode).await?;
+    let (profiled, detail) = measure_profiled_phase(&mut runner, &tokens, options, decode).await?;
     Ok(TokenProfile {
         device,
         baseline_wall: Duration::from_secs_f64(baseline.wall_seconds),
@@ -274,9 +274,7 @@ pub(crate) async fn measure_token_profile(
         profiled_wall: Duration::from_secs_f64(profiled.wall_seconds),
         profiled_gpu: Duration::from_secs_f64(profiled.gpu_seconds),
         cache_setup_wall: Duration::ZERO,
-        step: runner
-            .take_profile()
-            .ok_or("profiled phase produced no timing detail")?,
+        step: detail,
     })
 }
 
@@ -481,26 +479,29 @@ async fn measure_profiled_phase(
     tokens: &[u32],
     options: &Profile,
     decode: DecodeOptions,
-) -> Result<Sample, Box<dyn Error>> {
+) -> Result<(Sample, EngineStepProfile), Box<dyn Error>> {
     let result = match options.mode {
         ProfileMode::Prefill => {
             prepare_profile_prefix(runner, tokens, options.prefix_context).await?;
             runner.set_profiling(true);
-            measure_prefill_from(
-                runner,
-                &tokens[options.prefix_context..],
-                options.prefix_context,
-            )
-            .await
+            let suffix = &tokens[options.prefix_context..];
+            let limit = std::num::NonZeroUsize::new(suffix.len()).ok_or("empty prefill")?;
+            let (sample, profiles) =
+                measure_prefill_chunks(runner, suffix, options.prefix_context, limit).await?;
+            Ok((sample, merge_step_profiles(profiles)?))
         }
         ProfileMode::Decode => {
             let token = prepare_profile_context(runner, tokens, options.context, decode, 1).await?;
             runner.set_profiling(true);
-            profile_selection::decode(runner, token, options, decode, true).await
+            let sample = profile_selection::decode(runner, token, options, decode, true).await?;
+            Ok((
+                sample,
+                runner
+                    .take_profile()
+                    .ok_or("profiled phase produced no timing detail")?,
+            ))
         }
-        ProfileMode::Verify => {
-            return Err("verify profiling requires a declared batch shape".into());
-        }
+        ProfileMode::Verify => Err("verify profiling requires a declared batch shape".into()),
     };
     runner.set_profiling(false);
     result
@@ -1522,7 +1523,7 @@ async fn measure_record_prefill(
     prepare_benchmark_runner(runner, prompt.len())?;
     let setup = started.elapsed();
     let sample = if let Some(limit) = runners.prefill_step {
-        measure_prefill_chunks(runner, prompt, 0, limit).await?
+        measure_prefill_chunks(runner, prompt, 0, limit).await?.0
     } else {
         measure_prefill(runner, prompt).await?
     };
@@ -2223,7 +2224,9 @@ async fn measure_prefill_from(
     start: usize,
 ) -> Result<Sample, Box<dyn Error>> {
     let limit = std::num::NonZeroUsize::new(tokens.len()).ok_or("empty prefill")?;
-    measure_prefill_chunks(runner, tokens, start, limit).await
+    measure_prefill_chunks(runner, tokens, start, limit)
+        .await
+        .map(|(sample, _)| sample)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2273,12 +2276,13 @@ async fn measure_prefill_chunks(
     tokens: &[u32],
     start: usize,
     limit: std::num::NonZeroUsize,
-) -> Result<Sample, Box<dyn Error>> {
+) -> Result<(Sample, Vec<EngineStepProfile>), Box<dyn Error>> {
     let submissions = prompt_submissions(tokens, start, limit, |start, count| {
         runner.prompt_piece_limit(start, count).map_err(Into::into)
     })?;
     let before = runner.metrics();
     let started = Instant::now();
+    let mut profiles = Vec::new();
     for (position, chunk) in submissions {
         step(
             runner,
@@ -2288,8 +2292,14 @@ async fn measure_prefill_chunks(
         )
         .await?;
         runner.wait_for_queued_submissions().await?;
+        if let Some(profile) = runner.take_profile() {
+            profiles.push(profile);
+        }
     }
-    sample(before, runner.metrics(), started.elapsed())
+    Ok((
+        sample(before, runner.metrics(), started.elapsed())?,
+        profiles,
+    ))
 }
 
 #[cfg(target_os = "macos")]

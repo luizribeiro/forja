@@ -1,5 +1,9 @@
 schema-version = 1
 family = "qwen38"
+prompt-chunks = [
+  { through = 16384, tokens = 512 },
+  { through = 32768, tokens = 128 },
+]
 
 [model]
 id = "mlx-community/Qwen3.8-27B-4bit"

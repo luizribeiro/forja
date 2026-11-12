@@ -130,4 +130,43 @@ mod tests {
         assert!(measured.baseline_gpu > std::time::Duration::ZERO);
         Ok(())
     }
+    #[test]
+    #[ignore = "requires FORJA_MODELS and runs in the pre-push hook"]
+    fn metal_native_profile_keeps_every_context_bounded_piece() -> Result<(), Box<dyn Error>> {
+        let models = std::env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?;
+        let crate::args::Command::Profile(mut options) = crate::args::parse([
+            "--isolated".to_owned(),
+            "profile".to_owned(),
+            "--engine".to_owned(),
+            test_guests::qwen38().display().to_string(),
+            "--model".to_owned(),
+            std::path::Path::new(&models)
+                .join("Qwen3.8-27B-4bit")
+                .display()
+                .to_string(),
+            "--mode".to_owned(),
+            "prefill".to_owned(),
+            "--context".to_owned(),
+            "513".to_owned(),
+        ])?
+        else {
+            return Err("expected profile options".into());
+        };
+        options.warmups = 0;
+        let measured = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?
+            .block_on(super::super::measure_token_profile(&options))?;
+        assert!(measured.step.submissions.len() >= 2);
+        assert_eq!(
+            measured
+                .step
+                .submissions
+                .iter()
+                .map(|s| s.gpu_time)
+                .sum::<std::time::Duration>(),
+            measured.profiled_gpu
+        );
+        Ok(())
+    }
 }

@@ -51,11 +51,13 @@ impl Request {
     }
     async fn prefill(&mut self, mut start: u32, end: u32) -> Result<(), Box<dyn Error>> {
         while start < end {
-            let count = (end - start).min(2048);
+            let count = self
+                .runner
+                .prompt_piece_limit(start, (end - start).min(2048))?;
             let shape = BatchShape {
                 phase: BatchPhase::Prompt,
                 bucket: 1,
-                tokens: [64, 512, 2048]
+                tokens: [64, 128, 512, 2048]
                     .into_iter()
                     .find(|size| *size >= count)
                     .unwrap(),

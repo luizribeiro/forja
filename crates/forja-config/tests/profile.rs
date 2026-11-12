@@ -555,3 +555,36 @@ fn qwen38_long_profile_bounds_prompt_scratch_without_raising_host_quotas() {
             .is_err()
     );
 }
+
+#[test]
+fn recurrent_profiles_declare_context_dependent_prompt_pieces() {
+    for (source, start, expected) in [
+        (
+            include_str!(
+                "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml"
+            ),
+            16384,
+            512,
+        ),
+        (
+            include_str!(
+                "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4-f32-kv.toml"
+            ),
+            16384,
+            128,
+        ),
+        (
+            include_str!(
+                "../../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4-long.toml"
+            ),
+            65536,
+            128,
+        ),
+    ] {
+        let profile: Profile = toml::from_str(source).unwrap();
+        let policy = profile.prompt_chunk_policy().unwrap().unwrap();
+        assert_eq!(policy.limit(0, 2048).unwrap(), 512);
+        assert_eq!(policy.limit(start, 512).unwrap(), expected);
+        assert_eq!(profile.workload().prefill_chunk.get(), 2048);
+    }
+}

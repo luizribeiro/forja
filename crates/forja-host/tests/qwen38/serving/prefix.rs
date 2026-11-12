@@ -50,6 +50,7 @@ async fn evaluate<B: Backend + Send + Sync + 'static>(
                 (tokens.len() as u64 - position).min(2048) as u32,
             )?
         };
+        let count = runner.prompt_piece_limit(u32::try_from(position)?, count)?;
         let start = usize::try_from(position)?;
         let end = start + usize::try_from(count)?;
         let output = runner
