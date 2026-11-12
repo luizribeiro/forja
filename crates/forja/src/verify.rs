@@ -67,6 +67,76 @@ struct PromptChecks {
     first_router_mismatch: Option<String>,
 }
 
+#[derive(Default)]
+struct PromptOutput {
+    logits: Vec<f32>,
+    taps: Vec<Vec<f32>>,
+    routers: Vec<Vec<f32>>,
+}
+
+async fn prompt_pieces<B>(
+    runner: &mut EngineRunner<B>,
+    tokens: &[u32],
+    taps: bool,
+) -> Result<PromptOutput, Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if tokens.is_empty() {
+        return Err("verification prompt is empty".into());
+    }
+    let mut result = PromptOutput::default();
+    let mut offset = 0_usize;
+    while offset < tokens.len() {
+        let start_pos = u32::try_from(offset)?;
+        let remaining = tokens
+            .len()
+            .checked_sub(offset)
+            .ok_or("invalid prompt offset")?;
+        let count = runner.prompt_piece_limit(start_pos, u32::try_from(remaining)?)?;
+        let end = offset
+            .checked_add(usize::try_from(count)?)
+            .ok_or("verification prompt offset overflowed")?;
+        let output = runner
+            .step(EngineStep {
+                phase: forja_host::BatchPhase::Prompt,
+                tokens: tokens
+                    .get(offset..end)
+                    .ok_or("invalid prompt piece")?
+                    .to_vec(),
+                start_pos,
+                taps,
+            })
+            .await?
+            .map_err(|error| format!("engine step failed: {error:?}"))?;
+        result.logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+        append_tensors(runner, &mut result.taps, &output.taps).await?;
+        append_tensors(runner, &mut result.routers, &output.router_logits).await?;
+        offset = end;
+    }
+    Ok(result)
+}
+
+async fn append_tensors<B>(
+    runner: &mut EngineRunner<B>,
+    rows: &mut Vec<Vec<f32>>,
+    tensors: &[EngineTensor],
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + Send + Sync + 'static,
+{
+    if rows.is_empty() {
+        rows.resize_with(tensors.len(), Vec::new);
+    }
+    if rows.len() != tensors.len() {
+        return Err("verification tap count changed between prompt pieces".into());
+    }
+    for (rows, tensor) in rows.iter_mut().zip(tensors) {
+        rows.extend(decode_f32_le(&runner.read(tensor).await?)?);
+    }
+    Ok(())
+}
+
 struct DecodeInput<'a> {
     prompt: &'a str,
     expected_tokens: &'a [i64],
@@ -313,24 +383,15 @@ where
         .iter()
         .map(|&token| u32::try_from(token))
         .collect::<Result<Vec<_>, _>>()?;
-    let output = runner
-        .step(EngineStep {
-            phase: forja_host::BatchPhase::Prompt,
-            tokens: tokens.clone(),
-            start_pos: 0,
-            taps: true,
-        })
-        .await?
-        .map_err(|error| format!("engine step failed: {error:?}"))?;
-    let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+    let output = prompt_pieces(runner, &tokens, true).await?;
     let layer_tolerance = match precision {
         Precision::F32 => F32_HIDDEN_STATE_TOLERANCE,
         Precision::Bf16 => BF16_HIDDEN_STATE_TOLERANCE,
     };
     let (maximum_layer_error, first_failing) =
-        compare_layers(runner, fixture, &output.taps, layer_tolerance).await?;
+        compare_layers(fixture, &output.taps, layer_tolerance)?;
     let (routers_passed, first_router_mismatch) =
-        compare_routers(runner, fixture, &output.router_logits, layer_tolerance).await?;
+        compare_routers(fixture, &output.routers, layer_tolerance)?;
     let checks = PromptChecks {
         maximum_layer_error,
         first_failing,
@@ -342,7 +403,7 @@ where
         expected_tokens: fixture.greedy_tokens(),
         reference_logits: fixture.greedy_step_logits().values(),
         prompt_tokens: u32::try_from(fixture.prompt_ids().len())?,
-        logits,
+        logits: output.logits,
         vocab,
         steps: decode_steps,
     };
@@ -352,15 +413,11 @@ where
     }
 }
 
-async fn compare_routers<B>(
-    runner: &mut EngineRunner<B>,
+fn compare_routers(
     fixture: &golden_fixtures::PromptFixture,
-    routers: &[EngineTensor],
+    routers: &[Vec<f32>],
     tolerance: f64,
-) -> Result<(bool, Option<String>), Box<dyn Error>>
-where
-    B: Backend + Send + Sync + 'static,
-{
+) -> Result<(bool, Option<String>), Box<dyn Error>> {
     let Some(expected) = fixture.router_logits() else {
         return Ok((routers.is_empty(), None));
     };
@@ -379,8 +436,7 @@ where
         .ok_or("router fixture size overflowed")?;
     let mut passed = true;
     let mut first_mismatch = None;
-    for (layer, router) in routers.iter().enumerate() {
-        let actual = decode_f32_le(&runner.read(router).await?)?;
+    for (layer, actual) in routers.iter().enumerate() {
         let start = layer
             .checked_mul(layer_len)
             .ok_or("router fixture offset overflowed")?;
@@ -391,7 +447,7 @@ where
             .values()
             .get(start..end)
             .ok_or("router fixture is incomplete")?;
-        let error = normwise_relative_error(reference, &actual)?;
+        let error = normwise_relative_error(reference, actual)?;
         let layer_passed = error <= tolerance;
         if !layer_passed && first_mismatch.is_none() {
             first_mismatch = Some(format!("{}:*", layer + 1));
@@ -444,23 +500,18 @@ fn near_tie_swap(reference: &[f32], expected: &[usize], actual: &[usize]) -> boo
     matches!((minimum, maximum), (Some(minimum), Some(maximum)) if maximum - minimum <= ROUTER_NEAR_TIE)
 }
 
-async fn compare_layers<B>(
-    runner: &mut EngineRunner<B>,
+fn compare_layers(
     fixture: &golden_fixtures::PromptFixture,
-    taps: &[EngineTensor],
+    taps: &[Vec<f32>],
     tolerance: f64,
-) -> Result<(f64, Option<usize>), Box<dyn Error>>
-where
-    B: Backend + Send + Sync + 'static,
-{
+) -> Result<(f64, Option<usize>), Box<dyn Error>> {
     let mut first_failing = None;
     let mut maximum = 0.0_f64;
-    for (index, tap) in taps.iter().enumerate() {
-        let values = decode_f32_le(&runner.read(tap).await?)?;
+    for (index, values) in taps.iter().enumerate() {
         let reference = fixture
             .hidden_state(index + 1)
             .ok_or("hidden-state fixture is missing")?;
-        let error = normwise_relative_error(reference.values(), &values)?;
+        let error = normwise_relative_error(reference.values(), values)?;
         maximum = maximum.max(error);
         let passed = error <= tolerance;
         if !passed && first_failing.is_none() {
@@ -501,16 +552,8 @@ where
     let vocab = input.vocab;
     let steps = input.steps;
     let teacher_forced = decode(runner, input, DecodeMode::TeacherForced, true).await?;
-    let output = runner
-        .step(EngineStep {
-            phase: forja_host::BatchPhase::Prompt,
-            tokens: prompt_tokens,
-            start_pos: 0,
-            taps: false,
-        })
-        .await?
-        .map_err(|error| format!("engine step failed: {error:?}"))?;
-    let logits = decode_f32_le(&runner.read(&output.logits).await?)?;
+    let output = prompt_pieces(runner, &prompt_tokens, false).await?;
+    let logits = output.logits;
     let free_running = decode(
         runner,
         DecodeInput {
@@ -592,21 +635,13 @@ where
         teacher_forced.steps,
         if prompt_passed { "pass" } else { "FAIL" }
     );
-    let output = runner
-        .step(EngineStep {
-            phase: forja_host::BatchPhase::Prompt,
-            tokens: prompt_tokens,
-            start_pos: 0,
-            taps: false,
-        })
-        .await?
-        .map_err(|error| format!("engine step failed: {error:?}"))?;
+    let output = prompt_pieces(runner, &prompt_tokens, false).await?;
     let free_input = DecodeInput {
         prompt,
         expected_tokens,
         reference_logits,
         prompt_tokens: prompt_length,
-        logits: decode_f32_le(&runner.read(&output.logits).await?)?,
+        logits: output.logits,
         vocab,
         steps,
     };
@@ -859,6 +894,15 @@ mod tests {
             scratch: root.join("scratch"),
             engine_config: forja_config::Engine::default(),
         };
+        let profile = crate::resolution::read_embedded_profile(&options.engine)?;
+        let policy = profile
+            .prompt_chunk_policy()?
+            .ok_or("missing prompt limits")?;
+        let fixtures = FixtureDirectory::open(&options.fixtures)?;
+        assert!(fixtures.prompts().iter().any(|fixture| {
+            let rows = u32::try_from(fixture.prompt_ids().len()).unwrap();
+            policy.limit(0, rows).unwrap() < rows
+        }));
         tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(run_with_steps(&options, 8))
