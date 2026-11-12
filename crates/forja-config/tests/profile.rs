@@ -54,6 +54,36 @@ fn error(source: &str) -> String {
 }
 
 #[test]
+fn context_prompt_chunks_are_validated_and_part_of_profile_identity() {
+    let plain: Profile = toml::from_str(PROFILE).unwrap();
+    assert!(plain.prompt_chunk_policy().unwrap().is_none());
+    let declaration = "prompt-chunks = [{through=1024,tokens=512},{through=4096,tokens=64}]\n";
+    let source = format!("{declaration}{PROFILE}");
+    let profile: Profile = toml::from_str(&source).unwrap();
+    assert_eq!(
+        profile
+            .prompt_chunk_policy()
+            .unwrap()
+            .unwrap()
+            .limit(1024, 512)
+            .unwrap(),
+        64
+    );
+    assert_ne!(plain.sha256().unwrap(), profile.sha256().unwrap());
+    assert_eq!(
+        toml::from_str::<Profile>(&profile.canonical_toml().unwrap()).unwrap(),
+        profile
+    );
+    for bad in [
+        "through=4095,tokens=64",
+        "through=4096,tokens=0",
+        "through=4096,tokens=513",
+    ] {
+        assert!(error(&source.replace("through=4096,tokens=64", bad)).contains("prompt-chunks"));
+    }
+}
+
+#[test]
 fn lookup_policy_is_optional_and_part_of_the_profile_identity() {
     let plain: Profile = toml::from_str(PROFILE).unwrap();
     assert!(plain.prompt_lookup().is_none());

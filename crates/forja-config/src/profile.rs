@@ -91,6 +91,13 @@ impl Profile {
         self.0.prompt_lookup.as_ref()
     }
 
+    /// Validates the guest's optional context-dependent prompt chunk declaration.
+    /// # Errors
+    /// Refuses incomplete coverage or chunks outside the workload envelope.
+    pub fn prompt_chunk_policy(&self) -> Result<Option<forja_core::PromptChunkPolicy>, String> {
+        prompt_chunk_policy(&self.0)
+    }
+
     /// Returns the default tuning names.
     #[must_use]
     pub fn default_tunings(&self) -> &[String] {
@@ -161,9 +168,33 @@ struct ProfileData {
     serving: Option<Serving>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_lookup: Option<crate::LookupPolicy>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    prompt_chunks: Vec<PromptChunk>,
     variants: Variants,
     tuning_variants: BTreeMap<String, Variants>,
     quantization: Option<Quantization>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PromptChunk {
+    through: u32,
+    tokens: u32,
+}
+
+fn prompt_chunk_policy(
+    data: &ProfileData,
+) -> Result<Option<forja_core::PromptChunkPolicy>, String> {
+    if data.prompt_chunks.is_empty() {
+        return Ok(None);
+    }
+    forja_core::PromptChunkPolicy::new(
+        data.prompt_chunks.iter().map(|arm| (arm.through, arm.tokens)).collect(),
+        data.workload.max_context.get(),
+        data.workload.prefill_chunk.get(),
+    )
+    .map(Some)
+    .map_err(|_| "prompt-chunks must cover max-context with ordered, positive, nonincreasing chunks within prefill-chunk".to_owned())
 }
 
 /// Component build settings declared by a profile.
@@ -503,6 +534,7 @@ fn validate(profile: &ProfileData) -> Result<(), String> {
     if profile.workload.prefill_chunk > profile.workload.max_context {
         return Err("workload.prefill-chunk must not exceed max-context".to_owned());
     }
+    prompt_chunk_policy(profile)?;
     if let Some(lookup) = &profile.prompt_lookup
         && (profile.serving.is_none()
             || lookup.context_limit() != u64::from(profile.workload.max_context.get()))
