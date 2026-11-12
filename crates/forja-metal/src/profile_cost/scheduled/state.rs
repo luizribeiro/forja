@@ -17,6 +17,14 @@ fn group_bound(cost: KernelCost, groups: u64, factor: u64) -> Option<KernelCost>
     })
 }
 
+fn carry_factor(values: u64, panel: Option<u32>) -> u64 {
+    if panel.is_some_and(|panel| values.is_multiple_of(u64::from(panel))) {
+        1
+    } else {
+        2
+    }
+}
+
 pub(super) fn costs(dispatch: &Dispatch) -> Option<(KernelCost, KernelCost)> {
     let (panel, groups) = crate::encoding::block_schedule(dispatch)?;
     let mut stages = panel
@@ -35,10 +43,18 @@ pub(super) fn costs(dispatch: &Dispatch) -> Option<(KernelCost, KernelCost)> {
     }
     let block = u64::try_from(forja_core::DeltaBlockScratch::TOKENS).ok()?;
     let rows = u64::from(*dispatch.inputs().first()?.layout().shape().first()?).min(block);
-    let factors = [8_u64.checked_mul(block.div_ceil(rows))?, 4, 2, 8];
+    let values = u64::from(*dispatch.inputs().get(5)?.layout().shape().get(2)?);
+    let factors = [
+        8_u64.checked_mul(block.div_ceil(rows))?,
+        4,
+        carry_factor(values, panel),
+        8,
+    ];
     let mut total = KernelCost::default();
     let mut critical = KernelCost::default();
-    for ((mut cost, groups), factor) in stages.into_iter().zip(groups).zip(factors) {
+    for (stage, ((mut cost, groups), factor)) in
+        stages.into_iter().zip(groups).zip(factors).enumerate()
+    {
         if groups == 0 {
             continue;
         }
@@ -46,7 +62,12 @@ pub(super) fn costs(dispatch: &Dispatch) -> Option<(KernelCost, KernelCost)> {
             cost.scalar_ops = cost.scalar_ops.checked_add(cost.flops)?;
             cost.flops = 0;
         }
-        cost = super::addressing(dispatch, cost)?;
+        // Carry operands and all scratch cells are f32; partial value panels keep their bound.
+        cost = super::address_elements(
+            dispatch,
+            cost,
+            if stage == 2 && panel.is_some() { 4 } else { 2 },
+        )?;
         total = total.checked_add(cost)?;
         critical = critical.checked_add(group_bound(cost, groups, factor)?)?;
     }
@@ -92,6 +113,33 @@ pub(super) fn test_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn carry_panels_bound_a_walk_including_partial_columns() {
+        for values in [1_u64, 7, 33, 128, 4097] {
+            for panel in [16_u32, 32] {
+                let work = (0..values.div_ceil(u64::from(panel)))
+                    .map(|group| {
+                        let start = group * u64::from(panel);
+                        (start..(start + u64::from(panel)).min(values))
+                            .map(|_| 128 * 64 * 7)
+                            .sum::<u64>()
+                            + 28 * u64::from(panel)
+                    })
+                    .collect::<Vec<_>>();
+                let bound = group_bound(
+                    KernelCost {
+                        scalar_ops: work.iter().sum(),
+                        ..KernelCost::default()
+                    },
+                    u64::try_from(work.len()).unwrap(),
+                    carry_factor(values, Some(panel)),
+                )
+                .unwrap();
+                assert!(bound.scalar_ops >= *work.iter().max().unwrap());
+            }
+        }
+    }
+
     #[test]
     fn gram_group_bounds_cover_a_walk_of_the_triangular_stage() {
         for rows in [1_u64, 7, 33, 64] {

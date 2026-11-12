@@ -157,7 +157,15 @@ pub(crate) fn scalar_matrix_groups(dispatch: &Dispatch) -> Option<u64> {
         .checked_div(u64::from(group_size))
 }
 
-pub(super) fn addressing(dispatch: &Dispatch, mut cost: KernelCost) -> Option<KernelCost> {
+pub(super) fn addressing(dispatch: &Dispatch, cost: KernelCost) -> Option<KernelCost> {
+    address_elements(dispatch, cost, 2)
+}
+
+pub(super) fn address_elements(
+    dispatch: &Dispatch,
+    mut cost: KernelCost,
+    bytes_per_value: u64,
+) -> Option<KernelCost> {
     let layouts = dispatch
         .inputs()
         .iter()
@@ -201,7 +209,7 @@ pub(super) fn addressing(dispatch: &Dispatch, mut cost: KernelCost) -> Option<Ke
         .checked_sub(scratch)?;
     cost.scalar_ops = cost
         .scalar_ops
-        .checked_add(bytes.div_ceil(2).checked_mul(weight)?)?
+        .checked_add(bytes.div_ceil(bytes_per_value).checked_mul(weight)?)?
         .checked_add(scratch.div_ceil(2).checked_mul(weight.min(32))?)?;
     Some(cost)
 }
