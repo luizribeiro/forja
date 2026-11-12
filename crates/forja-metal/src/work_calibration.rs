@@ -8,6 +8,8 @@ const SERIAL_ITERATIONS: u32 = 1 << 18;
 const DEPENDENT_ELEMENTS: u32 = 4096;
 const SERIAL_READ_ELEMENTS: u32 = 1 << 24;
 const DISPATCH_GROUPS: u32 = 1 << 18;
+const REUSED_ELEMENTS: u32 = 1 << 25;
+pub(super) const REUSED_READ_BYTES: u64 = (REUSED_ELEMENTS as u64) * 4;
 
 #[derive(Clone, Copy)]
 pub(super) enum WorkProbe {
@@ -17,6 +19,7 @@ pub(super) enum WorkProbe {
     SfuWideGroup,
     Sfu,
     Gather,
+    ReusedRead,
     ScalarSerial,
     SfuSerial,
     DependentRead,
@@ -30,10 +33,11 @@ pub(super) enum WorkProbe {
 }
 
 impl WorkProbe {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Scalar,
         Self::Sfu,
         Self::Gather,
+        Self::ReusedRead,
         Self::ScalarSerial,
         Self::SfuSerial,
         Self::DependentRead,
@@ -53,6 +57,7 @@ impl WorkProbe {
             Self::SfuWideGroup => "calibration_sfu_wide_group",
             Self::Sfu => "calibration_sfu",
             Self::Gather => "calibration_gather",
+            Self::ReusedRead => "calibration_reused_read",
             Self::ScalarSerial => "calibration_scalar_serial",
             Self::SfuSerial => "calibration_sfu_serial",
             Self::DependentRead => "calibration_dependent_read",
@@ -69,6 +74,7 @@ impl WorkProbe {
     pub(super) const fn constants(self) -> [(u32, u32); 2] {
         let iterations = match self {
             Self::Gather => GATHER_ELEMENTS - 1,
+            Self::ReusedRead => REUSED_ELEMENTS - 1,
             Self::GroupDispatch => 16,
             Self::ReadSerial | Self::ReadGroup | Self::ReadWideGroup => SERIAL_READ_ELEMENTS,
             Self::ScalarWideGroup
@@ -87,6 +93,7 @@ impl WorkProbe {
     const fn elements(self) -> u32 {
         match self {
             Self::Gather => GATHER_ELEMENTS,
+            Self::ReusedRead => REUSED_ELEMENTS,
             Self::GroupDispatch => DISPATCH_GROUPS * crate::calibration::THREADS,
             Self::ScalarWideGroup
             | Self::SfuWideGroup
@@ -126,6 +133,7 @@ impl WorkProbe {
                 return Some(u64::from(SERIAL_ITERATIONS) * u64::from(crate::calibration::THREADS));
             }
             Self::GroupDispatch => return Some(u64::from(DISPATCH_GROUPS)),
+            Self::ReusedRead => return Some(REUSED_READ_BYTES * 32),
             Self::ScalarSerial => return Some(u64::from(SERIAL_ITERATIONS) * 2),
             Self::SfuSerial => return Some(u64::from(SERIAL_ITERATIONS)),
             Self::DependentRead => return Some(u64::from(SERIAL_ITERATIONS) * 4),
@@ -339,6 +347,22 @@ mod tests {
             assert_eq!(sample.name, probe.kernel());
             assert_eq!(Some(sample.units), probe.units());
             assert!(!sample.gpu.is_zero());
+        }
+    }
+
+    #[test]
+    fn repeated_read_passes_visit_the_complete_declared_footprint() {
+        assert_eq!(WorkProbe::ReusedRead.units(), Some(REUSED_READ_BYTES * 32));
+        for pass in 0..32_u64 {
+            let offset = pass * 1_048_576;
+            let addresses = (0..u64::from(REUSED_ELEMENTS))
+                .step_by(4096)
+                .map(|index| (index + offset) & u64::from(REUSED_ELEMENTS - 1))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                addresses.len(),
+                usize::try_from(REUSED_ELEMENTS / 4096).unwrap()
+            );
         }
     }
 

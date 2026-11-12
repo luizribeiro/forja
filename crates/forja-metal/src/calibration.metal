@@ -91,6 +91,16 @@ kernel void calibration_gather(device const float *input [[buffer(0)]],
     output[index] = input[address];
 }
 
+kernel void calibration_reused_read(device const float *input [[buffer(0)]],
+                                   device float *output [[buffer(1)]],
+                                   uint index [[thread_position_in_grid]]) {
+    float sum = 0;
+    for (uint pass = 0; pass < 32; ++pass) {
+        sum += input[(index + pass * 1048576u) & calibration_iterations];
+    }
+    output[index] = sum / 32.0f;
+}
+
 #define calibration_serial_kernel(name, expression, lanes) \
 kernel void name(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], \
                  uint index [[thread_position_in_grid]]) { \
