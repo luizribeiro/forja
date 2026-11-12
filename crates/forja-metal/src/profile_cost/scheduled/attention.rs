@@ -13,6 +13,7 @@ struct Shape {
     start: u64,
     causal: bool,
     paged: bool,
+    page_tokens: u64,
 }
 impl Shape {
     fn of(d: &Dispatch) -> Option<Self> {
@@ -67,6 +68,12 @@ impl Shape {
             start: u64::from(start),
             causal,
             paged,
+            page_tokens: match d.op() {
+                Op::PagedSdpa { page_tokens, .. } | Op::PagedSdpaAppend { page_tokens, .. } => {
+                    u64::from(page_tokens)
+                }
+                _ => 1,
+            },
         })
     }
 }
@@ -271,13 +278,27 @@ pub(crate) fn costs(d: &Dispatch, schedule: AttentionSchedule) -> Option<(Kernel
     }
     total.write_bytes = total.write_bytes.checked_add(output)?;
     if s.paged {
-        // Authentication is visited by every selected K/V tile or vector key visit.
-        let metadata = total.kv_bytes.checked_div(s.kv_bytes)?.checked_mul(16)?;
+        let (metadata, critical_metadata) = if let AttentionSchedule::Tiled { query, .. } = schedule
+        {
+            let pages = s.keys.div_ceil(s.page_tokens);
+            let groups = s.heads.checked_mul(s.queries.div_ceil(u64::from(query)))?;
+            let lookups = pages.checked_mul(4)?.checked_add(8)?;
+            (
+                pages
+                    .checked_mul(24)?
+                    .checked_add(groups.checked_mul(lookups)?)?,
+                pages.checked_mul(4)?.checked_add(32)?,
+            )
+        } else {
+            (
+                total.kv_bytes.checked_div(s.kv_bytes)?.checked_mul(16)?,
+                critical.kv_bytes.checked_div(s.kv_bytes)?.checked_mul(16)?,
+            )
+        };
         total.metadata_read_bytes = metadata;
         total.read_bytes = total.read_bytes.checked_add(metadata)?;
-        let metadata = critical.kv_bytes.checked_div(s.kv_bytes)?.checked_mul(16)?;
-        critical.metadata_read_bytes = metadata;
-        critical.read_bytes = critical.read_bytes.checked_add(metadata)?;
+        critical.metadata_read_bytes = critical_metadata;
+        critical.read_bytes = critical.read_bytes.checked_add(critical_metadata)?;
     }
     if matches!(schedule, AttentionSchedule::Tiled { .. }) {
         for cost in [&mut total, &mut critical] {
@@ -383,6 +404,18 @@ mod tests {
         commands.set_last_backend_data(BackendDispatchData::new(pick));
         commands.into_dispatches().remove(0)
     }
+    #[test]
+    fn tiled_paged_lookups_follow_pages_and_share_key_and_value_addresses() {
+        let d = paged(16, 8, 33, 4097, "paged-sdpa.steel");
+        let (total, critical) = costs(&d, AttentionSchedule::Tiled { query: 32, key: 16 }).unwrap();
+        let pages = 4097_u64.div_ceil(128);
+        assert_eq!(
+            total.metadata_read_bytes,
+            pages * 24 + 16 * 2 * (pages * 4 + 8)
+        );
+        assert_eq!(critical.metadata_read_bytes, pages * 4 + 32);
+    }
+
     #[test]
     fn bounded_tiles_price_both_private_accumulator_updates_if_they_spill() {
         let schedule = AttentionSchedule::Tiled { query: 16, key: 16 };
