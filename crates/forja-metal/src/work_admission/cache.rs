@@ -22,14 +22,15 @@ impl Cache {
             return None;
         }
         let identity = format!(
-            "admission-v1:{}:{:?}:{}{}{}{}{}",
+            "admission-v2:{}:{:?}:{}{}{}{}{}{}",
             backend.device.registryID(),
             build.stdout,
             crate::storage::shader_source(),
             include_str!("../work_calibration.rs"),
             include_str!("../calibration.rs"),
             include_str!("../bandwidth.rs"),
-            include_str!("../work_admission.rs")
+            include_str!("../work_admission.rs"),
+            include_str!("../../../forja-core/src/work_rates.rs")
         );
         let mut hash = DefaultHasher::new();
         identity.hash(&mut hash);

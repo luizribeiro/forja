@@ -144,6 +144,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
         rates[1].ok_or(BackendError::InvalidInput)?,
         rates[2].ok_or(BackendError::InvalidInput)?,
     ];
+    let reused_read = rate(&["calibration_reused_read"])?;
     WorkCalibration::new(
         rates,
         1.0 / latency(&["calibration_group_dispatch"])?,
@@ -164,6 +165,9 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
             .collect(),
         startup_reserve(samples)?,
     )
+    .and_then(|rates| {
+        rates.with_reused_read(crate::work_calibration::REUSED_READ_BYTES, reused_read)
+    })
     .ok_or(BackendError::InvalidInput)
 }
 
@@ -299,11 +303,33 @@ pub(super) fn predict(
             (groups, threads),
             if scattered {
                 MemoryAccess::Scattered
+            } else if let Some(footprint) = tiled_input_footprint(d) {
+                MemoryAccess::Reused { footprint }
             } else {
                 MemoryAccess::Coalesced
             },
         )
         .ok_or(BackendError::InvalidInput)
+}
+
+fn tiled_input_footprint(dispatch: &Dispatch) -> Option<u64> {
+    if !matches!(
+        crate::encoding::selected_variant(dispatch),
+        Some(
+            crate::variants::MetalVariant::QuantMatmulTiled
+                | crate::variants::MetalVariant::QuantMatmulTiledK64
+        )
+    ) {
+        return None;
+    }
+    dispatch.inputs().iter().try_fold(0_u64, |bytes, tensor| {
+        let layout = tensor.layout();
+        if !layout.is_contiguous() {
+            return None;
+        }
+        let span = layout.byte_span();
+        bytes.checked_add(span.end.checked_sub(span.start)?)
+    })
 }
 
 pub(super) type WorkFaults = forja_core::GpuWorkTracker<Arc<[usize]>>;
@@ -321,6 +347,42 @@ impl MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tile_reread_pricing_requires_a_validated_coalesced_schedule() {
+        use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability};
+        let cpu = forja_cpu::CpuBackend::new();
+        let x = cpu.alloc(DType::BF16, &[33, 128]).unwrap();
+        let w = cpu.alloc(DType::U32, &[128, 16]).unwrap();
+        let scale = cpu.alloc(DType::BF16, &[128, 2]).unwrap();
+        let out = cpu.alloc(DType::BF16, &[33, 128]).unwrap();
+        let mut commands = CommandList::new();
+        commands
+            .dispatch(
+                Op::QuantMatmul {
+                    bits: 4,
+                    group_size: 64,
+                },
+                &[&x, &w, &scale, &scale],
+                &out,
+            )
+            .unwrap();
+        let dispatch = commands.last_dispatch().unwrap();
+        assert!(tiled_input_footprint(dispatch).is_none());
+        let variant = crate::variants::resolve(
+            dispatch,
+            "quant-matmul.tiled-k64",
+            &[DeviceCapability::Metal4],
+        )
+        .unwrap();
+        let dispatch = dispatch
+            .clone()
+            .with_backend_data(BackendDispatchData::new(variant));
+        assert_eq!(
+            tiled_input_footprint(&dispatch),
+            Some(33 * 128 * 2 + 128 * 16 * 4 + 128 * 2 * 2 * 2)
+        );
+    }
+
     #[test]
     fn startup_reserve_compares_only_identical_probe_workloads() {
         let sample = CalibrationSample {
