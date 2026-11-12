@@ -100,7 +100,14 @@ fn matrix_tile(dispatch: &Dispatch, total: KernelCost) -> Option<KernelCost> {
     if !matches!(dispatch.op(), Op::Matmul | Op::QuantMatmul { .. }) {
         return None;
     }
-    let tile = crate::variants::selected_cost_model(dispatch).tile;
+    let tile = if matches!(
+        crate::encoding::selected_variant(dispatch),
+        Some(crate::variants::MetalVariant::MatmulGemvTransposed)
+    ) {
+        [1, 32, 1]
+    } else {
+        crate::variants::selected_cost_model(dispatch).tile
+    };
     let [rows, columns] = dispatch.output().layout().shape() else {
         return None;
     };
@@ -128,11 +135,22 @@ mod tests {
 
     #[test]
     fn tiled_matrix_critical_work_retains_a_complete_cooperative_tile() {
-        use forja_core::{BackendDispatchData, DeviceCapability};
+        use forja_core::{BackendDispatchData, DeviceCapability, ViewOp};
         let cpu = CpuBackend::new();
-        for (rows, columns, inner) in [(7, 33, 4097), (512, 192, 576), (512, 2048, 1024)] {
+        for (rows, columns, inner, transposed) in [
+            (7, 33, 4097, false),
+            (512, 192, 576, false),
+            (512, 2048, 1024, false),
+            (1, 33, 4097, true),
+            (1, 1024, 2048, true),
+        ] {
             let left = cpu.alloc(DType::F32, &[rows, inner]).unwrap();
-            let right = cpu.alloc(DType::F32, &[inner, columns]).unwrap();
+            let right = if transposed {
+                let packed = cpu.alloc(DType::F32, &[columns, inner]).unwrap();
+                cpu.view(&packed, ViewOp::Permute(vec![1, 0])).unwrap()
+            } else {
+                cpu.alloc(DType::F32, &[inner, columns]).unwrap()
+            };
             let output = cpu.alloc(DType::F32, &[rows, columns]).unwrap();
             let mut commands = CommandList::new();
             commands
@@ -140,7 +158,11 @@ mod tests {
                 .unwrap();
             let selected = crate::variants::resolve(
                 commands.last_dispatch().unwrap(),
-                "matmul.steel-32x64x16-1x2",
+                if transposed {
+                    "matmul.gemv-transposed"
+                } else {
+                    "matmul.steel-32x64x16-1x2"
+                },
                 &[DeviceCapability::Metal4],
             )
             .unwrap();
@@ -148,7 +170,11 @@ mod tests {
             let dispatch = commands.last_dispatch().unwrap();
             let total = super::super::of(dispatch).unwrap();
             let critical = of(dispatch).unwrap();
-            let groups = u64::from(rows).div_ceil(32) * u64::from(columns).div_ceil(64);
+            let groups = if transposed {
+                u64::from(columns).div_ceil(32)
+            } else {
+                u64::from(rows).div_ceil(32) * u64::from(columns).div_ceil(64)
+            };
             assert_eq!(critical.flops, total.flops.div_ceil(groups));
             assert_eq!(critical.read_bytes, total.read_bytes.div_ceil(groups));
         }
