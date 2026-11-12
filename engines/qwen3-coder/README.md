@@ -3,7 +3,8 @@
 Forja's Qwen3-Coder engine targets Qwen3-Coder-30B-A3B-Instruct with affine four-bit weights and
 q8 router gates on Metal for Apple M3 Ultra. The engine supports the model's native 262144-token
 maximum. The standard and exact-cache profiles declare 32768 tokens; the long-context profile
-declares 131072. Profiles bound prompt pieces to 16 tokens through 32768 context
+declares 131072. With `limits.enforce_gpu_time = true`, profiles bound prompt
+pieces to 16 tokens through 32768 context
 tokens. The long-context profile uses one token afterward, selecting its existing
 partitioned decode-attention path. Host work limits remain unchanged. The guest
 retains at most one full-chunk and one exact-tail graph.

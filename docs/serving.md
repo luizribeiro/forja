@@ -63,9 +63,13 @@ consume their attempt. Budget expiry disables that backend's compilation and GPU
 submission. These are operator settings; engine components cannot raise them.
 
 Metal always enforces logical work, dispatch-count, allocation and completion
-deadline limits. The CLI also enforces forecast admission, incremental submission
-and the measured-time backstop. Embedders enable these with
-`MetalBackend::with_work_limits`. These use conservative
+deadline limits. Calibrated time admission and profile `prompt-chunks` caps default
+to off, preserving the engine's normal prompt sizes. Set
+`limits.enforce_gpu_time = true` in host configuration, or pass
+`--set limits.enforce_gpu_time=true`, to enable both. Changing this flag requires
+a backend restart. It enables forecast admission, incremental submission and the
+measured-time backstop. Library backends also default to observational forecasts;
+embedders opt in with `MetalBackend::with_work_limits`. These use conservative
 device calibration and the actual encoded launch schedule. With
 the default ten-second deadline, forecasts are limited to two seconds per dispatch
 and command buffer and eight seconds per submission. Shorter host deadlines lower

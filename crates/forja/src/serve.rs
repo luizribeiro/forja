@@ -205,7 +205,11 @@ fn prepare_load(
     backend: BackendArg,
 ) -> Result<PreparedLoad, String> {
     let profile = validate_config(config, backend)?;
-    let load_config = engine_load_config(&config.model.engine, &Engine::default())?;
+    let load_config = engine_load_config(
+        &config.model.engine,
+        &Engine::default(),
+        config.limits.enforce_gpu_time,
+    )?;
     let hashes = [
         sha256_file(&config.model.engine).map_err(|error| error.to_string())?,
         profile.sha256().map_err(|error| error.to_string())?,
@@ -939,7 +943,7 @@ mod tests {
         )
         .await?;
         let info = runner.describe().await?;
-        let mut load = engine_load_config(component, &Engine::default())?;
+        let mut load = engine_load_config(component, &Engine::default(), false)?;
         load.paged_cache = true;
         runner.load_with_selections(None, &load).await??;
         let mut config = forja_config::HostConfig::default();
@@ -1045,7 +1049,7 @@ mod tests {
         )
         .await?;
         let info = runner.describe().await?;
-        let mut load = engine_load_config(component, &Engine::default())?;
+        let mut load = engine_load_config(component, &Engine::default(), false)?;
         load.paged_cache = paged_cache;
         runner.load_with_selections(None, &load).await??;
         let mut config = forja_config::HostConfig::default();

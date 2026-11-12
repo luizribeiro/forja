@@ -226,7 +226,11 @@ pub(crate) async fn measure_token_profile(
     runner
         .load_with_selections(
             None,
-            &engine_load_config(&options.engine, &options.engine_config)?,
+            &engine_load_config(
+                &options.engine,
+                &options.engine_config,
+                options.limits.enforce_gpu_time,
+            )?,
         )
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
@@ -1727,7 +1731,14 @@ async fn load_benchmark_runner(
     .await?;
     let info = runner.describe().await?;
     runner
-        .load_with_selections(None, &engine_load_config(component, &point.config.engine)?)
+        .load_with_selections(
+            None,
+            &engine_load_config(
+                component,
+                &point.config.engine,
+                options.limits.enforce_gpu_time,
+            )?,
+        )
         .await?
         .map_err(|error| format!("engine load failed: {error:?}"))?;
     Ok((runner, info, device))

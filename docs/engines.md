@@ -166,7 +166,8 @@ prompt-chunks = [
 ```
 
 The guest author chooses these values from conservative work forecasts. The host
-validates the declaration and enforces it before calling the guest for native or
+validates the declaration and, with `limits.enforce_gpu_time = true`, enforces it
+before calling the guest for native or
 batched prompts. A piece crossing an endpoint uses the later, smaller maximum.
 Numerical prompt-block alignment still applies. Serving, generation and benchmark
 planners use the same bounds. Without a declaration, existing guest chunk planning

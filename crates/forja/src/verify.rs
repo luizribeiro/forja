@@ -164,7 +164,11 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
         options.backend,
         &options.scratch,
     )?;
-    let load_config = engine_load_config(&options.engine, &options.engine_config)?;
+    let load_config = engine_load_config(
+        &options.engine,
+        &options.engine_config,
+        options.limits.enforce_gpu_time,
+    )?;
     let fixtures = FixtureDirectory::open(&options.fixtures)?;
     fixtures.require_complete_model_outputs()?;
     let weights = verify_model_hash(options, &fixtures)?;
@@ -190,7 +194,11 @@ async fn run_with_steps(options: &Verify, decode_steps: usize) -> Result<(), Box
         engine_config.tunings.base = forja_config::TuningBase::None;
         engine_config.tunings.add = tunings.clone();
         engine_config.tunings.remove.clear();
-        let load_config = engine_load_config(&options.engine, &engine_config)?;
+        let load_config = engine_load_config(
+            &options.engine,
+            &engine_config,
+            options.limits.enforce_gpu_time,
+        )?;
         run_with_component(
             options,
             &fixtures,
@@ -819,7 +827,11 @@ mod tests {
         let options = model_options(BackendArg::Metal, Precision::Bf16, Vec::new())?;
         let fixtures = FixtureDirectory::open(&options.fixtures)?;
         let weights = verify_model_hash(&options, &fixtures)?;
-        let load_config = engine_load_config(&options.engine, &options.engine_config)?;
+        let load_config = engine_load_config(
+            &options.engine,
+            &options.engine_config,
+            options.limits.enforce_gpu_time,
+        )?;
         let summary = tokio::runtime::Builder::new_current_thread()
             .build()?
             .block_on(run_with_component(
@@ -875,6 +887,7 @@ mod tests {
     fn metal_quantized_qwen3_coder_verification() -> Result<(), Box<dyn Error>> {
         let root = PathBuf::from(env::var_os("FORJA_MODELS").ok_or("FORJA_MODELS is not set")?);
         let limits = forja_config::Limits {
+            enforce_gpu_time: true,
             live_bytes: forja_config::Choice::Fixed(forja_config::ByteSize::new(
                 24 * 1024 * 1024 * 1024,
             )),
@@ -1039,7 +1052,8 @@ mod tests {
                 &weights,
             )
             .await?;
-            let mut config = engine_load_config(component, &forja_config::Engine::default())?;
+            let mut config =
+                engine_load_config(component, &forja_config::Engine::default(), false)?;
             config.replay = replay;
             runner.load_with_selections(None, &config).await??;
             let mut actual = Vec::new();
@@ -1094,7 +1108,7 @@ mod tests {
                 root.join("SmolLM2-135M-Instruct/model.safetensors"),
             )
             .await?;
-            let config = engine_load_config(component, &forja_config::Engine::default())?;
+            let config = engine_load_config(component, &forja_config::Engine::default(), false)?;
             runner.load_with_selections(None, &config).await??;
             for (step, &expected) in fixture.greedy_tokens().iter().enumerate() {
                 let output = runner

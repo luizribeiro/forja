@@ -272,6 +272,10 @@ fn perf_key_from(
     let mut key = BTreeMap::new();
     key.insert("backend.kind".to_owned(), serde_json::json!("metal"));
     key.insert(
+        "limits.enforce_gpu_time".to_owned(),
+        serde_json::json!(config.limits.enforce_gpu_time),
+    );
+    key.insert(
         "backend.metal.graph_replay".to_owned(),
         serde_json::to_value(graph_replay)
             .map_err(|error| format!("cannot serialize graph replay: {error}"))?,
@@ -433,11 +437,19 @@ mod tests {
         }];
         assert_eq!(
             config_hash(&snapshot, &inputs).unwrap(),
-            "sha256:61fc9af881bfc85fd62132628d63ade60f93c96f178acf7a33ee3ee0a158192e"
+            "sha256:d9363d564d047b252601df918a5a644508789ef550c5aba99e925d2d7b669fb0"
         );
         assert_eq!(
             comparison_hash(&perf_key(&point, &inputs[0], &profile()).unwrap()).unwrap(),
-            "sha256:8ef1ab198a395a78e3e0c9609e09ac5c74b8a9d49508d7f1aee6ee94c6497d85"
+            "sha256:71a6262a59f1719fea66338b065d0198382f3c9c447114e8141b5b2689271a97"
+        );
+        let default_key = perf_key(&point, &inputs[0], &profile()).unwrap();
+        let mut opted_in = point;
+        opted_in.config.limits.enforce_gpu_time = true;
+        let opted_in_key = perf_key(&opted_in, &inputs[0], &profile()).unwrap();
+        assert_ne!(
+            comparison_hash(&default_key).unwrap(),
+            comparison_hash(&opted_in_key).unwrap()
         );
     }
 

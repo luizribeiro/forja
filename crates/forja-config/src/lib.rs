@@ -516,6 +516,8 @@ pub struct Limits {
     pub work_per_dispatch: Unbounded<u64>,
     /// Maximum summed logical admission work in one complete GPU submission.
     pub work_per_submission: Unbounded<u64>,
+    /// Enforce calibrated GPU time admission and profile prompt-piece limits.
+    pub enforce_gpu_time: bool,
     /// Maximum CPU time for one guest export call.
     pub guest_call_timeout: Duration,
     /// Maximum time to wait for one GPU submission.
@@ -542,6 +544,7 @@ impl Default for Limits {
             dispatches_per_list: Unbounded::Limited(4_096),
             work_per_dispatch: Unbounded::Limited(forja_core::DEFAULT_DISPATCH_WORK_LIMIT),
             work_per_submission: Unbounded::Limited(forja_core::DEFAULT_SUBMISSION_WORK_LIMIT),
+            enforce_gpu_time: false,
             guest_call_timeout: Duration::from_secs(300),
             submission_timeout: Duration::from_secs(60),
             gpu_time_budget: Unbounded::Limited(Duration::from_secs(3_600)),
@@ -621,6 +624,7 @@ mod tests {
         assert_eq!(limits.tensor_rank, 4);
         assert_eq!(limits.tensor_elements, 1_000_000_000);
         assert_eq!(limits.live_tensor_handles, 20_000);
+        assert!(!limits.enforce_gpu_time);
         assert_eq!(limits.live_kernels, 64);
         assert_eq!(limits.pipeline_compilations, 256);
         assert_eq!(limits.compile_budget, Duration::from_secs(60));
@@ -660,6 +664,7 @@ dispatches_per_list = "unlimited"
 submission_timeout = "250ms"
 pipeline_compilations = 33
 compile_budget = "7s"
+enforce_gpu_time = true
 "#,
         )
         .unwrap();
@@ -672,6 +677,7 @@ compile_budget = "7s"
         assert_eq!(limits.submission_timeout, Duration::from_millis(250));
         assert_eq!(limits.pipeline_compilations, 33);
         assert_eq!(limits.compile_budget, Duration::from_secs(7));
+        assert!(limits.enforce_gpu_time);
     }
 
     #[test]

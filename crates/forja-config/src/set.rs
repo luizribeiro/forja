@@ -119,7 +119,7 @@ mod tests {
         let error = set_layer::<crate::DevConfig>(2, "limits.tensor_ranks=5").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "--set #2 limits.tensor_ranks=5: unknown field `tensor_ranks`, expected one of `live_bytes`, `tensor_rank`, `tensor_elements`, `live_tensor_handles`, `live_kernels`, `pipeline_compilations`, `compile_budget`, `live_graphs`, `read_bytes`, `guest_memory_bytes`, `table_elements`, `instances`, `dispatches_per_list`, `work_per_dispatch`, `work_per_submission`, `guest_call_timeout`, `submission_timeout`, `gpu_time_budget`"
+            "--set #2 limits.tensor_ranks=5: unknown field `tensor_ranks`, expected one of `live_bytes`, `tensor_rank`, `tensor_elements`, `live_tensor_handles`, `live_kernels`, `pipeline_compilations`, `compile_budget`, `live_graphs`, `read_bytes`, `guest_memory_bytes`, `table_elements`, `instances`, `dispatches_per_list`, `work_per_dispatch`, `work_per_submission`, `enforce_gpu_time`, `guest_call_timeout`, `submission_timeout`, `gpu_time_budget`"
         );
     }
 

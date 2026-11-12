@@ -29,7 +29,8 @@ The next turn replays any remaining partial block.
 
 The `qwen38-27b-4bit.metal-apple-m3-ultra.q4-long` profile declares 262,144 tokens
 with F16 KV. The operator may lower `serving.max_context`. Prompt scratch remains
-bounded by 2,048 tokens. Profile `prompt-chunks` bounds actual pieces to 512
+bounded by 2,048 tokens. With `limits.enforce_gpu_time = true`, profile
+`prompt-chunks` bounds actual pieces to 512
 through 32,768 context tokens and 128 afterward. The standard q4 profile uses
 512 through its 32,768-token limit. The F32 KV profile uses 512 through 2,048
 and 128 afterward. These guest declarations keep each submission within the

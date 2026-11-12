@@ -33,7 +33,11 @@ pub(super) async fn load<B: Backend + Send + Sync + 'static>(
         limits,
         &host_config(options, config),
         profile.clone(),
-        crate::engine::engine_load_config(&options.engine, &config.engine)?,
+        crate::engine::engine_load_config(
+            &options.engine,
+            &config.engine,
+            config.limits.enforce_gpu_time,
+        )?,
         [engine?, profile_hash?, weights?, tokenizer?, chat?],
         options.mode == Mode::Draft,
     )

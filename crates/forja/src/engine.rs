@@ -219,18 +219,24 @@ fn weight_cache_path(scratch: &Path, weights: &Path) -> PathBuf {
 pub(crate) fn engine_load_config(
     component: &Path,
     overrides: &Engine,
+    enforce_gpu_time: bool,
 ) -> Result<forja_host::EngineLoadConfig, String> {
     let profile = read_embedded_profile(component)?;
-    profile_load_config(&profile, overrides)
+    profile_load_config(&profile, overrides, enforce_gpu_time)
 }
 
 fn profile_load_config(
     profile: &Profile,
     overrides: &Engine,
+    enforce_gpu_time: bool,
 ) -> Result<forja_host::EngineLoadConfig, String> {
     let selection = overrides.resolve(profile)?;
     Ok(forja_host::EngineLoadConfig {
-        prompt_chunks: profile.prompt_chunk_policy()?.map(std::sync::Arc::new),
+        prompt_chunks: if enforce_gpu_time {
+            profile.prompt_chunk_policy()?.map(std::sync::Arc::new)
+        } else {
+            None
+        },
         max_context: Some(profile.workload().max_context.get()),
         replay: overrides.replay,
         paged_cache: profile.serving().is_some_and(|serving| serving.paged_cache),
@@ -371,7 +377,11 @@ pub(crate) fn metal_backend(
         .submission_timeout
         .get()
         .min(std::time::Duration::from_secs(10));
-    let backend = backend.with_work_limits(forja_core::GpuWorkLimits::for_timeout(timeout)?);
+    let backend = if limits.enforce_gpu_time {
+        backend.with_work_limits(forja_core::GpuWorkLimits::for_timeout(timeout)?)
+    } else {
+        backend.with_submission_timeout(timeout)?
+    };
     backend.prepare_work_estimation()?;
     Ok((backend, live_bytes))
 }
@@ -595,7 +605,7 @@ mod tests {
 
     #[test]
     fn converts_profiles_to_deterministic_guest_load_config() {
-        let config = profile_load_config(&profile(), &Engine::default()).unwrap();
+        let config = profile_load_config(&profile(), &Engine::default(), false).unwrap();
         assert_eq!(config.max_context, Some(4_096));
         assert!(config.paged_cache);
         assert_eq!(config.tunings.len(), 0);
@@ -605,6 +615,20 @@ mod tests {
         );
         assert_eq!(config.variant_rule_picks[0].site, "attention.decode");
         assert_eq!(config.variant_rule_picks[0].arms[2].hi, 4095);
+    }
+
+    #[test]
+    fn profile_prompt_limits_require_host_time_admission() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engines/qwen38/profiles/qwen38-27b-4bit.metal-apple-m3-ultra.q4.toml");
+        let profile: Profile = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        for enforce in [false, true] {
+            let config = profile_load_config(&profile, &Engine::default(), enforce).unwrap();
+            assert_eq!(config.prompt_chunks.is_some(), enforce);
+            if let Some(policy) = config.prompt_chunks {
+                assert_eq!(policy.limit(0, 2048).unwrap(), 512);
+            }
+        }
     }
 
     #[test]
