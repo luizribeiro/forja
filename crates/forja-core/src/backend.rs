@@ -403,6 +403,15 @@ pub enum BackendError {
         /// Host-selected maximum measured/predicted ratio.
         ratio: u32,
     },
+    /// A completed measurement exceeded a calibrated resource limit.
+    ImpossibleRate {
+        /// Resource and rate units being checked.
+        resource: &'static str,
+        /// Observed work units per second.
+        achieved: u64,
+        /// Calibrated units per second including the allowed margin.
+        limit: u64,
+    },
     /// Submitted work did not complete before its configured deadline.
     Timeout,
     /// An argument does not belong to this backend or violates an API rule.
@@ -572,6 +581,14 @@ pub struct SubmissionProfile {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ImpossibleRate {
+                resource,
+                achieved,
+                limit,
+            } => write!(
+                f,
+                "impossible benchmark record: {resource} rate {achieved}/s exceeds calibrated limit {limit}/s (including margin); run forja calibrate --force to refresh calibration"
+            ),
             Self::InvalidDeviceWorkingSet {
                 recommended,
                 physical,

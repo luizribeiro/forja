@@ -1,7 +1,9 @@
 //! Logical roofline bounds using measured, device-independent resource ceilings.
 
 mod estimate;
+mod rate_limit;
 pub use estimate::Estimate;
+pub use rate_limit::RateLimit;
 
 use crate::KernelCost;
 

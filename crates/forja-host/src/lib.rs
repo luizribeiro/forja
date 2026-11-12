@@ -10149,11 +10149,10 @@ fn guest_error(error: impl Into<GuestFailure>) -> compute::Error {
         GuestFailure::Backend(BackendError::ExecutionFailed) => {
             compute::Error::BackendExecution("backend execution failed".to_owned())
         }
-        GuestFailure::Backend(error @ BackendError::InvalidDeviceWorkingSet { .. }) => {
-            compute::Error::BackendExecution(error.to_string())
-        }
         GuestFailure::Backend(
-            error @ (BackendError::DeviceExecutionFailed { .. }
+            error @ (BackendError::InvalidDeviceWorkingSet { .. }
+            | BackendError::ImpossibleRate { .. }
+            | BackendError::DeviceExecutionFailed { .. }
             | BackendError::DeviceErrorFlag { .. }),
         ) => compute::Error::BackendExecution(error.to_string()),
         GuestFailure::Backend(BackendError::UnsupportedOperation) => {
