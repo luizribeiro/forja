@@ -303,6 +303,11 @@ pub(super) fn predict(
             (groups, threads),
             if scattered {
                 MemoryAccess::Scattered
+            } else if matches!(
+                schedule,
+                Some(crate::encoding::AttentionSchedule::Tiled { .. })
+            ) {
+                MemoryAccess::Phased
             } else if let Some(footprint) = tiled_input_footprint(d) {
                 MemoryAccess::Reused { footprint }
             } else {

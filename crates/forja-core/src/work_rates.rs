@@ -11,6 +11,8 @@ pub enum MemoryAccess {
     Coalesced,
     /// Strided or indexed accesses priced at the scattered-read rate.
     Scattered,
+    /// Coalesced reads separated from arithmetic by synchronization phases.
+    Phased,
     /// Repeated coalesced tile reads within a bounded live input footprint.
     Reused {
         /// Bytes of simultaneously live input data.
@@ -62,12 +64,17 @@ impl WorkRates {
         let [read, copy, gather, ..] = self.rates;
         let bytes = cost.read_bytes.checked_add(cost.write_bytes)?;
         let memory = match access {
-            MemoryAccess::Coalesced | MemoryAccess::Reused { .. } => {
+            MemoryAccess::Coalesced | MemoryAccess::Reused { .. } | MemoryAccess::Phased => {
                 (cost.read_bytes as f64 / read).max(bytes as f64 / copy)
             }
             MemoryAccess::Scattered => bytes as f64 / gather,
         };
-        self.predict_memory(cost, launches, memory)
+        self.predict_memory(
+            cost,
+            launches,
+            memory,
+            matches!(access, MemoryAccess::Phased),
+        )
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -82,11 +89,17 @@ impl WorkRates {
         let repeated = cost.read_bytes.checked_sub(unique)?;
         let [read, copy, ..] = self.rates;
         let cold = (unique as f64 / read).max(unique.checked_add(cost.write_bytes)? as f64 / copy);
-        self.predict_memory(cost, launches, cold + repeated as f64 / rate)
+        self.predict_memory(cost, launches, cold + repeated as f64 / rate, false)
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn predict_memory(self, cost: KernelCost, launches: u64, memory: f64) -> Option<Duration> {
+    fn predict_memory(
+        self,
+        cost: KernelCost,
+        launches: u64,
+        memory: f64,
+        phased: bool,
+    ) -> Option<Duration> {
         if launches == 0 {
             return None;
         }
@@ -94,7 +107,12 @@ impl WorkRates {
         let scalar_ops = cost.scalar_ops.checked_sub(cost.sfu_ops)?;
         let arithmetic =
             cost.flops as f64 / matrix + scalar_ops as f64 / scalar + cost.sfu_ops as f64 / sfu;
-        let seconds = memory.max(arithmetic) + launches as f64 * launch;
+        let resources = if phased {
+            memory + arithmetic
+        } else {
+            memory.max(arithmetic)
+        };
+        let seconds = resources + launches as f64 * launch;
         Duration::try_from_secs_f64(seconds)
             .ok()
             .filter(|time| !time.is_zero())
@@ -159,6 +177,24 @@ mod tests {
                     MemoryAccess::Coalesced
                 )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn synchronization_phases_charge_memory_before_arithmetic() {
+        let rates = WorkRates::new(100.0, 100.0, 10.0, 1000.0, 100.0, 10.0, 0.01).unwrap();
+        let cost = KernelCost {
+            read_bytes: 100,
+            flops: 1000,
+            ..KernelCost::default()
+        };
+        assert_eq!(
+            rates.predict(cost, 1, MemoryAccess::Phased),
+            Some(Duration::from_secs_f64(2.01))
+        );
+        assert_eq!(
+            rates.predict(cost, 1, MemoryAccess::Coalesced),
+            Some(Duration::from_secs_f64(1.01))
         );
     }
 
