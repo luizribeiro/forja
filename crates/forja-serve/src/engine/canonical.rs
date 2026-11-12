@@ -179,6 +179,10 @@ impl<B: Backend + Send + Sync + 'static> ServingEngine<B> {
         prompt_tokens: u32,
         proposed: u32,
     ) -> Result<u32, GenerationError> {
+        let proposed = self
+            .runner
+            .prompt_piece_limit(position, proposed)
+            .map_err(cache_error)?;
         self.canonical_cache
             .as_ref()
             .filter(|cache| cache.allowance.bytes() > 0)

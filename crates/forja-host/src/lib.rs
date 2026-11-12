@@ -1779,8 +1779,9 @@ where
     /// Refuses pieces outside the declared context or arithmetic overflow.
     pub fn prompt_piece_limit(&self, start: u32, proposed: u32) -> Result<u32, compute::Error> {
         self.prompt_chunks.as_ref().map_or(Ok(proposed), |policy| {
+            let maximum = policy.arms().first().map_or(proposed, |a| a.1);
             policy
-                .limit(start, proposed)
+                .limit(start, proposed.min(maximum))
                 .map_err(|_| quota("prompt context exceeds its declaration"))
         })
     }
@@ -15764,6 +15765,7 @@ mod tests {
         ));
         assert_eq!(runner.metrics().submissions, before);
         assert_eq!(runner.prompt_piece_limit(6, 4).unwrap(), 1);
+        assert_eq!(runner.prompt_piece_limit(0, 16).unwrap(), 4);
         let info = runner.info.as_ref().unwrap();
         let mut narrowed = config.clone();
         narrowed.max_context = Some(8);

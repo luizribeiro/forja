@@ -43,20 +43,15 @@ impl Prefix {
             runner.prepare_canonical_lane(0, prompt.clone(), None, reserved)?;
             Some((prompt, SnapshotAllowance::new(declared, None)?))
         };
-        let step_tokens = usize::try_from(shape.tokens)?;
-        for (index, chunk) in tokens[..options.prefix_context]
-            .chunks(step_tokens)
-            .enumerate()
-        {
-            run_serving_profile_step(
-                runner,
-                shape,
-                chunk,
-                index
-                    .checked_mul(step_tokens)
-                    .ok_or("prefix offset overflowed")?,
-            )
-            .await?;
+        let pieces = super::prompt_submissions(
+            &tokens[..options.prefix_context],
+            0,
+            std::num::NonZeroUsize::new(usize::try_from(shape.tokens)?)
+                .ok_or("empty prompt shape")?,
+            |start, count| runner.prompt_piece_limit(start, count).map_err(Into::into),
+        )?;
+        for (start, chunk) in pieces {
+            run_serving_profile_step(runner, shape, chunk, usize::try_from(start)?).await?;
         }
         let prefix = if let Some((prompt, allowance)) = paired {
             Self::Paired(prompt, runner.capture_canonical_prefix(0, allowance)?)

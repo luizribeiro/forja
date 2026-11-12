@@ -365,20 +365,14 @@ async fn measure_serving_profile_phase(
     let started = Instant::now();
     let mut profiles = Vec::new();
     runner.set_profiling(profiling);
-    let step_tokens = usize::try_from(shape.tokens)?;
-    for (index, chunk) in tokens[options.prefix_context..]
-        .chunks(step_tokens)
-        .enumerate()
-    {
-        let start = options
-            .prefix_context
-            .checked_add(
-                index
-                    .checked_mul(step_tokens)
-                    .ok_or("suffix offset overflowed")?,
-            )
-            .ok_or("suffix position overflowed")?;
-        run_serving_profile_step(runner, shape, chunk, start).await?;
+    let pieces = prompt_submissions(
+        &tokens[options.prefix_context..],
+        options.prefix_context,
+        std::num::NonZeroUsize::new(usize::try_from(shape.tokens)?).ok_or("empty prompt shape")?,
+        |start, count| runner.prompt_piece_limit(start, count).map_err(Into::into),
+    )?;
+    for (start, chunk) in pieces {
+        run_serving_profile_step(runner, shape, chunk, usize::try_from(start)?).await?;
         if profiling {
             profiles.push(
                 runner
@@ -2202,14 +2196,7 @@ async fn prepare_profile_prefix(
     prefix_context: usize,
 ) -> Result<(), Box<dyn Error>> {
     if prefix_context > 0 {
-        step(
-            runner,
-            tokens[..prefix_context].to_vec(),
-            0,
-            forja_host::BatchPhase::Prompt,
-        )
-        .await?;
-        runner.wait_for_queued_submissions().await?;
+        measure_prefill_from(runner, &tokens[..prefix_context], 0).await?;
     }
     Ok(())
 }
@@ -2232,6 +2219,7 @@ fn prompt_submissions(
     tokens: &[u32],
     start: usize,
     limit: std::num::NonZeroUsize,
+    mut context_limit: impl FnMut(u32, u32) -> Result<u32, Box<dyn Error>>,
 ) -> Result<PromptSubmissions<'_>, Box<dyn Error>> {
     let start = u64::try_from(start)?;
     u32::try_from(
@@ -2242,17 +2230,26 @@ fn prompt_submissions(
     if tokens.is_empty() {
         return Err("empty prefill".into());
     }
-    tokens
-        .chunks(limit.get())
-        .enumerate()
-        .map(|(index, tokens)| {
-            let offset = u64::try_from(index)?
-                .checked_mul(u64::try_from(limit.get())?)
-                .and_then(|n| n.checked_add(start))
-                .ok_or("prefill offset overflow")?;
-            Ok((u32::try_from(offset)?, tokens))
-        })
-        .collect()
+    let mut pieces = Vec::new();
+    let mut consumed = 0;
+    while consumed < tokens.len() {
+        let position = u32::try_from(
+            start
+                .checked_add(u64::try_from(consumed)?)
+                .ok_or("prompt position overflow")?,
+        )?;
+        let proposed = u32::try_from((tokens.len() - consumed).min(limit.get()))?;
+        let count = context_limit(position, proposed)?;
+        if count == 0 || count > proposed {
+            return Err("invalid prompt piece limit".into());
+        }
+        let end = consumed
+            .checked_add(usize::try_from(count)?)
+            .ok_or("prompt piece overflow")?;
+        pieces.push((position, &tokens[consumed..end]));
+        consumed = end;
+    }
+    Ok(pieces)
 }
 
 #[cfg(target_os = "macos")]
@@ -2262,7 +2259,9 @@ async fn measure_prefill_chunks(
     start: usize,
     limit: std::num::NonZeroUsize,
 ) -> Result<Sample, Box<dyn Error>> {
-    let submissions = prompt_submissions(tokens, start, limit)?;
+    let submissions = prompt_submissions(tokens, start, limit, |start, count| {
+        runner.prompt_piece_limit(start, count).map_err(Into::into)
+    })?;
     let before = runner.metrics();
     let started = Instant::now();
     for (position, chunk) in submissions {
@@ -2468,7 +2467,12 @@ async fn prepare_decode(
     options: DecodeOptions,
 ) -> Result<u32, Box<dyn Error>> {
     let token = if options.host_argmax {
-        select_from_tokens(runner, prompt.to_vec(), 0, options).await?
+        let block = runner.describe().await?.prompt_block_tokens;
+        let mut last = None;
+        for (start, piece) in profile_prompt_pieces(runner, prompt, block)? {
+            last = Some(select_from_tokens(runner, piece.to_vec(), start, options).await?);
+        }
+        last.ok_or("empty decode prompt")?
     } else {
         let output = decode_prompt(runner, prompt, options.sampling).await?;
         read_token(&runner.read(&output.token).await?)?
@@ -2485,8 +2489,7 @@ async fn decode_prompt(
 ) -> Result<forja_host::EngineDecodeOutput, Box<dyn Error>> {
     let block = runner.describe().await?.prompt_block_tokens;
     let mut last = None;
-    let mut start = 0_u32;
-    for tokens in profile_prompt_chunks(prompt, block)? {
+    for (start, tokens) in profile_prompt_pieces(runner, prompt, block)? {
         let output = runner
             .decode(EngineDecode {
                 phase: BatchPhase::Prompt,
@@ -2497,9 +2500,6 @@ async fn decode_prompt(
             .await?
             .map_err(|error| format!("prompt preparation failed: {error:?}"))?;
         read_token(&runner.read(&output.token).await?)?;
-        start = start
-            .checked_add(u32::try_from(tokens.len())?)
-            .ok_or("prompt position overflow")?;
         last = Some(output);
     }
     last.ok_or_else(|| "empty decode prompt".into())
@@ -2614,31 +2614,27 @@ async fn prepare_profile_context(
         .ok_or("profile prompt is incomplete")?;
     let block = runner.describe().await?.prompt_block_tokens;
     let mut token = None;
-    let mut start = 0_usize;
-    for chunk in profile_prompt_chunks(prompt, block)? {
-        token =
-            Some(select_from_tokens(runner, chunk.to_vec(), u32::try_from(start)?, options).await?);
-        start = start
-            .checked_add(chunk.len())
-            .ok_or("profile prompt offset overflow")?;
+    for (start, chunk) in profile_prompt_pieces(runner, prompt, block)? {
+        token = Some(select_from_tokens(runner, chunk.to_vec(), start, options).await?);
     }
     let token = token.ok_or("profile requires a nonempty prompt")?;
     select_next(runner, token, u32::try_from(prefill)?, options).await
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn profile_prompt_chunks(
-    tokens: &[u32],
+#[cfg(target_os = "macos")]
+fn profile_prompt_pieces<'a>(
+    runner: &EngineRunner<forja_metal::MetalBackend>,
+    tokens: &'a [u32],
     block: Option<std::num::NonZeroU32>,
-) -> Result<std::slice::Chunks<'_, u32>, Box<dyn Error>> {
+) -> Result<PromptSubmissions<'a>, Box<dyn Error>> {
     let length = block
         .map(|block| usize::try_from(block.get()))
         .transpose()?
         .unwrap_or(tokens.len());
-    if length == 0 || tokens.is_empty() {
-        return Err("profile requires a nonempty prompt".into());
-    }
-    Ok(tokens.chunks(length))
+    let limit = std::num::NonZeroUsize::new(length).ok_or("empty decode prompt")?;
+    prompt_submissions(tokens, 0, limit, |start, count| {
+        runner.prompt_piece_limit(start, count).map_err(Into::into)
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -3287,7 +3283,7 @@ mod tests {
         let limit = std::num::NonZeroUsize::new(2048).unwrap();
         for count in [1_u32, 7, 33, 4097] {
             let tokens = (0..count).collect::<Vec<_>>();
-            let pieces = prompt_submissions(&tokens, 64, limit).unwrap();
+            let pieces = prompt_submissions(&tokens, 64, limit, |_, n| Ok(n)).unwrap();
             let mut position = 64;
             for (start, values) in &pieces {
                 assert_eq!(*start, position);
@@ -3302,10 +3298,12 @@ mod tests {
                     .collect::<Vec<_>>(),
                 tokens
             );
-            assert!(prompt_submissions(&tokens, usize::MAX, limit).is_err());
+            assert!(prompt_submissions(&tokens, usize::MAX, limit, |_, n| Ok(n)).is_err());
         }
-        assert!(prompt_submissions(&[1, 7, 33], u32::MAX as usize - 1, limit).is_err());
-        assert!(prompt_submissions(&[], 0, limit).is_err());
+        assert!(
+            prompt_submissions(&[1, 7, 33], u32::MAX as usize - 1, limit, |_, n| Ok(n)).is_err()
+        );
+        assert!(prompt_submissions(&[], 0, limit, |_, n| Ok(n)).is_err());
     }
 
     #[test]
@@ -3324,31 +3322,42 @@ mod tests {
         crate::resolution::read_embedded_profile(test_guests::qwen3()).unwrap()
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn profile_prompt_priming_preserves_declared_blocks_and_true_tails() {
-        for length in [1, 7, 33, 4097] {
-            let tokens = vec![17; length];
-            let pieces = profile_prompt_chunks(&tokens, std::num::NonZeroU32::new(64))
-                .unwrap()
-                .collect::<Vec<_>>();
-            assert_eq!(
-                pieces
-                    .iter()
-                    .flat_map(|piece| piece.iter())
-                    .copied()
-                    .collect::<Vec<_>>(),
-                tokens
-            );
-            assert!(
-                pieces[..pieces.len() - 1]
-                    .iter()
-                    .all(|piece| piece.len() == 64)
-            );
-            assert!((1..=64).contains(&pieces.last().unwrap().len()));
-            assert_eq!(profile_prompt_chunks(&tokens, None).unwrap().count(), 1);
+    fn prompt_planning_respects_context_ends_and_keeps_the_true_tail() {
+        let tokens = vec![7; 200];
+        let limit = std::num::NonZeroUsize::new(128).unwrap();
+        let policy =
+            forja_core::PromptChunkPolicy::new(vec![(512, 128), (4096, 32)], 4096, 128).unwrap();
+        let pieces = prompt_submissions(&tokens, 480, limit, |start, count| {
+            policy.limit(start, count).map_err(Into::into)
+        })
+        .unwrap();
+        assert_eq!(
+            pieces
+                .iter()
+                .map(|(p, t)| (*p, t.len()))
+                .collect::<Vec<_>>(),
+            [
+                (480, 32),
+                (512, 32),
+                (544, 32),
+                (576, 32),
+                (608, 32),
+                (640, 32),
+                (672, 8)
+            ]
+        );
+        assert_eq!(
+            pieces
+                .iter()
+                .flat_map(|(_, t)| t.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+            tokens
+        );
+        for invalid in [0, 129] {
+            assert!(prompt_submissions(&tokens, 0, limit, |_, _| Ok(invalid)).is_err());
         }
-        assert!(profile_prompt_chunks(&[], None).is_err());
     }
 
     #[test]

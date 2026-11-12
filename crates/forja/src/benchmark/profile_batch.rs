@@ -56,12 +56,6 @@ fn select_shapes(shapes: &[BatchShape], bucket: u32) -> Result<[BatchShape; 2], 
     Ok([prompt, decode])
 }
 
-fn prompt_offset(index: usize, tokens: u32) -> Result<u32, Box<dyn Error>> {
-    u32::try_from(index)?
-        .checked_mul(tokens)
-        .ok_or_else(|| "prompt offset overflow".into())
-}
-
 async fn phase(
     runner: &mut EngineRunner<forja_metal::MetalBackend>,
     tokens: &[u32],
@@ -77,8 +71,14 @@ async fn phase(
     for lane in 0..options.batch_size {
         runner.prepare_paged_lane(lane, None, 0)?;
         runner.prepare_paged_lane(lane, None, reserved)?;
-        for (index, chunk) in tokens.chunks(usize::try_from(prompt.tokens)?).enumerate() {
-            let start_pos = prompt_offset(index, prompt.tokens)?;
+        let pieces = super::prompt_submissions(
+            tokens,
+            0,
+            std::num::NonZeroUsize::new(usize::try_from(prompt.tokens)?)
+                .ok_or("empty prompt shape")?,
+            |start, count| runner.prompt_piece_limit(start, count).map_err(Into::into),
+        )?;
+        for (start_pos, chunk) in pieces {
             let output = runner
                 .batch_step(EngineBatch {
                     shape: prompt,
@@ -161,21 +161,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn prompt_chunk_offsets_keep_the_partial_tail_and_refuse_overflow() {
-        for length in [1_usize, 7, 33, 65, 4097] {
-            let tokens = vec![0; length];
-            let mut covered = 0;
-            for (index, chunk) in tokens.chunks(64).enumerate() {
-                assert_eq!(prompt_offset(index, 64).unwrap() as usize, covered);
-                covered += chunk.len();
-            }
-            assert_eq!(covered, length);
-        }
-        assert!(prompt_offset(usize::MAX, 64).is_err());
-        assert!(prompt_offset(2, u32::MAX).is_err());
     }
 
     #[test]
