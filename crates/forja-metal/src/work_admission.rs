@@ -113,6 +113,7 @@ fn from_samples(samples: &[CalibrationSample]) -> Result<WorkCalibration, Backen
             "calibration_single_dispatch",
             "calibration_profiled_dispatch",
         ])?;
+    let launch = launch + dispatch_jitter(samples)?.as_secs_f64();
     let serial_read = rate(&["calibration_read_serial"])?;
     let dependent = rate(&["calibration_dependent_read"])?;
     let serial = rate(&["calibration_scalar_serial"])?;
@@ -221,6 +222,23 @@ fn sample_rate(
     } else {
         Err(BackendError::InvalidInput)
     }
+}
+
+fn dispatch_jitter(samples: &[CalibrationSample]) -> Result<Duration, BackendError> {
+    let times = samples
+        .iter()
+        .filter(|s| s.name == "calibration_profiled_scalar")
+        .map(|s| s.gpu)
+        .collect::<Vec<_>>();
+    let minimum = times.iter().min().ok_or(BackendError::InvalidInput)?;
+    let maximum = times.iter().max().ok_or(BackendError::InvalidInput)?;
+    if minimum.is_zero() {
+        return Err(BackendError::InvalidInput);
+    }
+    maximum
+        .checked_sub(*minimum)
+        .and_then(|d| d.checked_mul(2))
+        .ok_or(BackendError::InvalidInput)
 }
 
 fn startup_reserve(samples: &[CalibrationSample]) -> Result<Duration, BackendError> {
@@ -435,6 +453,22 @@ mod tests {
             tiled_input_footprint(&dispatch),
             Some(33 * 128 * 2 + 128 * 16 * 4 + 128 * 2 * 2 * 2)
         );
+    }
+
+    #[test]
+    fn dispatch_jitter_uses_the_mixed_schedule_observations() {
+        let samples = [2, 3, 2].map(|ms| CalibrationSample {
+            name: "calibration_profiled_scalar",
+            kernel: "scalar",
+            arithmetic: None,
+            independent_chains: 0,
+            screening: false,
+            units: 7,
+            wall: Duration::from_millis(ms),
+            gpu: Duration::from_millis(ms),
+        });
+        assert_eq!(dispatch_jitter(&samples), Ok(Duration::from_millis(2)));
+        assert!(dispatch_jitter(&[]).is_err());
     }
 
     #[test]

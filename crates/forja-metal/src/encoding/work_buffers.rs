@@ -854,7 +854,28 @@ mod tests {
         let original = prepared.predictions[0];
         let reserve = prepared.reserve;
         drop(prepared);
-        let budget = original * 3 / 4;
+        let mut halves = CommandList::new();
+        for half in commands.dispatches()[0]
+            .split_output_rows()
+            .unwrap()
+            .unwrap()
+        {
+            halves.record_validated(half);
+        }
+        let prepared = backend
+            .prepare_commands::<false>(
+                halves,
+                None,
+                None,
+                ProfileTimestampGranularity::Precise,
+                None,
+                None,
+            )
+            .unwrap();
+        let half = *prepared.predictions.iter().max().unwrap();
+        drop(prepared);
+        assert!(half < original);
+        let budget = half + original.checked_sub(half).unwrap() / 2;
         backend.work_limits = forja_core::GpuWorkLimits::new(
             budget,
             budget + reserve,

@@ -258,13 +258,16 @@ impl MetalBackend {
     pub(super) fn calibrate_profiled_launches(
         &self,
     ) -> Result<Vec<CalibrationSample>, BackendError> {
-        let input = self.alloc(DType::F32, &[128])?;
-        let output = self.alloc(DType::F32, &[128])?;
+        let input = self.alloc(DType::F32, &[ELEMENTS])?;
+        let output = self.alloc(DType::F32, &[ELEMENTS])?;
         let measured = (|| {
-            self.write(&input, &[1.0_f32.to_le_bytes(); 128].concat())?;
+            self.write(
+                &input,
+                &vec![1.0_f32.to_le_bytes(); ELEMENTS as usize].concat(),
+            )?;
             let mut commands = CommandList::new();
             for _ in 0..512 {
-                for probe in [WorkProbe::ScalarSerial, WorkProbe::SingleDispatch] {
+                for probe in [WorkProbe::ScalarParallel, WorkProbe::SingleDispatch] {
                     commands
                         .dispatch_many_with_backend_data(
                             Op::Copy,
@@ -285,14 +288,25 @@ impl MetalBackend {
                 .per_dispatch
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| !index.is_multiple_of(2))
-                .map(|(_, d)| CalibrationSample {
-                    name: "calibration_profiled_dispatch",
-                    kernel: WorkProbe::SingleDispatch.kernel(),
+                .map(|(index, d)| CalibrationSample {
+                    name: if index.is_multiple_of(2) {
+                        "calibration_profiled_scalar"
+                    } else {
+                        "calibration_profiled_dispatch"
+                    },
+                    kernel: if index.is_multiple_of(2) {
+                        WorkProbe::ScalarParallel.kernel()
+                    } else {
+                        WorkProbe::SingleDispatch.kernel()
+                    },
                     arithmetic: None,
                     independent_chains: 0,
                     screening: false,
-                    units: 1,
+                    units: if index.is_multiple_of(2) {
+                        u64::from(ELEMENTS) * u64::from(crate::calibration::ITERATIONS) * 8 * 2
+                    } else {
+                        1
+                    },
                     wall: d.gpu_time,
                     gpu: d.gpu_time,
                 })
@@ -410,10 +424,14 @@ mod tests {
     fn metal_profiled_launch_probe_retains_each_raw_interval() {
         let backend = MetalBackend::new().unwrap();
         let samples = backend.calibrate_profiled_launches().unwrap();
-        assert_eq!(samples.len(), 512);
-        assert!(samples.iter().all(|s| s.units == 1
-            && !s.gpu.is_zero()
-            && s.name == "calibration_profiled_dispatch"));
+        assert_eq!(samples.len(), 1024);
+        assert!(samples.iter().all(|s| s.units > 0 && !s.gpu.is_zero()));
+        for name in [
+            "calibration_profiled_dispatch",
+            "calibration_profiled_scalar",
+        ] {
+            assert_eq!(samples.iter().filter(|s| s.name == name).count(), 512);
+        }
     }
 
     #[test]
