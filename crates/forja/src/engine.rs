@@ -371,7 +371,7 @@ pub(crate) fn metal_backend(
         .submission_timeout
         .get()
         .min(std::time::Duration::from_secs(10));
-    let backend = backend.with_submission_timeout(timeout)?;
+    let backend = backend.with_work_limits(forja_core::GpuWorkLimits::for_timeout(timeout)?);
     backend.prepare_work_estimation()?;
     Ok((backend, live_bytes))
 }

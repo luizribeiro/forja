@@ -158,6 +158,14 @@ mod tests {
             .build()?
             .block_on(super::super::measure_token_profile(&options))?;
         assert!(measured.step.submissions.len() >= 2);
+        for submission in &measured.step.submissions {
+            assert!(submission.predicted_gpu <= std::time::Duration::from_secs(8));
+            assert_ne!(submission.buffer_admission.len(), 0);
+            assert!(submission.buffer_admission.iter().all(|buffer| {
+                buffer.backstop_ratio == 4
+                    && buffer.predicted_gpu <= std::time::Duration::from_secs(2)
+            }));
+        }
         assert_eq!(
             measured
                 .step
