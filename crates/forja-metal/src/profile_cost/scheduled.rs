@@ -186,7 +186,12 @@ pub(super) fn address_elements(
     let generic = !affine
         && (matches!(
             dispatch.op(),
-            Op::Program(_) | Op::RmsNorm { .. } | Op::State(_)
+            Op::Program(_)
+                | Op::RmsNorm { .. }
+                | Op::State(_)
+                | Op::Rope { .. }
+                | Op::Embed
+                | Op::QuantEmbed { .. }
         ) || layouts.clone().any(|layout| !layout.is_contiguous()));
     let weight = if generic {
         u64::try_from(
@@ -315,6 +320,33 @@ mod tests {
     use super::*;
     use forja_core::{BackendDispatchData, CommandList, DType, DeviceCapability};
     use forja_cpu::CpuBackend;
+
+    #[test]
+    fn rotary_address_work_covers_every_generic_operand_coordinate() {
+        let cpu = forja_cpu::CpuBackend::new();
+        for tokens in [1, 7, 33, 512] {
+            let x = cpu
+                .alloc(forja_core::DType::F32, &[tokens, 16, 128])
+                .unwrap();
+            let p = cpu.alloc(forja_core::DType::U32, &[tokens]).unwrap();
+            let out = cpu
+                .alloc(forja_core::DType::F32, &[tokens, 16, 128])
+                .unwrap();
+            let mut commands = forja_core::CommandList::new();
+            commands
+                .dispatch(Op::Rope { theta: 10_000.0 }, &[&x, &p], &out)
+                .unwrap();
+            let d = commands.last_dispatch().unwrap();
+            let logical = super::super::of(d).unwrap();
+            let scheduled = of(d).unwrap();
+            let mut coordinates = 0;
+            for _ in 0..u64::from(tokens) * 16 * 64 {
+                coordinates += 1 + 2 * 3 + 2 * 3;
+            }
+            assert!(scheduled.scalar_ops >= logical.scalar_ops + coordinates);
+            assert!(scheduled.sfu_ops >= u64::from(tokens) * 16 * 128);
+        }
+    }
 
     #[test]
     fn metal_sampling_launch_bound_covers_encoded_rejection_rounds() {
