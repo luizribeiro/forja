@@ -74,7 +74,7 @@ pub(super) fn inputs(options: &Profile) -> Result<Value, Box<dyn Error>> {
         json!({"component_sha256": golden_fixtures::sha256_file(&options.engine)?,
         "profile_sha256": profile.sha256()?, "model": profile.model(), "numerics": profile.numerics(),
         "engine_config": options.engine_config, "graph_replay": options.graph_replay,
-        "warmups": options.warmups, "sampling": options.sampling,
+        "warmups": options.warmups, "sampling": options.sampling, "selection": options.selection,
         "model_path": options.model_dir, "weights_hash_source": "embedded-profile" }),
     )
 }

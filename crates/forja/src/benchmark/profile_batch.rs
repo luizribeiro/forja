@@ -94,6 +94,9 @@ async fn phase(
             runner.read(&output.tokens).await?;
         }
     }
+    if options.selection != crate::args::ProfileSelection::Combined {
+        return super::profile_selection::batch(runner, options, decode, profiling).await;
+    }
     let before = runner.metrics();
     runner.set_profiling(profiling);
     let started = Instant::now();
@@ -185,14 +188,36 @@ mod tests {
             return Err("expected profile options".into());
         };
         options.warmups = 0;
-        let measurement = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?
-            .block_on(super::super::measure_token_profile(&options))?;
-        assert!(measurement.baseline_gpu > Duration::ZERO);
-        assert!(measurement.profiled_gpu > Duration::ZERO);
-        assert_eq!(measurement.step.submissions.len(), 1);
-        assert!(measurement.step.submissions[0].dispatches > 0);
+        for selection in [
+            crate::args::ProfileSelection::Combined,
+            crate::args::ProfileSelection::Forward,
+            crate::args::ProfileSelection::Masked,
+        ] {
+            options.selection = selection;
+            let measurement = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()?
+                .block_on(super::super::measure_token_profile(&options))?;
+            assert!(measurement.baseline_gpu > Duration::ZERO);
+            assert!(measurement.profiled_gpu > Duration::ZERO);
+            assert_ne!(measurement.step.submissions.len(), 0);
+            assert!(
+                measurement
+                    .step
+                    .submissions
+                    .iter()
+                    .all(|s| s.dispatches > 0)
+            );
+            assert_eq!(
+                measurement
+                    .step
+                    .submissions
+                    .iter()
+                    .map(|s| s.gpu_time)
+                    .sum::<Duration>(),
+                measurement.profiled_gpu
+            );
+        }
         Ok(())
     }
 }

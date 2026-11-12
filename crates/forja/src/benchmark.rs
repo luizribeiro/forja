@@ -8,6 +8,8 @@ mod profile_batch;
 #[cfg(target_os = "macos")]
 mod profile_prefix;
 #[cfg(target_os = "macos")]
+mod profile_selection;
+#[cfg(target_os = "macos")]
 mod resident;
 #[cfg(target_os = "macos")]
 mod timing;
@@ -485,7 +487,7 @@ async fn measure_profiled_phase(
         ProfileMode::Decode => {
             let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
             runner.set_profiling(true);
-            measure_decode_step(runner, token, options.context, decode).await
+            profile_selection::decode(runner, token, options, decode, true).await
         }
     };
     runner.set_profiling(false);
@@ -511,7 +513,7 @@ async fn measure_profile_phase(
         }
         ProfileMode::Decode => {
             let token = prepare_profile_context(runner, tokens, options.context, decode).await?;
-            measure_decode_step(runner, token, options.context, decode).await
+            profile_selection::decode(runner, token, options, decode, false).await
         }
     }
 }

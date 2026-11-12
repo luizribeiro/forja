@@ -27,6 +27,15 @@ pub(crate) enum ProfileMode {
     Prefill,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ProfileSelection {
+    #[default]
+    Combined,
+    Forward,
+    Masked,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Verify {
     pub(crate) engine: PathBuf,
@@ -190,6 +199,7 @@ pub(crate) struct BenchPoint {
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct Profile {
+    pub(crate) selection: ProfileSelection,
     pub(crate) engine: PathBuf,
     pub(crate) model_dir: PathBuf,
     pub(crate) context: usize,
@@ -209,6 +219,9 @@ pub(crate) struct Profile {
 
 #[derive(Args)]
 struct ProfileArgs {
+    /// Decode work to measure; masked selection prepares its logits separately.
+    #[arg(long, value_enum, default_value_t = ProfileSelection::Combined)]
+    selection: ProfileSelection,
     /// WebAssembly engine component.
     #[arg(long)]
     engine: PathBuf,
@@ -1439,7 +1452,14 @@ impl ProfileArgs {
                 "--batch-size greater than one requires decode mode",
             ));
         }
+        if self.selection != ProfileSelection::Combined && self.mode != ProfileMode::Decode {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                "--selection requires decode mode",
+            ));
+        }
         Ok(Profile {
+            selection: self.selection,
             batch_size: self.batch_size,
             engine,
             model_dir,
@@ -1763,6 +1783,33 @@ mod tests {
         assert_eq!(options.warmups, 7);
         assert!(options.json);
         assert_eq!(options.scratch, PathBuf::from("target/forja-bench"));
+    }
+
+    #[test]
+    fn profile_selection_requires_decode_and_survives_option_resolution() {
+        for selection in ["combined", "forward", "masked"] {
+            let args = [
+                "--isolated",
+                "profile",
+                "--engine",
+                "engine.wasm",
+                "--model",
+                "/tmp",
+                "--context",
+                "512",
+                "--selection",
+                selection,
+            ]
+            .map(str::to_owned);
+            let command = parse(args.clone()).unwrap();
+            let Command::Profile(options) = command else {
+                panic!("expected profile");
+            };
+            assert_eq!(serde_json::to_value(options.selection).unwrap(), selection);
+            let mut args = args.to_vec();
+            args.extend(["--mode".to_owned(), "prefill".to_owned()]);
+            assert_eq!(parse(args).is_err(), selection != "combined");
+        }
     }
 
     #[test]
