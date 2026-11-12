@@ -19,6 +19,10 @@ mod encoding;
 #[cfg(target_os = "macos")]
 mod epilogue_codegen;
 #[cfg(target_os = "macos")]
+mod execution_measurement;
+#[cfg(target_os = "macos")]
+mod execution_plan;
+#[cfg(target_os = "macos")]
 mod geometry;
 #[cfg(target_os = "macos")]
 mod map_codegen;
@@ -59,6 +63,8 @@ pub use calibration::CalibrationSample;
 pub use encoding::resources::KernelResources;
 #[cfg(target_os = "macos")]
 pub use encoding::{MetalProgramHandle, ProfileTimestampGranularity};
+#[cfg(target_os = "macos")]
+pub use execution_measurement::{ExecutionValidator, ExecutionWork};
 #[cfg(target_os = "macos")]
 pub use storage::{MetalBackend, MetalGraphReplay, ProgramCompileBudget};
 #[cfg(target_os = "macos")]

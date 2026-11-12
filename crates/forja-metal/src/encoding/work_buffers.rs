@@ -38,6 +38,7 @@ pub(super) fn retain_owners(completion: &Completion) {
 }
 
 pub(super) struct PreparedBuffer {
+    pub(super) observation: Option<crate::execution_measurement::Observation>,
     pub(super) predictions: Vec<Duration>,
     pub(super) reserve: Duration,
     pub(super) command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -65,6 +66,7 @@ impl PreparedBuffer {
             self.timestamps,
             &mut self.objects,
         )?;
+        submission.observation = self.observation;
         submission.deadline = deadline;
         if let Some(mut profile) = self.profile {
             profile.commit = started.elapsed();
@@ -206,8 +208,11 @@ impl MetalBackend {
         graph_arena: Option<&GraphArenaReservation>,
         granularity: ProfileTimestampGranularity,
         cache_nodes: Option<&[Arc<super::work_prediction::NodeCache>]>,
+        execution_plan: Option<&Arc<crate::execution_plan::ExecutionPlan>>,
     ) -> Result<MetalSubmission, BackendError> {
         let cache_nodes = cache_nodes.or_else(|| graph.map(|graph| graph.predictions.as_slice()));
+        let execution_plan =
+            execution_plan.or_else(|| graph.and_then(|graph| graph.execution_plan.as_ref()));
         let limits = self.submission_limits()?;
         let started = Instant::now();
         let first = self.prepare_commands::<PROFILE>(
@@ -216,6 +221,7 @@ impl MetalBackend {
             graph_arena,
             granularity,
             cache_nodes,
+            execution_plan.map(|plan| plan.total),
         )?;
         if !self.enforce_work_limits {
             let deadline = Instant::now()
@@ -233,7 +239,7 @@ impl MetalBackend {
                 .dispatch()
                 .min(limits.command_buffer().saturating_sub(first.reserve));
             let graph = graph
-                .map(|graph| graph.split_outputs(&first.predictions, budget))
+                .map(|graph| graph.split_outputs(&first.predictions, budget, &split))
                 .transpose()?;
             let split_cache = if graph.is_none() {
                 cache_nodes
@@ -244,6 +250,8 @@ impl MetalBackend {
             } else {
                 None
             };
+            let split_execution =
+                execution_plan.map(|plan| plan.split(&split, &first.predictions, budget));
             drop(first);
             return self.submit_commands_inner::<PROFILE>(
                 split,
@@ -251,6 +259,7 @@ impl MetalBackend {
                 graph_arena,
                 granularity,
                 split_cache.as_deref(),
+                split_execution.as_ref(),
             );
         }
         let ranges = partition(&first.predictions, limits, first.reserve)?;
@@ -285,18 +294,19 @@ impl MetalBackend {
                         .map(|nodes| nodes.get(range.clone()).ok_or(BackendError::InvalidInput))
                         .transpose()?;
                     let prepared = graph.map(|graph| graph.window(range.clone())).transpose()?;
+                    let execution = execution_plan.map(|plan| plan.window(range.clone()));
                     let mut chunk = CommandList::new();
                     for dispatch in dispatches.get(range).ok_or(BackendError::InvalidInput)? {
                         chunk.record_validated(dispatch.clone());
                     }
-                    Ok((chunk, prepared, caches))
+                    Ok((chunk, prepared, caches, execution))
                 })
                 .collect::<Result<Vec<_>, BackendError>>()?;
             let overhead = started.elapsed();
             let deadline = deadline()?;
             let mut prefixes = Vec::new();
             let last = chunks.len() - 1;
-            for (index, ((chunk, graph, caches), forecast)) in
+            for (index, ((chunk, graph, caches, execution), forecast)) in
                 chunks.into_iter().zip(predictions).enumerate()
             {
                 let committed = (|| {
@@ -306,6 +316,7 @@ impl MetalBackend {
                         graph_arena,
                         granularity,
                         caches,
+                        execution.as_ref().map(|plan| plan.total),
                     )?;
                     let actual = prepared
                         .predictions
@@ -545,6 +556,7 @@ mod tests {
                     None,
                     ProfileTimestampGranularity::Precise,
                     None,
+                    None,
                 )
                 .unwrap();
             if let Some(split) = backend
@@ -696,6 +708,7 @@ mod tests {
                 None,
                 ProfileTimestampGranularity::Precise,
                 None,
+                None,
             )
             .unwrap();
         let budget = *prepared.predictions.iter().max().unwrap();
@@ -738,6 +751,7 @@ mod tests {
                 None,
                 None,
                 ProfileTimestampGranularity::Precise,
+                None,
                 None,
             )
             .unwrap();
@@ -815,6 +829,7 @@ mod tests {
                 None,
                 ProfileTimestampGranularity::Precise,
                 None,
+                None,
             )
             .unwrap();
         let unit = prepared.predictions[0];
@@ -870,6 +885,7 @@ mod tests {
                 .split_outputs(
                     &[Duration::from_nanos(1), Duration::ZERO, Duration::ZERO],
                     Duration::ZERO,
+                    &CommandList::new(),
                 )
                 .unwrap();
             let plans = &expanded.encoding.as_ref().unwrap().dispatches;

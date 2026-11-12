@@ -1535,6 +1535,7 @@ struct CommandResources {
 
 pub(super) struct PreparedMetalGraph {
     predictions: Vec<Arc<work_prediction::NodeCache>>,
+    execution_plan: Option<Arc<crate::execution_plan::ExecutionPlan>>,
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     buffers: HashSet<BufferId>,
     encoding: Option<MetalEncodingPlan>,
@@ -1547,6 +1548,7 @@ impl PreparedMetalGraph {
         &self,
         predictions: &[Duration],
         budget: Duration,
+        commands: &CommandList,
     ) -> Result<Self, BackendError> {
         let mut result = self.window(0..predictions.len())?;
         result.predictions = work_prediction::split_nodes(&self.predictions, predictions, budget)?;
@@ -1582,6 +1584,10 @@ impl PreparedMetalGraph {
             }
             encoding.dispatches = expanded;
         }
+        result.execution_plan = self
+            .execution_plan
+            .as_ref()
+            .map(|plan| plan.split(commands, predictions, budget));
         result.variant_rechecks.clear();
         Ok(result)
     }
@@ -1624,6 +1630,10 @@ impl PreparedMetalGraph {
             })
             .transpose()?;
         Ok(Self {
+            execution_plan: self
+                .execution_plan
+                .as_ref()
+                .map(|plan| plan.window(range.clone())),
             predictions: self
                 .predictions
                 .get(range.clone())
@@ -2510,6 +2520,7 @@ impl InFlightTracker {
 
 /// Completion state for a Metal command buffer.
 pub struct MetalSubmission {
+    observation: Option<crate::execution_measurement::Observation>,
     completion: Arc<Completion>,
     timeout: Duration,
     deadline: Instant,
@@ -2611,7 +2622,11 @@ impl MetalSubmission {
             profile.wait = started.elapsed();
             profile.gpu_time = self.completion.gpu_time().unwrap_or_default();
         }
-        result.and(self.failure.map_or(Ok(()), Err))
+        result.and(self.failure.map_or(Ok(()), Err))?;
+        if let Some(observation) = &self.observation {
+            observation.check(self.completion.gpu_time())?;
+        }
+        Ok(())
     }
 
     /// Returns feedback and shared-event callback latency from queue commit after a successful wait.
@@ -2701,6 +2716,7 @@ impl MetalBackend {
             None,
             ProfileTimestampGranularity::Precise,
             None,
+            None,
         )
     }
 
@@ -2721,7 +2737,7 @@ impl MetalBackend {
         commands: CommandList,
         granularity: ProfileTimestampGranularity,
     ) -> Result<MetalSubmission, BackendError> {
-        self.submit_commands_inner::<true>(commands, None, None, granularity, None)
+        self.submit_commands_inner::<true>(commands, None, None, granularity, None, None)
     }
 
     pub(super) fn prepare_metal_graph(
@@ -2767,6 +2783,10 @@ impl MetalBackend {
         residency.commit();
         self.check_allocation_limit()?;
         Ok(PreparedMetalGraph {
+            execution_plan: self
+                .execution_validator
+                .as_ref()
+                .map(|_| crate::execution_plan::ExecutionPlan::graph(graph)),
             predictions: (0..graph.len()).map(|_| Arc::default()).collect(),
             residency,
             buffers: retained,
@@ -3015,6 +3035,7 @@ impl MetalBackend {
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
                 Some(&state.predictions),
+                state.execution_plan.as_ref(),
             )
         } else {
             self.submit_commands_inner::<false>(
@@ -3023,6 +3044,7 @@ impl MetalBackend {
                 arena.as_ref(),
                 ProfileTimestampGranularity::Precise,
                 Some(&state.predictions),
+                state.execution_plan.as_ref(),
             )
         };
         match submission {
@@ -3049,6 +3071,7 @@ impl MetalBackend {
         graph_arena: Option<&GraphArenaReservation>,
         timestamp_granularity: ProfileTimestampGranularity,
         cache_nodes: Option<&[Arc<work_prediction::NodeCache>]>,
+        execution_work: Option<crate::ExecutionWork>,
     ) -> Result<work_buffers::PreparedBuffer, BackendError> {
         let cache_nodes = cache_nodes.or_else(|| graph.map(|graph| graph.predictions.as_slice()));
         if cache_nodes.is_some_and(|nodes| nodes.len() != commands.len()) {
@@ -3286,6 +3309,13 @@ impl MetalBackend {
             state::fold_profiles(&dispatches, &mut dispatch_profiles)?;
         }
         Ok(work_buffers::PreparedBuffer {
+            observation: self.execution_validator.as_ref().map(|validator| {
+                crate::execution_measurement::Observation {
+                    work: execution_work.unwrap_or_else(|| crate::ExecutionWork::of(&dispatches)),
+                    validator: Arc::clone(validator),
+                    result: OnceLock::new(),
+                }
+            }),
             command_buffer,
             accesses,
             resources,
@@ -8718,6 +8748,7 @@ impl MetalBackend {
         drop(next_event_value);
         registration.register(event_value);
         Ok(MetalSubmission {
+            observation: None,
             completion,
             timeout: self.command_timeout(),
             deadline: Instant::now()

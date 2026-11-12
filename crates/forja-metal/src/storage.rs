@@ -583,6 +583,7 @@ pub struct MetalBackend {
     allocation_lock: Mutex<()>,
     baseline_device_bytes: u64,
     pub(super) bandwidth: Mutex<Option<crate::MemoryBandwidth>>,
+    pub(super) execution_validator: Option<Arc<crate::ExecutionValidator>>,
     // Keep concurrent compute calibrations from interleaving selection and confirmation.
     pub(super) calibration_lock: Mutex<()>,
     #[cfg(test)]
@@ -1038,6 +1039,7 @@ impl MetalBackend {
             allocation_lock: Mutex::new(()),
             baseline_device_bytes,
             bandwidth: Mutex::new(None),
+            execution_validator: None,
             calibration_lock: Mutex::new(()),
             #[cfg(test)]
             allocation_requests: AtomicUsize::new(0),
